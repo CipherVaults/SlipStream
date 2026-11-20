@@ -6,6 +6,8 @@ members = [
     "crates/media",
     "crates/torrent",
     "crates/native-host",
+    "apps/desktop/src-tauri",
+    "tests/safety-eval",
 ]
 
 [workspace.package]

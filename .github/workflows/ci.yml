@@ -17,6 +17,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Ensure Tauri frontendDist placeholder exists
+        run: New-Item -ItemType Directory -Force apps/desktop/dist | Out-Null
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run Rust tests

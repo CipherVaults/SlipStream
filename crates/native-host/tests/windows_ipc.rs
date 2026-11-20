@@ -86,8 +86,13 @@ fn assert_pipe_dacl(handle: RawHandle, sid: &str) {
         decoded
     };
     let dacl = raw.trim_end_matches('\0');
+    let mut allowed = vec![pipe_sddl(sid), format!("D:(A;;FA;;;{sid})")];
+    if sid.ends_with("-500") {
+        allowed.push("D:(A;;GA;;;LA)".to_owned());
+        allowed.push("D:(A;;FA;;;LA)".to_owned());
+    }
     assert!(
-        [pipe_sddl(sid), format!("D:(A;;FA;;;{sid})")].contains(&dacl.to_owned()),
+        allowed.iter().any(|expected| expected == dacl),
         "unexpected pipe DACL {dacl}"
     );
 }

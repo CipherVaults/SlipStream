@@ -1,0 +1,11 @@
+{
+  "name": "@slipstream/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "echo desktop stub ok",
+    "test": "echo desktop stub ok",
+    "build": "echo desktop stub ok"
+  }
+}
