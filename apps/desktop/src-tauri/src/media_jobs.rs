@@ -94,7 +94,7 @@ impl MediaJob {
             ui_segments: [0.0; UI_SEGMENT_COUNT],
             segments: Vec::new(),
             sha256_verified: None,
-            resumable: true,
+            resumable: false,
             queue_id: "default".into(),
             error_message: None,
             created_at: now,
@@ -122,7 +122,7 @@ impl MediaJob {
     pub(crate) async fn start(
         self: &Arc<Self>,
         config: ToolchainConfig,
-        scans: mpsc::UnboundedSender<ScanRequest>,
+        scans: mpsc::Sender<ScanRequest>,
     ) -> Result<(), String> {
         let mut run = self.run.lock().await;
         {
@@ -181,7 +181,7 @@ impl MediaJob {
     async fn download(
         &self,
         config: ToolchainConfig,
-        scans: mpsc::UnboundedSender<ScanRequest>,
+        scans: mpsc::Sender<ScanRequest>,
         mut stopped: watch::Receiver<bool>,
     ) {
         let (tx, mut rx) = mpsc::channel(16);
@@ -228,7 +228,9 @@ impl MediaJob {
                 snapshot.downloaded_bytes = bytes;
                 snapshot.total_bytes = Some(bytes);
                 snapshot.ui_segments.fill(1.0);
-                let _ = scans.send((self.directory.clone(), paths));
+                if let Err(error) = scans.try_send((self.directory.clone(), paths)) {
+                    tracing::debug!(%error, "could not enqueue media Defender scan");
+                }
             }
             Err(error) => {
                 snapshot.status = TransferStatus::Failed;

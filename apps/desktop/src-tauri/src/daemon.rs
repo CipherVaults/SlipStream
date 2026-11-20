@@ -1,17 +1,18 @@
 use crate::{
     media_jobs::{MediaJob, ScanRequest},
     paths::{
-        build_defender_scan_args, canonical_directory, decode_sha256, delete_files, hash_file,
-        reveal_args,
+        build_defender_scan_args, decode_sha256, delete_files, ensure_safe_directory, hash_file,
+        local_drive_path, reveal_action, RevealAction,
     },
     settings::{normalize, read_json, torrent_rate, write_json_atomically, SETTINGS_FILE},
-    tools::{defender_executable, toolchain_status, ToolchainStatus},
+    tools::{defender_executable, explorer_executable, toolchain_status, ToolchainStatus},
 };
 use serde::{Deserialize, Serialize};
 use slipstream_engine::{DownloadEngine, EngineConfig, EngineEvent};
 use slipstream_media::{probe_url, MediaToolchain, ProbeOptions};
 use slipstream_native_host::{
     pipe::{error_response, PipeRequestHandler, PipeServer},
+    registry::DEFAULT_BASE_KEY,
     security::default_pipe_name,
 };
 use slipstream_protocol::{
@@ -24,6 +25,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Display,
     future::{pending, Future},
+    os::windows::process::CommandExt,
     path::{Path, PathBuf},
     pin::Pin,
     process::{Command as StdCommand, Stdio},
@@ -39,13 +41,15 @@ use tokio::{
         broadcast, mpsc, watch, Mutex as AsyncMutex, MutexGuard, Notify, RwLock as AsyncRwLock,
     },
     task::JoinHandle,
-    time::Instant,
+    time::{timeout, Instant},
 };
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 type Result<T> = std::result::Result<T, String>;
 const DISMISSED_FILE: &str = "dismissed-http.json";
 const TELEMETRY_INTERVAL: Duration = Duration::from_millis(50);
+const DEFENDER_SCAN_QUEUE_CAPACITY: usize = 128;
+const DEFENDER_SCAN_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpenPickerEvent {
@@ -57,6 +61,7 @@ pub trait UiBridge: Send + Sync + 'static {
     fn emit_telemetry(&self, batch: &TelemetryBatch) -> Result<()>;
     fn emit_open_picker(&self, event: &OpenPickerEvent) -> Result<()>;
     fn has_main_window(&self) -> bool;
+    fn trigger_ready_check(&self) {}
     fn request_quit(&self);
 }
 
@@ -64,6 +69,7 @@ pub trait UiBridge: Send + Sync + 'static {
 pub struct DaemonOptions {
     pub pipe_name: Option<String>,
     pub allow_loopback: bool,
+    pub registry_base_key: Option<String>,
     pub torrent: TorrentManagerConfig,
 }
 
@@ -80,6 +86,7 @@ struct Picker {
 
 pub struct AppState {
     data_dir: PathBuf,
+    registry_base_key: String,
     ui: Arc<dyn UiBridge>,
     engine: DownloadEngine,
     torrent: AsyncRwLock<TorrentSession>,
@@ -93,7 +100,8 @@ pub struct AppState {
     window_changed: Notify,
     torrent_changed: Notify,
     torrent_completions: Mutex<HashSet<String>>,
-    scans: mpsc::UnboundedSender<ScanRequest>,
+    torrent_scanned_files: Mutex<HashMap<String, HashSet<String>>>,
+    scans: mpsc::Sender<ScanRequest>,
     stop: watch::Sender<bool>,
     tasks: AsyncMutex<Option<Vec<JoinHandle<()>>>>,
     quitting: AtomicBool,
@@ -156,11 +164,15 @@ impl AppState {
             .filter(|snapshot| snapshot.status == TransferStatus::Completed)
             .map(|snapshot| snapshot.id)
             .collect();
-        let (scans, scan_requests) = mpsc::unbounded_channel();
+        let (scans, scan_requests) = mpsc::channel(DEFENDER_SCAN_QUEUE_CAPACITY);
         let (stop, _) = watch::channel(false);
         let ready = ui.has_main_window();
+        let registry_base_key = options
+            .registry_base_key
+            .unwrap_or_else(|| DEFAULT_BASE_KEY.to_owned());
         let state = Arc::new(Self {
             data_dir,
+            registry_base_key,
             ui,
             engine,
             torrent: AsyncRwLock::new(torrent),
@@ -177,6 +189,7 @@ impl AppState {
             window_changed: Notify::new(),
             torrent_changed: Notify::new(),
             torrent_completions: Mutex::default(),
+            torrent_scanned_files: Mutex::default(),
             scans,
             stop,
             tasks: AsyncMutex::new(Some(Vec::new())),
@@ -343,9 +356,24 @@ impl AppState {
         mut request: AddHttpDownloadRequest,
         settings: &AppSettings,
     ) -> Result<String> {
-        request
+        let dir_raw = request
             .save_dir
-            .get_or_insert_with(|| settings.default_download_dir.clone());
+            .take()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| settings.default_download_dir.clone());
+        let validated_dir = tokio::task::spawn_blocking(move || {
+            let canonical = ensure_safe_directory(Path::new(&dir_raw))?;
+            local_drive_path(&canonical)
+        })
+        .await
+        .map_err(message)?
+        .map_err(message)?;
+        request.save_dir = Some(
+            validated_dir
+                .into_os_string()
+                .into_string()
+                .map_err(|_| "non-Unicode save directory".to_owned())?,
+        );
         request
             .max_connections
             .get_or_insert(settings.default_connections);
@@ -385,16 +413,17 @@ impl AppState {
     pub async fn add_media_download(&self, request: AddMediaDownloadRequest) -> Result<String> {
         let _operation = self.operation().await?;
         let settings = self.settings();
-        let directory = Path::new(
+        let raw_dir = PathBuf::from(
             request
                 .save_dir
                 .as_deref()
+                .filter(|s| !s.trim().is_empty())
                 .unwrap_or(&settings.default_download_dir),
         );
-        tokio::fs::create_dir_all(directory)
+        let directory = tokio::task::spawn_blocking(move || ensure_safe_directory(&raw_dir))
             .await
+            .map_err(message)?
             .map_err(message)?;
-        let directory = canonical_directory(directory).map_err(message)?;
         let job = Arc::new(MediaJob::new(request, directory)?);
         let id = job.snapshot().id;
         job.start((&settings).into(), self.scans.clone()).await?;
@@ -457,7 +486,11 @@ impl AppState {
             .manager
             .set_selected_files(id, &indices)
             .await
-            .map_err(message)
+            .map_err(message)?;
+        self.verified.write().unwrap().remove(id);
+        self.torrent_completions.lock().unwrap().insert(id.into());
+        self.torrent_changed.notify_one();
+        Ok(())
     }
 
     pub async fn pause_transfer(&self, id: &str) -> Result<()> {
@@ -558,6 +591,7 @@ impl AppState {
                 .await
                 .map_err(message)?;
             self.torrent_completions.lock().unwrap().remove(id);
+            self.torrent_scanned_files.lock().unwrap().remove(id);
         }
         self.verified.write().unwrap().remove(id);
         Ok(())
@@ -613,16 +647,23 @@ impl AppState {
 
     pub async fn reveal_in_explorer(&self, id: &str) -> Result<()> {
         let (root, files) = self.transfer_paths(id).await?;
-        let args = reveal_args(&root, files.first().map(String::as_str)).map_err(message)?;
-        StdCommand::new("explorer.exe")
-            .args(args)
-            .spawn()
-            .map_err(message)?;
+        let action = reveal_action(&root, files.first().map(String::as_str)).map_err(message)?;
+        let explorer = explorer_executable().map_err(message)?;
+        let mut command = StdCommand::new(explorer);
+        match action {
+            RevealAction::SelectFile(raw) => {
+                command.raw_arg(raw);
+            }
+            RevealAction::OpenDir(dir) => {
+                command.arg(dir);
+            }
+        }
+        command.spawn().map_err(message)?;
         Ok(())
     }
 
     pub async fn get_toolchain_status(&self) -> ToolchainStatus {
-        toolchain_status(&self.settings()).await
+        toolchain_status(&self.settings(), &self.registry_base_key).await
     }
 
     pub async fn show_main_window(&self) -> Result<()> {
@@ -651,9 +692,13 @@ impl AppState {
             }
         }
         self.show_main_window().await?;
-        {
+        let needs_ready_check = {
             let mut picker = self.picker.lock().unwrap();
             picker.pending.push_back(OpenPickerEvent { url });
+            !picker.ready
+        };
+        if needs_ready_check {
+            self.ui.trigger_ready_check();
         }
         self.flush_picker()
     }
@@ -764,8 +809,12 @@ impl AppState {
                     accent: settings.accent,
                 });
             }
-            AddHttpDownload { request } => {
-                return self.add_http_download(request).await.map(created)
+            AddHttpDownload { mut request } => {
+                if request.save_dir.is_some() {
+                    return Err("browser requests cannot override save_dir".into());
+                }
+                request.save_dir = None;
+                return self.add_http_download(request).await.map(created);
             }
             ProbeMedia { url } => {
                 return self
@@ -773,10 +822,21 @@ impl AppState {
                     .await
                     .map(|probe| NativeBridgeResponse::MediaProbed { probe })
             }
-            AddMediaDownload { request } => {
-                return self.add_media_download(request).await.map(created)
+            AddMediaDownload { mut request } => {
+                if request.save_dir.is_some() {
+                    return Err("browser requests cannot override save_dir".into());
+                }
+                request.save_dir = None;
+                return self.add_media_download(request).await.map(created);
             }
-            AddTorrent { request } => return self.add_torrent(request).await.map(created),
+            AddTorrent { mut request } => {
+                validate_magnet_uri(&request.source).map_err(message)?;
+                if request.save_dir.is_some() {
+                    return Err("browser requests cannot override save_dir".into());
+                }
+                request.save_dir = None;
+                return self.add_torrent(request).await.map(created);
+            }
             RefreshDownloadUrl { request } => self.refresh_download_url(request).await?,
             PauseTransfer { transfer_id } => self.pause_transfer(&transfer_id).await?,
             ResumeTransfer { transfer_id } => self.resume_transfer(&transfer_id).await?,
@@ -925,17 +985,22 @@ fn scan_http_completion(state: &AppState, seen: &mut HashSet<String>, snapshot: 
         && !state.dismissed_http.read().unwrap().contains(&snapshot.id)
         && state.settings.read().unwrap().auto_defender_scan
     {
-        let _ = state
+        if let Err(error) = state
             .scans
-            .send((snapshot.save_dir.into(), vec![snapshot.filename]));
+            .try_send((snapshot.save_dir.into(), vec![snapshot.filename]))
+        {
+            tracing::debug!(%error, "could not enqueue HTTP Defender scan");
+        }
     }
 }
 
 async fn scan_torrent_completions(state: &AppState) {
     let torrent = state.torrent.read().await;
     let mut pending = state.torrent_completions.lock().unwrap();
+    let mut scanned = state.torrent_scanned_files.lock().unwrap();
     pending.retain(|id| {
         let Ok(report) = torrent.manager.stats(id) else {
+            scanned.remove(id);
             return false;
         };
         if !report.finished {
@@ -943,12 +1008,20 @@ async fn scan_torrent_completions(state: &AppState) {
         }
         if state.settings.read().unwrap().auto_defender_scan {
             if let Ok(files) = torrent.manager.list_files(id) {
-                let paths = files
+                let already = scanned.entry(id.clone()).or_default();
+                let paths: Vec<String> = files
                     .into_iter()
-                    .filter(|file| file.selected)
+                    .filter(|file| file.selected && already.insert(file.relative_path.clone()))
                     .map(|file| file.relative_path)
                     .collect();
-                let _ = state.scans.send((report.snapshot.save_dir.into(), paths));
+                if !paths.is_empty() {
+                    if let Err(error) = state
+                        .scans
+                        .try_send((report.snapshot.save_dir.into(), paths))
+                    {
+                        tracing::debug!(%error, "could not enqueue torrent Defender scan");
+                    }
+                }
             }
         }
         false
@@ -958,7 +1031,7 @@ async fn scan_torrent_completions(state: &AppState) {
 async fn scan_completed(
     state: Weak<AppState>,
     stop: watch::Receiver<bool>,
-    mut requests: mpsc::UnboundedReceiver<ScanRequest>,
+    mut requests: mpsc::Receiver<ScanRequest>,
 ) {
     let stopped = stopped_signal(stop);
     tokio::pin!(stopped);
@@ -998,14 +1071,15 @@ async fn scan_completed(
             let result = tokio::select! {
                 biased;
                 _ = &mut stopped => return,
-                status = command.status() => status,
+                result = timeout(DEFENDER_SCAN_TIMEOUT, command.status()) => result,
             };
             match result {
-                Ok(status) if status.success() => {}
-                Ok(status) => {
+                Ok(Ok(status)) if status.success() => {}
+                Ok(Ok(status)) => {
                     tracing::warn!(%status, "Windows Defender scan returned an unsuccessful status")
                 }
-                Err(error) => tracing::warn!(%error, "could not run Windows Defender scan"),
+                Ok(Err(error)) => tracing::warn!(%error, "could not run Windows Defender scan"),
+                Err(_) => tracing::warn!("Windows Defender scan timed out"),
             }
         }
     }

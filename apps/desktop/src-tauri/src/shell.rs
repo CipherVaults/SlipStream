@@ -80,13 +80,17 @@ impl DesktopUi {
         }
         if let Some(window) = self.app.get_webview_window(MAIN) {
             self.destroying.send_replace(true);
-            if let Err(error) = window.destroy() {
-                self.destroying.send_replace(false);
-                return Err(error.to_string());
-            }
             self.present.store(false, Ordering::Release);
             self.page_generation.fetch_add(1, Ordering::AcqRel);
             self.app.state::<Arc<AppState>>().window_loading();
+            if let Err(error) = window.destroy() {
+                self.destroying.send_replace(false);
+                if self.app.get_webview_window(MAIN).is_some() {
+                    self.present.store(true, Ordering::Release);
+                    self.app.state::<Arc<AppState>>().window_shown();
+                }
+                return Err(error.to_string());
+            }
         }
         Ok(())
     }
@@ -136,19 +140,42 @@ impl UiBridge for DesktopUi {
     }
 
     fn emit_telemetry(&self, batch: &TelemetryBatch) -> Result<()> {
-        self.app
+        if !self.has_main_window() || *self.destroying.borrow() {
+            return Ok(());
+        }
+        let Some(window) = self.app.get_webview_window(MAIN) else {
+            return Ok(());
+        };
+        window
             .emit(TELEMETRY_EVENT, batch)
             .map_err(|error| error.to_string())
     }
 
     fn emit_open_picker(&self, event: &OpenPickerEvent) -> Result<()> {
-        self.app
+        if !self.has_main_window() || *self.destroying.borrow() {
+            return Err("main window is unavailable".into());
+        }
+        let Some(window) = self.app.get_webview_window(MAIN) else {
+            return Err("main window is unavailable".into());
+        };
+        window
             .emit(OPEN_PICKER_EVENT, event)
             .map_err(|error| error.to_string())
     }
 
     fn has_main_window(&self) -> bool {
-        self.present.load(Ordering::Acquire)
+        self.present.load(Ordering::Acquire) && !*self.destroying.borrow()
+    }
+
+    fn trigger_ready_check(&self) {
+        if !self.has_main_window() {
+            return;
+        }
+        if let Some(window) = self.app.get_webview_window(MAIN) {
+            let ui = self.app.state::<Arc<DesktopUi>>().inner().clone();
+            let state = self.app.state::<Arc<AppState>>().inner().clone();
+            page_finished(window, ui, state);
+        }
     }
 
     fn request_quit(&self) {
@@ -229,8 +256,10 @@ fn page_finished(window: WebviewWindow, ui: Arc<DesktopUi>, state: Arc<AppState>
     let generation = ui.page_generation.load(Ordering::Acquire);
     tauri::async_runtime::spawn(async move {
         let fast_until = tokio::time::Instant::now() + Duration::from_secs(3);
-        let fallback_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while ui.page_generation.load(Ordering::Acquire) == generation {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while ui.page_generation.load(Ordering::Acquire) == generation
+            && tokio::time::Instant::now() < deadline
+        {
             // Finished can arrive before React's effect has subscribed. Query
             // the Tauri v2 event registration before handing over pending URLs.
             let (tx, rx) = oneshot::channel();
@@ -249,8 +278,7 @@ fn page_finished(window: WebviewWindow, ui: Arc<DesktopUi>, state: Arc<AppState>
             let subscribed = tokio::time::timeout(Duration::from_millis(250), rx)
                 .await
                 .is_ok_and(|answer| answer == Ok(true));
-            let timed_out = tokio::time::Instant::now() >= fallback_deadline;
-            if subscribed || timed_out {
+            if subscribed {
                 if ui.page_generation.load(Ordering::Acquire) == generation {
                     if let Err(error) = state.window_ready() {
                         tracing::warn!(%error, "could not open the picker");
@@ -261,7 +289,7 @@ fn page_finished(window: WebviewWindow, ui: Arc<DesktopUi>, state: Arc<AppState>
             let delay = if tokio::time::Instant::now() < fast_until {
                 30
             } else {
-                150
+                200
             };
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }

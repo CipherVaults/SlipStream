@@ -27,6 +27,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 use uuid::Uuid;
+use windows_sys::Win32::System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER};
 
 const TEST_HASH: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
 
@@ -194,10 +195,29 @@ async fn wait_for(state: &AppState, id: &str, status: TransferStatus) -> Transfe
     .unwrap_or_else(|_| panic!("{id} did not reach {status:?}"))
 }
 
-fn options(pipe: &str) -> DaemonOptions {
+struct RegistryKey(String);
+
+impl RegistryKey {
+    fn isolated() -> Self {
+        Self(format!(
+            r"Software\SlipStreamDesktopDaemonTest-{}",
+            Uuid::new_v4()
+        ))
+    }
+}
+
+impl Drop for RegistryKey {
+    fn drop(&mut self) {
+        let wide: Vec<_> = self.0.encode_utf16().chain([0]).collect();
+        unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, wide.as_ptr()) };
+    }
+}
+
+fn options(pipe: &str, registry_key: &str) -> DaemonOptions {
     DaemonOptions {
         pipe_name: Some(pipe.into()),
         allow_loopback: true,
+        registry_base_key: Some(registry_key.into()),
         torrent: TorrentManagerConfig {
             enable_dht: false,
             enable_trackers: false,
@@ -290,8 +310,9 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
     let downloads = dir.join("Downloads");
     let settings = installed_settings(dir, &downloads);
     let pipe = format!(r"\\.\pipe\SlipStream.DesktopTest.{}", Uuid::new_v4());
+    let registry_key = RegistryKey::isolated();
     let ui = Arc::new(FakeUi::default());
-    let state = AppState::start(dir.clone(), ui.clone(), options(&pipe))
+    let state = AppState::start(dir.clone(), ui.clone(), options(&pipe, &registry_key.0))
         .await
         .unwrap();
     sleep(Duration::from_millis(80)).await;
@@ -382,6 +403,7 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
     let tools = state.get_toolchain_status().await;
     assert_eq!(tools.ytdlp_version.as_deref(), Some("yt-dlp fixture 1.0"));
     assert!(tools.ffmpeg_path.is_none());
+    assert!(!tools.native_hosts_installed);
     state
         .save_settings(AppSettings {
             ytdlp_path: Some(missing),
@@ -436,6 +458,7 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
         })
         .await;
     let media_snap = wait_for(&state, &media, TransferStatus::Completed).await;
+    assert!(!media_snap.resumable);
     assert!(media_snap.format_tags.contains(&"18".to_owned()));
     assert!(state.pause_transfer(&media).await.is_err());
     assert_eq!(fs::read(downloads.join("video.mp4")).unwrap(), b"test");
@@ -444,16 +467,89 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
         .await
         .unwrap());
 
-    let torrent = bridge
+    // Browser Named Pipe must reject non-magnet AddTorrent sources and any save_dir overrides.
+    let local_torrent = torrent_file(dir);
+    assert!(matches!(
+        bridge
+            .request(Request::AddTorrent {
+                request: AddTorrentRequest {
+                    source: local_torrent.to_string_lossy().into_owned(),
+                    save_dir: None,
+                    selected_file_indices: None,
+                    sequential: false,
+                },
+            })
+            .await,
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        bridge
+            .request(Request::AddTorrent {
+                request: AddTorrentRequest {
+                    source: r"\\server\share\evil.torrent".into(),
+                    save_dir: None,
+                    selected_file_indices: None,
+                    sequential: false,
+                },
+            })
+            .await,
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        bridge
+            .request(Request::AddHttpDownload {
+                request: AddHttpDownloadRequest {
+                    save_dir: Some(dir.to_string_lossy().into_owned()),
+                    ..http_request(&server, "fresh", "override.bin")
+                },
+            })
+            .await,
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        bridge
+            .request(Request::AddMediaDownload {
+                request: AddMediaDownloadRequest {
+                    url: media_url.into(),
+                    format_id: Some("18".into()),
+                    audio_only_preset: None,
+                    target_container: None,
+                    embed_subtitles_langs: Vec::new(),
+                    lossless_remux: false,
+                    normalize_audio: false,
+                    save_dir: Some(dir.to_string_lossy().into_owned()),
+                    filename: Some("override.mp4".into()),
+                    playlist_items: None,
+                },
+            })
+            .await,
+        Response::Error { .. }
+    ));
+
+    let torrent = state
+        .add_torrent(AddTorrentRequest {
+            source: local_torrent.to_string_lossy().into_owned(),
+            save_dir: Some(downloads.to_string_lossy().into_owned()),
+            selected_file_indices: Some(vec![0]),
+            sequential: false,
+        })
+        .await
+        .unwrap();
+    let magnet_from_pipe = bridge
         .created(Request::AddTorrent {
             request: AddTorrentRequest {
-                source: torrent_file(dir).to_string_lossy().into_owned(),
-                save_dir: Some(downloads.to_string_lossy().into_owned()),
-                selected_file_indices: Some(vec![0]),
+                source: "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&dn=PipeTest"
+                    .into(),
+                save_dir: None,
+                selected_file_indices: None,
                 sequential: false,
             },
         })
         .await;
+    state
+        .cancel_transfer(&magnet_from_pipe, false)
+        .await
+        .unwrap();
     assert_eq!(
         state.list_torrent_files(&torrent).await.unwrap()[0].relative_path,
         "torrent.bin"
@@ -603,9 +699,13 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
         .await
         .is_err());
 
-    let restarted = AppState::start(dir.clone(), Arc::new(FakeUi::default()), options(&pipe))
-        .await
-        .unwrap();
+    let restarted = AppState::start(
+        dir.clone(),
+        Arc::new(FakeUi::default()),
+        options(&pipe, &registry_key.0),
+    )
+    .await
+    .unwrap();
     assert!(restarted
         .snapshot()
         .await
@@ -622,9 +722,14 @@ async fn settings_reload_and_rebase_an_empty_torrent_manager() {
     let new_dir = temp.0.join("new");
     let mut settings = installed_settings(&temp.0, &old_dir);
     let pipe = format!(r"\\.\pipe\SlipStream.DesktopSettings.{}", Uuid::new_v4());
-    let state = AppState::start(temp.0.clone(), Arc::new(FakeUi::default()), options(&pipe))
-        .await
-        .unwrap();
+    let registry_key = RegistryKey::isolated();
+    let state = AppState::start(
+        temp.0.clone(),
+        Arc::new(FakeUi::default()),
+        options(&pipe, &registry_key.0),
+    )
+    .await
+    .unwrap();
     settings.default_download_dir = new_dir.to_string_lossy().into_owned();
     settings.default_connections = u8::MAX;
     settings.max_concurrent_downloads = 0;
@@ -657,9 +762,13 @@ async fn settings_reload_and_rebase_an_empty_torrent_manager() {
     assert_eq!(batch.transfers[0].id, torrent);
     assert_eq!(Path::new(&batch.transfers[0].save_dir), new_dir);
     state.shutdown().await.unwrap();
-    let state = AppState::start(temp.0.clone(), Arc::new(FakeUi::default()), options(&pipe))
-        .await
-        .unwrap();
+    let state = AppState::start(
+        temp.0.clone(),
+        Arc::new(FakeUi::default()),
+        options(&pipe, &registry_key.0),
+    )
+    .await
+    .unwrap();
     assert_eq!(state.settings().default_connections, 32);
     assert_eq!(state.settings().max_concurrent_downloads, 1);
     assert_eq!(state.snapshot().await.speed_limit_bps, Some(1024));

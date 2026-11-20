@@ -1,11 +1,11 @@
 use crate::{
     expand_wildcard_urls, install_browser_hosts_into,
     paths::{
-        build_defender_scan_args, decode_sha256, delete_files, hash_file, local_drive_path,
-        reveal_args,
+        build_defender_scan_args, decode_sha256, delete_files, ensure_safe_directory, hash_file,
+        local_drive_path, reveal_action, RevealAction,
     },
     settings::{normalize, torrent_rate},
-    tools::native_hosts_installed,
+    tools::{explorer_executable, native_hosts_installed},
     ToolchainStatus,
 };
 use serde_json::{json, Value};
@@ -109,26 +109,33 @@ fn explorer_and_defender_args_preserve_discrete_paths() {
     let temp = TempDir::new();
     let root = temp.0.join("download & save");
     fs::create_dir(&root).unwrap();
-    let filename = "video, with spaces.mp4";
-    let file = root.join(filename);
-    fs::write(&file, b"test").unwrap();
-    let expected: OsString = local_drive_path(&fs::canonicalize(&file).unwrap())
-        .unwrap()
-        .into();
-    assert_eq!(
-        reveal_args(&root, Some(filename)).unwrap(),
-        [OsString::from("/select,"), expected.clone()]
-    );
-    let args = build_defender_scan_args(&root, filename).unwrap();
-    assert_eq!(&args[..4], ["-Scan", "-ScanType", "3", "-File"]);
-    assert_eq!(args[4], expected);
+    for filename in ["video, with spaces.mp4", "a,b.mp4"] {
+        let file = root.join(filename);
+        fs::write(&file, b"test").unwrap();
+        let expected: OsString = local_drive_path(&fs::canonicalize(&file).unwrap())
+            .unwrap()
+            .into();
+        let quoted = OsString::from(format!("/select,\"{}\"", expected.to_string_lossy()));
+        assert_eq!(
+            reveal_action(&root, Some(filename)).unwrap(),
+            RevealAction::SelectFile(quoted)
+        );
+        let args = build_defender_scan_args(&root, filename).unwrap();
+        assert_eq!(&args[..4], ["-Scan", "-ScanType", "3", "-File"]);
+        assert_eq!(args[4], expected);
+    }
     let directory = local_drive_path(&fs::canonicalize(&root).unwrap()).unwrap();
     for missing in [None, Some("missing.bin")] {
         assert_eq!(
-            reveal_args(&root, missing).unwrap(),
-            [directory.as_os_str()]
+            reveal_action(&root, missing).unwrap(),
+            RevealAction::OpenDir(directory.clone())
         );
     }
+    let explorer = explorer_executable().unwrap();
+    assert!(explorer.is_file());
+    assert!(explorer
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe")));
     assert_eq!(
         local_drive_path(Path::new(r"\\?\C:\Downloads\test.txt")).unwrap(),
         Path::new(r"C:\Downloads\test.txt")
@@ -155,6 +162,10 @@ fn traversal_and_links_are_rejected_for_every_file_operation() {
     let junction = root.join("junction");
     directory_junction(&junction, &outside);
 
+    assert!(ensure_safe_directory(Path::new("relative/downloads")).is_err());
+    assert!(ensure_safe_directory(&junction.join("missing_leaf")).is_err());
+    assert!(!outside.join("missing_leaf").exists());
+
     let mut bad_paths = vec![
         "../outside/secret.bin",
         "junction/secret.bin",
@@ -171,12 +182,12 @@ fn traversal_and_links_are_rejected_for_every_file_operation() {
         Err(error) => panic!("{error}"),
     }
     for bad in bad_paths {
-        assert!(reveal_args(&root, Some(bad)).is_err(), "{bad}");
+        assert!(reveal_action(&root, Some(bad)).is_err(), "{bad}");
         assert!(build_defender_scan_args(&root, bad).is_err(), "{bad}");
         assert!(hash_file(&root, bad).is_err(), "{bad}");
         assert!(delete_files(&root, &[bad.into()]).is_err(), "{bad}");
     }
-    assert!(reveal_args(&junction, Some("secret.bin")).is_err());
+    assert!(reveal_action(&junction, Some("secret.bin")).is_err());
     assert_eq!(fs::read(&protected).unwrap(), b"private");
 }
 
@@ -279,6 +290,7 @@ fn settings_normalize_validates_paths_and_trims_tool_paths() {
     assert_eq!(valid.ffmpeg_path.as_deref(), Some(r"C:\Tools\ffmpeg.exe"));
 
     for bad_dir in [
+        "relative_dir".to_owned(),
         r"\\host\share\dl".to_owned(),
         junction.to_string_lossy().into_owned(),
         junction.join("sub").to_string_lossy().into_owned(),
@@ -289,13 +301,30 @@ fn settings_normalize_validates_paths_and_trims_tool_paths() {
         };
         assert!(normalize(&mut invalid, &data).is_err());
     }
+    assert!(!outside.join("sub").exists());
 
-    let mut nul_tool = AppSettings {
+    for bad_tool in [
+        "evil.exe",
+        r"bin\evil.exe",
+        r"\\server\share\evil.exe",
+        r"C:\Tools\script.cmd",
+        "bad\0.exe",
+    ] {
+        let mut invalid_tool = AppSettings {
+            default_download_dir: downloads.to_string_lossy().into_owned(),
+            ytdlp_path: Some(bad_tool.into()),
+            ..AppSettings::default()
+        };
+        assert!(normalize(&mut invalid_tool, &data).is_err(), "{bad_tool}");
+    }
+    let junction_exe = junction.join("tool.exe");
+    fs::write(outside.join("tool.exe"), b"exe").unwrap();
+    let mut junction_tool = AppSettings {
         default_download_dir: downloads.to_string_lossy().into_owned(),
-        ytdlp_path: Some("bad\0.exe".into()),
+        ffmpeg_path: Some(junction_exe.to_string_lossy().into_owned()),
         ..AppSettings::default()
     };
-    assert!(normalize(&mut nul_tool, &data).is_err());
+    assert!(normalize(&mut junction_tool, &data).is_err());
     assert!(decode_sha256(&format!("  {}  \n", "a".repeat(64))).is_ok());
 }
 

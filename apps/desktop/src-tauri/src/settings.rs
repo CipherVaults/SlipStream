@@ -1,4 +1,4 @@
-use crate::paths::{canonical_directory, invalid, local_drive_path};
+use crate::paths::{ensure_safe_directory, invalid, local_drive_path, validate_configured_exe};
 use serde::{de::DeserializeOwned, Serialize};
 use slipstream_protocol::AppSettings;
 use std::{
@@ -37,14 +37,17 @@ pub(crate) fn write_json_atomically(path: &Path, value: &impl Serialize) -> io::
 
 fn normalize_tool_path(value: &mut Option<String>) -> io::Result<()> {
     if let Some(raw) = value.as_deref() {
-        if raw.contains('\0') {
-            return Err(invalid("tool path contains NUL byte"));
-        }
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             *value = None;
         } else {
-            *value = Some(trimmed.to_owned());
+            let clean = validate_configured_exe(trimmed)?;
+            *value = Some(
+                clean
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|_| invalid("non-Unicode tool path"))?,
+            );
         }
     }
     Ok(())
@@ -57,25 +60,15 @@ pub(crate) fn normalize(settings: &mut AppSettings, data_dir: &Path) -> io::Resu
     normalize_tool_path(&mut settings.ytdlp_path)?;
     normalize_tool_path(&mut settings.ffmpeg_path)?;
 
-    let path = if settings.default_download_dir.trim().is_empty() {
+    let canonical = if settings.default_download_dir.trim().is_empty() {
         env::var_os("USERPROFILE")
             .map(PathBuf::from)
-            .filter(|dir| dir.is_absolute())
             .map(|dir| dir.join("Downloads"))
-            .filter(|dir| {
-                local_drive_path(dir).is_ok()
-                    && fs::create_dir_all(dir).is_ok()
-                    && canonical_directory(dir).is_ok()
-            })
-            .unwrap_or_else(|| data_dir.join("Downloads"))
+            .and_then(|dir| ensure_safe_directory(&dir).ok())
+            .map_or_else(|| ensure_safe_directory(&data_dir.join("Downloads")), Ok)?
     } else {
-        let raw = PathBuf::from(&settings.default_download_dir);
-        let absolute = std::path::absolute(&raw)?;
-        local_drive_path(&absolute)?
+        ensure_safe_directory(Path::new(&settings.default_download_dir))?
     };
-    let clean = local_drive_path(&std::path::absolute(&path)?)?;
-    fs::create_dir_all(&clean)?;
-    let canonical = canonical_directory(&clean)?;
     let final_path = local_drive_path(&canonical)?;
     settings.default_download_dir = final_path
         .into_os_string()

@@ -1,12 +1,12 @@
 use crate::{
-    paths::{canonical_exe, invalid, local_drive_path},
+    paths::{canonical_directory, canonical_exe, invalid, local_drive_path},
     settings::write_json_atomically,
 };
 use serde::{Deserialize, Serialize};
 use slipstream_media::{args::validate_local_path, MediaToolchain, ToolchainConfig};
 use slipstream_native_host::{
     manifest::{chromium_origin, generate, Browser, DEFAULT_FIREFOX_ID},
-    registry::{host_key, install_hosts, DEFAULT_BASE_KEY},
+    registry::{host_key, install_hosts},
 };
 use slipstream_protocol::{AppSettings, NATIVE_HOST_NAME};
 use std::{
@@ -40,7 +40,7 @@ pub struct ToolchainStatus {
     pub native_hosts_installed: bool,
 }
 
-pub(crate) async fn toolchain_status(settings: &AppSettings) -> ToolchainStatus {
+pub(crate) async fn toolchain_status(settings: &AppSettings, base_key: &str) -> ToolchainStatus {
     let config = ToolchainConfig::from(settings);
     let discovery = MediaToolchain::discover(config.clone()).await;
     let (ytdlp, ffmpeg) = if let Ok(tools) = discovery {
@@ -72,7 +72,7 @@ pub(crate) async fn toolchain_status(settings: &AppSettings) -> ToolchainStatus 
         ytdlp_version,
         ffmpeg_path,
         ffmpeg_version,
-        native_hosts_installed: native_hosts_installed(DEFAULT_BASE_KEY),
+        native_hosts_installed: native_hosts_installed(base_key),
     }
 }
 
@@ -82,7 +82,7 @@ async fn probe_version(path: Option<&Path>, name: &str, flag: &str) -> Option<(P
         None => env::var_os("PATH")
             .iter()
             .flat_map(env::split_paths)
-            .filter(|dir| dir.is_absolute())
+            .filter(|dir| dir.is_absolute() && canonical_directory(dir).is_ok())
             .find_map(|dir| canonical_exe(&dir.join(name)).ok())?,
     };
     validate_local_path(&path).ok()?;
@@ -133,9 +133,6 @@ pub(crate) fn native_host_executable(resource_dir: &Path) -> io::Result<PathBuf>
             dirs.push(parent.to_owned());
         }
     }
-    if let Some(path_var) = env::var_os("PATH") {
-        dirs.extend(env::split_paths(&path_var).filter(|dir| dir.is_absolute()));
-    }
     dirs.into_iter()
         .find_map(|dir| canonical_exe(&dir.join("slipstream-native-host.exe")).ok())
         .ok_or_else(|| {
@@ -144,6 +141,15 @@ pub(crate) fn native_host_executable(resource_dir: &Path) -> io::Result<PathBuf>
                 "slipstream-native-host.exe is missing",
             )
         })
+}
+
+pub(crate) fn explorer_executable() -> io::Result<PathBuf> {
+    let system_root = env::var_os("SystemRoot")
+        .or_else(|| env::var_os("WINDIR"))
+        .map(PathBuf::from)
+        .ok_or_else(|| invalid("SystemRoot environment variable is unavailable"))?;
+    let system32 = system_root.join("explorer.exe");
+    canonical_exe(&system32)
 }
 
 pub fn install_browser_hosts_into(

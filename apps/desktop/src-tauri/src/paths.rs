@@ -56,10 +56,43 @@ pub(crate) fn local_drive_path(path: &Path) -> io::Result<PathBuf> {
     Ok(clean)
 }
 
+pub(crate) fn validate_existing_ancestors(clean: &Path) -> io::Result<()> {
+    let ancestors: Vec<_> = clean
+        .ancestors()
+        .take_while(|path| path.is_absolute())
+        .collect();
+    for ancestor in ancestors.into_iter().rev() {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) => {
+                if !metadata.is_dir() || reparse(&metadata) {
+                    return Err(invalid(
+                        "directory contains a non-directory or reparse point",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_safe_directory(root: &Path) -> io::Result<PathBuf> {
+    if !root.is_absolute() {
+        return Err(invalid("expected an absolute local directory path"));
+    }
+    let clean = local_drive_path(root)?;
+    validate_existing_ancestors(&clean)?;
+    fs::create_dir_all(&clean)?;
+    canonical_directory(&clean)
+}
+
 pub(crate) fn canonical_directory(root: &Path) -> io::Result<PathBuf> {
-    let absolute = std::path::absolute(root)?;
-    local_drive_path(&absolute)?;
-    let ancestors: Vec<_> = absolute
+    if !root.is_absolute() {
+        return Err(invalid("expected an absolute local directory path"));
+    }
+    local_drive_path(root)?;
+    let ancestors: Vec<_> = root
         .ancestors()
         .take_while(|path| path.is_absolute())
         .collect();
@@ -71,10 +104,10 @@ pub(crate) fn canonical_directory(root: &Path) -> io::Result<PathBuf> {
             ));
         }
     }
-    let canonical = fs::canonicalize(&absolute)?;
+    let canonical = fs::canonicalize(root)?;
     local_drive_path(&canonical)?;
-    if matches!(absolute.components().next(), Some(std::path::Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_)))
-        && canonical != absolute
+    if matches!(root.components().next(), Some(std::path::Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_)))
+        && canonical != root
     {
         return Err(invalid("save directory changed since it was resolved"));
     }
@@ -109,18 +142,30 @@ pub(crate) fn confined_target(root: &Path, relative: &str) -> io::Result<Option<
     Ok(Some(canonical))
 }
 
-pub(crate) fn reveal_args(root: &Path, relative: Option<&str>) -> io::Result<Vec<OsString>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RevealAction {
+    SelectFile(OsString),
+    OpenDir(PathBuf),
+}
+
+pub(crate) fn reveal_action(root: &Path, relative: Option<&str>) -> io::Result<RevealAction> {
     if let Some(relative) = relative {
         if let Some(target) = confined_target(root, relative)? {
-            return Ok(vec![
-                "/select,".into(),
-                local_drive_path(&target)?.into_os_string(),
-            ]);
+            let drive = local_drive_path(&target)?;
+            let text = drive
+                .to_str()
+                .ok_or_else(|| invalid("expected a Unicode local drive path"))?;
+            if text.contains('"') || text.chars().any(char::is_control) {
+                return Err(invalid("invalid characters in reveal path"));
+            }
+            return Ok(RevealAction::SelectFile(OsString::from(format!(
+                "/select,\"{text}\""
+            ))));
         }
     }
-    Ok(vec![
-        local_drive_path(&canonical_directory(root)?)?.into_os_string()
-    ])
+    Ok(RevealAction::OpenDir(local_drive_path(
+        &canonical_directory(root)?,
+    )?))
 }
 
 pub(crate) fn build_defender_scan_args(root: &Path, relative: &str) -> io::Result<Vec<OsString>> {
@@ -138,19 +183,58 @@ pub(crate) fn canonical_exe(path: &Path) -> io::Result<PathBuf> {
             .and_then(OsStr::to_str)
             .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
     };
-    if !has_exe_extension(path) {
+    if !path.is_absolute() {
+        return Err(invalid("expected an absolute .exe path"));
+    }
+    let clean = local_drive_path(path)?;
+    if !has_exe_extension(&clean) {
         return Err(invalid("expected an .exe file"));
     }
-    let metadata = fs::symlink_metadata(path)?;
+    if let Some(parent) = clean.parent() {
+        canonical_directory(parent)?;
+    }
+    let metadata = fs::symlink_metadata(&clean)?;
     if !metadata.is_file() || reparse(&metadata) {
         return Err(invalid("expected a regular .exe file"));
     }
-    let canonical = fs::canonicalize(path)?;
+    let canonical = fs::canonicalize(&clean)?;
     local_drive_path(&canonical)?;
     if !has_exe_extension(&canonical) {
         return Err(invalid("expected an .exe file"));
     }
     Ok(canonical)
+}
+
+pub(crate) fn validate_configured_exe(raw: &str) -> io::Result<PathBuf> {
+    if raw.chars().any(|c| c == '\0' || c.is_control()) {
+        return Err(invalid(
+            "executable path contains invalid control characters",
+        ));
+    }
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return Err(invalid("expected an absolute local .exe path"));
+    }
+    let clean = local_drive_path(path)?;
+    let is_exe = clean
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
+    if !is_exe {
+        return Err(invalid("expected an .exe file"));
+    }
+    let parent = clean
+        .parent()
+        .ok_or_else(|| invalid("executable path needs a parent directory"))?;
+    validate_existing_ancestors(parent)?;
+    match fs::symlink_metadata(&clean) {
+        Ok(_) => {
+            canonical_exe(&clean)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(clean)
 }
 
 fn existing_file(root: &Path, relative: &str) -> io::Result<PathBuf> {
