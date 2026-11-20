@@ -67,7 +67,7 @@ describe("Tauri v2 adapter", () => {
     ]);
   });
 
-  it("unwraps telemetry and both picker payload shapes and returns event cleanup", async () => {
+  it("unwraps telemetry and { url: string | null } picker payloads and returns event cleanup", async () => {
     useTauri();
     const telemetry = vi.fn();
     const picker = vi.fn();
@@ -76,17 +76,15 @@ describe("Tauri v2 adapter", () => {
     const batch = demo.snapshot();
     await emit("slipstream://telemetry", batch);
     await emit("slipstream://open-picker", { url: "magnet:?xt=example" });
-    await emit("slipstream://open-picker", "https://example.org");
     await emit("slipstream://open-picker", { url: null });
-    await emit("slipstream://open-picker", null);
     expect(telemetry).toHaveBeenCalledWith(batch);
-    expect(picker.mock.calls).toEqual([["magnet:?xt=example"], ["https://example.org"], [null], [null]]);
+    expect(picker.mock.calls).toEqual([["magnet:?xt=example"], [null]]);
     await offTelemetry();
     await offPicker();
     await emit("slipstream://telemetry", batch);
-    await emit("slipstream://open-picker", "https://unused.example.org");
+    await emit("slipstream://open-picker", { url: "https://unused.example.org" });
     expect(telemetry).toHaveBeenCalledOnce();
-    expect(picker).toHaveBeenCalledTimes(4);
+    expect(picker).toHaveBeenCalledTimes(2);
   });
 
   it("guards native window controls and passes native drop paths through", async () => {

@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState, type DragEvent } from "react"
 import { AddDialog, type AddSeed } from "./components/AddDialog";
 import { Inspector } from "./components/Inspector";
 import { Palette, type QuickCommand } from "./components/Palette";
-import { SettingsDialog } from "./components/SettingsDialog";
+import { SettingsDialog, type SettingsLoadState } from "./components/SettingsDialog";
 import { Sidebar, Toolbar, matchesStatus, matchesView, type StatusFilter, type View } from "./components/Shell";
 import { TransferDialog } from "./components/TransferDialog";
 import { TransferList, type OnTransferAction } from "./components/TransferList";
@@ -16,18 +16,17 @@ import type { AppSettings, TelemetryBatch, TransferSnapshot } from "./types/ipc"
 type Overlay = { type: "add"; seed: AddSeed; key: number } | { type: "settings" } | { type: "palette" }
   | { type: "refresh" | "verify"; transfer: TransferSnapshot };
 type Notice = { tone: "ok" | "error"; message: string };
+type Unsubscribe = () => void | Promise<void>;
 
 const systemThemeQuery = "(prefers-color-scheme: dark)";
-const removedStorageKey = "slipstream.removed-transfers";
 const emptySamples: number[] = [];
 const sampleCount = 40;
 
-function readRemoved() {
+function stopSafely(unsubscribe: Unsubscribe) {
   try {
-    const ids: unknown = JSON.parse(localStorage.getItem(removedStorageKey) ?? "[]");
-    return new Set(Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : []);
+    void Promise.resolve(unsubscribe()).catch(() => {});
   } catch {
-    return new Set<string>();
+    // Ignore synchronous listener cleanup failures on teardown.
   }
 }
 
@@ -54,28 +53,35 @@ function useTheme(settings: AppSettings) {
 export default function App() {
   const [preview] = useState(() => !isTauri());
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
-  const [settingsReady, setSettingsReady] = useState(false);
+  const [settingsLoadState, setSettingsLoadState] = useState<SettingsLoadState>("loading");
+  const [settingsError, setSettingsError] = useState("");
   const settingsRef = useRef(DEFAULT_SETTINGS);
+  const settingsLoadedRef = useRef(false);
+  const settingsLoadRef = useRef<Promise<AppSettings> | null>(null);
   const settingsQueue = useRef(Promise.resolve());
+  const liveRef = useRef(true);
   const [batch, setBatch] = useState<TelemetryBatch | null>(null);
   const latest = useRef<TelemetryBatch | null>(null);
   const eventVersion = useRef(0);
   const [samples, setSamples] = useState<number[]>(() => preview ? [18, 30, 46, 40, 74, 70, 92, 86].map(value => value * MB) : []);
-  const [history, setHistory] = useState<Record<string, number[]>>((): Record<string, number[]> => preview ? {
-    alpine: [37, 42, 45.4, 48, 46, 52.4, 50, 52.4].map(value => value * MB),
-  } : {});
+  const [history, setHistory] = useState<Record<string, number[]>>((): Record<string, number[]> =>
+    preview ? { alpine: [37, 42, 45.4, 48, 46, 52.4, 50, 52.4].map(value => value * MB) } : {});
   const [view, setView] = useState<View>("all");
   const [filter, setFilter] = useState<StatusFilter>("All");
   const [search, setSearch] = useState("");
   const [selectedId, setSelectedId] = useState<string>();
-  const [removed, setRemoved] = useState(() => preview ? new Set<string>() : readRemoved());
+  const [removed, setRemoved] = useState<Set<string>>(() => new Set());
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [overlay, setOverlay] = useState<Overlay>();
+  const [droppedSource, setDroppedSource] = useState<{ url: string; seq: number }>();
   const [busy, setBusy] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [notice, setNotice] = useState<Notice>();
   const modalSequence = useRef(0);
+  const dropSequence = useRef(0);
   const busyRef = useRef(false);
+  const overlayRef = useRef<Overlay | undefined>(undefined);
+  overlayRef.current = overlay;
   const pendingPicker = useRef<AddSeed | undefined>(undefined);
   const dragDepth = useRef(0);
   const theme = useTheme(settings);
@@ -89,6 +95,34 @@ export default function App() {
 
   const showError = useCallback((error: unknown) => setNotice({ tone: "error", message: errorMessage(error) }), []);
   const notify = (message: string) => setNotice({ tone: "ok", message });
+
+  const loadSettings = useCallback(async () => {
+    if (settingsLoadedRef.current) return settingsRef.current;
+    if (!settingsLoadRef.current) {
+      if (liveRef.current) {
+        setSettingsLoadState("loading");
+        setSettingsError("");
+      }
+      settingsLoadRef.current = desktop.getSettings().then(next => {
+        settingsLoadedRef.current = true;
+        settingsRef.current = next;
+        if (liveRef.current) {
+          setSettings(next);
+          setSettingsLoadState("ready");
+          setSettingsError("");
+        }
+        return next;
+      }).catch(error => {
+        settingsLoadRef.current = null;
+        if (liveRef.current) {
+          setSettingsLoadState("error");
+          setSettingsError(errorMessage(error));
+        }
+        throw error;
+      });
+    }
+    return settingsLoadRef.current;
+  }, []);
 
   const acceptBatch = useCallback((next: TelemetryBatch) => {
     if (latest.current && Date.parse(next.timestamp) < Date.parse(latest.current.timestamp)) return;
@@ -108,63 +142,66 @@ export default function App() {
     if (eventVersion.current === before || Date.parse(next.timestamp) > Date.parse(latest.current?.timestamp ?? "")) acceptBatch(next);
   }, [acceptBatch]);
 
-  const openAdd = useCallback((seed: AddSeed = {}) => {
-    if (busyRef.current) {
+  const openAdd = useCallback((seed: AddSeed = {}, deferIfOpen = false) => {
+    if (busyRef.current || (deferIfOpen && overlayRef.current && overlayRef.current.type !== "palette")) {
       pendingPicker.current = seed;
       return;
     }
+    setDroppedSource(undefined);
     setOverlay({ type: "add", seed, key: ++modalSequence.current });
   }, []);
+
+  const handleDroppedSource = useCallback((source: string, autoProbe: boolean) => {
+    if (overlayRef.current?.type === "add" && !busyRef.current && !autoProbe) {
+      setDroppedSource({ url: source, seq: ++dropSequence.current });
+      return;
+    }
+    openAdd({ url: source, autoProbe }, true);
+  }, [openAdd]);
 
   const updateBusy = useCallback((value: boolean) => {
     busyRef.current = value;
     setBusy(value);
-    if (!value && pendingPicker.current) {
-      const pending = pendingPicker.current;
-      pendingPicker.current = undefined;
-      openAdd(pending);
-    }
-  }, [openAdd]);
+  }, []);
 
   useEffect(() => {
-    let live = true;
-    const cleanup: Array<() => void> = [];
-    const report = (error: unknown) => { if (live) showError(error); };
-    async function connect(listener: Promise<() => void>) {
+    liveRef.current = true;
+    const cleanup: Unsubscribe[] = [];
+    const report = (error: unknown) => { if (liveRef.current) showError(error); };
+    async function connect(listener: Promise<Unsubscribe>) {
       try {
         const stop = await listener;
-        if (live) cleanup.push(stop);
-        else stop();
+        if (liveRef.current) cleanup.push(stop);
+        else stopSafely(stop);
       } catch (error) {
         report(error);
       }
     }
     void connect(desktop.onTelemetry(next => {
-      if (!live) return;
+      if (!liveRef.current) return;
       eventVersion.current++;
       acceptBatch(next);
     })).then(() => {
-      if (live) void pullSnapshot().catch(report);
+      if (liveRef.current) void pullSnapshot().catch(report);
     });
     void connect(desktop.onOpenPicker(url => {
-      if (live) openAdd({ url: url ?? undefined, autoProbe: Boolean(url) });
+      if (liveRef.current) openAdd({ url: url ?? undefined, autoProbe: Boolean(url) }, true);
     }));
     void connect(desktop.onFileDrop(event => {
-      if (!live) return;
+      if (!liveRef.current) return;
       if (event.type === "enter") setDragging(event.paths.some(isTorrentSource));
       if (event.type === "leave" || event.type === "drop") setDragging(false);
       if (event.type === "drop") {
         const path = event.paths.find(isTorrentSource);
-        if (path) openAdd({ url: path });
+        if (path) handleDroppedSource(path, false);
       }
     }));
-    void desktop.getSettings().then(next => {
-      if (!live) return;
-      settingsRef.current = next;
-      setSettings(next);
-    }).catch(report).finally(() => { if (live) setSettingsReady(true); });
-    return () => { live = false; cleanup.forEach(stop => stop()); };
-  }, [acceptBatch, openAdd, pullSnapshot, showError]);
+    void loadSettings().catch(report);
+    return () => {
+      liveRef.current = false;
+      cleanup.forEach(stopSafely);
+    };
+  }, [acceptBatch, handleDroppedSource, loadSettings, openAdd, pullSnapshot, showError]);
 
   useEffect(() => {
     if (!notice || notice.tone === "error") return;
@@ -181,35 +218,42 @@ export default function App() {
     }
   }
 
-  function saveAppearance(change: Partial<AppSettings>) {
-    if (!settingsReady) return;
-    const next = { ...settingsRef.current, ...change };
-    settingsRef.current = next;
-    setSettings(next);
-
-    const saved = settingsQueue.current.then(() => desktop.saveSettings(next));
-    settingsQueue.current = saved.catch(async error => {
-      showError(error);
-      if (settingsRef.current !== next) return;
-      try {
-        const current = await desktop.getSettings();
-        if (settingsRef.current === next) {
-          settingsRef.current = current;
-          setSettings(current);
-        }
-      } catch {
-        // Keep the applied appearance until a subsequent settings load succeeds.
-      }
+  function enqueueSettings(operation: () => Promise<void>) {
+    const task = settingsQueue.current.then(async () => {
+      await loadSettings();
+      await operation();
     });
+    settingsQueue.current = task.catch(() => {});
+    return task;
   }
 
-  const toggleTheme = () => saveAppearance({ theme: theme === "dark" ? "light" : "dark",
-    global_speed_limit_bps: speedLimit });
-  const toggleAccent = () => saveAppearance({ accent: settings.accent === "blue" ? "mono" : "blue",
-    global_speed_limit_bps: speedLimit });
-  const closeDialog = () => setOverlay(undefined);
+  function saveAppearance(change: Partial<AppSettings>) {
+    void enqueueSettings(async () => {
+      const next = { ...settingsRef.current, ...change };
+      await desktop.saveSettings(next);
+      settingsRef.current = next;
+      if (liveRef.current) setSettings(next);
+    }).catch(showError);
+  }
+
+  const toggleTheme = () => saveAppearance({ theme: theme === "dark" ? "light" : "dark" });
+  const toggleAccent = () => saveAppearance({ accent: settings.accent === "blue" ? "mono" : "blue" });
+  const closeDialog = useCallback(() => {
+    if (pendingPicker.current) {
+      const pending = pendingPicker.current;
+      pendingPicker.current = undefined;
+      setDroppedSource(undefined);
+      setOverlay({ type: "add", seed: pending, key: ++modalSequence.current });
+      return;
+    }
+    setDroppedSource(undefined);
+    setOverlay(undefined);
+  }, []);
   const openPalette = () => setOverlay({ type: "palette" });
-  const openSettings = () => setOverlay({ type: "settings" });
+  const openSettings = () => {
+    if (settingsLoadState === "error") void loadSettings().catch(() => {});
+    setOverlay({ type: "settings" });
+  };
   const openSource = (url: string) => openAdd({ url, autoProbe: true });
   const toggleInspector = () => setInspectorOpen(open => !open);
   const hibernate = async () => {
@@ -222,7 +266,7 @@ export default function App() {
       if (event.defaultPrevented || event.repeat) return;
       if (event.key === "Escape" && overlay) {
         event.preventDefault();
-        if (!busy) setOverlay(undefined);
+        if (!busy) closeDialog();
         return;
       }
       if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
@@ -243,7 +287,7 @@ export default function App() {
     }
     document.addEventListener("keydown", handleKey);
     return () => document.removeEventListener("keydown", handleKey);
-  }, [overlay, busy, openAdd]);
+  }, [overlay, busy, openAdd, closeDialog]);
 
   const onTransferAction: OnTransferAction = (action, transfer) => {
     if (action === "refresh" || action === "verify") {
@@ -260,14 +304,8 @@ export default function App() {
           return;
         case "cancel": await desktop.cancelTransfer(transfer.id, false); break;
         case "remove":
-          if (transfer.status !== "canceled" && transfer.status !== "completed") await desktop.cancelTransfer(transfer.id, false);
-          setRemoved(previous => {
-            const next = new Set([...previous, transfer.id]);
-            if (!preview) {
-              try { localStorage.setItem(removedStorageKey, JSON.stringify([...next])); } catch { /* Storage can be disabled. */ }
-            }
-            return next;
-          });
+          await desktop.cancelTransfer(transfer.id, false);
+          setRemoved(previous => new Set([...previous, transfer.id]));
           break;
       }
       await pullSnapshot();
@@ -288,13 +326,13 @@ export default function App() {
     const file = Array.from(event.dataTransfer.files).find(item => item.name.toLowerCase().endsWith(".torrent"));
     if (file) {
       const path = (file as File & { path?: string }).path;
-      if (path || preview) openAdd({ url: path ?? file.name });
+      if (path || preview) handleDroppedSource(path ?? file.name, false);
       else showError("Use the full .torrent path or drop the file from Explorer.");
       return;
     }
     const content = event.dataTransfer.getData("text/uri-list") || event.dataTransfer.getData("text/plain");
     const source = content.split(/\r?\n/).map(line => line.trim()).find(isDownloadSource);
-    if (source) openSource(source);
+    if (source) handleDroppedSource(source, !isTorrentSource(source));
     else if (content || event.dataTransfer.files.length) showError("Drop an HTTP, HTTPS, or magnet link, or a .torrent file.");
   }
 
@@ -325,14 +363,14 @@ export default function App() {
     <div className="app-shell" inert={Boolean(overlay)}>
       <Sidebar view={view} select={next => { setView(next); setFilter("All"); }} transfers={transfers} batch={batch}
         folder={settings.default_download_dir} samples={samples} limit={speedLimit} preview={preview} openSettings={openSettings}
-        toggleLimit={() => void perform(async () => {
-          await settingsQueue.current;
-          const limit = speedLimit === null ? SPEED_CAP : null;
+        toggleLimit={() => void enqueueSettings(async () => {
+          const currentLimit = (latest.current ? latest.current.speed_limit_bps : settingsRef.current.global_speed_limit_bps) ?? null;
+          const limit = currentLimit === null ? SPEED_CAP : null;
           await desktop.setSpeedLimit(limit);
           settingsRef.current = { ...settingsRef.current, global_speed_limit_bps: limit };
-          setSettings(settingsRef.current);
+          if (liveRef.current) setSettings(settingsRef.current);
           await pullSnapshot();
-        })} />
+        }).catch(showError)} />
       <div className="main-col">
         <Toolbar search={search} setSearch={setSearch} filter={filter} setFilter={setFilter}
           theme={theme} accent={settings.accent} toggleTheme={toggleTheme} toggleAccent={toggleAccent}
@@ -351,19 +389,21 @@ export default function App() {
       <span>{notice.message}</span>
       <IconButton className="folder-ghost" label="Dismiss notification" onClick={() => setNotice(undefined)}><X size={13} /></IconButton>
     </div>}
-    {overlay?.type === "add" && <AddDialog key={overlay.key} seed={overlay.seed} settings={settings} onClose={closeDialog}
+    {overlay?.type === "add" && <AddDialog key={overlay.key} seed={overlay.seed} droppedSource={droppedSource} settings={settings} onClose={closeDialog}
       onBusyChange={updateBusy} onAdded={(message, id) => {
         closeDialog();
         setView("all"); setFilter("All"); setSearch(""); setSelectedId(id);
         notify(message);
         void pullSnapshot().catch(showError);
       }} />}
-    {overlay?.type === "settings" && <SettingsDialog key={String(settingsReady)} settings={{ ...settings, global_speed_limit_bps: speedLimit }}
+    {overlay?.type === "settings" && <SettingsDialog settings={{ ...settings, global_speed_limit_bps: speedLimit }}
+      loadState={settingsLoadState} loadError={settingsError} onRetryLoad={() => void loadSettings().catch(showError)}
       onClose={closeDialog} onBusyChange={updateBusy} onHibernate={hibernate} onSave={async next => {
-        await settingsQueue.current;
-        await desktop.saveSettings(next);
-        settingsRef.current = next;
-        setSettings(next);
+        await enqueueSettings(async () => {
+          await desktop.saveSettings(next);
+          settingsRef.current = next;
+          if (liveRef.current) setSettings(next);
+        });
         closeDialog();
         notify("Settings saved.");
         void pullSnapshot().catch(showError);

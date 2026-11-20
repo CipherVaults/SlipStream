@@ -1,5 +1,5 @@
 import { FileCheck2, Folder, Pause, Play, RefreshCw } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import alpinePreview from "../assets/alpine-preview.svg";
 import { desktop } from "../lib/tauri";
 import { bytes, errorMessage, isDone, isRunning, parentFolder, percentage, ratio, SEGMENT_COUNT, speed, statusLabel } from "../lib/transfers";
@@ -8,25 +8,42 @@ import { Sparkline } from "./Sparkline";
 import { primaryAction, TransferIcon, type OnTransferAction } from "./TransferList";
 import { Tabs } from "./ui";
 
-const threadStates: Record<SegmentState, string> = {
-  pending: "Pending", active: "Active", split: "Split", completed: "Done", paused: "Paused", error: "Error",
+const threadStates: Record<SegmentState | "idle", string> = {
+  idle: "Idle", pending: "Pending", active: "Active", split: "Split", completed: "Done", paused: "Paused", error: "Error",
 };
 
 function Segments({ transfer }: { transfer: TransferSnapshot }) {
   const segments = new Map(transfer.segments.map(segment => [segment.index, segment]));
+  const hasExplicit = transfer.segments.length > 0;
   return <div className="insp-content">
     <div className="seg-grid-head tabular"><span>{transfer.kind === "torrent" ? "16-Segment Piece Map" : "16-Thread Dynamic Split Map"}</span>
       <strong className="accent-text">{speed(transfer.download_speed_bps)}</strong></div>
     <div className="seg-grid tabular">
       {Array.from({ length: SEGMENT_COUNT }, (_, index) => {
         const segment = segments.get(index);
+        const label = "T" + String(index + 1).padStart(2, "0");
+        if (hasExplicit && !segment) {
+          return <div className="thread-tile" key={index}>
+            <div className="thread-top"><span>{label}</span><span className="thread-state idle">Idle</span></div>
+            <div className="thread-bar idle" role="progressbar" aria-label={label + " progress"}
+              aria-valuenow={0}><div style={{ width: "0%" }} /></div>
+            <div className="thread-spd">—</div>
+          </div>;
+        }
+        if (!hasExplicit && transfer.kind !== "torrent") {
+          return <div className="thread-tile" key={index}>
+            <div className="thread-top"><span>{label}</span><span className="thread-state idle">Idle</span></div>
+            <div className="thread-bar idle" role="progressbar" aria-label={label + " progress"}
+              aria-valuenow={0}><div style={{ width: "0%" }} /></div>
+            <div className="thread-spd">—</div>
+          </div>;
+        }
         const length = segment ? Math.max(1, segment.end_byte - segment.start_byte + 1) : 0;
         const progress = segment ? ratio(segment.downloaded_bytes / length) : ratio(transfer.ui_segments[index] ?? 0);
-        let state = segment?.state ?? (progress === 1 ? "completed" : progress > 0 ? "active" : "pending");
+        let state: SegmentState = segment?.state ?? (progress === 1 ? "completed" : progress > 0 ? "active" : "pending");
         if (transfer.status === "paused" && state !== "completed") state = "paused";
         if (transfer.status === "failed" && state !== "completed") state = "error";
         const className = state === "completed" ? "done" : state;
-        const label = "T" + String(index + 1).padStart(2, "0");
         const range = segment ? bytes(segment.start_byte) + " – " + bytes(segment.end_byte) : undefined;
 
         return <div className="thread-tile" key={index} title={range}>
@@ -82,52 +99,25 @@ function Overview({ transfer, samples, preview, onAction }: {
 }
 
 type DetailData = { files?: TorrentFileEntry[]; probe?: MediaProbeResult };
-type DetailState = { status: "loading" } | { status: "ready"; data: DetailData } | { status: "error"; message: string };
+type DetailState = { status: "idle" } | { status: "loading" } | { status: "ready"; data: DetailData } | { status: "error"; message: string };
 
-function Details({ transfer, preview, onFormat, onThumbnail }: {
-  transfer: TransferSnapshot; preview: boolean; onFormat: (probe: MediaProbeResult, format: MediaFormatOption) => void;
-  onThumbnail: (url: string | null) => void;
+function Details({ transfer, preview, state, saving, selectionError, onLoad, onSelectFile, onFormat }: {
+  transfer: TransferSnapshot; preview: boolean; state: DetailState; saving: boolean; selectionError: string;
+  onLoad: () => void; onSelectFile: (index: number, selected: boolean) => void;
+  onFormat: (probe: MediaProbeResult, format: MediaFormatOption) => void;
 }) {
-  const { id, kind, source_url } = transfer;
-  const torrent = kind === "torrent";
-  const [state, setState] = useState<DetailState>({ status: "loading" });
-  const [retry, setRetry] = useState(0);
-  const [saving, setSaving] = useState(false);
-  const [selectionError, setSelectionError] = useState("");
+  const torrent = transfer.kind === "torrent";
 
-  useEffect(() => {
-    let current = true;
-    setState({ status: "loading" });
-    const request: Promise<DetailData> = torrent ? desktop.listTorrentFiles(id).then(files => ({ files }))
-      : desktop.probeMedia(source_url).then(probe => ({ probe }));
-    request.then(data => {
-      if (!current) return;
-      setState({ status: "ready", data });
-      if (data.probe) onThumbnail(data.probe.thumbnail_url);
-    }, error => {
-      if (current) setState({ status: "error", message: errorMessage(error) });
-    });
-    return () => { current = false; };
-  }, [id, torrent, source_url, retry, onThumbnail]);
-
-  async function select(files: TorrentFileEntry[], index: number, selected: boolean) {
-    if (saving) return;
-    setSaving(true);
-    setSelectionError("");
-    const next = files.map(file => file.index === index ? { ...file, selected } : file);
-    try {
-      await desktop.setTorrentFiles(id, next.filter(file => file.selected).map(file => file.index));
-      setState({ status: "ready", data: { files: next } });
-    } catch (error) {
-      setSelectionError(errorMessage(error));
-    } finally {
-      setSaving(false);
-    }
+  if (state.status === "idle") {
+    return <div className="insp-content">
+      <div className="seg-grid-head"><span>Direct HTTP Transfer</span><span>{transfer.protocol_label}</span></div>
+      <p className="empty-state">Probe this URL with yt-dlp if it points to a media stream.</p>
+      <button type="button" className="btn-ghost form-button" onClick={onLoad}>Probe Media Streams</button>
+    </div>;
   }
-
   if (state.status === "loading") return <p className="empty-state" role="status">{torrent ? "Loading torrent files…" : "Probing available streams…"}</p>;
   if (state.status === "error") return <div className="inline-error"><p role="alert">{state.message}</p>
-    <button type="button" className="btn-ghost form-button" onClick={() => setRetry(retry + 1)}>Retry</button></div>;
+    <button type="button" className="btn-ghost form-button" onClick={onLoad}>Retry</button></div>;
   if (state.data.files) {
     const files = state.data.files;
     return <div className="insp-content">
@@ -135,7 +125,7 @@ function Details({ transfer, preview, onFormat, onThumbnail }: {
         <span>{files.filter(file => file.selected).length} / {files.length}</span></div>
       <div className="mini-format-list">
         {files.map(file => <label className="mini-format-row file-option" key={file.index}>
-          <input type="checkbox" checked={file.selected} disabled={saving} onChange={event => void select(files, file.index, event.target.checked)} />
+          <input type="checkbox" checked={file.selected} disabled={saving} onChange={event => onSelectFile(file.index, event.target.checked)} />
           <span title={file.relative_path}>{file.relative_path}</span><small>{bytes(file.size_bytes)}</small>
         </label>)}
         {!files.length && <p className="empty-state">File metadata is unavailable.</p>}
@@ -166,6 +156,85 @@ export function Inspector({ transfer, samples, preview, onAction, onFormat }: {
 }) {
   const [tab, setTab] = useState<InspectorTab>("overview");
   const [thumbnail, setThumbnail] = useState<string | null>(null);
+  const [detailState, setDetailState] = useState<DetailState>({ status: "idle" });
+  const [savingFiles, setSavingFiles] = useState(false);
+  const [selectionError, setSelectionError] = useState("");
+  const mountedRef = useRef(true);
+  const filesRef = useRef<TorrentFileEntry[] | undefined>(undefined);
+  const pendingSavesRef = useRef(0);
+  const fileQueueRef = useRef(Promise.resolve());
+  const detailRequestedRef = useRef(false);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  const transferId = transfer?.id;
+  const transferKind = transfer?.kind;
+  const transferUrl = transfer?.source_url;
+
+  function fetchDetails(force = false) {
+    if (!transferId || !transferKind || !transferUrl) return;
+    if (!force && detailRequestedRef.current) return;
+    detailRequestedRef.current = true;
+    setDetailState({ status: "loading" });
+    setSelectionError("");
+    const request: Promise<DetailData> = transferKind === "torrent"
+      ? desktop.listTorrentFiles(transferId).then(files => ({ files }))
+      : desktop.probeMedia(transferUrl).then(probe => ({ probe }));
+    void request.then(data => {
+      if (!mountedRef.current) return;
+      if (data.files) {
+        filesRef.current = data.files;
+      }
+      if (data.probe) setThumbnail(data.probe.thumbnail_url);
+      setDetailState({ status: "ready", data });
+    }, error => {
+      if (!mountedRef.current) return;
+      detailRequestedRef.current = false;
+      setDetailState({ status: "error", message: errorMessage(error) });
+    });
+  }
+
+  useEffect(() => {
+    if (tab !== "details" || !transferId || !transferKind) return;
+    if (transferKind === "torrent" || transferKind === "media") {
+      fetchDetails(false);
+    }
+  }, [tab, transferId, transferKind, transferUrl]);
+
+  function selectTorrentFile(index: number, checked: boolean) {
+    const current = filesRef.current;
+    if (!transferId || !current) return;
+    const next = current.map(file => file.index === index ? { ...file, selected: checked } : file);
+    filesRef.current = next;
+    setDetailState({ status: "ready", data: { files: next } });
+    setSelectionError("");
+    pendingSavesRef.current += 1;
+    setSavingFiles(true);
+    const indices = next.filter(file => file.selected).map(file => file.index);
+    fileQueueRef.current = fileQueueRef.current.then(async () => {
+      try {
+        await desktop.setTorrentFiles(transferId, indices);
+      } catch (error) {
+        if (mountedRef.current) setSelectionError(errorMessage(error));
+        try {
+          const fresh = await desktop.listTorrentFiles(transferId);
+          if (mountedRef.current && pendingSavesRef.current <= 1) {
+            filesRef.current = fresh;
+            setDetailState({ status: "ready", data: { files: fresh } });
+          }
+        } catch {
+          // Retain optimistic state and show selectionError.
+        }
+      } finally {
+        pendingSavesRef.current = Math.max(0, pendingSavesRef.current - 1);
+        if (mountedRef.current && pendingSavesRef.current === 0) setSavingFiles(false);
+      }
+    });
+  }
+
   if (!transfer) return <aside className="inspector" aria-label="Transfer inspector"><p className="empty-state">Select a transfer to inspect.</p></aside>;
   const torrent = transfer.kind === "torrent";
   const primary = primaryAction(transfer);
@@ -187,7 +256,8 @@ export function Inspector({ transfer, samples, preview, onAction, onFormat }: {
       options={[["overview", "Overview"], ["segments", "Segments"], ["details", torrent ? "Torrent Files" : "Media"]]}>
       {tab === "overview" && <Overview transfer={transfer} samples={samples} preview={preview} onAction={onAction} />}
       {tab === "segments" && <Segments transfer={transfer} />}
-      {tab === "details" && <Details transfer={transfer} preview={preview} onFormat={onFormat} onThumbnail={setThumbnail} />}
+      {tab === "details" && <Details transfer={transfer} preview={preview} state={detailState} saving={savingFiles}
+        selectionError={selectionError} onLoad={() => fetchDetails(true)} onSelectFile={selectTorrentFile} onFormat={onFormat} />}
     </Tabs>
     <div className="insp-footer">
       <div className="insp-status-line">

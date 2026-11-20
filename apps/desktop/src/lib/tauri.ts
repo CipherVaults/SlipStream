@@ -58,8 +58,8 @@ export const desktop = {
       : demo.listenTelemetry(handler);
   },
   async onOpenPicker(handler: (url: string | null) => void) {
-    return isTauri() ? listen<{ url: string | null } | string | null>("slipstream://open-picker", ({ payload }) => {
-      handler(typeof payload === "string" ? payload : payload?.url ?? null);
+    return isTauri() ? listen<{ url: string | null }>("slipstream://open-picker", ({ payload }) => {
+      handler(payload?.url ?? null);
     }) : demo.listenPicker(handler);
   },
   async onFileDrop(handler: (event: DragDropEvent) => void) {

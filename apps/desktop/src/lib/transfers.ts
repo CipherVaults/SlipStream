@@ -68,7 +68,8 @@ export function isTorrentSource(input: string) {
 }
 
 export function isWildcard(input: string) {
-  return /\[[^\]]+\]/.test(input.replace(/^(https?:\/\/)\[[\da-f:.]+\]/i, "$1localhost"));
+  const withoutIpv6Host = input.replace(/^(https?:\/\/(?:[^/@]+@)?)\[[\da-f:.]+\]/i, "$1localhost");
+  return /\[(?:\d+-\d+|[a-z]-[a-z]|[A-Z]-[A-Z])(?::\d+)?\]/.test(withoutIpv6Host);
 }
 
 export function isDownloadSource(input: string) {

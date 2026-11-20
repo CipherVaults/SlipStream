@@ -1,5 +1,5 @@
 import { FileCheck2, RefreshCw } from "lucide-react";
-import { useState, type FormEvent } from "react";
+import { useRef, useState, type FormEvent } from "react";
 import { desktop } from "../lib/tauri";
 import { errorMessage, isHttpUrl } from "../lib/transfers";
 import type { TransferSnapshot } from "../types/ipc";
@@ -17,9 +17,11 @@ export function TransferDialog({ mode, transfer, onClose, onBusyChange, onChange
   const [status, setStatus] = useState<boolean | null>(null);
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  const busyLock = useRef(false);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
+    if (busyLock.current) return;
     const input = value.trim();
     setStatus(null);
     setMessage("");
@@ -31,6 +33,7 @@ export function TransferDialog({ mode, transfer, onClose, onBusyChange, onChange
       setMessage("Enter a valid HTTP or HTTPS referrer.");
       return;
     }
+    busyLock.current = true;
     setBusy(true);
     onBusyChange(true);
     try {
@@ -52,6 +55,7 @@ export function TransferDialog({ mode, transfer, onClose, onBusyChange, onChange
     } catch (error) {
       setMessage(errorMessage(error));
     } finally {
+      busyLock.current = false;
       setBusy(false);
       onBusyChange(false);
     }

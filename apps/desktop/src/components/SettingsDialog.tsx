@@ -1,12 +1,15 @@
 import { Check, Download, Plug, Save, Settings, Timer } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { desktop } from "../lib/tauri";
 import { MB, errorMessage } from "../lib/transfers";
 import type { AppSettings, ToolchainStatus } from "../types/ipc";
 import { Dialog, Switch } from "./ui";
 
-export function SettingsDialog({ settings, onClose, onSave, onHibernate, onBusyChange }: {
-  settings: AppSettings; onClose: () => void; onSave: (next: AppSettings) => Promise<void>;
+export type SettingsLoadState = "loading" | "ready" | "error";
+
+export function SettingsDialog({ settings, loadState, loadError, onRetryLoad, onClose, onSave, onHibernate, onBusyChange }: {
+  settings: AppSettings; loadState: SettingsLoadState; loadError?: string; onRetryLoad: () => void;
+  onClose: () => void; onSave: (next: AppSettings) => Promise<void>;
   onHibernate: () => Promise<void>; onBusyChange: (busy: boolean) => void;
 }) {
   const [draft, setDraft] = useState(settings);
@@ -14,9 +17,22 @@ export function SettingsDialog({ settings, onClose, onSave, onHibernate, onBusyC
   const [tools, setTools] = useState<ToolchainStatus>();
   const [ids, setIds] = useState({ chrome: "", edge: "", firefox: "" });
   const [busy, setBusy] = useState("");
+  const busyLock = useRef(false);
   const [message, setMessage] = useState("");
   const [problem, setProblem] = useState("");
   const [toolError, setToolError] = useState("");
+
+  const wasReadyRef = useRef(loadState === "ready");
+  useEffect(() => {
+    if (loadState !== "ready") {
+      wasReadyRef.current = false;
+      return;
+    }
+    if (wasReadyRef.current) return;
+    wasReadyRef.current = true;
+    setDraft(settings);
+    setLimit(settings.global_speed_limit_bps === null ? "" : String(settings.global_speed_limit_bps / MB));
+  }, [loadState, settings]);
 
   useEffect(() => {
     let mounted = true;
@@ -30,7 +46,8 @@ export function SettingsDialog({ settings, onClose, onSave, onHibernate, onBusyC
   }
 
   async function run(action: string, operation: () => Promise<void>) {
-    if (busy) return;
+    if (busyLock.current) return;
+    busyLock.current = true;
     setBusy(action);
     onBusyChange(true);
     setMessage("");
@@ -40,6 +57,7 @@ export function SettingsDialog({ settings, onClose, onSave, onHibernate, onBusyC
     } catch (error) {
       setProblem(errorMessage(error));
     } finally {
+      busyLock.current = false;
       setBusy("");
       onBusyChange(false);
     }
@@ -52,18 +70,40 @@ export function SettingsDialog({ settings, onClose, onSave, onHibernate, onBusyC
     setToolError("");
   }
 
+  const ready = loadState === "ready";
+
   return <Dialog title="Settings & Browser Integration" className="settings-sheet" onClose={onClose} busy={Boolean(busy)}
     header={<Settings className="dialog-symbol" size={19} />}>
     <form className="dialog-form" onSubmit={event => {
       event.preventDefault();
-      const amount = limit.trim() && Number(limit);
+      if (!ready) return;
+      const trimmedLimit = limit.trim();
+      let speedLimitBps: number | null = null;
+      if (trimmedLimit !== "") {
+        const parsed = Number(trimmedLimit);
+        const scaled = parsed * MB;
+        if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isFinite(scaled) || scaled > Number.MAX_SAFE_INTEGER) {
+          setProblem("Enter a positive finite speed limit in MB/s, or leave blank for unlimited.");
+          return;
+        }
+        speedLimitBps = Math.round(scaled);
+      }
+      if (!Number.isInteger(draft.max_concurrent_downloads) || draft.max_concurrent_downloads < 1 || draft.max_concurrent_downloads > 255) {
+        setProblem("Enter a whole number between 1 and 255 for max concurrent downloads.");
+        return;
+      }
       void run("save", async () => {
         await onSave({ ...draft, ytdlp_path: draft.ytdlp_path?.trim() || null, ffmpeg_path: draft.ffmpeg_path?.trim() || null,
           default_download_dir: draft.default_download_dir.trim(),
-          global_speed_limit_bps: amount ? Math.round(amount * MB) : null });
+          global_speed_limit_bps: speedLimitBps });
       });
     }}>
-      <fieldset className="dialog-fields" disabled={Boolean(busy)}>
+      {loadState === "loading" && <p className="field-note" role="status">Loading settings…</p>}
+      {loadState === "error" && <div className="inline-error" role="alert">
+        <p>{loadError || "Failed to load saved settings."}</p>
+        <button type="button" className="btn-ghost form-button" onClick={onRetryLoad}>Retry</button>
+      </div>}
+      <fieldset className="dialog-fields" disabled={Boolean(busy) || !ready}>
         <div className="fields-grid">
           <label className="field">Theme<select data-initial-focus value={draft.theme} onChange={event => update("theme", event.target.value as AppSettings["theme"])}>
             <option value="system">System</option><option value="dark">Graphite</option><option value="light">Porcelain</option>
@@ -122,7 +162,7 @@ export function SettingsDialog({ settings, onClose, onSave, onHibernate, onBusyC
       {problem && <p role="alert" className="inline-error">{problem}</p>}
       <div className="sheet-footer align-right"><div className="sheet-foot-btns">
         <button className="btn-ghost form-button" type="button" onClick={onClose} disabled={Boolean(busy)}>Cancel</button>
-        <button className="btn-primary" type="submit" disabled={Boolean(busy)}><Save size={14} />{busy === "save" ? "Saving…" : "Save Settings"}</button>
+        <button className="btn-primary" type="submit" disabled={Boolean(busy) || !ready}><Save size={14} />{busy === "save" ? "Saving…" : "Save Settings"}</button>
       </div></div>
     </form>
   </Dialog>;

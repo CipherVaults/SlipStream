@@ -128,6 +128,7 @@ describe("workspace and inspector", () => {
 
   it("uses the sidebar speed cap and quick transfer controls", async () => {
     const pause = vi.spyOn(desktop, "pauseTransfer").mockResolvedValue();
+    const cancel = vi.spyOn(desktop, "cancelTransfer").mockResolvedValue();
     const reveal = vi.spyOn(desktop, "revealInExplorer").mockResolvedValue();
     const cap = vi.spyOn(desktop, "setSpeedLimit").mockResolvedValue();
     const user = await start();
@@ -139,7 +140,61 @@ describe("workspace and inspector", () => {
     expect(reveal).toHaveBeenCalledWith("design-pdf");
     await user.click(within(row(pdf)).getByRole("button", { name: /More actions/ }));
     await user.click(within(row(pdf)).getByRole("button", { name: "Remove" }));
+    expect(cancel).toHaveBeenCalledWith("design-pdf", false);
     expect(screen.queryByRole("article", { name: pdf })).not.toBeInTheDocument();
+  });
+
+  it("handles unassigned segment slots, preserves pending torrent file updates across tabs, and gates http auto-probe", async () => {
+    const latest = demo.snapshot();
+    const singleSegHttp = {
+      ...latest.transfers[1],
+      ui_segments: [1, 1, 1, 1, 1, 1, 1, 1, .5, 0, 0, 0, 0, 0, 0, 0],
+      segments: [
+        {
+          index: 0,
+          start_byte: 0,
+          end_byte: 5_599_999_999,
+          downloaded_bytes: 3_000_000_000,
+          speed_bps: 12_000_000,
+          state: "active" as const,
+        },
+      ],
+    };
+    vi.spyOn(desktop, "getSnapshot").mockResolvedValue({
+      ...latest,
+      transfers: [singleSegHttp, ...latest.transfers.filter(item => item.id !== singleSegHttp.id)],
+    });
+    const probeSpy = vi.spyOn(desktop, "probeMedia");
+    const listSpy = vi.spyOn(desktop, "listTorrentFiles");
+    let resolveSelect!: () => void;
+    const selectSpy = vi.spyOn(desktop, "setTorrentFiles").mockImplementation(
+      () => new Promise<void>(resolve => { resolveSelect = resolve; }),
+    );
+    const user = await start();
+
+    await user.click(within(row(ubuntu)).getByRole("button", { name: /Inspect/ }));
+    await user.click(inspector().getByRole("tab", { name: "Segments" }));
+    expect(inspector().getAllByText("Idle")).toHaveLength(15);
+    expect(inspector().queryByText("Done")).not.toBeInTheDocument();
+
+    await user.click(inspector().getByRole("tab", { name: "Media" }));
+    expect(probeSpy).not.toHaveBeenCalled();
+    expect(inspector().getByRole("button", { name: "Probe Media Streams" })).toBeVisible();
+
+    await user.click(within(row(blender)).getByRole("button", { name: /Inspect/ }));
+    await user.click(inspector().getByRole("tab", { name: "Torrent Files" }));
+    const textures = await inspector().findByRole("checkbox", { name: /Studio_Textures/ });
+    expect(listSpy).toHaveBeenCalledTimes(1);
+    await user.click(textures);
+    expect(selectSpy).toHaveBeenCalledWith("blender", [0, 2, 3]);
+
+    await user.click(inspector().getByRole("tab", { name: "Overview" }));
+    await user.click(inspector().getByRole("tab", { name: "Torrent Files" }));
+    expect(listSpy).toHaveBeenCalledTimes(1);
+    expect(inspector().getByRole("checkbox", { name: /Studio_Textures/ })).not.toBeChecked();
+    expect(inspector().getByRole("checkbox", { name: /Studio_Textures/ })).toBeDisabled();
+    act(() => resolveSelect());
+    await waitFor(() => expect(inspector().getByRole("checkbox", { name: /Studio_Textures/ })).toBeEnabled());
   });
 });
 
@@ -399,5 +454,80 @@ describe("appearance, settings and transfer dialogs", () => {
     expect(verifyDialog.getByRole("status")).toHaveTextContent("SHA-256 checksum matches.");
     await user.click(verifyDialog.getByRole("button", { name: "Done" }));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("prevents settings overwrite on startup failure and serializes limit + theme updates", async () => {
+    const getSettingsSpy = vi.spyOn(desktop, "getSettings").mockRejectedValue(new Error("Settings unreadable"));
+    const saveSpy = vi.spyOn(desktop, "saveSettings").mockResolvedValue();
+    const user = await start();
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Settings unreadable");
+    await user.click(screen.getByRole("button", { name: "Graphite" }));
+    expect(saveSpy).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    const settingsDlg = dialog("Settings & Browser Integration");
+    expect(settingsDlg.getByRole("button", { name: "Save Settings" })).toBeDisabled();
+
+    getSettingsSpy.mockResolvedValue({ ...demo.getSettings(), theme: "dark", accent: "blue" });
+    await user.click(settingsDlg.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(settingsDlg.getByRole("button", { name: "Save Settings" })).toBeEnabled());
+
+    fireEvent.change(settingsDlg.getByLabelText("Global speed limit in MB/s"), { target: { value: "-5" } });
+    fireEvent.submit(settingsDlg.getByRole("button", { name: "Save Settings" }).closest("form")!);
+    expect(settingsDlg.getByRole("alert")).toHaveTextContent("positive finite speed limit");
+    expect(saveSpy).not.toHaveBeenCalled();
+    await user.click(settingsDlg.getByRole("button", { name: "Cancel" }));
+
+    let resolveCap!: () => void;
+    vi.spyOn(desktop, "setSpeedLimit").mockImplementation(() => new Promise<void>(resolve => { resolveCap = resolve; }));
+    await user.click(screen.getByRole("button", { name: "Unlimited" }));
+    await user.click(screen.getByRole("button", { name: "Graphite" }));
+    expect(saveSpy).not.toHaveBeenCalled();
+    act(() => resolveCap());
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledWith(expect.objectContaining({
+      theme: "light",
+      global_speed_limit_bps: 50_000_000,
+    })));
+  });
+
+  it("guards duplicate submits, preserves error/draft across picker & drop, and ignores bracket query params as wildcards", async () => {
+    let rejectAdd!: (err: Error) => void;
+    const httpSpy = vi.spyOn(desktop, "addHttpDownload").mockImplementation(
+      () => new Promise<string>((_resolve, reject) => { rejectAdd = reject; }),
+    );
+    const expandSpy = vi.spyOn(desktop, "expandWildcardUrls");
+    let dropHandler!: (event: { type: string; paths: string[] }) => void;
+    vi.spyOn(desktop, "onFileDrop").mockImplementation(async handler => {
+      dropHandler = handler as unknown as typeof dropHandler;
+      return () => Promise.reject(new Error("teardown ignored"));
+    });
+    const user = await start();
+
+    await user.click(screen.getByRole("button", { name: "Add" }));
+    const sheet = dialog("Add Download");
+    await user.type(sheet.getByRole("textbox", { name: "Download source" }), "https://api.example.com/items?filter[name]=1");
+    expect(sheet.queryByText("Wildcard Batch Preview")).not.toBeInTheDocument();
+    expect(expandSpy).not.toHaveBeenCalled();
+
+    await user.clear(sheet.getByLabelText("Save folder"));
+    await user.type(sheet.getByLabelText("Save folder"), "E:\\Custom");
+    const downloadBtn = sheet.getByRole("button", { name: "Download" });
+    fireEvent.click(downloadBtn);
+    fireEvent.click(downloadBtn);
+    expect(httpSpy).toHaveBeenCalledTimes(1);
+
+    act(() => openPicker("https://example.org/queued.mp4"));
+    act(() => rejectAdd(new Error("Network down")));
+    expect(await sheet.findByRole("alert")).toHaveTextContent("Network down");
+    expect(sheet.getByDisplayValue("E:\\Custom")).toBeVisible();
+
+    act(() => dropHandler({ type: "drop", paths: ["D:\\Downloads\\dropped.torrent"] }));
+    expect(sheet.getByRole("textbox", { name: "Download source" })).toHaveValue("D:\\Downloads\\dropped.torrent");
+    expect(sheet.getByDisplayValue("E:\\Custom")).toBeVisible();
+
+    await user.click(sheet.getByRole("button", { name: "Cancel" }));
+    const queuedSheet = await screen.findByRole("dialog", { name: "Add Download" });
+    expect(within(queuedSheet).getByRole("textbox", { name: "Download source" })).toHaveValue("https://example.org/queued.mp4");
   });
 });

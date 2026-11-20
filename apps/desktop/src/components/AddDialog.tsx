@@ -20,10 +20,11 @@ export interface AddSeed {
   autoProbe?: boolean;
 }
 
-export function AddDialog({ seed, settings, onClose, onAdded, onBusyChange }: {
-  seed: AddSeed; settings: AppSettings; onClose: () => void; onAdded: (message: string, id?: string) => void;
-  onBusyChange: (busy: boolean) => void;
+export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onBusyChange }: {
+  seed: AddSeed; droppedSource?: { url: string; seq: number }; settings: AppSettings; onClose: () => void;
+  onAdded: (message: string, id?: string) => void; onBusyChange: (busy: boolean) => void;
 }) {
+  const native = isTauri();
   const [url, setUrl] = useState(seed.url ?? "");
   const [tab, setTab] = useState<AddTab>(() => seed.format?.is_audio_only ? "audio"
     : isTorrentSource(seed.url ?? "") || isWildcard(seed.url ?? "") ? "torrent" : "video");
@@ -46,7 +47,10 @@ export function AddDialog({ seed, settings, onClose, onAdded, onBusyChange }: {
   const [submitting, setSubmitting] = useState(false);
   const [message, setMessage] = useState("");
   const probeRequest = useRef(0);
+  const probeLock = useRef<{ active: boolean; source: string }>({ active: false, source: "" });
+  const submitLock = useRef(false);
   const batchProgress = useRef({ pattern: "", count: 0 });
+  const appliedDropSeq = useRef(0);
 
   const source = url.trim();
   const wildcard = isWildcard(source);
@@ -63,6 +67,7 @@ export function AddDialog({ seed, settings, onClose, onAdded, onBusyChange }: {
     setLanguages([]);
     setWildcardUrls([]);
     setProbeBusy(false);
+    probeLock.current = { active: false, source: "" };
     probeRequest.current++;
     batchProgress.current = { pattern: "", count: 0 };
     const next = value.trim();
@@ -71,7 +76,9 @@ export function AddDialog({ seed, settings, onClose, onAdded, onBusyChange }: {
   }
 
   async function probeSource(value: string) {
+    if (probeLock.current.active && probeLock.current.source === value) return;
     const request = ++probeRequest.current;
+    probeLock.current = { active: true, source: value };
     setMessage("");
     setProbeBusy(true);
     try {
@@ -91,7 +98,10 @@ export function AddDialog({ seed, settings, onClose, onAdded, onBusyChange }: {
     } catch (error) {
       if (request === probeRequest.current) setMessage(errorMessage(error));
     } finally {
-      if (request === probeRequest.current) setProbeBusy(false);
+      if (request === probeRequest.current) {
+        probeLock.current = { active: false, source: "" };
+        setProbeBusy(false);
+      }
     }
   }
 
@@ -101,14 +111,20 @@ export function AddDialog({ seed, settings, onClose, onAdded, onBusyChange }: {
     return () => { probeRequest.current++; };
   }, [seed]);
 
+  useEffect(() => {
+    if (!droppedSource || droppedSource.seq === appliedDropSeq.current) return;
+    appliedDropSeq.current = droppedSource.seq;
+    changeSource(droppedSource.url);
+  }, [droppedSource]);
+
   function useFile(file: File) {
     if (!file.name.toLowerCase().endsWith(".torrent")) {
       setMessage("Choose a .torrent file.");
       return;
     }
     const path = (file as File & { path?: string }).path;
-    if (isTauri() && !path) {
-      setMessage("Enter the full path to " + file.name + " or drag the file here from Explorer.");
+    if (native && !path) {
+      setMessage("Drop the .torrent file from Explorer or paste its path above.");
       return;
     }
     changeSource(path ?? file.name);
@@ -116,7 +132,7 @@ export function AddDialog({ seed, settings, onClose, onAdded, onBusyChange }: {
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (submitting) return;
+    if (submitLock.current) return;
     setMessage("");
     if (torrent ? !isTorrentSource(source) : !wildcard && !isHttpUrl(source)) {
       setMessage(torrent ? "Enter a magnet link or the path to a .torrent file." : "Enter a valid HTTP or HTTPS URL.");
@@ -130,6 +146,7 @@ export function AddDialog({ seed, settings, onClose, onAdded, onBusyChange }: {
       setMessage("Probe the URL and select at least one subtitle language.");
       return;
     }
+    submitLock.current = true;
     setSubmitting(true);
     onBusyChange(true);
     const saveDir = folder.trim() || null;
@@ -173,6 +190,7 @@ export function AddDialog({ seed, settings, onClose, onAdded, onBusyChange }: {
       const count = batchProgress.current.count;
       setMessage((wildcard && count ? count + " downloads added. Retry to add the remaining URLs. " : "") + errorMessage(error));
     } finally {
+      submitLock.current = false;
       setSubmitting(false);
       onBusyChange(false);
     }
@@ -236,7 +254,16 @@ export function AddDialog({ seed, settings, onClose, onAdded, onBusyChange }: {
               : <p className="field-note">Probe the pattern to preview expanded URLs, such as file_[001-010].zip.</p>}
             {wildcardUrls.length > 20 && <p className="field-note">Showing the first 20 URLs.</p>}
           </div> : <div className="torrent-entry">
-            <label className="file-chooser" onDragOver={event => { event.preventDefault(); event.stopPropagation(); }}
+            {native ? <div className="file-chooser" onDragOver={event => { event.preventDefault(); event.stopPropagation(); }}
+              onDrop={event => {
+                event.preventDefault(); event.stopPropagation();
+                const file = event.dataTransfer.files[0];
+                const text = event.dataTransfer.getData("text/uri-list") || event.dataTransfer.getData("text/plain");
+                if (file) useFile(file);
+                else if (isTorrentSource(text.trim())) changeSource(text.trim());
+              }}>
+              <Upload size={15} />Drop a .torrent file from Explorer, or paste its path above
+            </div> : <label className="file-chooser" onDragOver={event => { event.preventDefault(); event.stopPropagation(); }}
               onDrop={event => {
                 event.preventDefault(); event.stopPropagation();
                 const file = event.dataTransfer.files[0];
@@ -250,7 +277,7 @@ export function AddDialog({ seed, settings, onClose, onAdded, onBusyChange }: {
                   if (event.target.files?.[0]) useFile(event.target.files[0]);
                   event.target.value = "";
                 }} />
-            </label>
+            </label>}
             <Switch label="Sequential" checked={sequential} onChange={setSequential} />
           </div>)}
         </Tabs>
