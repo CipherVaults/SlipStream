@@ -199,7 +199,7 @@ struct State {
 struct RunControl {
     task: Id,
     stop: watch::Sender<bool>,
-    done: watch::Sender<bool>,
+    done: watch::Sender<Option<std::result::Result<TransferStatus, String>>>,
     desired: Option<TransferStatus>,
 }
 
@@ -572,17 +572,15 @@ impl DownloadEngine {
                 return Ok(());
             }
         };
-        let _ = done.wait_for(|done| *done).await;
-        let final_status = self.inner.lock().job(id)?.record.status;
-        if final_status == target {
-            Ok(())
-        } else if matches!(
-            final_status,
-            TransferStatus::Completed | TransferStatus::Canceled
-        ) {
-            Err(EngineError::InvalidState("transfer has already finished"))
-        } else {
-            Ok(())
+        let outcome = done.wait_for(Option::is_some).await;
+        match outcome.ok().and_then(|value| value.clone()) {
+            Some(Ok(final_status)) if final_status == target => Ok(()),
+            Some(Ok(TransferStatus::Completed | TransferStatus::Canceled)) => {
+                Err(EngineError::InvalidState("transfer has already finished"))
+            }
+            Some(Ok(_)) => Ok(()),
+            Some(Err(message)) => Err(EngineError::InvalidRequest(message)),
+            None => Err(EngineError::Closed),
         }
     }
 
@@ -768,7 +766,7 @@ impl Inner {
             db.save_record(&record)?;
             job.record = record;
             let (stop, signal) = watch::channel(false);
-            let (done, _) = watch::channel(false);
+            let (done, _) = watch::channel(None);
             let engine = Arc::clone(self);
             let transfer_id = id.clone();
             let task = runs.spawn(async move { engine.download(&transfer_id, signal).await });
@@ -826,14 +824,17 @@ impl Inner {
             Err(error) => (TransferStatus::Failed, Some(error.to_string())),
         };
         let (db, job) = state.job_mut(&id)?;
-        save_status(db, job, status, error)?;
+        if let Err(err) = save_status(db, job, status, error) {
+            let _ = run.done.send_replace(Some(Err(err.to_string())));
+            return Err(err);
+        }
         self.status(&id, status);
         if state.running.is_empty() && self.telemetry.receiver_count() > 0 {
             let _ = self
                 .telemetry
                 .send(state.telemetry_batch(self.global_limiter.rate()));
         }
-        run.done.send_replace(true);
+        let _ = run.done.send_replace(Some(Ok(status)));
         Ok(())
     }
 

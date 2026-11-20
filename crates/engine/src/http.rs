@@ -17,34 +17,56 @@ use url::{Host, Url};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Validators {
     pub etag: Option<String>,
+    #[serde(default)]
+    pub etag_present: bool,
+    #[serde(default)]
+    pub etag_raw: Option<String>,
     pub last_modified: Option<String>,
 }
 
 impl Validators {
     pub(crate) fn from_response(response: &Response) -> Self {
-        let read = |name| {
-            response
-                .headers()
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned)
-        };
+        let etags: Vec<_> = response.headers().get_all(ETAG).iter().collect();
+        let etag_present = !etags.is_empty();
+        let etag = (etags.len() == 1)
+            .then(|| etags[0].to_str().ok().map(str::to_owned))
+            .flatten();
+        let etag_raw = (etag_present && etag.is_none()).then(|| {
+            etags
+                .iter()
+                .map(|value| hex::encode(value.as_bytes()))
+                .collect::<Vec<_>>()
+                .join(",")
+        });
+        let last_modified = response
+            .headers()
+            .get(LAST_MODIFIED)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         Self {
-            etag: read(ETAG),
-            last_modified: read(LAST_MODIFIED),
+            etag,
+            etag_present,
+            etag_raw,
+            last_modified,
         }
     }
 
-    pub(crate) fn if_range(&self) -> Option<&str> {
+    pub(crate) fn has_strong_etag(&self) -> bool {
         self.etag
             .as_deref()
-            .filter(|tag| tag.len() >= 2 && tag.starts_with('"') && tag.ends_with('"'))
-            .or_else(|| {
-                self.etag
-                    .is_none()
-                    .then_some(self.last_modified.as_deref())
-                    .flatten()
-            })
+            .is_some_and(|tag| tag.len() >= 2 && tag.starts_with('"') && tag.ends_with('"'))
+    }
+
+    pub(crate) fn if_range(&self) -> Option<&str> {
+        if self.has_strong_etag() {
+            return self.etag.as_deref();
+        }
+        if self.etag_present || self.etag.is_some() {
+            return None;
+        }
+        self.last_modified
+            .as_deref()
+            .filter(|value| is_valid_http_date(value))
     }
 
     pub(crate) fn changed(&self, response: &Response, conditional: bool) -> bool {
@@ -55,18 +77,33 @@ impl Validators {
                 .zip(received.as_ref())
                 .is_some_and(|(saved, received)| saved != received)
         };
-        changed(&self.etag, &actual.etag)
+        let raw_changed = (self.etag_present && actual.etag_present)
+            && (self.etag != actual.etag || self.etag_raw != actual.etag_raw);
+        raw_changed
+            || changed(&self.etag, &actual.etag)
             || changed(&self.last_modified, &actual.last_modified)
-            || (conditional && self.if_range() != actual.if_range_for(self))
+            || (conditional
+                && (self.if_range().is_none() || self.if_range() != actual.if_range_for(self)))
     }
 
     fn if_range_for(&self, saved: &Self) -> Option<&str> {
-        if saved.etag.as_deref() == saved.if_range() {
+        if saved.has_strong_etag() {
             self.etag.as_deref()
+        } else if self.etag_present || self.etag.is_some() {
+            None
         } else {
             self.last_modified.as_deref()
         }
     }
+}
+
+fn is_valid_http_date(value: &str) -> bool {
+    let valid_imf = value.ends_with(" GMT") && chrono::DateTime::parse_from_rfc2822(value).is_ok();
+    let valid_rfc850 = value.ends_with(" GMT")
+        && chrono::NaiveDateTime::parse_from_str(value, "%A, %d-%b-%y %H:%M:%S GMT").is_ok();
+    let valid_asctime =
+        chrono::NaiveDateTime::parse_from_str(value, "%a %b %e %H:%M:%S %Y").is_ok();
+    valid_imf || valid_rfc850 || valid_asctime
 }
 
 pub(crate) struct Metadata {
@@ -176,8 +213,21 @@ impl Source {
             {
                 continue;
             }
-            let value = HeaderValue::from_str(value)
-                .map_err(|_| EngineError::InvalidRequest(format!("invalid {name} header value")))?;
+            let value = if name == REFERER {
+                if value.trim().is_empty() {
+                    continue;
+                }
+                let sanitized = sanitize_http_url_credentials(value).ok_or_else(|| {
+                    EngineError::InvalidRequest("invalid referer header value".into())
+                })?;
+                HeaderValue::from_str(&sanitized).map_err(|_| {
+                    EngineError::InvalidRequest("invalid referer header value".into())
+                })?
+            } else {
+                HeaderValue::from_str(value).map_err(|_| {
+                    EngineError::InvalidRequest(format!("invalid {name} header value"))
+                })?
+            };
             request_headers.insert(name, value);
         }
         if let Some(referrer) = referrer.filter(|raw| !raw.trim().is_empty()) {
@@ -343,21 +393,42 @@ impl Http {
         })
     }
 
-    pub(crate) async fn get(
+    pub(crate) async fn get_or_restart(
         &self,
         source: &Source,
         range: Option<(u64, u64)>,
         total: Option<u64>,
         validators: &Validators,
         conditional: bool,
-    ) -> Result<Response> {
-        let if_range = conditional.then(|| validators.if_range()).flatten();
+    ) -> Result<GetOutcome> {
+        let if_range = if conditional {
+            let Some(value) = validators.if_range() else {
+                return Ok(GetOutcome::Restart(RestartReason::RepresentationChanged));
+            };
+            Some(value)
+        } else {
+            None
+        };
         let response = self.request(source, Method::GET, range, if_range).await?;
         if let Some((start, last)) = range {
             match response.status() {
-                StatusCode::OK
-                | StatusCode::PRECONDITION_FAILED
-                | StatusCode::RANGE_NOT_SATISFIABLE => return Err(EngineError::RestartRequired),
+                StatusCode::OK | StatusCode::RANGE_NOT_SATISFIABLE => {
+                    let unchanged = if_range.is_none()
+                        && !validators.changed(&response, false)
+                        && (response.status() == StatusCode::RANGE_NOT_SATISFIABLE
+                            || !total
+                                .zip(length(&response)?)
+                                .is_some_and(|(old, new)| old != new));
+                    let reason = if unchanged {
+                        RestartReason::RangeUnsupported
+                    } else {
+                        RestartReason::RepresentationChanged
+                    };
+                    return Ok(GetOutcome::Restart(reason));
+                }
+                StatusCode::PRECONDITION_FAILED => {
+                    return Ok(GetOutcome::Restart(RestartReason::RepresentationChanged));
+                }
                 StatusCode::PARTIAL_CONTENT => {}
                 status => return Err(EngineError::Status(status)),
             }
@@ -365,7 +436,7 @@ impl Http {
             if validators.changed(&response, if_range.is_some())
                 || total != content_range(&response, start, last)?
             {
-                return Err(EngineError::RestartRequired);
+                return Ok(GetOutcome::Restart(RestartReason::RepresentationChanged));
             }
         } else {
             if response.status() != StatusCode::OK {
@@ -377,11 +448,22 @@ impl Http {
                     .zip(length(&response)?)
                     .is_some_and(|(old, new)| old != new)
             {
-                return Err(EngineError::RestartRequired);
+                return Ok(GetOutcome::Restart(RestartReason::RepresentationChanged));
             }
         }
-        Ok(response)
+        Ok(GetOutcome::Response(response))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartReason {
+    RepresentationChanged,
+    RangeUnsupported,
+}
+
+pub(crate) enum GetOutcome {
+    Response(Response),
+    Restart(RestartReason),
 }
 
 pub(crate) fn sanitize_http_url_credentials(raw: &str) -> Option<String> {
@@ -391,6 +473,7 @@ pub(crate) fn sanitize_http_url_credentials(raw: &str) -> Option<String> {
         let _ = parsed.set_username("");
         let _ = parsed.set_password(None);
     }
+    parsed.set_fragment(None);
     Some(parsed.into())
 }
 
@@ -634,9 +717,28 @@ mod tests {
         headers.insert(COOKIE, HeaderValue::from_static("sid=secret"));
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
         let clean_ref =
-            sanitize_http_url_credentials("https://user:pass@app.example.com/page").unwrap();
+            sanitize_http_url_credentials("https://user:pass@app.example.com/page#secret").unwrap();
         assert_eq!(clean_ref, "https://app.example.com/page");
         headers.insert(REFERER, HeaderValue::from_str(&clean_ref).unwrap());
+
+        let header_src = Source::new(
+            "https://cdn.example.com/file",
+            &[(
+                "Referer".into(),
+                "https://alice:pw@ref.example.com/doc#frag".into(),
+            )]
+            .into(),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            header_src
+                .headers
+                .get(REFERER)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://ref.example.com/doc")
+        );
 
         apply_redirect_header_policy(
             &mut headers,
@@ -658,5 +760,40 @@ mod tests {
             &http_other,
         );
         assert!(headers.get(REFERER).is_none());
+    }
+
+    #[test]
+    fn validators_block_weak_or_non_ascii_etag_fallback_and_validate_http_dates() {
+        let weak = Validators {
+            etag: Some("W/\"weak\"".into()),
+            etag_present: true,
+            etag_raw: None,
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
+        };
+        assert_eq!(weak.if_range(), None);
+
+        let non_ascii = Validators {
+            etag: None,
+            etag_present: true,
+            etag_raw: Some("22ff22".into()),
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
+        };
+        assert_eq!(non_ascii.if_range(), None);
+
+        let invalid_date = Validators {
+            etag: None,
+            etag_present: false,
+            etag_raw: None,
+            last_modified: Some("not-a-valid-date".into()),
+        };
+        assert_eq!(invalid_date.if_range(), None);
+
+        let valid_date = Validators {
+            etag: None,
+            etag_present: false,
+            etag_raw: None,
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".into()),
+        };
+        assert_eq!(valid_date.if_range(), Some("Wed, 21 Oct 2015 07:28:00 GMT"));
     }
 }

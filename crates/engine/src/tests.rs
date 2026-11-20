@@ -1243,8 +1243,13 @@ async fn checksum_failure_resets_progress_so_resume_recovers() {
 async fn telemetry_stream_emits_terminal_idle_batch_on_completion() {
     let data = payload(64 * KIB, 21);
     let source = Arc::clone(&data);
+    let (release, hold) = watch::channel(false);
     let server = Server::new(move |req| {
-        Reply::resource(req, &source, "\"idle\"").with_delay(Duration::from_millis(15))
+        let mut reply = Reply::resource(req, &source, "\"idle\"");
+        if req.method == "GET" && req.range() != Some(0..1) {
+            reply.body_gate = Some(hold.clone());
+        }
+        reply
     })
     .await;
     let dir = TestDir::new().await;
@@ -1259,7 +1264,10 @@ async fn telemetry_stream_emits_terminal_idle_batch_on_completion() {
         loop {
             let batch = rx.recv().await.unwrap();
             if batch.active_count > 0 {
-                saw_active = true;
+                if !saw_active {
+                    saw_active = true;
+                    release.send_replace(true);
+                }
             } else if saw_active
                 && batch.active_count == 0
                 && batch
@@ -1275,6 +1283,83 @@ async fn telemetry_stream_emits_terminal_idle_batch_on_completion() {
     .unwrap();
     assert_eq!(idle.active_threads, 0);
     assert_eq!(idle.aggregate_down_bps, 0);
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn etag_rotation_during_probe_to_range_keeps_ranges_enabled() {
+    let data = payload(128 * KIB, 22);
+    let source = Arc::clone(&data);
+    let rotated = AtomicBool::new(false);
+    let server = Server::new(move |req| {
+        if req.method == "HEAD" && !rotated.swap(true, Ordering::SeqCst) {
+            return Reply::resource(req, &source, "\"v1\"");
+        }
+        Reply::resource(req, &source, "\"v2\"")
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    let id = engine
+        .add_http_download(request(server.url("/rotate.bin"), None, 4))
+        .await
+        .unwrap();
+    let done = completed(&engine, &id).await;
+    assert!(done.resumable);
+    assert_eq!(done.segments.len(), 4);
+    dir.assert_output("rotate.bin", &data).await;
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn weak_etag_merged_on_last_modified_resume_triggers_restart() {
+    let old = payload(256 * KIB, 23);
+    let new = payload(256 * KIB, 24);
+    let new_source = Arc::clone(&new);
+    let phase = Arc::new(AtomicUsize::new(0));
+    let server_phase = Arc::clone(&phase);
+    let server = Server::new(move |req| {
+        if req.method == "HEAD" {
+            let mut reply = if server_phase.load(Ordering::SeqCst) == 0 {
+                Reply::resource(req, &old, "\"unused\"")
+            } else {
+                Reply::resource(req, &new_source, "\"v2\"")
+            };
+            reply.headers.retain(|(name, _)| *name != "ETag");
+            reply
+                .headers
+                .push(("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT".into()));
+            return reply;
+        }
+        if server_phase.load(Ordering::SeqCst) == 0 {
+            let mut reply =
+                Reply::resource(req, &old, "\"unused\"").with_delay(Duration::from_millis(8));
+            reply.headers.retain(|(name, _)| *name != "ETag");
+            reply
+                .headers
+                .push(("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT".into()));
+            return reply;
+        }
+        let mut reply = Reply::resource(req, &new_source, "W/\"weak-new\"");
+        reply
+            .headers
+            .push(("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT".into()));
+        reply
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    let id = engine
+        .add_http_download(request(server.url("/weak-merge.bin"), None, 2))
+        .await
+        .unwrap();
+    wait_for(&engine, &id, |s| s.downloaded_bytes >= 32 * KIB as u64).await;
+    engine.pause_transfer(&id).await.unwrap();
+    phase.store(1, Ordering::SeqCst);
+    engine.resume_transfer(&id).await.unwrap();
+    let done = completed(&engine, &id).await;
+    assert_eq!(done.total_bytes, Some(new.len() as u64));
+    dir.assert_output("weak-merge.bin", &new).await;
     engine.shutdown().await.unwrap();
 }
 

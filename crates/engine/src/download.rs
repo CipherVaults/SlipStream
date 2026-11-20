@@ -1,4 +1,6 @@
-use crate::http::{protocol, request_error, Metadata, Source, Validators};
+use crate::http::{
+    protocol, request_error, GetOutcome, Metadata, RestartReason, Source, Validators,
+};
 use crate::limiter::Limiter;
 use crate::output;
 use crate::storage::{Record, Segment, Segments};
@@ -103,18 +105,17 @@ impl Inner {
         };
         for restarts in 0..=RESTARTS {
             match run.execute_plan(&plan, &mut stop).await {
-                Err(EngineError::RestartRequired) if restarts < RESTARTS => {
-                    let allow_ranges = plan.conditional;
+                Ok(None) => return run.finalize(&stop).await,
+                Ok(Some(reason)) if restarts < RESTARTS => {
+                    let allow_ranges = reason != RestartReason::RangeUnsupported;
                     plan = run.fresh_plan(&mut stop, true, allow_ranges).await?;
                 }
+                Ok(Some(_)) => return Err(EngineError::RestartRequired),
                 Err(error) => {
                     if matches!(error, EngineError::Interrupted) {
                         output::sync_part(&plan.part).await?;
                     }
                     return Err(error);
-                }
-                Ok(()) => {
-                    return run.finalize(&stop).await;
                 }
             }
         }
@@ -229,7 +230,7 @@ impl Run<'_> {
         Ok(plan)
     }
 
-    async fn execute_plan(&self, plan: &Plan, stop: &mut Stop) -> Result<()> {
+    async fn execute_plan(&self, plan: &Plan, stop: &mut Stop) -> Result<Option<RestartReason>> {
         stop.check()?;
         self.activate(plan)?;
         if plan.indices.is_empty() {
@@ -239,7 +240,7 @@ impl Run<'_> {
                 let validators = self.validators()?;
                 for retry in 0..=RETRIES {
                     match stop
-                        .during(self.engine.http.get(
+                        .during(self.engine.http.get_or_restart(
                             &self.source,
                             Some((0, 0)),
                             plan.total,
@@ -251,21 +252,22 @@ impl Run<'_> {
                         Err(error) if error.is_transient() && retry < RETRIES => {
                             stop.backoff(retry).await?;
                         }
-                        result => {
-                            result?;
-                            break;
-                        }
+                        Ok(GetOutcome::Response(_)) => break,
+                        Ok(GetOutcome::Restart(reason)) => return Ok(Some(reason)),
+                        Err(error) => return Err(error),
                     }
                 }
             }
-            return Ok(());
+            return Ok(None);
         }
+        let restart = std::sync::Mutex::new(None);
         let (group_stop, group) = watch::channel(false);
         let mut workers = FuturesUnordered::new();
         for &index in &plan.indices {
             workers.push(self.worker(
                 plan,
                 index,
+                &restart,
                 Stop {
                     transfer: stop.transfer.clone(),
                     group: group.clone(),
@@ -284,7 +286,11 @@ impl Run<'_> {
                 group_stop.send_replace(true);
             }
         }
-        failure.map_or(Ok(()), Err)
+        if matches!(failure, Some(EngineError::RestartRequired)) {
+            let reason = (*restart.lock().unwrap()).unwrap_or(RestartReason::RepresentationChanged);
+            return Ok(Some(reason));
+        }
+        failure.map_or(Ok(None), Err)
     }
 
     fn activate(&self, plan: &Plan) -> Result<()> {
@@ -309,11 +315,17 @@ impl Run<'_> {
         Ok(())
     }
 
-    async fn worker(&self, plan: &Plan, mut index: u8, mut stop: Stop) -> Result<()> {
+    async fn worker(
+        &self,
+        plan: &Plan,
+        mut index: u8,
+        restart: &std::sync::Mutex<Option<RestartReason>>,
+        mut stop: Stop,
+    ) -> Result<()> {
         let mut file = OpenOptions::new().write(true).open(&plan.part).await?;
         loop {
             stop.check()?;
-            self.download_segment(plan, index, &mut file, &mut stop)
+            self.download_segment(plan, index, &mut file, restart, &mut stop)
                 .await?;
             stop.check()?;
             let Some(next_index) = self.finish_segment(index, plan.ranges)? else {
@@ -328,6 +340,7 @@ impl Run<'_> {
         plan: &Plan,
         index: u8,
         file: &mut File,
+        restart: &std::sync::Mutex<Option<RestartReason>>,
         stop: &mut Stop,
     ) -> Result<()> {
         for retry in 0..=RETRIES {
@@ -349,16 +362,28 @@ impl Run<'_> {
                 )
             };
             let result = async {
-                let response = stop
-                    .during(self.engine.http.get(
+                let response = match stop
+                    .during(self.engine.http.get_or_restart(
                         &self.source,
                         range,
                         plan.total,
                         &validators,
                         conditional,
                     ))
-                    .await?;
-                self.note_response(&response)?;
+                    .await?
+                {
+                    GetOutcome::Response(response) => response,
+                    GetOutcome::Restart(reason) => {
+                        record_restart(restart, reason);
+                        return Err(EngineError::RestartRequired);
+                    }
+                };
+                if let Err(error) = self.note_response(&response, conditional) {
+                    if matches!(error, EngineError::RestartRequired) {
+                        record_restart(restart, RestartReason::RepresentationChanged);
+                    }
+                    return Err(error);
+                }
                 file.seek(SeekFrom::Start(range.map_or(0, |(start, _)| start)))
                     .await?;
                 self.write_response(response, index, plan.ranges, file, stop)
@@ -382,22 +407,33 @@ impl Run<'_> {
         Ok(self.engine.lock().job(self.id)?.record.validators.clone())
     }
 
-    fn note_response(&self, response: &Response) -> Result<()> {
+    fn note_response(&self, response: &Response, conditional: bool) -> Result<()> {
         let mut state = self.engine.lock();
         let (db, job) = state.job_mut(self.id)?;
         let mut record = job.record.clone();
         let known = &mut record.validators;
-        if known.changed(response, false) {
+        if known.changed(response, conditional) {
             return Err(EngineError::RestartRequired);
         }
         let found = Validators::from_response(response);
         let protocol = protocol(response);
         if record.use_server_filename
+            || (!known.etag_present && found.etag_present)
             || (known.etag.is_none() && found.etag.is_some())
             || (known.last_modified.is_none() && found.last_modified.is_some())
             || protocol != record.protocol
         {
-            known.etag = known.etag.take().or(found.etag);
+            if !known.etag_present && found.etag_present {
+                known.etag_present = true;
+                known.etag = found.etag;
+                known.etag_raw = found.etag_raw;
+                if conditional && known.if_range().is_none() {
+                    return Err(EngineError::RestartRequired);
+                }
+            } else {
+                known.etag = known.etag.take().or(found.etag);
+                known.etag_raw = known.etag_raw.take().or(found.etag_raw);
+            }
             known.last_modified = known.last_modified.take().or(found.last_modified);
             record.protocol = protocol.into();
             if record.use_server_filename {
@@ -611,6 +647,7 @@ impl Run<'_> {
             if let Some(mismatch) = verification.mismatch {
                 let empty = Segments::new();
                 db.replace_segments(&record, &empty)?;
+                db.checkpoint(false)?;
                 job.record = record;
                 job.segments = empty;
                 return Err(EngineError::ChecksumMismatch(mismatch));
@@ -627,6 +664,13 @@ impl Run<'_> {
             record
         };
         output::commit(&record).await
+    }
+}
+
+fn record_restart(slot: &std::sync::Mutex<Option<RestartReason>>, reason: RestartReason) {
+    let mut guard = slot.lock().unwrap();
+    if *guard != Some(RestartReason::RepresentationChanged) {
+        *guard = Some(reason);
     }
 }
 
