@@ -2,8 +2,8 @@ use sha1::{Digest, Sha1};
 use slipstream_protocol::{AddTorrentRequest, SegmentState, TransferKind, TransferStatus};
 use slipstream_torrent::{
     bencode::{self, BencodeValue as V},
-    build_v1_multi_file_torrent, build_v1_single_file_torrent, TorrentAddOptions, TorrentError,
-    TorrentManager, TorrentManagerConfig,
+    build_v1_multi_file_torrent, build_v1_single_file_torrent, parse_torrent_bytes,
+    TorrentAddOptions, TorrentError, TorrentManager, TorrentManagerConfig, MAX_TORRENT_BYTES,
 };
 use std::{
     fs,
@@ -120,6 +120,62 @@ async fn hostile_manifests_create_no_files() {
                 Err(TorrentError::PathSecurity(_))
             ),
             "root {segment:?}"
+        );
+        assert!(
+            matches!(
+                manager
+                    .add_torrent_bytes(&single_file_fixture(segment), TorrentAddOptions::default())
+                    .await,
+                Err(TorrentError::PathSecurity(_))
+            ),
+            "single {segment:?}"
+        );
+        assert!(
+            matches!(
+                manager
+                    .add_torrent_bytes(&utf8_name_fixture(segment), TorrentAddOptions::default())
+                    .await,
+                Err(TorrentError::PathSecurity(_))
+            ),
+            "name.utf-8 {segment:?}"
+        );
+        assert!(
+            matches!(
+                manager
+                    .add_torrent_bytes(&utf8_path_fixture(segment), TorrentAddOptions::default())
+                    .await,
+                Err(TorrentError::PathSecurity(_))
+            ),
+            "path.utf-8 {segment:?}"
+        );
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+    for v2_bad in [
+        b"../".as_slice(),
+        b"..",
+        b"CON",
+        b"con.mp4",
+        b"file.mp4:Zone.Identifier",
+        b"C:\\foo",
+        b"/abs",
+        "\u{202E}gpj.exe".as_bytes(),
+    ] {
+        let v2_manifest = v2_hostile_fixture(v2_bad);
+        assert!(
+            matches!(
+                parse_torrent_bytes(&v2_manifest, temp.path()),
+                Err(TorrentError::PathSecurity(_))
+            ),
+            "v2 parse {v2_bad:?}"
+        );
+        assert!(
+            matches!(
+                manager
+                    .add_torrent_bytes(&v2_manifest, TorrentAddOptions::default())
+                    .await,
+                Err(TorrentError::PathSecurity(_))
+            ),
+            "v2 add {v2_bad:?}"
         );
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
     }
@@ -250,6 +306,85 @@ fn dict<const N: usize>(entries: [(&[u8], V); N]) -> V {
             .map(|(key, value)| (key.to_vec(), value))
             .collect(),
     )
+}
+
+fn single_file_fixture(name: &[u8]) -> Vec<u8> {
+    bencode::encode(&dict([(
+        b"info",
+        dict([
+            (b"length", V::Int(4)),
+            (b"name", V::Bytes(name.to_vec())),
+            (b"piece length", V::Int(PIECE as i64)),
+            (b"pieces", V::Bytes(Sha1::digest(b"test").to_vec())),
+        ]),
+    )]))
+}
+
+fn utf8_name_fixture(name_utf8: &[u8]) -> Vec<u8> {
+    bencode::encode(&dict([(
+        b"info",
+        dict([
+            (b"length", V::Int(4)),
+            (b"name", V::Bytes(b"safe.bin".to_vec())),
+            (b"name.utf-8", V::Bytes(name_utf8.to_vec())),
+            (b"piece length", V::Int(PIECE as i64)),
+            (b"pieces", V::Bytes(Sha1::digest(b"test").to_vec())),
+        ]),
+    )]))
+}
+
+fn utf8_path_fixture(bad_segment: &[u8]) -> Vec<u8> {
+    let file = dict([
+        (b"length", V::Int(4)),
+        (
+            b"path",
+            V::List(vec![
+                V::Bytes(b"sub".to_vec()),
+                V::Bytes(b"ok.bin".to_vec()),
+            ]),
+        ),
+        (
+            b"path.utf-8",
+            V::List(vec![
+                V::Bytes(b"sub".to_vec()),
+                V::Bytes(bad_segment.to_vec()),
+            ]),
+        ),
+    ]);
+    bencode::encode(&dict([(
+        b"info",
+        dict([
+            (b"files", V::List(vec![file])),
+            (b"name", V::Bytes(b"valid".to_vec())),
+            (b"piece length", V::Int(PIECE as i64)),
+            (b"pieces", V::Bytes(Sha1::digest(b"test").to_vec())),
+        ]),
+    )]))
+}
+
+fn v2_hostile_fixture(bad_segment: &[u8]) -> Vec<u8> {
+    let leaf = dict([
+        (b"length", V::Int(4)),
+        (
+            b"pieces root",
+            V::Bytes(sha2::Sha256::digest(b"test").to_vec()),
+        ),
+    ]);
+    let tree = dict([(
+        b"folder".as_slice(),
+        dict([(bad_segment, dict([(b"".as_slice(), leaf)]))]),
+    )]);
+    bencode::encode(&dict([
+        (
+            b"info",
+            dict([
+                (b"file tree", tree),
+                (b"meta version", V::Int(2)),
+                (b"piece length", V::Int(PIECE as i64)),
+            ]),
+        ),
+        (b"piece layers", dict([])),
+    ]))
 }
 
 fn fixture(name: &[u8], paths: &[&[u8]], attr: Option<(&[u8], V)>) -> Vec<u8> {
@@ -501,4 +636,142 @@ async fn real_tcp_transfer_and_magnet_selection() {
     leech.remove(&id, false).await.unwrap();
     assert!(leech_dir.path().join(files[1].0).is_file());
     tokio::join!(leech.shutdown(), seed.shutdown());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejects_oversized_and_non_regular_torrent_sources() {
+    let temp = tempdir().unwrap();
+    let src_dir = tempdir().unwrap();
+    let manager = TorrentManager::new(local_config(temp.path()))
+        .await
+        .unwrap();
+
+    let oversized_bytes = vec![b'0'; MAX_TORRENT_BYTES + 1];
+    assert!(matches!(
+        parse_torrent_bytes(&oversized_bytes, temp.path()),
+        Err(TorrentError::Metadata(_))
+    ));
+    assert!(matches!(
+        manager
+            .add_torrent_bytes(&oversized_bytes, TorrentAddOptions::default())
+            .await,
+        Err(TorrentError::Metadata(_))
+    ));
+
+    let oversized_path = src_dir.path().join("huge.torrent");
+    let file = fs::File::create(&oversized_path).unwrap();
+    file.set_len((MAX_TORRENT_BYTES + 1) as u64).unwrap();
+    drop(file);
+    assert!(matches!(
+        manager
+            .add_torrent(AddTorrentRequest {
+                source: oversized_path.to_string_lossy().into_owned(),
+                save_dir: None,
+                selected_file_indices: None,
+                sequential: false,
+            })
+            .await,
+        Err(TorrentError::Metadata(_))
+    ));
+
+    assert!(matches!(
+        manager
+            .add_torrent(AddTorrentRequest {
+                source: src_dir.path().to_string_lossy().into_owned(),
+                save_dir: None,
+                selected_file_indices: None,
+                sequential: false,
+            })
+            .await,
+        Err(TorrentError::Metadata(_))
+    ));
+
+    assert!(manager.list_snapshots().is_empty());
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_preserves_uploads_and_remove_recovers_after_delete_failure() {
+    let seed_dir = tempdir().unwrap();
+    let leech_dir = tempdir().unwrap();
+    let payload = vec![77u8; 4 * PIECE];
+    fs::write(seed_dir.path().join("blob.bin"), &payload).unwrap();
+    let manifest = build_v1_single_file_torrent("blob.bin", &payload, PIECE as u32).unwrap();
+
+    let mut seed_cfg = local_config(seed_dir.path());
+    seed_cfg.listen_port_range = Some(0..1);
+    let seed = TorrentManager::new(seed_cfg).await.unwrap();
+    let leech = TorrentManager::new(local_config(leech_dir.path()))
+        .await
+        .unwrap();
+
+    let seed_id = seed
+        .add_torrent_bytes(
+            &manifest,
+            TorrentAddOptions {
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    seed.wait_until_completed(&seed_id, WAIT).await.unwrap();
+    let peer = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), seed.listen_port().unwrap());
+
+    let leech_id = leech
+        .add_torrent_bytes(
+            &manifest,
+            TorrentAddOptions {
+                initial_peers: vec![peer],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    leech.wait_until_completed(&leech_id, WAIT).await.unwrap();
+
+    let pre_shutdown = seed.stats(&seed_id).unwrap();
+    assert_eq!(pre_shutdown.snapshot.status, TransferStatus::Seeding);
+    assert!(pre_shutdown.snapshot.uploaded_bytes > 0);
+
+    seed.shutdown().await;
+    let post_shutdown = seed.stats(&seed_id).unwrap();
+    assert_eq!(post_shutdown.snapshot.status, TransferStatus::Paused);
+    assert!(post_shutdown.snapshot.uploaded_bytes >= pre_shutdown.snapshot.uploaded_bytes);
+    assert!(matches!(
+        seed.add_torrent_bytes(&manifest, TorrentAddOptions::default())
+            .await,
+        Err(TorrentError::InvalidState(_))
+    ));
+    assert!(matches!(
+        seed.resume(&seed_id).await,
+        Err(TorrentError::InvalidState(_))
+    ));
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let downloaded_path = leech_dir.path().join("blob.bin");
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&downloaded_path)
+            .unwrap();
+        assert!(leech.remove(&leech_id, true).await.is_err());
+        assert!(leech.stats(&leech_id).is_ok());
+        assert!(downloaded_path.exists());
+        drop(lock);
+        leech.remove(&leech_id, true).await.unwrap();
+        assert!(matches!(
+            leech.stats(&leech_id),
+            Err(TorrentError::NotFound(_))
+        ));
+        assert!(!downloaded_path.exists());
+    }
+    #[cfg(not(windows))]
+    {
+        leech.remove(&leech_id, true).await.unwrap();
+    }
+
+    leech.shutdown().await;
 }

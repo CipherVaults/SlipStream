@@ -11,6 +11,7 @@ use std::{
 
 type Dict = BTreeMap<Vec<u8>, Value>;
 const V2_BLOCK_SIZE: u64 = 16 * 1024;
+pub const MAX_TORRENT_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TorrentVersion {
@@ -68,6 +69,11 @@ fn parse_metadata(
     save_dir: &Path,
     from_v1_wire: bool,
 ) -> Result<TorrentMetadata, TorrentError> {
+    if bytes.len() > MAX_TORRENT_BYTES {
+        return Err(invalid(format!(
+            "torrent manifest exceeds maximum size of {MAX_TORRENT_BYTES} bytes"
+        )));
+    }
     let (root, info_raw) = bencode::decode_with_info(bytes)?;
     let root = dict(&root)?;
     let info_raw = info_raw.ok_or_else(|| invalid("missing info dictionary"))?;

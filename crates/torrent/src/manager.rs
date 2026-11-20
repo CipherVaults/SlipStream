@@ -3,8 +3,9 @@ mod telemetry;
 use crate::{
     error::session_error,
     parse_magnet_uri, parse_torrent_bytes,
-    storage::{validate_output, SharedBitmap},
+    storage::{is_link, validate_output, SharedBitmap},
     ConfinedStorageFactory, ParsedMagnet, PieceBitmap, TorrentError, TorrentMetadata,
+    MAX_TORRENT_BYTES,
 };
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -12,17 +13,23 @@ use librqbit::{
     api::TorrentIdOrHash, limits::LimitsConfig, AddTorrent, AddTorrentOptions, AddTorrentResponse,
     ManagedTorrent, Session, SessionOptions,
 };
-use slipstream_protocol::{AddTorrentRequest, TorrentFileEntry, TransferSnapshot};
+use slipstream_protocol::{
+    AddTorrentRequest, PathSecurityError, TorrentFileEntry, TransferSnapshot,
+};
 use std::{
     collections::{BTreeMap, HashSet},
     net::{Ipv4Addr, SocketAddr},
     num::NonZeroU32,
     ops::Range,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, RwLock,
+    },
     time::Duration,
 };
 use tokio::{
+    io::AsyncReadExt,
     sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock},
     task::JoinHandle,
     time,
@@ -83,6 +90,7 @@ struct ManagerInner {
     config: TorrentManagerConfig,
     session: Arc<Session>,
     lifecycle: AsyncRwLock<()>,
+    shutting_down: AtomicBool,
     stop: CancellationToken,
     entries: RwLock<BTreeMap<String, Arc<Entry>>>,
 }
@@ -168,6 +176,7 @@ impl TorrentManager {
                 config,
                 session,
                 lifecycle: AsyncRwLock::new(()),
+                shutting_down: AtomicBool::new(false),
                 stop,
                 entries: RwLock::new(BTreeMap::new()),
             }),
@@ -205,7 +214,8 @@ impl TorrentManager {
         {
             return self.add_magnet(&req.source, options).await;
         }
-        let bytes = tokio::fs::read(&req.source).await?;
+        self.inner.check_running()?;
+        let bytes = read_torrent_file(Path::new(&req.source)).await?;
         self.add_bytes(&bytes, options, req.source).await
     }
 
@@ -390,31 +400,23 @@ impl TorrentManager {
         if let Some(handle) = handle {
             // Wait for rqbit's checksum task before detaching its open files.
             let _ = handle.wait_until_initialized().await;
-            let result = self
-                .inner
+            self.inner
                 .session
                 .delete(TorrentIdOrHash::Id(handle.id()), delete_files)
-                .await;
-            self.inner.entries.write().unwrap().remove(id);
-            result.map_err(session_error)?;
-            if delete_files {
-                let metadata = entry.metadata()?;
-                for (file, path) in metadata.file_specs.iter().zip(&metadata.resolved_paths) {
-                    if !file.is_padding {
-                        match std::fs::symlink_metadata(path) {
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(error) => return Err(error.into()),
-                            Ok(_) => {
-                                return Err(TorrentError::Session(format!(
-                                    "could not delete {}",
-                                    path.display()
-                                )))
-                            }
-                        }
-                    }
+                .await
+                .map_err(session_error)?;
+            let mut state = entry.state.lock().unwrap();
+            state.handle = None;
+            state.updated_at = Utc::now();
+        }
+        if delete_files {
+            let metadata = entry.state.lock().unwrap().metadata.clone();
+            if let Some(metadata) = metadata {
+                if let Err(error) = cleanup_deleted_files(&entry.save_dir, &metadata) {
+                    entry.set_error(&error);
+                    return Err(error);
                 }
             }
-            return Ok(());
         }
         self.inner.entries.write().unwrap().remove(id);
         Ok(())
@@ -564,11 +566,11 @@ impl TorrentManager {
     }
 
     pub async fn shutdown(&self) {
+        self.inner.shutting_down.store(true, Ordering::Release);
         let _exclusive = self.inner.lifecycle.write().await;
         if self.inner.stop.is_cancelled() {
             return;
         }
-        self.inner.stop.cancel();
         for entry in self.inner.list_entries() {
             let _operation = entry.operation.lock().await;
             entry.cancel_resolution().await;
@@ -578,17 +580,20 @@ impl TorrentManager {
                 state.updated_at = Utc::now();
                 state.handle.clone()
             };
-            if let Some((handle, live)) =
-                handle.and_then(|handle| handle.live().map(|live| (handle, live)))
-            {
-                if self.inner.session.pause(&handle).await.is_ok() {
-                    let mut state = entry.state.lock().unwrap();
-                    state.previous_uploads = state
-                        .previous_uploads
-                        .saturating_add(live.get_uploaded_bytes());
+            if let Some(handle) = handle {
+                if let Some(live) = handle.live() {
+                    let uploaded = live.get_uploaded_bytes();
+                    if self.inner.session.pause(&handle).await.is_ok() {
+                        let mut state = entry.state.lock().unwrap();
+                        state.previous_uploads = state.previous_uploads.saturating_add(uploaded);
+                        state.updated_at = Utc::now();
+                    }
+                } else if !handle.is_paused() {
+                    let _ = self.inner.session.pause(&handle).await;
                 }
             }
         }
+        self.inner.stop.cancel();
         self.inner.session.stop().await;
     }
 }
@@ -607,7 +612,7 @@ impl ManagerInner {
     }
 
     fn check_running(&self) -> Result<(), TorrentError> {
-        if self.stop.is_cancelled() {
+        if self.shutting_down.load(Ordering::Acquire) || self.stop.is_cancelled() {
             return Err(TorrentError::InvalidState(
                 "torrent manager is stopped".into(),
             ));
@@ -979,6 +984,81 @@ fn validate_engine_layout(metadata: &TorrentMetadata) -> Result<(), TorrentError
         .is_err()
     {
         return Err(unsupported());
+    }
+    Ok(())
+}
+
+async fn read_torrent_file(path: &Path) -> Result<Vec<u8>, TorrentError> {
+    let meta = tokio::fs::symlink_metadata(path).await?;
+    if is_link(&meta) {
+        return Err(PathSecurityError::EscapesBaseDir.into());
+    }
+    if !meta.file_type().is_file() {
+        return Err(TorrentError::Metadata(
+            "torrent source must be a regular file".into(),
+        ));
+    }
+    if meta.len() > MAX_TORRENT_BYTES as u64 {
+        return Err(TorrentError::Metadata(format!(
+            "torrent manifest exceeds maximum size of {MAX_TORRENT_BYTES} bytes"
+        )));
+    }
+    let file = tokio::fs::File::open(path).await?;
+    let actual_meta = file.metadata().await?;
+    if !actual_meta.file_type().is_file() || actual_meta.len() > MAX_TORRENT_BYTES as u64 {
+        return Err(TorrentError::Metadata(format!(
+            "torrent manifest exceeds maximum size of {MAX_TORRENT_BYTES} bytes"
+        )));
+    }
+    let mut buf = Vec::with_capacity(usize::try_from(actual_meta.len()).unwrap_or(0));
+    let mut limited = file.take((MAX_TORRENT_BYTES + 1) as u64);
+    limited.read_to_end(&mut buf).await?;
+    if buf.len() > MAX_TORRENT_BYTES {
+        return Err(TorrentError::Metadata(format!(
+            "torrent manifest exceeds maximum size of {MAX_TORRENT_BYTES} bytes"
+        )));
+    }
+    Ok(buf)
+}
+
+fn cleanup_deleted_files(save_dir: &Path, metadata: &TorrentMetadata) -> Result<(), TorrentError> {
+    let mut dirs = HashSet::new();
+    for (file, path) in metadata.file_specs.iter().zip(&metadata.resolved_paths) {
+        if file.is_padding {
+            continue;
+        }
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(meta) if is_link(&meta) => return Err(PathSecurityError::EscapesBaseDir.into()),
+            Ok(meta) if meta.file_type().is_file() => {
+                std::fs::remove_file(path)?;
+            }
+            Ok(_) => {
+                return Err(TorrentError::Session(format!(
+                    "could not delete non-regular path {}",
+                    path.display()
+                )));
+            }
+        }
+        let mut parent = path.parent();
+        while let Some(dir) = parent {
+            if dir == save_dir || !dir.starts_with(save_dir) {
+                break;
+            }
+            dirs.insert(dir.to_path_buf());
+            parent = dir.parent();
+        }
+    }
+    let mut dirs: Vec<_> = dirs.into_iter().collect();
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.as_os_str().len()));
+    for dir in dirs {
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if !is_link(&meta) && meta.is_dir() => {
+                let _ = std::fs::remove_dir(&dir);
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
