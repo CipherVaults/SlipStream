@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="44" height="44" viewBox="0 0 44 44">
+<defs>
+<linearGradient id="mtn-mini" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0%" stop-color="#3E495D"/>
+<stop offset="100%" stop-color="#1E232E"/>
+</linearGradient>
+</defs>
+<rect width="44" height="44" fill="url(#mtn-mini)"/>
+<path d="M0 32 L13 18 L22 27 L31 15 L44 30 L44 44 L0 44 Z" fill="#131720"/>
+<path d="M13 18 L17 22 L13 21 L9 22 Z" fill="#CFD8E8" opacity="0.7"/>
+<path d="M31 15 L36 21 L31 19.5 L26.5 21 Z" fill="#CFD8E8" opacity="0.85"/>
+</svg>

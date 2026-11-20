@@ -1,0 +1,403 @@
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import App from "../App";
+import { demo } from "../lib/demo";
+import { desktop } from "../lib/tauri";
+import type { TelemetryBatch } from "../types/ipc";
+
+const alpine = "Alpine_Cinema_4K_60fps.mp4";
+const ubuntu = "Ubuntu-26.04-desktop-amd64.iso";
+const blender = "Blender_5.2_Studio_Assets.torrent";
+const symphony = "Symphony_Live_Master.flac";
+const pdf = "Design_System_Specs_2026.pdf";
+const mediaUrl = "https://example.org/watch?v=tokyo";
+
+let pushTelemetry: (batch: TelemetryBatch) => void;
+let openPicker: (url: string | null) => void;
+
+beforeEach(() => {
+  vi.spyOn(desktop, "onTelemetry").mockImplementation(async handler => {
+    pushTelemetry = handler;
+    return () => {};
+  });
+  vi.spyOn(desktop, "onOpenPicker").mockImplementation(async handler => {
+    openPicker = handler;
+    return () => {};
+  });
+});
+
+async function start() {
+  const user = userEvent.setup();
+  render(<App />);
+  await screen.findByRole("progressbar", { name: alpine + " progress" });
+  return user;
+}
+
+const row = (filename: string) => screen.getByRole("article", { name: filename });
+const inspector = () => within(screen.getByRole("complementary", { name: "Transfer inspector" }));
+const dialog = (name: string | RegExp) => within(screen.getByRole("dialog", { name }));
+
+describe("workspace and inspector", () => {
+  it("filters by sidebar, segmented status, search, queue and night schedule", async () => {
+    const user = await start();
+    const nav = within(screen.getByRole("navigation", { name: "Download views" }));
+    const toolbar = within(screen.getByRole("group", { name: "Transfer status" }));
+    expect(row(pdf)).toBeVisible();
+    expect(nav.getByRole("button", { name: /All Downloads/ })).toHaveTextContent("7");
+    await user.click(nav.getByRole("button", { name: /Torrents/ }));
+    expect(row(blender)).toBeVisible();
+    expect(screen.queryByRole("article", { name: alpine })).not.toBeInTheDocument();
+    await user.click(nav.getByRole("button", { name: /All Downloads/ }));
+    await user.click(toolbar.getByRole("button", { name: "Active" }));
+    expect(row(alpine)).toBeVisible();
+    expect(screen.queryByRole("article", { name: symphony })).not.toBeInTheDocument();
+    await user.click(toolbar.getByRole("button", { name: "Paused" }));
+    expect(row(symphony)).toBeVisible();
+    expect(screen.queryByRole("article", { name: blender })).not.toBeInTheDocument();
+    await user.click(toolbar.getByRole("button", { name: "Done" }));
+    expect(row(pdf)).toBeVisible();
+    expect(screen.queryByRole("article", { name: alpine })).not.toBeInTheDocument();
+    await user.click(toolbar.getByRole("button", { name: "All" }));
+    const search = screen.getByRole("searchbox", { name: "Search downloads" });
+    await user.type(search, "ubuntu");
+    expect(row(ubuntu)).toBeVisible();
+    expect(screen.queryByRole("article", { name: alpine })).not.toBeInTheDocument();
+    await user.clear(search);
+    await user.click(nav.getByRole("button", { name: /Queues/ }));
+    expect(screen.getByRole("heading", { name: "Queues" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Default queue" })).toBeVisible();
+    await user.click(nav.getByRole("button", { name: /Night Schedule/ }));
+    expect(screen.getByRole("heading", { name: "Night Schedule" })).toBeVisible();
+    expect(row(symphony)).toBeVisible();
+    expect(screen.queryByRole("article", { name: blender })).not.toBeInTheDocument();
+  });
+
+  it("projects live ui_segments into 16 pills with active, torrent and paused treatments", async () => {
+    await start();
+    for (const [filename, mode, fill] of [[alpine, "active", "62%"], [blender, "torrent", "100%"], [symphony, "paused", "0%"]]) {
+      const bar = within(row(filename)).getByRole("progressbar", { name: filename + " progress" });
+      const pills = bar.querySelectorAll(".seg-cell." + mode);
+      expect(pills).toHaveLength(16);
+      expect(pills[11].firstElementChild).toHaveStyle({ width: fill });
+      expect(bar).toHaveClass("tabular");
+      expect(row(filename).querySelector(".transfer-stats")).toHaveClass("tabular");
+    }
+    const latest = demo.snapshot();
+    const transfers = latest.transfers.map(transfer => transfer.id === "alpine"
+      ? { ...transfer, ui_segments: Array<number>(16).fill(.25), download_speed_bps: 32_000_000 } : transfer);
+    act(() => pushTelemetry({ ...latest, transfers }));
+    expect(within(row(alpine)).getByText("32.0 MB/s")).toBeVisible();
+    const bar = within(row(alpine)).getByRole("progressbar");
+    expect(bar.querySelector(".seg-fill")).toHaveStyle({ width: "25%" });
+  });
+
+  it("toggles the inspector, shows the thread map and lists selectable torrent files", async () => {
+    const list = vi.spyOn(desktop, "listTorrentFiles");
+    const select = vi.spyOn(desktop, "setTorrentFiles").mockResolvedValue();
+    const user = await start();
+    expect(inspector().getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
+    await user.keyboard("{Control>}i{/Control}");
+    expect(screen.queryByRole("complementary", { name: "Transfer inspector" })).not.toBeInTheDocument();
+    await user.keyboard("{Control>}i{/Control}");
+    await user.click(inspector().getByRole("tab", { name: "Segments" }));
+    expect(inspector().getByText("16-Thread Dynamic Split Map")).toBeVisible();
+    expect(inspector().getAllByRole("progressbar")).toHaveLength(16);
+    expect(inspector().getByText("T01")).toBeVisible();
+    expect(inspector().getByText("T16")).toBeVisible();
+    expect(inspector().getAllByText("Split")).toHaveLength(2);
+    await user.click(within(row(blender)).getByRole("button", { name: /Inspect/ }));
+    await user.click(inspector().getByRole("tab", { name: "Torrent Files" }));
+    const textures = await inspector().findByRole("checkbox", { name: /Studio_Textures/ });
+    expect(list).toHaveBeenCalledWith("blender");
+    expect(textures).toBeChecked();
+    await user.click(textures);
+    await waitFor(() => expect(textures).not.toBeChecked());
+    expect(select).toHaveBeenCalledWith("blender", [0, 2, 3]);
+  });
+
+  it("probes inspector media and opens the chosen format in Add Download", async () => {
+    const spy = vi.spyOn(desktop, "probeMedia");
+    const user = await start();
+    await user.click(inspector().getByRole("tab", { name: "Media" }));
+    const format = await inspector().findByRole("button", { name: /1440p QHD/ });
+    expect(spy).toHaveBeenCalledWith("https://youtube.com/watch?v=alpine-cinema");
+    await user.click(format);
+    expect(dialog("Add Download").getByRole("button", { name: /1440p QHD/ })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("uses the sidebar speed cap and quick transfer controls", async () => {
+    const pause = vi.spyOn(desktop, "pauseTransfer").mockResolvedValue();
+    const reveal = vi.spyOn(desktop, "revealInExplorer").mockResolvedValue();
+    const cap = vi.spyOn(desktop, "setSpeedLimit").mockResolvedValue();
+    const user = await start();
+    await user.click(screen.getByRole("button", { name: "Unlimited" }));
+    expect(cap).toHaveBeenCalledWith(50_000_000);
+    await user.click(within(row(alpine)).getByRole("button", { name: "Pause" }));
+    expect(pause).toHaveBeenCalledWith("alpine");
+    await user.click(within(row(pdf)).getByRole("button", { name: "Show in Explorer" }));
+    expect(reveal).toHaveBeenCalledWith("design-pdf");
+    await user.click(within(row(pdf)).getByRole("button", { name: /More actions/ }));
+    await user.click(within(row(pdf)).getByRole("button", { name: "Remove" }));
+    expect(screen.queryByRole("article", { name: pdf })).not.toBeInTheDocument();
+  });
+});
+
+describe("add and command palette", () => {
+  it("handles Ctrl+K, command filtering, Ctrl+N, Escape and picker events", async () => {
+    const user = await start();
+    await user.keyboard("{Control>}k{/Control}");
+    const palette = dialog("Command Palette");
+    expect(palette.getByRole("button", { name: /Toggle Inspector/ })).toBeVisible();
+    await user.type(palette.getByRole("textbox"), "Ubuntu");
+    await user.keyboard("{Enter}");
+    expect(screen.getByRole("searchbox")).toHaveValue("Ubuntu");
+    expect(row(ubuntu)).toBeVisible();
+    expect(screen.queryByRole("article", { name: alpine })).not.toBeInTheDocument();
+    await user.keyboard("{Control>}n{/Control}");
+    expect(dialog("Add Download").getByRole("textbox", { name: "Download source" })).toHaveFocus();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    act(() => openPicker(mediaUrl));
+    const add = dialog("Add Download");
+    expect(add.getByRole("textbox", { name: "Download source" })).toHaveValue(mediaUrl);
+    expect(await add.findByRole("button", { name: /2160p 4K/ })).toBeVisible();
+  });
+
+  it("probes video, selects audio and subtitle options, and submits the chosen media format", async () => {
+    const probe = vi.spyOn(desktop, "probeMedia");
+    const add = vi.spyOn(desktop, "addMediaDownload").mockResolvedValue("media-id");
+    const user = await start();
+    await user.click(screen.getByRole("button", { name: "Add" }));
+    const sheet = dialog("Add Download");
+    await user.type(sheet.getByRole("textbox", { name: "Download source" }), mediaUrl);
+    await user.click(sheet.getByRole("button", { name: "Probe" }));
+    const video = await sheet.findByRole("button", { name: /2160p 4K/ });
+    expect(probe).toHaveBeenCalledWith(mediaUrl);
+    expect(video).toHaveAttribute("aria-pressed", "true");
+    await user.click(sheet.getByRole("tab", { name: "Audio Only" }));
+    for (const name of [/MP3 · High Quality/, /M4A · AAC/, /^Opus/, /FLAC · Lossless/, /WAV · Uncompressed/, /Audio · Lossless Studio/]) {
+      expect(sheet.getByRole("button", { name })).toBeVisible();
+    }
+    await user.click(sheet.getByRole("tab", { name: "Subtitles" }));
+    await user.click(sheet.getByRole("checkbox", { name: /Arabic/ }));
+    await user.click(sheet.getByRole("tab", { name: "Video" }));
+    const remux = sheet.getByRole("switch", { name: "Lossless Remux" });
+    expect(remux.querySelector(".mac-switch")).toHaveClass("on");
+    await user.click(remux);
+    await user.click(sheet.getByRole("switch", { name: "Audio Track Normalization" }));
+    expect(remux).toHaveAttribute("aria-checked", "false");
+    await user.click(sheet.getByRole("button", { name: "Download" }));
+    expect(add).toHaveBeenCalledWith(expect.objectContaining({
+      url: mediaUrl, format_id: "401", embed_subtitles_langs: ["en", "ar"], lossless_remux: false, normalize_audio: true,
+    }));
+    expect(await screen.findByText("Download added.")).toBeVisible();
+  });
+
+  it("pairs adaptive video-only streams with +bestaudio and strips subtitles on audio-only downloads", async () => {
+    vi.spyOn(desktop, "probeMedia").mockResolvedValue({
+      title: "Adaptive Test",
+      source_url: mediaUrl,
+      extractor: "youtube",
+      duration_seconds: 120,
+      thumbnail_url: null,
+      is_playlist: false,
+      playlist_count: null,
+      formats: [
+        {
+          format_id: "137",
+          label: "1080p HD · 60fps",
+          container: "mp4",
+          video_codec: "H.264",
+          audio_codec: null,
+          height: 1080,
+          fps: 60,
+          filesize_bytes: 250_000_000,
+          is_audio_only: false,
+          has_video: true,
+          has_audio: false,
+        },
+        {
+          format_id: "140",
+          label: "Audio · AAC",
+          container: "m4a",
+          video_codec: null,
+          audio_codec: "AAC",
+          height: null,
+          fps: null,
+          filesize_bytes: 12_000_000,
+          is_audio_only: true,
+          has_video: false,
+          has_audio: true,
+        },
+      ],
+      subtitles: [{ lang: "en", name: "English", is_auto: false }],
+    });
+    const add = vi.spyOn(desktop, "addMediaDownload").mockResolvedValue("media-id");
+    const user = await start();
+
+    await user.click(screen.getByRole("button", { name: "Add" }));
+    let sheet = dialog("Add Download");
+    await user.type(sheet.getByRole("textbox", { name: "Download source" }), mediaUrl);
+    await user.click(sheet.getByRole("button", { name: "Probe" }));
+    expect(await sheet.findByRole("button", { name: /1080p HD/ })).toBeVisible();
+    await user.click(sheet.getByRole("button", { name: "Download" }));
+    expect(add).toHaveBeenLastCalledWith(expect.objectContaining({
+      format_id: "137+bestaudio",
+      embed_subtitles_langs: ["en"],
+    }));
+
+    await user.click(screen.getByRole("button", { name: "Add" }));
+    sheet = dialog("Add Download");
+    await user.type(sheet.getByRole("textbox", { name: "Download source" }), mediaUrl);
+    await user.click(sheet.getByRole("button", { name: "Probe" }));
+    expect(await sheet.findByRole("button", { name: /1080p HD/ })).toBeVisible();
+    await user.click(sheet.getByRole("tab", { name: "Audio Only" }));
+    expect(sheet.queryByRole("switch", { name: "Embed Subtitles" })).not.toBeInTheDocument();
+    await user.click(sheet.getByRole("button", { name: "Download" }));
+    expect(add).toHaveBeenLastCalledWith(expect.objectContaining({
+      audio_only_preset: "mp3_320",
+      embed_subtitles_langs: [],
+    }));
+  });
+
+  it("submits direct HTTP, torrent file and wildcard batch requests", async () => {
+    const http = vi.spyOn(desktop, "addHttpDownload").mockResolvedValue("http-id");
+    const torrent = vi.spyOn(desktop, "addTorrent").mockResolvedValue("torrent-id");
+    const expand = vi.spyOn(desktop, "expandWildcardUrls");
+    const user = await start();
+
+    await user.click(screen.getByRole("button", { name: "Add" }));
+    let sheet = dialog("Add Download");
+    await user.type(sheet.getByRole("textbox", { name: "Download source" }), "https://example.org/archive.zip");
+    await user.selectOptions(sheet.getByLabelText("Threads"), "32");
+    await user.click(sheet.getByText("Filename / Expected SHA-256"));
+    await user.type(sheet.getByRole("textbox", { name: "Filename" }), "studio.zip");
+    await user.click(sheet.getByRole("button", { name: "Download" }));
+    expect(http).toHaveBeenCalledWith(expect.objectContaining({
+      url: "https://example.org/archive.zip", filename: "studio.zip", max_connections: 32, headers: {},
+    }));
+
+    await user.keyboard("{Control>}n{/Control}");
+    sheet = dialog("Add Download");
+    await user.click(sheet.getByRole("tab", { name: "Torrent / Magnet" }));
+    await user.upload(sheet.getByLabelText("Choose a .torrent file"), new File(["demo"], "sample.torrent", { type: "application/x-bittorrent" }));
+    await user.click(sheet.getByRole("switch", { name: "Sequential" }));
+    await user.click(sheet.getByRole("button", { name: "Download" }));
+    expect(torrent).toHaveBeenCalledWith({ source: "sample.torrent", save_dir: "D:\\Downloads", sequential: true });
+
+    await user.click(screen.getByRole("button", { name: "Add" }));
+    sheet = dialog("Add Download");
+    const pattern = "https://example.org/file_[001-003].zip";
+    fireEvent.change(sheet.getByRole("textbox", { name: "Download source" }), { target: { value: pattern } });
+    expect(sheet.getByText("Wildcard Batch Preview")).toBeVisible();
+    await user.click(sheet.getByRole("button", { name: "Probe" }));
+    expect(expand).toHaveBeenCalledWith(pattern);
+    expect(await sheet.findByText("https://example.org/file_002.zip")).toBeVisible();
+    await user.click(sheet.getByRole("button", { name: "Download" }));
+    expect(await screen.findByText("3 downloads added.")).toBeVisible();
+    expect(http.mock.calls.slice(1).map(([request]) => request.url)).toEqual([
+      "https://example.org/file_001.zip", "https://example.org/file_002.zip", "https://example.org/file_003.zip",
+    ]);
+  });
+});
+
+
+describe("appearance, settings and transfer dialogs", () => {
+  it("switches dark, light, system, blue and mono using root data attributes", async () => {
+    const listeners = new Set<() => void>();
+    const system = {
+      matches: false,
+      addEventListener: (_event: string, listener: () => void) => { listeners.add(listener); },
+      removeEventListener: (_event: string, listener: () => void) => { listeners.delete(listener); },
+    };
+    vi.stubGlobal("matchMedia", vi.fn(() => system));
+    const save = vi.spyOn(desktop, "saveSettings").mockResolvedValue();
+    const user = await start();
+    const html = document.documentElement;
+    expect(html).toHaveAttribute("data-theme", "dark");
+    expect(html).toHaveAttribute("data-accent", "blue");
+    await user.click(screen.getByRole("button", { name: "Graphite" }));
+    expect(html).toHaveAttribute("data-theme", "light");
+    await user.click(screen.getByRole("button", { name: "Switch to Monochrome accent" }));
+    expect(html).toHaveAttribute("data-accent", "mono");
+    await user.click(screen.getByRole("button", { name: "Switch to Blue accent" }));
+    expect(html).toHaveAttribute("data-accent", "blue");
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    const settings = dialog(/Settings & Browser Integration/);
+    await user.selectOptions(settings.getByLabelText("Theme"), "system");
+    await user.selectOptions(settings.getByLabelText("Accent"), "mono");
+    await user.click(settings.getByRole("button", { name: "Save Settings" }));
+    await waitFor(() => expect(save).toHaveBeenLastCalledWith(expect.objectContaining({ theme: "system", accent: "mono" })));
+    expect(html).toHaveAttribute("data-theme", "light");
+    expect(html).toHaveAttribute("data-accent", "mono");
+    act(() => {
+      system.matches = true;
+      listeners.forEach(listener => listener());
+    });
+    expect(html).toHaveAttribute("data-theme", "dark");
+    expect(window.matchMedia).toHaveBeenCalledWith("(prefers-color-scheme: dark)");
+  });
+
+  it("shows the toolchain and installs and saves browser integration settings", async () => {
+    const getTools = vi.spyOn(desktop, "getToolchainStatus");
+    const install = vi.spyOn(desktop, "installBrowserHosts").mockResolvedValue(["Chrome", "Firefox"]);
+    const save = vi.spyOn(desktop, "saveSettings").mockResolvedValue();
+    const hibernate = vi.spyOn(desktop, "hibernateToTray").mockResolvedValue();
+    const user = await start();
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    const settings = dialog("Settings & Browser Integration");
+    expect(await settings.findByText(/yt-dlp .* FFmpeg/)).toBeVisible();
+    expect(getTools).toHaveBeenCalled();
+    await user.type(settings.getByLabelText("Chrome extension ID"), "chrome-demo");
+    await user.type(settings.getByLabelText("Firefox extension ID"), "firefox@demo.test");
+    await user.click(settings.getByRole("button", { name: "Install Browser Native Hosts" }));
+    expect(install).toHaveBeenCalledWith("chrome-demo", null, "firefox@demo.test");
+    expect(await settings.findByText("Browser hosts installed for Chrome, Firefox.")).toBeVisible();
+    expect(getTools).toHaveBeenCalledTimes(2);
+    await user.click(settings.getByRole("button", { name: "Hibernate Now" }));
+    expect(hibernate).toHaveBeenCalledOnce();
+    await user.selectOptions(settings.getByLabelText("Max connections"), "24");
+    await user.type(settings.getByLabelText("Global speed limit in MB/s"), "25.5");
+    await user.click(settings.getByRole("switch", { name: "Monitor clipboard" }));
+    await user.click(settings.getByRole("button", { name: "Save Settings" }));
+    expect(save).toHaveBeenCalledWith(expect.objectContaining({
+      default_connections: 24, global_speed_limit_bps: 25_500_000, monitor_clipboard: true,
+    }));
+    expect(await screen.findByText("Settings saved.")).toBeVisible();
+  });
+
+  it("refreshes a link with optional request fields and reports checksum results", async () => {
+    const refresh = vi.spyOn(desktop, "refreshDownloadUrl").mockResolvedValue();
+    const verify = vi.spyOn(desktop, "verifyTransferChecksum").mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    const user = await start();
+    await user.click(inspector().getByRole("button", { name: "Refresh URL" }));
+    const refreshDialog = dialog("Refresh Expired Link");
+    await user.type(refreshDialog.getByLabelText("New URL"), "https://example.org/new.mp4");
+    await user.click(refreshDialog.getByText("Request options"));
+    await user.type(refreshDialog.getByLabelText("Referrer"), "https://example.org/");
+    await user.type(refreshDialog.getByLabelText("HTTP headers"), "Accept: video/mp4");
+    await user.click(refreshDialog.getByRole("button", { name: "Refresh URL" }));
+    expect(refresh).toHaveBeenCalledWith({ transfer_id: "alpine", new_url: "https://example.org/new.mp4",
+      headers: { Accept: "video/mp4" }, referrer: "https://example.org/" });
+    expect(await screen.findByText("Download link refreshed.")).toBeVisible();
+
+    await user.click(within(row(pdf)).getByRole("button", { name: "SHA-256" }));
+    const verifyDialog = dialog("Verify SHA-256 Checksum");
+    const input = verifyDialog.getByLabelText("Expected SHA-256");
+    await user.type(input, "bad");
+    await user.click(verifyDialog.getByRole("button", { name: "Verify SHA-256" }));
+    expect(verifyDialog.getByRole("alert")).toHaveTextContent("64 hexadecimal characters");
+    expect(verify).not.toHaveBeenCalled();
+    await user.clear(input);
+    const digest = "a".repeat(64);
+    await user.type(input, digest);
+    await user.click(verifyDialog.getByRole("button", { name: "Verify SHA-256" }));
+    expect(verify).toHaveBeenCalledWith("design-pdf", digest);
+    expect(verifyDialog.getByRole("status")).toHaveTextContent("SHA-256 checksum does not match.");
+    await user.click(verifyDialog.getByRole("button", { name: "Verify SHA-256" }));
+    expect(verifyDialog.getByRole("status")).toHaveTextContent("SHA-256 checksum matches.");
+    await user.click(verifyDialog.getByRole("button", { name: "Done" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+});

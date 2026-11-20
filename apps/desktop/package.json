@@ -4,8 +4,32 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "typecheck": "echo desktop stub ok",
-    "test": "echo desktop stub ok",
-    "build": "echo desktop stub ok"
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@slipstream/ipc-types": "workspace:*",
+    "@tauri-apps/api": "^2.12.5",
+    "lucide-react": "~1.71.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.5",
+    "@testing-library/dom": "^10.4.0",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.13",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "jsdom": "^27.0.0",
+    "tailwindcss": "^4.3.5",
+    "typescript": "^5.7.2",
+    "vite": "^6.4.6",
+    "vitest": "^4.0.0"
   }
 }
