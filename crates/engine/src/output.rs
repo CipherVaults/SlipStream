@@ -209,10 +209,13 @@ pub(crate) fn mark_of_the_web(path: &Path, host: &str, referrer: Option<&str>) -
     let mut stream = path.as_os_str().to_os_string();
     stream.push(":Zone.Identifier");
     let mut file = File::create(stream)?;
-    let clean = |url: &str| url.replace(['\r', '\n'], "");
+    let clean = |url: &str| {
+        crate::http::sanitize_http_url_credentials(url)
+            .unwrap_or_else(|| url.replace(['\r', '\n', '\0'], ""))
+    };
     write!(file, "[ZoneTransfer]\r\nZoneId=3\r\n")?;
-    if let Some(referrer) = referrer {
-        write!(file, "ReferrerUrl={}\r\n", clean(referrer))?;
+    if let Some(referrer) = referrer.and_then(crate::http::sanitize_http_url_credentials) {
+        write!(file, "ReferrerUrl={referrer}\r\n")?;
     }
     write!(file, "HostUrl={}\r\n", clean(host))?;
     file.sync_all()?;

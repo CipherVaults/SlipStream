@@ -39,7 +39,12 @@ impl Validators {
         self.etag
             .as_deref()
             .filter(|tag| tag.len() >= 2 && tag.starts_with('"') && tag.ends_with('"'))
-            .or(self.last_modified.as_deref())
+            .or_else(|| {
+                self.etag
+                    .is_none()
+                    .then_some(self.last_modified.as_deref())
+                    .flatten()
+            })
     }
 
     pub(crate) fn changed(&self, response: &Response, conditional: bool) -> bool {
@@ -175,8 +180,11 @@ impl Source {
                 .map_err(|_| EngineError::InvalidRequest(format!("invalid {name} header value")))?;
             request_headers.insert(name, value);
         }
-        if let Some(referrer) = referrer {
-            let referrer = HeaderValue::from_str(referrer)
+        if let Some(referrer) = referrer.filter(|raw| !raw.trim().is_empty()) {
+            let sanitized = sanitize_http_url_credentials(referrer).ok_or_else(|| {
+                EngineError::InvalidRequest("invalid referrer header value".into())
+            })?;
+            let referrer = HeaderValue::from_str(&sanitized)
                 .map_err(|_| EngineError::InvalidRequest("invalid referrer header value".into()))?;
             request_headers.insert(REFERER, referrer);
         }
@@ -262,17 +270,9 @@ impl Http {
                 .ok_or(EngineError::InvalidResponse(
                     "missing or invalid redirect location",
                 ))?;
-            url = validate_redirect_target(&url, location, self.allow_loopback)?;
-            if url.origin() != initial_origin {
-                for name in [
-                    COOKIE,
-                    HeaderName::from_static("cookie2"),
-                    AUTHORIZATION,
-                    PROXY_AUTHORIZATION,
-                ] {
-                    headers.remove(name);
-                }
-            }
+            let next = validate_redirect_target(&url, location, self.allow_loopback)?;
+            apply_redirect_header_policy(&mut headers, &initial_origin, &url, &next);
+            url = next;
         }
         unreachable!("request loop returns after its final hop")
     }
@@ -381,6 +381,37 @@ impl Http {
             }
         }
         Ok(response)
+    }
+}
+
+pub(crate) fn sanitize_http_url_credentials(raw: &str) -> Option<String> {
+    let cleaned = raw.replace(['\r', '\n', '\0'], "");
+    let mut parsed = validate_http_url(&cleaned).ok()?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        let _ = parsed.set_username("");
+        let _ = parsed.set_password(None);
+    }
+    Some(parsed.into())
+}
+
+fn apply_redirect_header_policy(
+    headers: &mut HeaderMap,
+    initial_origin: &url::Origin,
+    previous: &Url,
+    next: &Url,
+) {
+    if previous.scheme() == "https" && next.scheme() == "http" {
+        headers.remove(REFERER);
+    }
+    if next.origin() != *initial_origin {
+        for name in [
+            COOKIE,
+            HeaderName::from_static("cookie2"),
+            AUTHORIZATION,
+            PROXY_AUTHORIZATION,
+        ] {
+            headers.remove(name);
+        }
     }
 }
 
@@ -591,5 +622,41 @@ mod tests {
         }
         assert!(validate_redirect_target(&origin, "http://127.0.0.1", true).is_ok());
         assert!(validate_redirect_target(&origin, "http://10.0.0.1", true).is_err());
+    }
+
+    #[test]
+    fn redirect_strips_referer_on_https_downgrade_and_credentials_from_referrer() {
+        let https_origin = validate_http_url("https://cdn.example.com/start").unwrap();
+        let https_other = validate_http_url("https://mirror.example.com/file").unwrap();
+        let http_other = validate_http_url("http://mirror.example.com/file").unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, HeaderValue::from_static("sid=secret"));
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
+        let clean_ref =
+            sanitize_http_url_credentials("https://user:pass@app.example.com/page").unwrap();
+        assert_eq!(clean_ref, "https://app.example.com/page");
+        headers.insert(REFERER, HeaderValue::from_str(&clean_ref).unwrap());
+
+        apply_redirect_header_policy(
+            &mut headers,
+            &https_origin.origin(),
+            &https_origin,
+            &https_other,
+        );
+        assert!(headers.get(COOKIE).is_none());
+        assert!(headers.get(AUTHORIZATION).is_none());
+        assert_eq!(
+            headers.get(REFERER).and_then(|v| v.to_str().ok()),
+            Some("https://app.example.com/page")
+        );
+
+        apply_redirect_header_policy(
+            &mut headers,
+            &https_origin.origin(),
+            &https_other,
+            &http_other,
+        );
+        assert!(headers.get(REFERER).is_none());
     }
 }

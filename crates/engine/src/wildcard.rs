@@ -2,6 +2,7 @@ use crate::{EngineError, Result};
 use slipstream_protocol::validate_http_url;
 
 pub const MAX_WILDCARD_EXPANSION: usize = 10_000;
+const MAX_WILDCARD_GROUPS: usize = 32;
 const MAX_PATTERN_BYTES: usize = 8192;
 const MAX_BATCH_BYTES: usize = 16 * 1024 * 1024;
 
@@ -28,24 +29,43 @@ pub fn expand_wildcard_url(pattern: &str) -> Result<Vec<String>> {
         }
     }
 
+    let mut groups = 0usize;
     while let Some(open) = rest.find('[') {
+        groups += 1;
+        if groups > MAX_WILDCARD_GROUPS {
+            return Err(EngineError::InvalidRequest(format!(
+                "wildcard exceeds {MAX_WILDCARD_GROUPS} bracket groups"
+            )));
+        }
         let fixed = &rest[..open];
         let (expression, tail) = rest[open + 1..].split_once(']').ok_or_else(invalid)?;
         if fixed.contains(']') {
             return Err(invalid());
         }
         let values = expand_range(expression, MAX_WILDCARD_EXPANSION / urls.len())?;
-        let prefix_bytes = urls.iter().map(String::len).sum::<usize>() + fixed.len() * urls.len();
-        let value_bytes = values.iter().map(String::len).sum::<usize>();
-        check_size(prefix_bytes * values.len() + value_bytes * urls.len())?;
-        urls = urls
-            .iter()
-            .flat_map(|url| {
-                values
-                    .iter()
-                    .map(move |value| format!("{url}{fixed}{value}"))
-            })
-            .collect();
+        if values.len() == 1 {
+            let value = &values[0];
+            let added = fixed.len() + value.len();
+            let total_bytes = urls.iter().map(String::len).sum::<usize>() + added * urls.len();
+            check_size(total_bytes)?;
+            for url in &mut urls {
+                url.push_str(fixed);
+                url.push_str(value);
+            }
+        } else {
+            let prefix_bytes =
+                urls.iter().map(String::len).sum::<usize>() + fixed.len() * urls.len();
+            let value_bytes = values.iter().map(String::len).sum::<usize>();
+            check_size(prefix_bytes * values.len() + value_bytes * urls.len())?;
+            urls = urls
+                .iter()
+                .flat_map(|url| {
+                    values
+                        .iter()
+                        .map(move |value| format!("{url}{fixed}{value}"))
+                })
+                .collect();
+        }
         rest = tail;
     }
 

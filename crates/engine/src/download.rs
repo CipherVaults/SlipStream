@@ -99,12 +99,13 @@ impl Inner {
         };
         let mut plan = match run.resume_plan(&record, &segments).await? {
             Some(plan) => plan,
-            None => run.fresh_plan(&mut stop, false).await?,
+            None => run.fresh_plan(&mut stop, false, true).await?,
         };
         for restarts in 0..=RESTARTS {
             match run.execute_plan(&plan, &mut stop).await {
                 Err(EngineError::RestartRequired) if restarts < RESTARTS => {
-                    plan = run.fresh_plan(&mut stop, true).await?;
+                    let allow_ranges = plan.conditional;
+                    plan = run.fresh_plan(&mut stop, true, allow_ranges).await?;
                 }
                 Err(error) => {
                     if matches!(error, EngineError::Interrupted) {
@@ -129,7 +130,7 @@ impl Run<'_> {
         if !record.ranges
             || !has_progress
             || record.total.is_none()
-            || (record.validators.etag.is_some() && record.validators.if_range().is_none())
+            || record.validators.if_range().is_none()
         {
             return Ok(None);
         }
@@ -168,7 +169,12 @@ impl Run<'_> {
         unreachable!("probe loop returns after its final attempt")
     }
 
-    async fn fresh_plan(&self, stop: &mut Stop, force_get: bool) -> Result<Plan> {
+    async fn fresh_plan(
+        &self,
+        stop: &mut Stop,
+        force_get: bool,
+        allow_ranges: bool,
+    ) -> Result<Plan> {
         let meta = self.probe(stop, force_get).await?;
         stop.check()?;
         let plan = {
@@ -182,7 +188,7 @@ impl Run<'_> {
             let reprobe = record.status != TransferStatus::Probing;
             record.set_status(TransferStatus::Probing);
             record.total = meta.total;
-            record.ranges = meta.ranges && meta.total.is_some();
+            record.ranges = allow_ranges && meta.ranges && meta.total.is_some();
             record.validators = meta.validators;
             record.protocol = meta.protocol.into();
             record.sha256_verified = None;
@@ -602,11 +608,15 @@ impl Run<'_> {
             let (db, job) = state.job_mut(self.id)?;
             let mut record = job.record.clone();
             record.sha256_verified = verification.sha256_verified;
-            db.save_record(&record)?;
-            job.record = record.clone();
             if let Some(mismatch) = verification.mismatch {
+                let empty = Segments::new();
+                db.replace_segments(&record, &empty)?;
+                job.record = record;
+                job.segments = empty;
                 return Err(EngineError::ChecksumMismatch(mismatch));
             }
+            db.save_record(&record)?;
+            job.record = record.clone();
             stop.check()?;
             // The verified file and its ADS are durable before the rename.
             // A crash after rename can be reconciled on the next open.

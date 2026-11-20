@@ -17,7 +17,7 @@ pub use slipstream_protocol::{
 pub use wildcard::{expand_wildcard_url, MAX_WILDCARD_EXPANSION};
 
 use chrono::Utc;
-use http::{filename_from_url, Http, Source};
+use http::{filename_from_url, sanitize_http_url_credentials, Http, Source};
 use limiter::Limiter;
 use serde::{Deserialize, Serialize};
 use slipstream_protocol::{safe_join_under, sanitize_filename, TransferKind, UI_SEGMENT_COUNT};
@@ -356,7 +356,10 @@ impl DownloadEngine {
             source_url: source.url.to_string(),
             save_dir,
             headers: request.headers,
-            referrer: request.referrer,
+            referrer: request
+                .referrer
+                .as_deref()
+                .and_then(sanitize_http_url_credentials),
             expected_sha256,
             expected_md5,
             status: TransferStatus::Queued,
@@ -510,7 +513,10 @@ impl DownloadEngine {
         record.source_domain = source.url.host_str().unwrap_or_default().to_owned();
         record.source_url = source.url.to_string();
         record.headers = request.headers;
-        record.referrer = request.referrer;
+        record.referrer = request
+            .referrer
+            .as_deref()
+            .and_then(sanitize_http_url_credentials);
         let changed = record.status == TransferStatus::Failed;
         record.set_status(TransferStatus::Paused);
         if changed {
@@ -567,7 +573,17 @@ impl DownloadEngine {
             }
         };
         let _ = done.wait_for(|done| *done).await;
-        Ok(())
+        let final_status = self.inner.lock().job(id)?.record.status;
+        if final_status == target {
+            Ok(())
+        } else if matches!(
+            final_status,
+            TransferStatus::Completed | TransferStatus::Canceled
+        ) {
+            Err(EngineError::InvalidState("transfer has already finished"))
+        } else {
+            Ok(())
+        }
     }
 
     pub async fn resume_transfer(&self, id: &str) -> Result<()> {
@@ -812,6 +828,11 @@ impl Inner {
         let (db, job) = state.job_mut(&id)?;
         save_status(db, job, status, error)?;
         self.status(&id, status);
+        if state.running.is_empty() && self.telemetry.receiver_count() > 0 {
+            let _ = self
+                .telemetry
+                .send(state.telemetry_batch(self.global_limiter.rate()));
+        }
         run.done.send_replace(true);
         Ok(())
     }
@@ -916,7 +937,9 @@ impl Job {
             ui_segments: project(&self.segments, record.total, record.status),
             segments,
             sha256_verified: record.sha256_verified,
-            resumable: record.ranges && record.total.is_some(),
+            resumable: record.ranges
+                && record.total.is_some()
+                && record.validators.if_range().is_some(),
             queue_id: record.queue_id.clone(),
             error_message: record.error.clone(),
             created_at: record.created_at,

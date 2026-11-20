@@ -758,13 +758,18 @@ async fn windows_ads_moves_with_the_download_and_sanitizes_newlines() {
         ads,
         format!("[ZoneTransfer]\r\nZoneId=3\r\nReferrerUrl={referrer}\r\nHostUrl={url}\r\n")
     );
-    output::mark_of_the_web(&path, "https://example.com/\r\nsource", None).unwrap();
+    output::mark_of_the_web(
+        &path,
+        "https://user:secret@example.com/\r\nsource",
+        Some("https://alice:pw@ref.example.com/list"),
+    )
+    .unwrap();
     let ads = tokio::fs::read_to_string(path.with_file_name("mark.bin:Zone.Identifier"))
         .await
         .unwrap();
     assert_eq!(
         ads,
-        "[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=https://example.com/source\r\n"
+        "[ZoneTransfer]\r\nZoneId=3\r\nReferrerUrl=https://ref.example.com/list\r\nHostUrl=https://example.com/source\r\n"
     );
     engine.shutdown().await.unwrap();
 }
@@ -1124,4 +1129,168 @@ async fn telemetry_batch_reports_live_speed_without_subscribers() {
     assert_eq!(idle.active_threads, 0);
     assert_eq!(idle.aggregate_down_bps, 0);
     engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn validatorless_transfer_restarts_from_zero_on_resume() {
+    let old = payload(512 * KIB, 16);
+    let new = payload(512 * KIB, 17);
+    let new_source = Arc::clone(&new);
+    let switched = Arc::new(AtomicBool::new(false));
+    let switch = Arc::clone(&switched);
+    let server = Server::new(move |req| {
+        let data = if switch.load(Ordering::SeqCst) {
+            &new_source
+        } else {
+            &old
+        };
+        let mut reply = Reply::resource(req, data, "\"ignored\"");
+        reply.headers.retain(|(name, _)| *name != "ETag");
+        if !switch.load(Ordering::SeqCst) {
+            reply = reply.with_delay(Duration::from_millis(8));
+        }
+        reply
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    let id = engine
+        .add_http_download(request(server.url("/no-validator.bin"), None, 2))
+        .await
+        .unwrap();
+    wait_for(&engine, &id, |s| s.downloaded_bytes >= 64 * KIB as u64).await;
+    engine.pause_transfer(&id).await.unwrap();
+    assert!(!engine.snapshot(&id).unwrap().resumable);
+    switched.store(true, Ordering::SeqCst);
+    let earlier = server.requests().len();
+    engine.resume_transfer(&id).await.unwrap();
+    completed(&engine, &id).await;
+    assert!(server.requests()[earlier..]
+        .iter()
+        .all(|req| req.header("if-range").is_none()));
+    dir.assert_output("no-validator.bin", &new).await;
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn probe_206_but_range_200_falls_back_to_single_stream() {
+    let data = payload(128 * KIB, 18);
+    let source = Arc::clone(&data);
+    let server = Server::new(move |req| {
+        if req.method == "HEAD" {
+            return Reply::empty("405 Method Not Allowed");
+        }
+        if req.range() == Some(0..1) {
+            return Reply::resource(req, &source, "\"range-probe\"");
+        }
+        let mut reply = Reply::resource(req, &source, "\"range-probe\"");
+        reply.status = "200 OK";
+        reply.content = Some((Arc::clone(&source), 0..source.len()));
+        reply.headers = vec![
+            ("ETag", "\"range-probe\"".into()),
+            ("Content-Length", source.len().to_string()),
+        ];
+        reply
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    let id = engine
+        .add_http_download(request(server.url("/fallback.bin"), None, 4))
+        .await
+        .unwrap();
+    let done = completed(&engine, &id).await;
+    assert!(!done.resumable);
+    assert_eq!(done.segments.len(), 1);
+    dir.assert_output("fallback.bin", &data).await;
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn checksum_failure_resets_progress_so_resume_recovers() {
+    let valid = payload(96 * KIB, 19);
+    let corrupt = payload(96 * KIB, 20);
+    let valid_source = Arc::clone(&valid);
+    let fixed = Arc::new(AtomicBool::new(false));
+    let switch = Arc::clone(&fixed);
+    let server = Server::new(move |req| {
+        let data = if switch.load(Ordering::SeqCst) {
+            &valid_source
+        } else {
+            &corrupt
+        };
+        Reply::resource(req, data, "\"sum\"")
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    let mut download = request(server.url("/sum.bin"), None, 2);
+    download.expected_sha256 = Some(hex::encode(Sha256::digest(&*valid)));
+    let id = engine.add_http_download(download).await.unwrap();
+    let err_snap = failed(&engine, &id).await;
+    assert_eq!(err_snap.sha256_verified, Some(false));
+    assert_eq!(err_snap.downloaded_bytes, 0);
+
+    fixed.store(true, Ordering::SeqCst);
+    engine.resume_transfer(&id).await.unwrap();
+    let ok_snap = completed(&engine, &id).await;
+    assert_eq!(ok_snap.sha256_verified, Some(true));
+    dir.assert_output("sum.bin", &valid).await;
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn telemetry_stream_emits_terminal_idle_batch_on_completion() {
+    let data = payload(64 * KIB, 21);
+    let source = Arc::clone(&data);
+    let server = Server::new(move |req| {
+        Reply::resource(req, &source, "\"idle\"").with_delay(Duration::from_millis(15))
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    let mut rx = engine.subscribe_telemetry();
+    let id = engine
+        .add_http_download(request(server.url("/idle.bin"), None, 2))
+        .await
+        .unwrap();
+    let idle = timeout(WAIT, async {
+        let mut saw_active = false;
+        loop {
+            let batch = rx.recv().await.unwrap();
+            if batch.active_count > 0 {
+                saw_active = true;
+            } else if saw_active
+                && batch.active_count == 0
+                && batch
+                    .transfers
+                    .iter()
+                    .any(|t| t.id == id && t.status == TransferStatus::Completed)
+            {
+                break batch;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(idle.active_threads, 0);
+    assert_eq!(idle.aggregate_down_bps, 0);
+    engine.shutdown().await.unwrap();
+}
+
+#[test]
+fn chained_singleton_wildcards_respect_group_cap_and_inplace_expansion() {
+    let ok = expand_wildcard_url("https://example.com/[1-2]/[1-1]/[a-b].zip").unwrap();
+    assert_eq!(
+        ok,
+        [
+            "https://example.com/1/1/a.zip",
+            "https://example.com/1/1/b.zip",
+            "https://example.com/2/1/a.zip",
+            "https://example.com/2/1/b.zip",
+        ]
+    );
+    let many_singletons = "[1-1]".repeat(40);
+    let abuse = format!("https://example.com/[1-10000]/{many_singletons}");
+    assert!(expand_wildcard_url(&abuse).is_err());
 }
