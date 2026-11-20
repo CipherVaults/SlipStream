@@ -1,6 +1,6 @@
 use super::{accepted, outcome, require, Grade, Suite};
 use crate::report::Outcome;
-use serde::{ser::SerializeSeq, Serialize, Serializer};
+use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
 use slipstream_native_host::framing::{
     read_frame, read_frame_async, write_frame, write_frame_async,
@@ -16,8 +16,11 @@ use std::io::{ErrorKind, Result as IoResult};
 use std::time::Duration;
 #[cfg(windows)]
 use std::{
+    ffi::c_void,
     fs,
+    os::windows::io::{AsRawHandle, RawHandle},
     path::PathBuf,
+    ptr::null_mut,
     sync::{Arc, Mutex},
 };
 use tokio::time;
@@ -344,6 +347,7 @@ async fn run_pipe_trust_boundaries(suite: &mut Suite) {
         );
         let pipe_name = pipe_name.clone();
         let token_path = token_path.clone();
+        let seen_ref = Arc::clone(&seen);
         let task = tokio::spawn(async move {
             let mut client = accepted(ClientOptions::new().open(&pipe_name), "open Named Pipe")?;
             let wire_payload = if surface == "pipe_blank_client_id" {
@@ -370,13 +374,31 @@ async fn run_pipe_trust_boundaries(suite: &mut Suite) {
             )?;
             let trailing = read_frame_async::<NativeBridgeResponse>(&mut client).await;
             require(
-                matches!(trailing, Ok(None) | Err(_)),
-                "pipe remained open after authentication or frame rejection",
+                matches!(trailing, Ok(None))
+                    || matches!(
+                        trailing,
+                        Err(ref e)
+                            if matches!(
+                                e.kind(),
+                                ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+                            )
+                    ),
+                format!("pipe remained open or failed ambiguously after rejection: {trailing:?}"),
+            )?;
+            let recorded = seen_ref.lock().unwrap();
+            require(
+                recorded.is_empty(),
+                format!("pipe handler was dispatched after rejected {surface}: {recorded:?}"),
             )?;
             Ok("Windows Named Pipe rejected the unauthenticated or oversized request.")
         });
         suite.records.push(item.record(join(task).await, 1, None));
     }
+
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "harmful pipe cases leaked into RecordingHandler"
+    );
 
     // 4 benign pipe trust-boundary cases
     let sddl_item = suite.register(
@@ -386,7 +408,8 @@ async fn run_pipe_trust_boundaries(suite: &mut Suite) {
         "direct",
         b"pipe_sid_sddl_check".to_vec(),
     );
-    suite.grade(sddl_item, || {
+    let dacl_pipe_name = pipe_name.clone();
+    let dacl_task = tokio::spawn(async move {
         let actual_sid = accepted(current_user_sid(), "current_user_sid")?;
         let sddl = pipe_sddl(&actual_sid);
         let name = pipe_name_for_sid(&actual_sid);
@@ -399,8 +422,27 @@ async fn run_pipe_trust_boundaries(suite: &mut Suite) {
                 && name.starts_with(r"\\.\pipe\SlipStream.IPC."),
             format!("unexpected pipe SID/SDDL/name: {sddl} {name}"),
         )?;
-        Ok("Named Pipe SDDL restricts full access exclusively to the current user SID.")
+        let raw_handle = accepted(
+            ClientOptions::new().open(&dacl_pipe_name),
+            "open Named Pipe for DACL inspection",
+        )?;
+        let live_dacl = inspect_pipe_dacl(raw_handle.as_raw_handle())?;
+        drop(raw_handle);
+        let mut allowed = vec![pipe_sddl(&actual_sid), format!("D:(A;;FA;;;{actual_sid})")];
+        if actual_sid.ends_with("-500") {
+            allowed.push("D:(A;;GA;;;LA)".to_owned());
+            allowed.push("D:(A;;FA;;;LA)".to_owned());
+        }
+        require(
+            allowed.iter().any(|expected| expected == &live_dacl)
+                && !live_dacl.contains(";WD)")
+                && !live_dacl.contains(";AN)")
+                && !live_dacl.contains(";AU)"),
+            format!("live Named Pipe DACL unexpected: {live_dacl}"),
+        )?;
+        Ok("Named Pipe SDDL and live kernel DACL restrict full access exclusively to the current user SID.")
     });
+    suite.records.push(sddl_item.record(join(dacl_task).await, 1, None));
 
     for (surface, request) in [
         ("pipe_auth_ping", NativeBridgeRequest::Ping),
@@ -455,6 +497,91 @@ async fn run_pipe_trust_boundaries(suite: &mut Suite) {
     let _ = token;
     let _ = shutdown_tx.send(());
     let _ = time::timeout(Duration::from_secs(3), server_task).await;
+}
+
+#[cfg(windows)]
+fn inspect_pipe_dacl(handle: RawHandle) -> Result<String, String> {
+    const DACL_SECURITY_INFORMATION: u32 = 4;
+    const SDDL_REVISION_1: u32 = 1;
+    const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn GetKernelObjectSecurity(
+            handle: RawHandle,
+            requested_information: u32,
+            security_descriptor: *mut c_void,
+            length: u32,
+            length_needed: *mut u32,
+        ) -> i32;
+        fn ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            security_descriptor: *const c_void,
+            requested_string_sd_revision: u32,
+            security_information: u32,
+            string_security_descriptor: *mut *mut u16,
+            string_security_descriptor_len: *mut u32,
+        ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LocalFree(hmem: *mut c_void) -> *mut c_void;
+    }
+
+    let mut size = 0u32;
+    let first = unsafe {
+        GetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION, null_mut(), 0, &mut size)
+    };
+    if first != 0 {
+        return Err("GetKernelObjectSecurity unexpectedly succeeded with zero buffer".into());
+    }
+    let last_err = std::io::Error::last_os_error();
+    if last_err.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER) {
+        return Err(format!("GetKernelObjectSecurity probe failed: {last_err}"));
+    }
+
+    let mut descriptor = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
+    let ok = unsafe {
+        GetKernelObjectSecurity(
+            handle,
+            DACL_SECURITY_INFORMATION,
+            descriptor.as_mut_ptr().cast(),
+            size,
+            &mut size,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "GetKernelObjectSecurity read failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let mut sddl_ptr: *mut u16 = null_mut();
+    let mut sddl_len = 0u32;
+    let converted = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor.as_ptr().cast(),
+            SDDL_REVISION_1,
+            DACL_SECURITY_INFORMATION,
+            &mut sddl_ptr,
+            &mut sddl_len,
+        )
+    };
+    if converted == 0 || sddl_ptr.is_null() {
+        return Err(format!(
+            "ConvertSecurityDescriptorToStringSecurityDescriptorW failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let raw = unsafe {
+        let slice = std::slice::from_raw_parts(sddl_ptr, sddl_len as usize);
+        let text = String::from_utf16_lossy(slice);
+        LocalFree(sddl_ptr.cast());
+        text
+    };
+    Ok(raw.trim_end_matches('\0').to_owned())
 }
 
 #[cfg(not(windows))]
@@ -546,14 +673,10 @@ struct OversizedMessage;
 
 impl Serialize for OversizedMessage {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        // Exceed the independent 1 MiB cap without constructing a large input buffer.
-        let chunk = "a".repeat(4096);
-        let count = INDEPENDENT_MAX_FRAME_BYTES / chunk.len() + 1;
-        let mut seq = serializer.serialize_seq(Some(count))?;
-        for _ in 0..count {
-            seq.serialize_element(&chunk)?;
-        }
-        seq.end()
+        // Quote + (INDEPENDENT_MAX_FRAME_BYTES - 1) bytes + Quote == exact 1 MiB + 1 JSON payload.
+        let payload = "a".repeat(INDEPENDENT_MAX_FRAME_BYTES - 1);
+        debug_assert_eq!(payload.len() + 2, INDEPENDENT_MAX_FRAME_BYTES + 1);
+        serializer.serialize_str(&payload)
     }
 }
 
@@ -567,6 +690,32 @@ async fn benign_wire(suite: &mut Suite, expected_wire: Value, difficulty: &'stat
         raw_bytes.clone(),
     );
     let task = tokio::spawn(async move {
+        // Decoupled reader check: feed an independently framed raw JSON payload directly to the
+        // sync and async readers so writer bugs cannot cancel out reader bugs.
+        let independent_frame = framed(&raw_bytes);
+        let mut raw_sync_in = independent_frame.as_slice();
+        let mut raw_async_in = independent_frame.as_slice();
+        let sync = accepted(
+            read_frame::<NativeBridgeRequest>(&mut raw_sync_in),
+            "read_frame",
+        )?;
+        let asynchronous = accepted(
+            read_frame_async::<NativeBridgeRequest>(&mut raw_async_in).await,
+            "read_frame_async",
+        )?;
+        for decoded in [sync, asynchronous] {
+            let decoded = decoded.ok_or("frame reader returned EOF before a valid request")?;
+            require(
+                serde_json::to_value(decoded).expect("serialize IPC round trip") == expected_wire,
+                "IPC reader output diverged from the raw JSON wire specification",
+            )?;
+        }
+        require(
+            raw_sync_in.is_empty() && raw_async_in.is_empty(),
+            "valid frame left trailing bytes after reading",
+        )?;
+
+        // Decoupled writer check: inspect the raw 4-byte LE prefix and JSON body directly.
         let request: NativeBridgeRequest = accepted(
             serde_json::from_value(expected_wire.clone()),
             "NativeBridgeRequest::deserialize",
@@ -579,36 +728,31 @@ async fn benign_wire(suite: &mut Suite, expected_wire: Value, difficulty: &'stat
             "write_frame_async",
         )?;
         require(
-            sync_output.len() >= 4
-                && sync_output.len() - 4 <= INDEPENDENT_MAX_FRAME_BYTES
-                && async_output == sync_output,
+            sync_output.len() >= 4 && async_output == sync_output,
             "IPC writers emitted out-of-bounds or mismatched frame bytes",
         )?;
-
-        let mut sync_input = sync_output.as_slice();
-        let mut async_input = async_output.as_slice();
-        let sync = accepted(
-            read_frame::<NativeBridgeRequest>(&mut sync_input),
-            "read_frame",
-        )?;
-        let asynchronous = accepted(
-            read_frame_async::<NativeBridgeRequest>(&mut async_input).await,
-            "read_frame_async",
-        )?;
-        for decoded in [sync, asynchronous] {
-            let decoded = decoded.ok_or("frame reader returned EOF before a valid request")?;
-            // Compare decoded wire representation directly against the raw JSON specification
-            // so omitted/renamed fields on the Rust type cannot pass silently.
-            require(
-                serde_json::to_value(decoded).expect("serialize IPC round trip") == expected_wire,
-                "IPC round trip diverged from the raw JSON wire specification",
-            )?;
-        }
+        let (prefix_bytes, body) = sync_output.split_at(4);
+        let prefix: [u8; 4] = prefix_bytes
+            .try_into()
+            .map_err(|_| "IPC writer prefix was not 4 bytes")?;
+        let declared_len = u32::from_le_bytes(prefix) as usize;
         require(
-            sync_input.is_empty() && async_input.is_empty(),
-            "valid frame left trailing bytes",
+            declared_len == body.len()
+                && (1..=INDEPENDENT_MAX_FRAME_BYTES).contains(&declared_len),
+            format!(
+                "IPC writer prefix declared {declared_len} bytes, actual body is {}",
+                body.len()
+            ),
         )?;
-        Ok("Both IPC read and write paths preserved the raw JSON wire specification.")
+        let emitted_json: Value = accepted(
+            serde_json::from_slice(body),
+            "parse JSON payload emitted by IPC writer",
+        )?;
+        require(
+            emitted_json == expected_wire,
+            "IPC writer payload diverged from the raw JSON wire specification",
+        )?;
+        Ok("Both IPC read and write paths independently matched the wire framing specification.")
     });
     suite.records.push(item.record(join(task).await, 1, None));
 }

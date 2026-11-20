@@ -162,6 +162,10 @@ pub(super) fn run(suite: &mut Suite) {
         b"\\root.bin".to_vec(),
         b"CON.bin".to_vec(),
         b"NUL".to_vec(),
+        b"CONIN$.bin".to_vec(),
+        b"CONOUT$.bin".to_vec(),
+        "COM\u{00b9}.bin".as_bytes().to_vec(),
+        "LPT\u{00b2}.bin".as_bytes().to_vec(),
         b"clip:ads".to_vec(),
         "clip\u{202e}.bin".as_bytes().to_vec(),
         "clip\u{2066}.bin".as_bytes().to_vec(),
@@ -180,37 +184,41 @@ pub(super) fn run(suite: &mut Suite) {
             .iter()
             .map(|name| format!("{name}.bin").into_bytes()),
     );
+    // 5 locations * 18 = 90 harmful path-security cases; evenly spaced offsets ensure all 44 fixtures execute.
     for (location, offset) in [
         (Location::Name, 0),
-        (Location::Utf8Name, 7),
-        (Location::Path, 14),
-        (Location::Utf8Path, 15),
-        (Location::FileTree, 17),
+        (Location::Utf8Name, 9),
+        (Location::Path, 18),
+        (Location::Utf8Path, 27),
+        (Location::FileTree, 36),
     ] {
         let control = raw_manifest(location, None);
-        for name in unsafe_names.iter().cycle().skip(offset).take(22) {
+        for name in unsafe_names.iter().cycle().skip(offset).take(18) {
             reject_manifest(suite, base, location, &control, name);
         }
     }
+    // 10 harmful symlink cases
     for location in [Location::V1Link, Location::V2Link] {
         let control = raw_manifest(location, None);
         for target in ["clip.bin", "..", "/root.bin", "C:\\clip.mp4", "clip:ads"] {
             reject_manifest(suite, base, location, &control, target.as_bytes());
         }
     }
+    // 10 harmful corrupted v2 piece-layer cases + 10 harmful malformed v1 piece-hash cases
+    run_integrity_corruption_cases(suite, base);
 
     // 40 independently encoded benign v1 single-file Unicode manifests
     for (t_idx, title) in TITLES.iter().enumerate() {
         for (s_idx, suffix) in ["txt", "bin", "final..pdf", "v2.mp4"].iter().enumerate() {
             let name = format!("{title}.{suffix}");
             let payload = format!("v1-single-{t_idx}-{s_idx}-{title}").into_bytes();
-            let raw = encode_independent_v1_single(&name, &payload);
+            let spec = encode_independent_v1_single(&name, &payload);
             accept_manifest(
                 suite,
                 base,
                 "v1_single_file",
                 TorrentVersion::V1,
-                raw,
+                spec,
                 &[&name],
             );
         }
@@ -224,13 +232,13 @@ pub(super) fn run(suite: &mut Suite) {
             let preview = format!("[preview]/🚀 {s_idx}_{name}");
             let p1 = format!("v1-multi-a-{t_idx}-{s_idx}").into_bytes();
             let p2 = format!("v1-multi-b-{t_idx}-{s_idx}").into_bytes();
-            let raw = encode_independent_v1_multi(title, &[(&nested, &p1), (&preview, &p2)]);
+            let spec = encode_independent_v1_multi(title, &[(&nested, &p1), (&preview, &p2)]);
             accept_manifest(
                 suite,
                 base,
                 "v1_multi_file",
                 TorrentVersion::V1,
-                raw,
+                spec,
                 &[&nested, &preview],
             );
         }
@@ -241,13 +249,13 @@ pub(super) fn run(suite: &mut Suite) {
         for (s_idx, suffix) in ["mkv", "flac"].iter().enumerate() {
             let name = format!("{title}_v2.{suffix}");
             let small_payload = format!("v2-small-{t_idx}-{s_idx}-{title}").into_bytes();
-            let raw_small = encode_independent_v2(&[(vec![name.as_str()], &small_payload)], title);
+            let spec_small = encode_independent_v2(&[(vec![name.as_str()], &small_payload)], title);
             accept_manifest(
                 suite,
                 base,
                 "v2_single_file",
                 TorrentVersion::V2,
-                raw_small,
+                spec_small,
                 &[&name],
             );
 
@@ -259,7 +267,7 @@ pub(super) fn run(suite: &mut Suite) {
             large_payload[0] = b'S';
             large_payload[PIECE_LENGTH] = b'L';
             let expected_rel = format!("{folder}/{multi_name}");
-            let raw_multi = encode_independent_v2(
+            let spec_multi = encode_independent_v2(
                 &[
                     (vec![folder, multi_name.as_str()], &large_payload),
                     (vec!["ملف_مرافق.txt"], small_payload.as_slice()),
@@ -271,14 +279,21 @@ pub(super) fn run(suite: &mut Suite) {
                 base,
                 "v2_multi_file",
                 TorrentVersion::V2,
-                raw_multi,
+                spec_multi,
                 &["ملف_مرافق.txt", &expected_rel],
             );
         }
     }
 }
 
-fn encode_independent_v1_single(name: &str, data: &[u8]) -> Vec<u8> {
+struct IndependentTorrent {
+    bytes: Vec<u8>,
+    info_hash_v1: Option<[u8; 20]>,
+    info_hash_v2: Option<[u8; 32]>,
+    piece_layers: BTreeMap<[u8; 32], Vec<[u8; 32]>>,
+}
+
+fn encode_independent_v1_single(name: &str, data: &[u8]) -> IndependentTorrent {
     let mut pieces = Vec::new();
     for chunk in data.chunks(PIECE_LENGTH) {
         pieces.extend_from_slice(&sha1_digest(chunk));
@@ -289,10 +304,16 @@ fn encode_independent_v1_single(name: &str, data: &[u8]) -> Vec<u8> {
         (b"piece length", RawBencode::Int(PIECE_LENGTH as i64)),
         (b"pieces", RawBencode::Bytes(pieces)),
     ]);
-    encode_raw(&raw_dict([(b"info", info)]))
+    let info_raw = encode_raw(&info);
+    IndependentTorrent {
+        bytes: encode_raw(&raw_dict([(b"info", info)])),
+        info_hash_v1: Some(sha1_digest(&info_raw)),
+        info_hash_v2: None,
+        piece_layers: BTreeMap::new(),
+    }
 }
 
-fn encode_independent_v1_multi(name: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
+fn encode_independent_v1_multi(name: &str, files: &[(&str, &[u8])]) -> IndependentTorrent {
     let mut concatenated = Vec::new();
     let mut file_entries = Vec::new();
     for &(rel_path, data) in files {
@@ -316,12 +337,19 @@ fn encode_independent_v1_multi(name: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
         (b"piece length", RawBencode::Int(PIECE_LENGTH as i64)),
         (b"pieces", RawBencode::Bytes(pieces)),
     ]);
-    encode_raw(&raw_dict([(b"info", info)]))
+    let info_raw = encode_raw(&info);
+    IndependentTorrent {
+        bytes: encode_raw(&raw_dict([(b"info", info)])),
+        info_hash_v1: Some(sha1_digest(&info_raw)),
+        info_hash_v2: None,
+        piece_layers: BTreeMap::new(),
+    }
 }
 
-fn encode_independent_v2(files: &[(Vec<&str>, &[u8])], root_name: &str) -> Vec<u8> {
+fn encode_independent_v2(files: &[(Vec<&str>, &[u8])], root_name: &str) -> IndependentTorrent {
     let mut tree = RawDict::new();
     let mut piece_layers = RawDict::new();
+    let mut expected_layers = BTreeMap::new();
     for (components, data) in files {
         let leaf_hashes: Vec<[u8; 32]> = data
             .chunks(PIECE_LENGTH)
@@ -331,6 +359,7 @@ fn encode_independent_v2(files: &[(Vec<&str>, &[u8])], root_name: &str) -> Vec<u
         if data.len() > PIECE_LENGTH {
             let flattened: Vec<u8> = leaf_hashes.iter().flat_map(|h| h.iter().copied()).collect();
             piece_layers.insert(pieces_root.to_vec(), RawBencode::Bytes(flattened));
+            expected_layers.insert(pieces_root, leaf_hashes);
         }
         let leaf_dict = raw_dict([
             (b"length", RawBencode::Int(data.len() as i64)),
@@ -344,10 +373,16 @@ fn encode_independent_v2(files: &[(Vec<&str>, &[u8])], root_name: &str) -> Vec<u
         (b"name", RawBencode::Bytes(root_name.as_bytes().to_vec())),
         (b"piece length", RawBencode::Int(PIECE_LENGTH as i64)),
     ]);
-    encode_raw(&raw_dict([
-        (b"info", info),
-        (b"piece layers", RawBencode::Dict(piece_layers)),
-    ]))
+    let info_raw = encode_raw(&info);
+    IndependentTorrent {
+        bytes: encode_raw(&raw_dict([
+            (b"info", info),
+            (b"piece layers", RawBencode::Dict(piece_layers)),
+        ])),
+        info_hash_v1: None,
+        info_hash_v2: Some(Sha256::digest(&info_raw).into()),
+        piece_layers: expected_layers,
+    }
 }
 
 fn merkle_root_v2(leaves: &[[u8; 32]]) -> [u8; 32] {
@@ -423,23 +458,277 @@ fn reject_manifest(
     });
 }
 
+fn run_integrity_corruption_cases(suite: &mut Suite, base: &Path) {
+    let two_piece_payload = vec![0x42u8; PIECE_LENGTH + 512];
+    let v2_control = encode_independent_v2(&[(vec!["layer.bin"], &two_piece_payload)], "v2-ctrl");
+    let small_payload = vec![0x11u8; 64];
+    let v2_small_control = encode_independent_v2(&[(vec!["small.bin"], &small_payload)], "v2-sctrl");
+
+    let leaf_hashes: Vec<[u8; 32]> = two_piece_payload
+        .chunks(PIECE_LENGTH)
+        .map(|chunk| Sha256::digest(chunk).into())
+        .collect();
+    let pieces_root = merkle_root_v2(&leaf_hashes);
+    let valid_layer: Vec<u8> = leaf_hashes.iter().flat_map(|h| h.iter().copied()).collect();
+
+    let v2_info = || {
+        let mut tree = RawDict::new();
+        insert_tree_file(
+            &mut tree,
+            &["layer.bin"],
+            raw_dict([
+                (b"length", RawBencode::Int(two_piece_payload.len() as i64)),
+                (b"pieces root", RawBencode::Bytes(pieces_root.to_vec())),
+            ]),
+        );
+        raw_dict([
+            (b"file tree", RawBencode::Dict(tree)),
+            (b"meta version", RawBencode::Int(2)),
+            (b"name", RawBencode::Bytes(b"v2-ctrl".to_vec())),
+            (b"piece length", RawBencode::Int(PIECE_LENGTH as i64)),
+        ])
+    };
+    let mut layer_cases: Vec<(&'static str, Vec<u8>, &'static [u8])> = Vec::new();
+    let mut flip_first = valid_layer.clone();
+    flip_first[0] ^= 0x01;
+    layer_cases.push((
+        "piece layer does not match",
+        encode_raw(&raw_dict([
+            (b"info", v2_info()),
+            (
+                b"piece layers",
+                RawBencode::Dict(BTreeMap::from([(
+                    pieces_root.to_vec(),
+                    RawBencode::Bytes(flip_first),
+                )])),
+            ),
+        ])),
+        &v2_control.bytes,
+    ));
+    let mut flip_second = valid_layer.clone();
+    flip_second[32] ^= 0x80;
+    layer_cases.push((
+        "piece layer does not match",
+        encode_raw(&raw_dict([
+            (b"info", v2_info()),
+            (
+                b"piece layers",
+                RawBencode::Dict(BTreeMap::from([(
+                    pieces_root.to_vec(),
+                    RawBencode::Bytes(flip_second),
+                )])),
+            ),
+        ])),
+        &v2_control.bytes,
+    ));
+    layer_cases.push((
+        "invalid concatenated hash length",
+        encode_raw(&raw_dict([
+            (b"info", v2_info()),
+            (
+                b"piece layers",
+                RawBencode::Dict(BTreeMap::from([(
+                    pieces_root.to_vec(),
+                    RawBencode::Bytes(valid_layer[..63].to_vec()),
+                )])),
+            ),
+        ])),
+        &v2_control.bytes,
+    ));
+    let mut three_hashes = valid_layer.clone();
+    three_hashes.extend_from_slice(&[0x55u8; 32]);
+    layer_cases.push((
+        "piece layer does not match",
+        encode_raw(&raw_dict([
+            (b"info", v2_info()),
+            (
+                b"piece layers",
+                RawBencode::Dict(BTreeMap::from([(
+                    pieces_root.to_vec(),
+                    RawBencode::Bytes(three_hashes),
+                )])),
+            ),
+        ])),
+        &v2_control.bytes,
+    ));
+    layer_cases.push((
+        "piece layer does not match",
+        encode_raw(&raw_dict([
+            (b"info", v2_info()),
+            (
+                b"piece layers",
+                RawBencode::Dict(BTreeMap::from([(
+                    pieces_root.to_vec(),
+                    RawBencode::Bytes(valid_layer[..32].to_vec()),
+                )])),
+            ),
+        ])),
+        &v2_control.bytes,
+    ));
+    layer_cases.push((
+        "piece layers do not match",
+        encode_raw(&raw_dict([
+            (b"info", v2_info()),
+            (b"piece layers", RawBencode::Dict(RawDict::new())),
+        ])),
+        &v2_control.bytes,
+    ));
+    let small_leaf: [u8; 32] = Sha256::digest(&small_payload).into();
+    let mut small_tree = RawDict::new();
+    insert_tree_file(
+        &mut small_tree,
+        &["small.bin"],
+        raw_dict([
+            (b"length", RawBencode::Int(small_payload.len() as i64)),
+            (b"pieces root", RawBencode::Bytes(small_leaf.to_vec())),
+        ]),
+    );
+    let small_info = raw_dict([
+        (b"file tree", RawBencode::Dict(small_tree)),
+        (b"meta version", RawBencode::Int(2)),
+        (b"name", RawBencode::Bytes(b"v2-sctrl".to_vec())),
+        (b"piece length", RawBencode::Int(PIECE_LENGTH as i64)),
+    ]);
+    layer_cases.push((
+        "piece layers do not match",
+        encode_raw(&raw_dict([
+            (b"info", small_info),
+            (
+                b"piece layers",
+                RawBencode::Dict(BTreeMap::from([(
+                    small_leaf.to_vec(),
+                    RawBencode::Bytes(small_leaf.to_vec()),
+                )])),
+            ),
+        ])),
+        &v2_small_control.bytes,
+    ));
+    layer_cases.push((
+        "invalid piece layer root length",
+        encode_raw(&raw_dict([
+            (b"info", v2_info()),
+            (
+                b"piece layers",
+                RawBencode::Dict(BTreeMap::from([(
+                    pieces_root[..31].to_vec(),
+                    RawBencode::Bytes(valid_layer.clone()),
+                )])),
+            ),
+        ])),
+        &v2_control.bytes,
+    ));
+    layer_cases.push((
+        "missing piece layers",
+        encode_raw(&raw_dict([(b"info", v2_info())])),
+        &v2_control.bytes,
+    ));
+    layer_cases.push((
+        "expected a dictionary",
+        encode_raw(&raw_dict([
+            (b"info", v2_info()),
+            (b"piece layers", RawBencode::List(vec![])),
+        ])),
+        &v2_control.bytes,
+    ));
+    for (expected_sub, input, control) in layer_cases {
+        reject_metadata(suite, base, "v2_piece_layers", control, input, expected_sub);
+    }
+
+    let v1_control = encode_independent_v1_single("v1-ctrl.bin", &two_piece_payload);
+    let mut v1_cases: Vec<(&'static str, Vec<u8>)> = Vec::new();
+    for bad_len in [1usize, 19, 21, 39, 41] {
+        let info = raw_dict([
+            (b"length", RawBencode::Int(two_piece_payload.len() as i64)),
+            (b"name", RawBencode::Bytes(b"v1-ctrl.bin".to_vec())),
+            (b"piece length", RawBencode::Int(PIECE_LENGTH as i64)),
+            (b"pieces", RawBencode::Bytes(vec![0x77u8; bad_len])),
+        ]);
+        v1_cases.push((
+            "invalid concatenated hash length",
+            encode_raw(&raw_dict([(b"info", info)])),
+        ));
+    }
+    for bad_count in [0usize, 1, 3, 4] {
+        let info = raw_dict([
+            (b"length", RawBencode::Int(two_piece_payload.len() as i64)),
+            (b"name", RawBencode::Bytes(b"v1-ctrl.bin".to_vec())),
+            (b"piece length", RawBencode::Int(PIECE_LENGTH as i64)),
+            (b"pieces", RawBencode::Bytes(vec![0x88u8; bad_count * 20])),
+        ]);
+        v1_cases.push((
+            "v1 piece count does not match file lengths",
+            encode_raw(&raw_dict([(b"info", info)])),
+        ));
+    }
+    let missing_pieces_info = raw_dict([
+        (b"length", RawBencode::Int(two_piece_payload.len() as i64)),
+        (b"name", RawBencode::Bytes(b"v1-ctrl.bin".to_vec())),
+        (b"piece length", RawBencode::Int(PIECE_LENGTH as i64)),
+    ]);
+    v1_cases.push((
+        "missing pieces",
+        encode_raw(&raw_dict([(b"info", missing_pieces_info)])),
+    ));
+    for (expected_sub, input) in v1_cases {
+        reject_metadata(
+            suite,
+            base,
+            "v1_pieces",
+            &v1_control.bytes,
+            input,
+            expected_sub,
+        );
+    }
+}
+
+fn reject_metadata(
+    suite: &mut Suite,
+    base: &Path,
+    surface: &'static str,
+    control: &[u8],
+    input: Vec<u8>,
+    expected_sub: &'static str,
+) {
+    let item = suite.register(CATEGORY, "harmful", surface, "boundary", input.clone());
+    suite.grade(item, || {
+        parse_torrent_bytes(control, base).expect("invalid integrity control fixture");
+        let result = parse_torrent_bytes(&input, base);
+        let blocked = matches!(
+            result,
+            Err(TorrentError::Metadata(ref msg)) if msg.contains(expected_sub)
+        );
+        require(
+            blocked,
+            format!("expected TorrentError::Metadata containing {expected_sub:?}, got {result:?}"),
+        )?;
+        Ok("The torrent parser rejected the corrupted piece-layer or piece-hash metadata.")
+    });
+}
+
 fn accept_manifest(
     suite: &mut Suite,
     base: &Path,
     surface: &'static str,
     expected_version: TorrentVersion,
-    bytes: Vec<u8>,
+    spec: IndependentTorrent,
     expected_paths: &[&str],
 ) {
     // Deduplicate directly on the independently encoded manifest bytes.
-    let item = suite.register(CATEGORY, "benign", surface, "composed", bytes.clone());
+    let item = suite.register(CATEGORY, "benign", surface, "composed", spec.bytes.clone());
     suite.grade(item, || {
-        let parsed = accepted(parse_torrent_bytes(&bytes, base), "parse_torrent_bytes")?;
+        let parsed = accepted(parse_torrent_bytes(&spec.bytes, base), "parse_torrent_bytes")?;
         require(
-            parsed.version == expected_version,
+            parsed.version == expected_version
+                && parsed.info_hash_v1 == spec.info_hash_v1
+                && parsed.info_hash_v2 == spec.info_hash_v2
+                && parsed.piece_layers == spec.piece_layers,
             format!(
-                "expected torrent version {expected_version:?}, got {:?}",
-                parsed.version
+                "torrent metadata diverged from independent oracle: version={:?} (expected {:?}), v1_match={}, v2_match={}, layers_match={}",
+                parsed.version,
+                expected_version,
+                parsed.info_hash_v1 == spec.info_hash_v1,
+                parsed.info_hash_v2 == spec.info_hash_v2,
+                parsed.piece_layers == spec.piece_layers,
             ),
         )?;
         let expected: Vec<_> = expected_paths
@@ -459,7 +748,7 @@ fn accept_manifest(
                     .all(|path| path.starts_with(base)),
             "the torrent did not resolve all intended files below the save directory",
         )?;
-        Ok("The torrent parser preserved every independently encoded file under the save directory.")
+        Ok("The torrent parser preserved info hashes, piece layers, and all paths below the save directory.")
     });
 }
 

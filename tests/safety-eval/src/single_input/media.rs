@@ -265,29 +265,54 @@ pub(super) fn run(suite: &mut Suite) {
                         )?;
                     }
                     let yt = accepted(yt_builder.build(&url), "yt-dlp build")?;
+                    let mut expected_yt: Vec<OsString> = vec![
+                        "--ignore-config",
+                        "--no-config-locations",
+                        "--no-cache-dir",
+                        "--no-exec",
+                        "--no-warnings",
+                        if playlist {
+                            "--yes-playlist"
+                        } else {
+                            "--no-playlist"
+                        },
+                        "--newline",
+                        "--progress",
+                        "--progress-template",
+                        "download:SLIPSTREAM|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s",
+                        "-o",
+                        &name,
+                        "-f",
+                        format,
+                    ]
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect();
+                    if playlist {
+                        expected_yt.extend(
+                            ["--playlist-items", playlist_spec]
+                                .into_iter()
+                                .map(OsString::from),
+                        );
+                    }
+                    if with_subs {
+                        expected_yt.extend(
+                            [
+                                "--write-subs",
+                                "--write-auto-subs",
+                                "--sub-langs",
+                                "^en-US$,^ar$",
+                                "--sub-format",
+                                "srt/vtt",
+                            ]
+                            .into_iter()
+                            .map(OsString::from),
+                        );
+                    }
+                    expected_yt.extend(["--", &url].into_iter().map(OsString::from));
                     require(
-                        has_flag(&yt, "--ignore-config")
-                            && has_flag(&yt, "--no-config-locations")
-                            && has_flag(&yt, "--no-cache-dir")
-                            && has_flag(&yt, "--no-exec")
-                            && has_args(&yt, &["-f", format])
-                            && has_args(&yt, &["-o", &name])
-                            && has_flag(
-                                &yt,
-                                if playlist {
-                                    "--yes-playlist"
-                                } else {
-                                    "--no-playlist"
-                                },
-                            )
-                            && (!playlist || has_args(&yt, &["--playlist-items", playlist_spec]))
-                            && (!with_subs
-                                || (has_flag(&yt, "--write-subs")
-                                    && has_flag(&yt, "--write-auto-subs")
-                                    && has_args(&yt, &["--sub-langs", "^en-US$,^ar$"])
-                                    && has_args(&yt, &["--sub-format", "srt/vtt"])))
-                            && ends_with(&yt, &["--", &url]),
-                        "yt-dlp omitted mandatory safety flags or mangled discrete arguments",
+                        yt == expected_yt,
+                        format!("yt-dlp argv {yt:?} diverged from exact expected {expected_yt:?}"),
                     )?;
                     let ff = accepted(
                         BuildFfmpegArgs::new()
@@ -295,37 +320,34 @@ pub(super) fn run(suite: &mut Suite) {
                             .and_then(|b| b.normalize_audio().build(Path::new(&output), container)),
                         "FFmpeg builder",
                     )?;
+                    let expected_ff: Vec<OsString> = [
+                        "-hide_banner",
+                        "-nostdin",
+                        "-y",
+                        "-progress",
+                        "pipe:1",
+                        "-nostats",
+                        "-f",
+                        demuxer,
+                        "-i",
+                        &name,
+                        "-af",
+                        "loudnorm=I=-16:TP=-1.5:LRA=11",
+                        "-f",
+                        muxer,
+                        "--",
+                        &output,
+                    ]
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect();
                     require(
-                        has_flag(&ff, "-hide_banner")
-                            && has_flag(&ff, "-nostdin")
-                            && has_flag(&ff, "-y")
-                            && has_args(&ff, &["-f", demuxer, "-i", &name])
-                            && has_args(&ff, &["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"])
-                            && ends_with(&ff, &["-f", muxer, "--", &output]),
-                        "FFmpeg omitted mandatory safety flags or mangled demuxer/output boundaries",
+                        ff == expected_ff,
+                        format!("FFmpeg argv {ff:?} diverged from exact expected {expected_ff:?}"),
                     )?;
-                    Ok("Both sidecar builders preserved all safety flags, subtitles, playlists, and option boundaries.")
+                    Ok("Both sidecar builders produced exact expected argv sequences.")
                 });
             }
         }
     }
-}
-
-fn has_flag(args: &[OsString], flag: &str) -> bool {
-    args.iter().any(|arg| arg == flag)
-}
-
-fn has_args(args: &[OsString], sequence: &[&str]) -> bool {
-    args.windows(sequence.len())
-        .any(|window| matches_args(window, sequence))
-}
-
-fn ends_with(args: &[OsString], sequence: &[&str]) -> bool {
-    args.len() >= sequence.len() && matches_args(&args[args.len() - sequence.len()..], sequence)
-}
-
-fn matches_args(args: &[OsString], sequence: &[&str]) -> bool {
-    args.iter()
-        .zip(sequence)
-        .all(|(actual, expected)| actual == expected)
 }

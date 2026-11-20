@@ -42,21 +42,22 @@ async fn run() -> io::Result<()> {
     let prereg = PreregSpec::load(&prereg_path)?;
     fs::create_dir_all(&out_dir)?;
 
-    // Persist single-input results before launching stateful chains so partial outputs
-    // are never lost if stateful chain execution encounters an infrastructure failure.
+    // Persist and validate single-input results before launching stateful chains so
+    // partial outputs are preserved and preregistration violations abort early.
     let single = run_single_inputs().await;
     let single_path = out_dir.join("single_input_results.jsonl");
     write_jsonl(&single_path, &single)?;
-    let single_result = report("Single inputs", &single);
+    report("Single inputs", &single)?;
+    prereg.validate_single(&single)?;
 
     let chains = run_stateful_chains().await?;
     let chain_path = out_dir.join("multi_chain_results.jsonl");
     write_jsonl(&chain_path, &chains)?;
-    let chain_result = report("Stateful chains", &chains);
+    report("Stateful chains", &chains)?;
+    prereg.validate_chains(&chains)?;
 
     println!("Wrote JSONL to {}", out_dir.display());
-    prereg.validate_suite(&single, &chains)?;
-    single_result.and(chain_result)
+    Ok(())
 }
 
 fn usage_error() -> io::Error {

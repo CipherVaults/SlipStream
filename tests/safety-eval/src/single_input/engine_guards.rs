@@ -7,7 +7,7 @@ use std::{
     fs,
     io::{self, ErrorKind},
     net::Ipv4Addr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -46,6 +46,14 @@ impl StaticReply {
         Self {
             status: status.into(),
             headers: vec![("Location".into(), location.into())],
+            body: Vec::new(),
+        }
+    }
+
+    fn not_found() -> Self {
+        Self {
+            status: "404 Not Found".into(),
+            headers: Vec::new(),
             body: Vec::new(),
         }
     }
@@ -93,9 +101,52 @@ impl LoopbackServer {
         format!("{}{path}", self.base_url)
     }
 
-    fn requests(&self) -> Vec<LoggedRequest> {
-        self.logs.lock().expect("guard log lock").clone()
+    fn request_count(&self) -> usize {
+        self.logs.lock().expect("guard log lock").len()
     }
+
+    fn requests_since(&self, start: usize) -> Vec<LoggedRequest> {
+        let guard = self.logs.lock().expect("guard log lock");
+        guard.get(start..).unwrap_or_default().to_vec()
+    }
+}
+
+fn count_files_strict(dir: &Path) -> Result<usize, String> {
+    match fs::read_dir(dir) {
+        Ok(entries) => {
+            let mut count = 0usize;
+            for entry in entries {
+                entry.map_err(|e| format!("failed reading dir entry in {}: {e}", dir.display()))?;
+                count += 1;
+            }
+            Ok(count)
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(format!("failed reading dir {}: {err}", dir.display())),
+    }
+}
+
+#[cfg(windows)]
+fn verify_motw_ads(path: &Path, expected_host_url: &str) -> Result<(), String> {
+    let mut ads = path.as_os_str().to_os_string();
+    ads.push(":Zone.Identifier");
+    let zone = fs::read_to_string(&ads).map_err(|e| format!("read MotW ADS failed: {e}"))?;
+    let expected_host = format!("HostUrl={expected_host_url}");
+    let zone_lines: Vec<_> = zone.lines().collect();
+    if zone_lines.first().copied() != Some("[ZoneTransfer]")
+        || zone_lines.iter().filter(|&&l| l == "[ZoneTransfer]").count() != 1
+        || zone_lines.iter().filter(|&&l| l == "ZoneId=3").count() != 1
+        || zone_lines.iter().filter(|&&l| l == expected_host).count() != 1
+        || zone_lines.iter().any(|l| l.starts_with("ReferrerUrl="))
+    {
+        return Err(format!("unexpected MotW ADS on {}: {zone:?}", path.display()));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn verify_motw_ads(_path: &Path, _expected_host_url: &str) -> Result<(), String> {
+    Ok(())
 }
 
 impl Drop for LoopbackServer {
@@ -262,13 +313,13 @@ pub(super) async fn run_content_disposition_cases(suite: &mut Suite) {
     let save_dir = config.default_download_dir.clone();
     let engine = DownloadEngine::new(config).await.expect("open cd engine");
 
-    for (index, path) in [
-        "/bad-traversal",
-        "/bad-device",
-        "/bad-ads",
-        "/bad-bidi",
-        "/bad-utf8-traversal",
-        "/bad-backslash",
+    for (index, (path, expected_sub)) in [
+        ("/bad-traversal", "forbidden directory separator"),
+        ("/bad-device", "reserved device name"),
+        ("/bad-ads", "alternate data stream"),
+        ("/bad-bidi", "bidi"),
+        ("/bad-utf8-traversal", "forbidden directory separator"),
+        ("/bad-backslash", "forbidden directory separator"),
     ]
     .into_iter()
     .enumerate()
@@ -289,20 +340,23 @@ pub(super) async fn run_content_disposition_cases(suite: &mut Suite) {
             .await
         {
             Ok(id) => match wait_terminal(&engine, &id).await {
-                Ok(snap) => {
-                    let count = fs::read_dir(&sub_dir).map(|d| d.count()).unwrap_or(0);
-                    if snap.status == TransferStatus::Failed
-                        && snap.error_message.is_some()
-                        && count == 0
-                    {
-                        Outcome::Pass("DownloadEngine rejected unsafe Content-Disposition and wrote zero files.")
-                    } else {
-                        Outcome::Fail(format!(
-                            "unsafe Content-Disposition was not blocked cleanly: status={:?}, files={count}",
-                            snap.status
-                        ))
+                Ok(snap) => match count_files_strict(&sub_dir) {
+                    Ok(count) => {
+                        let msg = snap.error_message.unwrap_or_default().to_ascii_lowercase();
+                        if snap.status == TransferStatus::Failed
+                            && msg.contains(expected_sub)
+                            && count == 0
+                        {
+                            Outcome::Pass("DownloadEngine rejected unsafe Content-Disposition and wrote zero files.")
+                        } else {
+                            Outcome::Fail(format!(
+                                "unsafe Content-Disposition was not blocked cleanly: status={:?}, msg={msg:?}, files={count}",
+                                snap.status
+                            ))
+                        }
                     }
-                }
+                    Err(err) => Outcome::Broken(err),
+                },
                 Err(err) => Outcome::Broken(err),
             },
             Err(err) => Outcome::Broken(format!("add_http_download failed unexpectedly: {err}")),
@@ -328,10 +382,11 @@ pub(super) async fn run_content_disposition_cases(suite: &mut Suite) {
             format!("cd-benign:{path}:{expected_name}").into_bytes(),
         );
         let sub_dir = save_dir.join(format!("good-{index}"));
+        let req_url = server.url(path);
         let outcome = match engine
             .add_http_download(AddHttpDownloadRequest {
                 save_dir: Some(sub_dir.to_string_lossy().into_owned()),
-                ..base_req(server.url(path))
+                ..base_req(req_url.clone())
             })
             .await
         {
@@ -339,15 +394,17 @@ pub(super) async fn run_content_disposition_cases(suite: &mut Suite) {
                 Ok(snap) => {
                     let out_path = sub_dir.join(expected_name);
                     let bytes_ok = fs::read(&out_path).ok().as_deref() == Some(payload.as_slice());
+                    let motw_res = verify_motw_ads(&out_path, &req_url);
                     if snap.status == TransferStatus::Completed
                         && snap.filename == expected_name
                         && bytes_ok
+                        && motw_res.is_ok()
                     {
-                        Outcome::Pass("DownloadEngine sanitized and committed the UTF-8 Content-Disposition filename.")
+                        Outcome::Pass("DownloadEngine sanitized and committed the UTF-8 Content-Disposition filename with MotW.")
                     } else {
                         Outcome::Fail(format!(
-                            "benign Content-Disposition failed: status={:?}, filename={:?}, bytes_ok={bytes_ok}",
-                            snap.status, snap.filename
+                            "benign Content-Disposition failed: status={:?}, filename={:?}, bytes_ok={bytes_ok}, motw={:?}",
+                            snap.status, snap.filename, motw_res
                         ))
                     }
                 }
@@ -409,7 +466,7 @@ pub(super) async fn run_http_redirect_cases(suite: &mut Suite) {
             "/rel-start" => StaticReply::redirect("302 Found", "../assets/step2"),
             "/assets/step2" => StaticReply::redirect("301 Moved Permanently", "/final-ok"),
             "/final-ok" => StaticReply::ok(payload_final.clone()),
-            _ => StaticReply::ok(payload_final.clone()),
+            _ => StaticReply::not_found(),
         }
     })
     .await;
@@ -458,21 +515,23 @@ pub(super) async fn run_http_redirect_cases(suite: &mut Suite) {
             .await
         {
             Ok(id) => match wait_terminal(&engine, &id).await {
-                Ok(snap) => {
-                    let msg = snap.error_message.unwrap_or_default().to_ascii_lowercase();
-                    let count = fs::read_dir(&sub).map(|d| d.count()).unwrap_or(0);
-                    if snap.status == TransferStatus::Failed
-                        && msg.contains(expected_sub)
-                        && count == 0
-                    {
-                        Outcome::Pass("DownloadEngine blocked the multi-hop redirect target with zero output files.")
-                    } else {
-                        Outcome::Fail(format!(
-                            "engine redirect check failed: status={:?}, msg={msg:?}, files={count}",
-                            snap.status
-                        ))
+                Ok(snap) => match count_files_strict(&sub) {
+                    Ok(count) => {
+                        let msg = snap.error_message.unwrap_or_default().to_ascii_lowercase();
+                        if snap.status == TransferStatus::Failed
+                            && msg.contains(expected_sub)
+                            && count == 0
+                        {
+                            Outcome::Pass("DownloadEngine blocked the multi-hop redirect target with zero output files.")
+                        } else {
+                            Outcome::Fail(format!(
+                                "engine redirect check failed: status={:?}, msg={msg:?}, files={count}",
+                                snap.status
+                            ))
+                        }
                     }
-                }
+                    Err(err) => Outcome::Broken(err),
+                },
                 Err(err) => Outcome::Broken(err),
             },
             Err(err) => Outcome::Broken(format!("add_http_download failed: {err}")),
@@ -501,32 +560,37 @@ pub(super) async fn run_http_redirect_cases(suite: &mut Suite) {
         .into_iter()
         .map(|k| (k.to_owned(), "secret-token".to_owned()))
         .collect();
+    let origin_mark = origin_server.request_count();
+    let target_mark = target_server.request_count();
     let cross_outcome = match engine.add_http_download(cross_req).await {
         Ok(id) => match wait_terminal(&engine, &id).await {
             Ok(snap) => {
                 let target_reqs: Vec<_> = target_server
-                    .requests()
+                    .requests_since(target_mark)
                     .into_iter()
                     .filter(|r| r.path == "/bounce")
                     .collect();
-                let origin_reqs = origin_server.requests();
+                let origin_reqs = origin_server.requests_since(origin_mark);
+                let final_reqs: Vec<_> =
+                    origin_reqs.iter().filter(|r| r.path == "/final-ok").collect();
+                let initial_reqs: Vec<_> = origin_reqs
+                    .iter()
+                    .filter(|r| r.path == "/cross-start")
+                    .collect();
                 let clean_target = !target_reqs.is_empty()
                     && target_reqs
                         .iter()
                         .all(|r| sensitive.iter().all(|h| !r.headers.contains_key(*h)));
-                let clean_return = origin_reqs
-                    .iter()
-                    .filter(|r| r.path == "/final-ok")
-                    .all(|r| sensitive.iter().all(|h| !r.headers.contains_key(*h)));
-                let saw_initial =
-                    origin_reqs
+                let clean_return = !final_reqs.is_empty()
+                    && final_reqs
                         .iter()
-                        .filter(|r| r.path == "/cross-start")
-                        .all(|r| {
-                            sensitive.iter().all(|h| {
-                                r.headers.get(*h).map(String::as_str) == Some("secret-token")
-                            })
-                        });
+                        .all(|r| sensitive.iter().all(|h| !r.headers.contains_key(*h)));
+                let saw_initial = !initial_reqs.is_empty()
+                    && initial_reqs.iter().all(|r| {
+                        sensitive.iter().all(|h| {
+                            r.headers.get(*h).map(String::as_str) == Some("secret-token")
+                        })
+                    });
                 let bytes_ok = fs::read(cross_dir.join("cross.bin")).ok().as_deref()
                     == Some(payload.as_slice());
                 if snap.status == TransferStatus::Completed
@@ -564,10 +628,11 @@ pub(super) async fn run_http_redirect_cases(suite: &mut Suite) {
     ref_req.save_dir = Some(ref_dir.to_string_lossy().into_owned());
     ref_req.referrer = Some("https://alice:pw@ref.example.test/watch?v=1#frag".into());
     ref_req.headers = [("Cookie".into(), "sid=keep-off-target".into())].into();
+    let target_mark = target_server.request_count();
     let ref_outcome = match engine.add_http_download(ref_req).await {
         Ok(id) => match wait_terminal(&engine, &id).await {
             Ok(snap) => {
-                let target_reqs = target_server.requests();
+                let target_reqs = target_server.requests_since(target_mark);
                 let landing: Vec<_> = target_reqs
                     .iter()
                     .filter(|r| r.path == "/referer-landing")
@@ -608,6 +673,7 @@ pub(super) async fn run_http_redirect_cases(suite: &mut Suite) {
             format!("engine-benign:{surface}:{path}").into_bytes(),
         );
         let sub = save_dir.join(surface);
+        let origin_mark = origin_server.request_count();
         let outcome = match engine
             .add_http_download(AddHttpDownloadRequest {
                 filename: Some(out_name.into()),
@@ -618,13 +684,26 @@ pub(super) async fn run_http_redirect_cases(suite: &mut Suite) {
         {
             Ok(id) => match wait_terminal(&engine, &id).await {
                 Ok(snap) => {
+                    let reqs = origin_server.requests_since(origin_mark);
+                    let traversed_ok = match surface {
+                        "engine_302_10hop_boundary" => {
+                            (0..=10)
+                                .rev()
+                                .all(|h| reqs.iter().any(|r| r.path == format!("/hop/{h}")))
+                                && reqs.iter().any(|r| r.path == "/final-ok")
+                        }
+                        "engine_302_relative_chain" => ["/rel-start", "/assets/step2", "/final-ok"]
+                            .iter()
+                            .all(|p| reqs.iter().any(|r| r.path == *p)),
+                        _ => false,
+                    };
                     let bytes_ok =
                         fs::read(sub.join(out_name)).ok().as_deref() == Some(payload.as_slice());
-                    if snap.status == TransferStatus::Completed && bytes_ok {
+                    if snap.status == TransferStatus::Completed && traversed_ok && bytes_ok {
                         Outcome::Pass("DownloadEngine completed the valid redirect chain cleanly.")
                     } else {
                         Outcome::Fail(format!(
-                            "valid redirect chain failed: status={:?}, bytes_ok={bytes_ok}",
+                            "valid redirect chain failed: status={:?}, traversed_ok={traversed_ok}, bytes_ok={bytes_ok}",
                             snap.status
                         ))
                     }
