@@ -1,0 +1,202 @@
+use crate::TorrentError;
+use slipstream_protocol::{sanitize_filename, validate_magnet_uri, UrlSecurityError};
+use std::collections::BTreeSet;
+use url::Url;
+
+// `so` is peer/user input. Bound expansion independently of the index values.
+const MAX_SELECTED_INDICES: usize = 100_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedMagnet {
+    pub info_hash_hex: String,
+    pub is_v2: bool,
+    /// A hybrid URI may advertise both hashes. The v1 hash can be used with librqbit.
+    pub info_hash_v1_hex: Option<String>,
+    pub info_hash_v2_hex: Option<String>,
+    pub display_name: Option<String>,
+    pub trackers: Vec<String>,
+    pub exact_length: Option<u64>,
+    pub select_only: Option<Vec<usize>>,
+    pub exact_sources: Vec<String>,
+}
+
+impl ParsedMagnet {
+    pub fn safe_display_name(&self) -> String {
+        self.display_name
+            .as_deref()
+            .and_then(|name| sanitize_filename(name).ok())
+            .unwrap_or_else(|| self.info_hash_hex.clone())
+    }
+
+    pub(crate) fn v1_uri(&self, use_trackers: bool) -> Option<String> {
+        let hash = self.info_hash_v1_hex.as_ref()?;
+        let mut uri = Url::parse("magnet:?").expect("constant magnet URI");
+        uri.query_pairs_mut()
+            .append_pair("xt", &format!("urn:btih:{hash}"));
+        if use_trackers {
+            for tracker in &self.trackers {
+                uri.query_pairs_mut().append_pair("tr", tracker);
+            }
+        }
+        Some(uri.into())
+    }
+}
+
+pub fn parse_magnet_uri(raw: &str) -> Result<ParsedMagnet, TorrentError> {
+    let verified = validate_magnet_uri(raw)?;
+    let uri = Url::parse(&verified.raw).map_err(|_| UrlSecurityError::InvalidMagnet)?;
+    let mut magnet = ParsedMagnet {
+        info_hash_hex: String::new(),
+        is_v2: false,
+        info_hash_v1_hex: None,
+        info_hash_v2_hex: None,
+        display_name: verified.display_name,
+        trackers: Vec::new(),
+        exact_length: None,
+        select_only: None,
+        exact_sources: Vec::new(),
+    };
+    let mut selection = BTreeSet::new();
+    let mut expansion_budget = MAX_SELECTED_INDICES;
+    for (key, value) in uri.query_pairs() {
+        match key.as_ref() {
+            "xt" => {
+                if let Some(hash) = value.strip_prefix("urn:btih:").and_then(normalize_btih) {
+                    magnet.info_hash_hex = hash.clone();
+                    magnet.is_v2 = false;
+                    magnet.info_hash_v1_hex = Some(hash);
+                } else if let Some(hash) = value
+                    .strip_prefix("urn:btmh:1220")
+                    .filter(|hash| is_hex(hash, 64))
+                {
+                    let hash = hash.to_ascii_lowercase();
+                    magnet.info_hash_hex = hash.clone();
+                    magnet.is_v2 = true;
+                    magnet.info_hash_v2_hex = Some(hash);
+                }
+            }
+            "tr" if !value.is_empty() => magnet.trackers.push(value.into_owned()),
+            "xs" if !value.is_empty() => magnet.exact_sources.push(value.into_owned()),
+            "xl" => magnet.exact_length = Some(decimal(&value)?),
+            "so" => {
+                parse_selection(&value, &mut selection, &mut expansion_budget)?;
+                magnet.select_only = Some(Vec::new());
+            }
+            _ => {}
+        }
+    }
+    if magnet.select_only.is_some() {
+        magnet.select_only = Some(selection.into_iter().collect());
+    }
+    Ok(magnet)
+}
+
+fn is_hex(hash: &str, len: usize) -> bool {
+    hash.len() == len && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn normalize_btih(hash: &str) -> Option<String> {
+    if is_hex(hash, 40) {
+        return Some(hash.to_ascii_lowercase());
+    }
+    if hash.len() != 32 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(20);
+    let mut accumulator = 0u16;
+    let mut bits = 0;
+    for byte in hash.bytes().map(|byte| byte.to_ascii_uppercase()) {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'2'..=b'7' => byte - b'2' + 26,
+            _ => return None,
+        };
+        accumulator = (accumulator << 5) | u16::from(value);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push((accumulator >> bits) as u8);
+        }
+    }
+    Some(hex::encode(bytes))
+}
+
+fn decimal<T: std::str::FromStr>(value: &str) -> Result<T, UrlSecurityError> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(UrlSecurityError::InvalidMagnet);
+    }
+    value.parse().map_err(|_| UrlSecurityError::InvalidMagnet)
+}
+
+fn parse_selection(
+    value: &str,
+    selection: &mut BTreeSet<usize>,
+    expansion_budget: &mut usize,
+) -> Result<(), UrlSecurityError> {
+    for entry in value.split(',') {
+        let (start, end) = entry.split_once('-').unwrap_or((entry, entry));
+        let start: usize = decimal(start)?;
+        let end: usize = decimal(end)?;
+        let count = end
+            .checked_sub(start)
+            .and_then(|span| span.checked_add(1))
+            .ok_or(UrlSecurityError::InvalidMagnet)?;
+        *expansion_budget = expansion_budget
+            .checked_sub(count)
+            .ok_or(UrlSecurityError::InvalidMagnet)?;
+        selection.extend(start..=end);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_hashes_selection_and_optional_fields() {
+        let btih = "MFRGGZDFMZTWQ2LKNNWG23TPOBYXE43U";
+        let btmh = "ab".repeat(32);
+        let uri = format!("magnet:?xt=urn:btih:{btih}&xt=urn:btmh:1220{btmh}&dn=Tokyo+%F0%9F%97%BC&tr=udp%3A%2F%2Ftracker.test%3A60&tr=https%3A%2F%2Ftracker.test&xl=50&so=0,2-4&so=3,7&xs=https%3A%2F%2Fexample.test%2Fmetadata");
+        let parsed = parse_magnet_uri(&uri).unwrap();
+        assert_eq!(
+            parsed.info_hash_v1_hex,
+            Some(hex::encode(b"abcdefghijklmnopqrst"))
+        );
+        assert_eq!(parsed.info_hash_hex, btmh);
+        assert!(parsed.is_v2);
+        assert_eq!(parsed.safe_display_name(), "Tokyo 🗼");
+        assert_eq!(parsed.select_only, Some(vec![0, 2, 3, 4, 7]));
+        assert_eq!(
+            parsed.trackers,
+            ["udp://tracker.test:60", "https://tracker.test"]
+        );
+        assert_eq!(parsed.exact_length, Some(50));
+        assert_eq!(parsed.exact_sources, ["https://example.test/metadata"]);
+        let hash = "AB".repeat(20);
+        let parsed =
+            parse_magnet_uri(&format!("magnet:?xt=urn:btih:{hash}&dn=..%2Fescape")).unwrap();
+        assert!(!parsed.is_v2);
+        assert_eq!(parsed.safe_display_name(), hash.to_ascii_lowercase());
+    }
+
+    #[test]
+    fn rejects_bad_magnets_and_ranges() {
+        for invalid in [
+            "magnet:",
+            "magnet:?xt=urn:btmh:1230aa",
+            "magnet:?xt=urn:btih:x",
+            "https://example.test/torrent",
+            "magnet:\0",
+        ] {
+            assert!(parse_magnet_uri(invalid).is_err());
+        }
+        for invalid in ["3-2", "0-100000", "2,,4", "2-3-4", "-3", ""] {
+            assert!(parse_magnet_uri(&format!(
+                "magnet:?xt=urn:btih:{}&so={invalid}",
+                "ab".repeat(20)
+            ))
+            .is_err());
+        }
+    }
+}
