@@ -24,6 +24,7 @@ apps/desktop/src-tauri/target/
 *.slipstream-part
 .tmp/
 scratch/
+.worktrees/
 
 # Env & Secrets
 .env
