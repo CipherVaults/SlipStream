@@ -60,7 +60,7 @@ function TransferMenu({ transfer, onAction }: { transfer: TransferSnapshot; onAc
     <IconButton label={"More actions for " + transfer.filename} className="folder-ghost more-trigger"
       aria-expanded={open} onClick={() => setOpen(!open)}><Ellipsis size={15} /></IconButton>
     {open && <div className="transfer-popover">
-      {!isDone(transfer) && transfer.kind !== "torrent" && action("refresh", "Refresh Link", <RefreshCw size={13} />)}
+      {!isDone(transfer) && transfer.kind === "http" && action("refresh", "Refresh Link", <RefreshCw size={13} />)}
       {!isDone(transfer) && action("reveal", "Reveal", <Folder size={14} />)}
       {isDone(transfer) && action("verify", "Verify SHA-256", <FileCheck2 size={14} />)}
       {!isDone(transfer) && transfer.status !== "canceled" && action("cancel", "Cancel transfer", <X size={14} />)}
@@ -118,7 +118,7 @@ function TransferRow({ transfer, selected, select, onAction, preview }: {
       {primary && <IconButton label={primary === "pause" ? "Pause" : "Resume"} onClick={() => onAction(primary, transfer)}>
         {primary === "pause" ? <Pause size={12} fill="currentColor" /> : <Play size={12} fill="currentColor" />}
       </IconButton>}
-      {transfer.status === "failed" && transfer.kind !== "torrent" && <IconButton label="Refresh Link"
+      {transfer.status === "failed" && transfer.kind === "http" && <IconButton label="Refresh Link"
         onClick={() => onAction("refresh", transfer)}><RefreshCw size={13} /></IconButton>}
       <TransferMenu transfer={transfer} onAction={onAction} />
     </div>

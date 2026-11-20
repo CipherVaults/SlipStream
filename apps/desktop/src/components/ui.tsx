@@ -48,7 +48,7 @@ export function Dialog({ title, onClose, className = "", header, children, busy 
   useEffect(() => {
     const previous = document.activeElement;
     const element = panel.current;
-    (element?.querySelector<HTMLElement>("[data-initial-focus]") ?? element)?.focus();
+    (element?.querySelector<HTMLElement>("[data-initial-focus]:not(:disabled)") ?? element)?.focus();
     return () => { if (previous instanceof HTMLElement && previous.isConnected) previous.focus(); };
   }, []);
 

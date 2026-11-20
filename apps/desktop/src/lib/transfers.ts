@@ -64,16 +64,17 @@ export function isHttpUrl(input: string) {
 }
 
 export function isTorrentSource(input: string) {
-  return /^magnet:\?/i.test(input) || /\.torrent$/i.test(input);
+  return /^magnet:\?/i.test(input) || (!/^https?:\/\//i.test(input) && /\.torrent$/i.test(input));
 }
 
 export function isWildcard(input: string) {
+  if (!/^https?:\/\//i.test(input)) return false;
   const withoutIpv6Host = input.replace(/^(https?:\/\/(?:[^/@]+@)?)\[[\da-f:.]+\]/i, "$1localhost");
   return /\[(?:\d+-\d+|[a-z]-[a-z]|[A-Z]-[A-Z])(?::\d+)?\]/.test(withoutIpv6Host);
 }
 
 export function isDownloadSource(input: string) {
-  return isHttpUrl(input) || isTorrentSource(input) || (/^https?:\/\//i.test(input) && isWildcard(input));
+  return isHttpUrl(input) || isTorrentSource(input) || isWildcard(input);
 }
 
 export function fileCategory(transfer: TransferSnapshot) {

@@ -8,6 +8,14 @@ import { Sparkline } from "./Sparkline";
 import { primaryAction, TransferIcon, type OnTransferAction } from "./TransferList";
 import { Tabs } from "./ui";
 
+export interface TorrentFilesEntry {
+  status: "idle" | "loading" | "ready" | "error";
+  files?: TorrentFileEntry[];
+  error?: string;
+  saving: boolean;
+  selectionError: string;
+}
+
 const threadStates: Record<SegmentState | "idle", string> = {
   idle: "Idle", pending: "Pending", active: "Active", split: "Split", completed: "Done", paused: "Paused", error: "Error",
 };
@@ -22,7 +30,7 @@ function Segments({ transfer }: { transfer: TransferSnapshot }) {
       {Array.from({ length: SEGMENT_COUNT }, (_, index) => {
         const segment = segments.get(index);
         const label = "T" + String(index + 1).padStart(2, "0");
-        if (hasExplicit && !segment) {
+        if ((hasExplicit && !segment) || (!hasExplicit && transfer.kind !== "torrent")) {
           return <div className="thread-tile" key={index}>
             <div className="thread-top"><span>{label}</span><span className="thread-state idle">Idle</span></div>
             <div className="thread-bar idle" role="progressbar" aria-label={label + " progress"}
@@ -30,15 +38,7 @@ function Segments({ transfer }: { transfer: TransferSnapshot }) {
             <div className="thread-spd">—</div>
           </div>;
         }
-        if (!hasExplicit && transfer.kind !== "torrent") {
-          return <div className="thread-tile" key={index}>
-            <div className="thread-top"><span>{label}</span><span className="thread-state idle">Idle</span></div>
-            <div className="thread-bar idle" role="progressbar" aria-label={label + " progress"}
-              aria-valuenow={0}><div style={{ width: "0%" }} /></div>
-            <div className="thread-spd">—</div>
-          </div>;
-        }
-        const length = segment ? Math.max(1, segment.end_byte - segment.start_byte + 1) : 0;
+        const length = segment ? Math.max(1, segment.end_byte - segment.start_byte) : 0;
         const progress = segment ? ratio(segment.downloaded_bytes / length) : ratio(transfer.ui_segments[index] ?? 0);
         let state: SegmentState = segment?.state ?? (progress === 1 ? "completed" : progress > 0 ? "active" : "pending");
         if (transfer.status === "paused" && state !== "completed") state = "paused";
@@ -93,147 +93,130 @@ function Overview({ transfer, samples, preview, onAction }: {
     </div>}
     {transfer.status === "failed" && <div className="inline-error" role="alert">
       <p>{transfer.error_message || "The transfer failed."}</p>
-      {!torrent && <button type="button" className="btn-ghost form-button" onClick={() => onAction("refresh", transfer)}>Refresh Link</button>}
+      {transfer.kind === "http" && <button type="button" className="btn-ghost form-button" onClick={() => onAction("refresh", transfer)}>Refresh Link</button>}
     </div>}
   </div>;
 }
 
-type DetailData = { files?: TorrentFileEntry[]; probe?: MediaProbeResult };
-type DetailState = { status: "idle" } | { status: "loading" } | { status: "ready"; data: DetailData } | { status: "error"; message: string };
+type MediaDetailState = { status: "idle" } | { status: "loading" } | { status: "ready"; probe: MediaProbeResult } | { status: "error"; message: string };
 
-function Details({ transfer, preview, state, saving, selectionError, onLoad, onSelectFile, onFormat }: {
-  transfer: TransferSnapshot; preview: boolean; state: DetailState; saving: boolean; selectionError: string;
-  onLoad: () => void; onSelectFile: (index: number, selected: boolean) => void;
-  onFormat: (probe: MediaProbeResult, format: MediaFormatOption) => void;
+function Details({ transfer, preview, torrentEntry, mediaState, onLoadTorrent, onSelectFile, onProbeMedia, onFormat }: {
+  transfer: TransferSnapshot; preview: boolean; torrentEntry?: TorrentFilesEntry; mediaState: MediaDetailState;
+  onLoadTorrent: () => void; onSelectFile: (index: number, selected: boolean) => void;
+  onProbeMedia: () => void; onFormat: (probe: MediaProbeResult, format: MediaFormatOption) => void;
 }) {
-  const torrent = transfer.kind === "torrent";
-
-  if (state.status === "idle") {
-    return <div className="insp-content">
-      <div className="seg-grid-head"><span>Direct HTTP Transfer</span><span>{transfer.protocol_label}</span></div>
-      <p className="empty-state">Probe this URL with yt-dlp if it points to a media stream.</p>
-      <button type="button" className="btn-ghost form-button" onClick={onLoad}>Probe Media Streams</button>
-    </div>;
-  }
-  if (state.status === "loading") return <p className="empty-state" role="status">{torrent ? "Loading torrent files…" : "Probing available streams…"}</p>;
-  if (state.status === "error") return <div className="inline-error"><p role="alert">{state.message}</p>
-    <button type="button" className="btn-ghost form-button" onClick={onLoad}>Retry</button></div>;
-  if (state.data.files) {
-    const files = state.data.files;
+  if (transfer.kind === "torrent") {
+    if (!torrentEntry || torrentEntry.status === "idle" || torrentEntry.status === "loading") {
+      return <p className="empty-state" role="status">Loading torrent files…</p>;
+    }
+    if (torrentEntry.status === "error") {
+      return <div className="inline-error"><p role="alert">{torrentEntry.error || "Could not load torrent files."}</p>
+        <button type="button" className="btn-ghost form-button" onClick={onLoadTorrent}>Retry</button></div>;
+    }
+    const files = torrentEntry.files ?? [];
     return <div className="insp-content">
       <div className="seg-grid-head tabular"><span>Select files to download</span>
         <span>{files.filter(file => file.selected).length} / {files.length}</span></div>
       <div className="mini-format-list">
         {files.map(file => <label className="mini-format-row file-option" key={file.index}>
-          <input type="checkbox" checked={file.selected} disabled={saving} onChange={event => onSelectFile(file.index, event.target.checked)} />
+          <input type="checkbox" checked={file.selected} disabled={torrentEntry.saving}
+            onChange={event => onSelectFile(file.index, event.target.checked)} />
           <span title={file.relative_path}>{file.relative_path}</span><small>{bytes(file.size_bytes)}</small>
         </label>)}
         {!files.length && <p className="empty-state">File metadata is unavailable.</p>}
       </div>
-      {selectionError && <p className="inline-error" role="alert">{selectionError}</p>}
+      {torrentEntry.selectionError && <p className="inline-error" role="alert">{torrentEntry.selectionError}</p>}
     </div>;
   }
 
-  const probe = state.data.probe;
+  if (mediaState.status === "idle") {
+    return <div className="insp-content">
+      <div className="seg-grid-head"><span>Direct HTTP Transfer</span><span>{transfer.protocol_label}</span></div>
+      <p className="empty-state">Probe this URL with yt-dlp if it points to a media stream.</p>
+      <button type="button" className="btn-ghost form-button" onClick={onProbeMedia}>Probe Media Streams</button>
+    </div>;
+  }
+  if (mediaState.status === "loading") return <p className="empty-state" role="status">Probing available streams…</p>;
+  if (mediaState.status === "error") return <div className="inline-error"><p role="alert">{mediaState.message}</p>
+    <button type="button" className="btn-ghost form-button" onClick={onProbeMedia}>Retry</button></div>;
+
+  const probe = mediaState.probe;
   return <div className="insp-content">
     <div className="seg-grid-head"><span>Available Streams & Presets</span><span>yt-dlp + FFmpeg</span></div>
     <div className="mini-format-list tabular">
-      {probe?.formats.map((format, index) => <button className={"mini-format-row" + (preview && index === 0 ? " active" : "")}
+      {probe.formats.map((format, index) => <button className={"mini-format-row" + (preview && index === 0 ? " active" : "")}
         type="button" onClick={() => onFormat(probe, format)} title={"Download " + format.label} key={format.format_id}>
         <span><strong>{format.label}</strong> · {format.video_codec ?? format.audio_codec ?? format.container}</span>
         <span>{bytes(format.filesize_bytes)}</span>
       </button>)}
-      {!probe?.formats.length && <p className="empty-state">No media formats detected.</p>}
+      {!probe.formats.length && <p className="empty-state">No media formats detected.</p>}
     </div>
   </div>;
 }
 
 type InspectorTab = "overview" | "segments" | "details";
 
-export function Inspector({ transfer, samples, preview, onAction, onFormat }: {
-  transfer: TransferSnapshot | undefined; samples: readonly number[]; preview: boolean; onAction: OnTransferAction;
-  onFormat: (probe: MediaProbeResult, format: MediaFormatOption) => void;
+export function Inspector({ transfer, samples, preview, torrentEntry, onLoadTorrentFiles, onSelectTorrentFile, onAction, onFormat }: {
+  transfer: TransferSnapshot | undefined; samples: readonly number[]; preview: boolean;
+  torrentEntry?: TorrentFilesEntry; onLoadTorrentFiles: (transferId: string, force?: boolean) => void;
+  onSelectTorrentFile: (transferId: string, index: number, selected: boolean) => void;
+  onAction: OnTransferAction; onFormat: (probe: MediaProbeResult, format: MediaFormatOption) => void;
 }) {
   const [tab, setTab] = useState<InspectorTab>("overview");
   const [thumbnail, setThumbnail] = useState<string | null>(null);
-  const [detailState, setDetailState] = useState<DetailState>({ status: "idle" });
-  const [savingFiles, setSavingFiles] = useState(false);
-  const [selectionError, setSelectionError] = useState("");
+  const [mediaState, setMediaState] = useState<MediaDetailState>({ status: "idle" });
+  const mediaRequestToken = useRef(0);
+  const mediaRequestedUrl = useRef<string | null>(null);
   const mountedRef = useRef(true);
-  const filesRef = useRef<TorrentFileEntry[] | undefined>(undefined);
-  const pendingSavesRef = useRef(0);
-  const fileQueueRef = useRef(Promise.resolve());
-  const detailRequestedRef = useRef(false);
 
   useEffect(() => {
     mountedRef.current = true;
-    return () => { mountedRef.current = false; };
+    return () => {
+      mountedRef.current = false;
+      mediaRequestToken.current++;
+    };
   }, []);
 
   const transferId = transfer?.id;
   const transferKind = transfer?.kind;
   const transferUrl = transfer?.source_url;
 
-  function fetchDetails(force = false) {
-    if (!transferId || !transferKind || !transferUrl) return;
-    if (!force && detailRequestedRef.current) return;
-    detailRequestedRef.current = true;
-    setDetailState({ status: "loading" });
-    setSelectionError("");
-    const request: Promise<DetailData> = transferKind === "torrent"
-      ? desktop.listTorrentFiles(transferId).then(files => ({ files }))
-      : desktop.probeMedia(transferUrl).then(probe => ({ probe }));
-    void request.then(data => {
-      if (!mountedRef.current) return;
-      if (data.files) {
-        filesRef.current = data.files;
-      }
-      if (data.probe) setThumbnail(data.probe.thumbnail_url);
-      setDetailState({ status: "ready", data });
+  useEffect(() => {
+    mediaRequestToken.current++;
+    mediaRequestedUrl.current = null;
+    setThumbnail(null);
+    setMediaState({ status: "idle" });
+  }, [transferId, transferUrl]);
+
+  function probeCurrentMedia(force = false) {
+    if (!transferUrl || transferKind === "torrent") return;
+    if (!force && mediaRequestedUrl.current === transferUrl) return;
+    mediaRequestedUrl.current = transferUrl;
+    const token = ++mediaRequestToken.current;
+    setMediaState({ status: "loading" });
+    void desktop.probeMedia(transferUrl).then(probe => {
+      if (!mountedRef.current || token !== mediaRequestToken.current) return;
+      setThumbnail(probe.thumbnail_url);
+      setMediaState({ status: "ready", probe });
     }, error => {
-      if (!mountedRef.current) return;
-      detailRequestedRef.current = false;
-      setDetailState({ status: "error", message: errorMessage(error) });
+      if (!mountedRef.current || token !== mediaRequestToken.current) return;
+      mediaRequestedUrl.current = null;
+      setMediaState({ status: "error", message: errorMessage(error) });
     });
   }
 
   useEffect(() => {
     if (tab !== "details" || !transferId || !transferKind) return;
-    if (transferKind === "torrent" || transferKind === "media") {
-      fetchDetails(false);
-    }
-  }, [tab, transferId, transferKind, transferUrl]);
-
-  function selectTorrentFile(index: number, checked: boolean) {
-    const current = filesRef.current;
-    if (!transferId || !current) return;
-    const next = current.map(file => file.index === index ? { ...file, selected: checked } : file);
-    filesRef.current = next;
-    setDetailState({ status: "ready", data: { files: next } });
-    setSelectionError("");
-    pendingSavesRef.current += 1;
-    setSavingFiles(true);
-    const indices = next.filter(file => file.selected).map(file => file.index);
-    fileQueueRef.current = fileQueueRef.current.then(async () => {
-      try {
-        await desktop.setTorrentFiles(transferId, indices);
-      } catch (error) {
-        if (mountedRef.current) setSelectionError(errorMessage(error));
-        try {
-          const fresh = await desktop.listTorrentFiles(transferId);
-          if (mountedRef.current && pendingSavesRef.current <= 1) {
-            filesRef.current = fresh;
-            setDetailState({ status: "ready", data: { files: fresh } });
-          }
-        } catch {
-          // Retain optimistic state and show selectionError.
-        }
-      } finally {
-        pendingSavesRef.current = Math.max(0, pendingSavesRef.current - 1);
-        if (mountedRef.current && pendingSavesRef.current === 0) setSavingFiles(false);
+    if (transferKind === "torrent") {
+      if (!torrentEntry || torrentEntry.status === "idle") {
+        onLoadTorrentFiles(transferId, false);
       }
-    });
-  }
+      return;
+    }
+    if (transferKind === "media") {
+      probeCurrentMedia(false);
+    }
+  }, [tab, transferId, transferKind, transferUrl, torrentEntry?.status, onLoadTorrentFiles]);
 
   if (!transfer) return <aside className="inspector" aria-label="Transfer inspector"><p className="empty-state">Select a transfer to inspect.</p></aside>;
   const torrent = transfer.kind === "torrent";
@@ -256,8 +239,10 @@ export function Inspector({ transfer, samples, preview, onAction, onFormat }: {
       options={[["overview", "Overview"], ["segments", "Segments"], ["details", torrent ? "Torrent Files" : "Media"]]}>
       {tab === "overview" && <Overview transfer={transfer} samples={samples} preview={preview} onAction={onAction} />}
       {tab === "segments" && <Segments transfer={transfer} />}
-      {tab === "details" && <Details transfer={transfer} preview={preview} state={detailState} saving={savingFiles}
-        selectionError={selectionError} onLoad={() => fetchDetails(true)} onSelectFile={selectTorrentFile} onFormat={onFormat} />}
+      {tab === "details" && <Details transfer={transfer} preview={preview} torrentEntry={torrentEntry} mediaState={mediaState}
+        onLoadTorrent={() => onLoadTorrentFiles(transfer.id, true)}
+        onSelectFile={(index, checked) => onSelectTorrentFile(transfer.id, index, checked)}
+        onProbeMedia={() => probeCurrentMedia(true)} onFormat={onFormat} />}
     </Tabs>
     <div className="insp-footer">
       <div className="insp-status-line">
@@ -271,7 +256,7 @@ export function Inspector({ transfer, samples, preview, onAction, onFormat }: {
         <button type="button" className="btn-ghost" onClick={() => onAction("reveal", transfer)}><Folder size={13} />Folder</button>
       </div>
       <div className="insp-secondary-actions">
-        {!torrent && !isDone(transfer) && <button type="button" className="footer-btn" onClick={() => onAction("refresh", transfer)}><RefreshCw size={12} />Refresh URL</button>}
+        {transfer.kind === "http" && !isDone(transfer) && <button type="button" className="footer-btn" onClick={() => onAction("refresh", transfer)}><RefreshCw size={12} />Refresh URL</button>}
         <button type="button" className="footer-btn" onClick={() => onAction("verify", transfer)}><FileCheck2 size={13} />Verify SHA-256</button>
       </div>
     </div>

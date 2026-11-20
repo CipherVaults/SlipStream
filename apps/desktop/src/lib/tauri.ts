@@ -59,7 +59,7 @@ export const desktop = {
   },
   async onOpenPicker(handler: (url: string | null) => void) {
     return isTauri() ? listen<{ url: string | null }>("slipstream://open-picker", ({ payload }) => {
-      handler(payload?.url ?? null);
+      handler(typeof payload?.url === "string" ? payload.url : null);
     }) : demo.listenPicker(handler);
   },
   async onFileDrop(handler: (event: DragDropEvent) => void) {

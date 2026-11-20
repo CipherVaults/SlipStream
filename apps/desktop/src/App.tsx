@@ -1,7 +1,7 @@
 import { Download, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type DragEvent } from "react";
 import { AddDialog, type AddSeed } from "./components/AddDialog";
-import { Inspector } from "./components/Inspector";
+import { Inspector, type TorrentFilesEntry } from "./components/Inspector";
 import { Palette, type QuickCommand } from "./components/Palette";
 import { SettingsDialog, type SettingsLoadState } from "./components/SettingsDialog";
 import { Sidebar, Toolbar, matchesStatus, matchesView, type StatusFilter, type View } from "./components/Shell";
@@ -11,7 +11,7 @@ import { IconButton } from "./components/ui";
 import { DEFAULT_SETTINGS } from "./lib/demo";
 import { desktop, isTauri } from "./lib/tauri";
 import { errorMessage, isDownloadSource, isRunning, isTorrentSource, MB, SPEED_CAP } from "./lib/transfers";
-import type { AppSettings, TelemetryBatch, TransferSnapshot } from "./types/ipc";
+import type { AppSettings, TelemetryBatch, TorrentFileEntry, TransferSnapshot } from "./types/ipc";
 
 type Overlay = { type: "add"; seed: AddSeed; key: number } | { type: "settings" } | { type: "palette" }
   | { type: "refresh" | "verify"; transfer: TransferSnapshot };
@@ -59,7 +59,8 @@ export default function App() {
   const settingsLoadedRef = useRef(false);
   const settingsLoadRef = useRef<Promise<AppSettings> | null>(null);
   const settingsQueue = useRef(Promise.resolve());
-  const liveRef = useRef(true);
+  const settingsFailureMessageRef = useRef("");
+  const mountedRef = useRef(true);
   const [batch, setBatch] = useState<TelemetryBatch | null>(null);
   const latest = useRef<TelemetryBatch | null>(null);
   const eventVersion = useRef(0);
@@ -71,6 +72,12 @@ export default function App() {
   const [search, setSearch] = useState("");
   const [selectedId, setSelectedId] = useState<string>();
   const [removed, setRemoved] = useState<Set<string>>(() => new Set());
+  const [torrentFilesMap, setTorrentFilesMap] = useState<Record<string, TorrentFilesEntry>>({});
+  const torrentFilesRef = useRef<Record<string, TorrentFilesEntry>>({});
+  torrentFilesRef.current = torrentFilesMap;
+  const torrentQueuesRef = useRef(new Map<string, Promise<void>>());
+  const torrentPendingRef = useRef(new Map<string, number>());
+  const torrentLatestFilesRef = useRef(new Map<string, TorrentFileEntry[]>());
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [overlay, setOverlay] = useState<Overlay>();
   const [droppedSource, setDroppedSource] = useState<{ url: string; seq: number }>();
@@ -82,7 +89,7 @@ export default function App() {
   const busyRef = useRef(false);
   const overlayRef = useRef<Overlay | undefined>(undefined);
   overlayRef.current = overlay;
-  const pendingPicker = useRef<AddSeed | undefined>(undefined);
+  const pendingPickers = useRef<AddSeed[]>([]);
   const dragDepth = useRef(0);
   const theme = useTheme(settings);
   const transfers = batch?.transfers.filter(transfer => !removed.has(transfer.id)) ?? [];
@@ -93,30 +100,42 @@ export default function App() {
   const selected = items.find(transfer => transfer.id === selectedId) ?? items[0];
   const speedLimit = (batch ? batch.speed_limit_bps : settings.global_speed_limit_bps) ?? null;
 
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
   const showError = useCallback((error: unknown) => setNotice({ tone: "error", message: errorMessage(error) }), []);
   const notify = (message: string) => setNotice({ tone: "ok", message });
 
   const loadSettings = useCallback(async () => {
     if (settingsLoadedRef.current) return settingsRef.current;
     if (!settingsLoadRef.current) {
-      if (liveRef.current) {
+      if (mountedRef.current) {
         setSettingsLoadState("loading");
         setSettingsError("");
       }
       settingsLoadRef.current = desktop.getSettings().then(next => {
         settingsLoadedRef.current = true;
         settingsRef.current = next;
-        if (liveRef.current) {
+        const staleError = settingsFailureMessageRef.current;
+        settingsFailureMessageRef.current = "";
+        if (mountedRef.current) {
           setSettings(next);
           setSettingsLoadState("ready");
           setSettingsError("");
+          if (staleError) {
+            setNotice(current => current?.tone === "error" && current.message === staleError ? undefined : current);
+          }
         }
         return next;
       }).catch(error => {
         settingsLoadRef.current = null;
-        if (liveRef.current) {
+        const msg = errorMessage(error);
+        settingsFailureMessageRef.current = msg;
+        if (mountedRef.current) {
           setSettingsLoadState("error");
-          setSettingsError(errorMessage(error));
+          setSettingsError(msg);
         }
         throw error;
       });
@@ -129,6 +148,17 @@ export default function App() {
     const duplicate = latest.current?.timestamp === next.timestamp;
     latest.current = next;
     setBatch(next);
+    const present = new Set(next.transfers.map(transfer => transfer.id));
+    setRemoved(previous => {
+      if (previous.size === 0) return previous;
+      let changed = false;
+      const retained = new Set<string>();
+      previous.forEach(id => {
+        if (present.has(id)) retained.add(id);
+        else changed = true;
+      });
+      return changed ? retained : previous;
+    });
     if (duplicate) return;
     setSamples(previous => [...previous.slice(1 - sampleCount), next.aggregate_down_bps]);
     setHistory(previous => Object.fromEntries(next.transfers.map(transfer => [
@@ -144,7 +174,7 @@ export default function App() {
 
   const openAdd = useCallback((seed: AddSeed = {}, deferIfOpen = false) => {
     if (busyRef.current || (deferIfOpen && overlayRef.current && overlayRef.current.type !== "palette")) {
-      pendingPicker.current = seed;
+      pendingPickers.current.push(seed);
       return;
     }
     setDroppedSource(undefined);
@@ -164,31 +194,144 @@ export default function App() {
     setBusy(value);
   }, []);
 
+  const loadTorrentFiles = useCallback((transferId: string, force = false) => {
+    const existing = torrentFilesRef.current[transferId];
+    if (!force && existing && (existing.status === "loading" || existing.status === "ready")) return;
+    if ((torrentPendingRef.current.get(transferId) ?? 0) > 0) return;
+
+    setTorrentFilesMap(previous => ({
+      ...previous,
+      [transferId]: {
+        status: "loading",
+        files: previous[transferId]?.files,
+        saving: previous[transferId]?.saving ?? false,
+        selectionError: "",
+      },
+    }));
+
+    void desktop.listTorrentFiles(transferId).then(files => {
+      if (!mountedRef.current) return;
+      if ((torrentPendingRef.current.get(transferId) ?? 0) > 0) return;
+      torrentLatestFilesRef.current.set(transferId, files);
+      setTorrentFilesMap(previous => ({
+        ...previous,
+        [transferId]: {
+          status: "ready",
+          files,
+          saving: (torrentPendingRef.current.get(transferId) ?? 0) > 0,
+          selectionError: previous[transferId]?.selectionError ?? "",
+        },
+      }));
+    }, error => {
+      if (!mountedRef.current) return;
+      setTorrentFilesMap(previous => ({
+        ...previous,
+        [transferId]: {
+          status: "error",
+          files: previous[transferId]?.files,
+          error: errorMessage(error),
+          saving: (torrentPendingRef.current.get(transferId) ?? 0) > 0,
+          selectionError: previous[transferId]?.selectionError ?? "",
+        },
+      }));
+    });
+  }, []);
+
+  const selectTorrentFile = useCallback((transferId: string, index: number, checked: boolean) => {
+    const currentFiles = torrentLatestFilesRef.current.get(transferId) ?? torrentFilesRef.current[transferId]?.files;
+    if (!currentFiles) return;
+    const nextFiles = currentFiles.map(file => file.index === index ? { ...file, selected: checked } : file);
+    torrentLatestFilesRef.current.set(transferId, nextFiles);
+    const nextPending = (torrentPendingRef.current.get(transferId) ?? 0) + 1;
+    torrentPendingRef.current.set(transferId, nextPending);
+
+    setTorrentFilesMap(previous => ({
+      ...previous,
+      [transferId]: {
+        status: "ready",
+        files: nextFiles,
+        saving: true,
+        selectionError: "",
+      },
+    }));
+
+    const indices = nextFiles.filter(file => file.selected).map(file => file.index);
+    const prior = torrentQueuesRef.current.get(transferId) ?? Promise.resolve();
+    const nextQueue = prior.then(async () => {
+      try {
+        await desktop.setTorrentFiles(transferId, indices);
+      } catch (error) {
+        if (mountedRef.current) {
+          const msg = errorMessage(error);
+          setTorrentFilesMap(previous => ({
+            ...previous,
+            [transferId]: {
+              ...previous[transferId],
+              status: "ready",
+              files: previous[transferId]?.files ?? nextFiles,
+              saving: (torrentPendingRef.current.get(transferId) ?? 0) > 1,
+              selectionError: msg,
+            },
+          }));
+        }
+        try {
+          if ((torrentPendingRef.current.get(transferId) ?? 0) <= 1) {
+            const fresh = await desktop.listTorrentFiles(transferId);
+            if (mountedRef.current && (torrentPendingRef.current.get(transferId) ?? 0) <= 1) {
+              torrentLatestFilesRef.current.set(transferId, fresh);
+              setTorrentFilesMap(previous => ({
+                ...previous,
+                [transferId]: {
+                  status: "ready",
+                  files: fresh,
+                  saving: false,
+                  selectionError: previous[transferId]?.selectionError ?? "",
+                },
+              }));
+            }
+          }
+        } catch {
+          // Retain optimistic state and keep selectionError visible.
+        }
+      } finally {
+        const remaining = Math.max(0, (torrentPendingRef.current.get(transferId) ?? 1) - 1);
+        torrentPendingRef.current.set(transferId, remaining);
+        if (mountedRef.current && remaining === 0) {
+          setTorrentFilesMap(previous => previous[transferId] ? {
+            ...previous,
+            [transferId]: { ...previous[transferId], saving: false },
+          } : previous);
+        }
+      }
+    });
+    torrentQueuesRef.current.set(transferId, nextQueue);
+  }, []);
+
   useEffect(() => {
-    liveRef.current = true;
+    let cancelled = false;
     const cleanup: Unsubscribe[] = [];
-    const report = (error: unknown) => { if (liveRef.current) showError(error); };
+    const report = (error: unknown) => { if (!cancelled) showError(error); };
     async function connect(listener: Promise<Unsubscribe>) {
       try {
         const stop = await listener;
-        if (liveRef.current) cleanup.push(stop);
+        if (!cancelled) cleanup.push(stop);
         else stopSafely(stop);
       } catch (error) {
         report(error);
       }
     }
     void connect(desktop.onTelemetry(next => {
-      if (!liveRef.current) return;
+      if (cancelled) return;
       eventVersion.current++;
       acceptBatch(next);
     })).then(() => {
-      if (liveRef.current) void pullSnapshot().catch(report);
+      if (!cancelled) void pullSnapshot().catch(report);
     });
     void connect(desktop.onOpenPicker(url => {
-      if (liveRef.current) openAdd({ url: url ?? undefined, autoProbe: Boolean(url) }, true);
+      if (!cancelled) openAdd({ url: url ?? undefined, autoProbe: Boolean(url) }, true);
     }));
     void connect(desktop.onFileDrop(event => {
-      if (!liveRef.current) return;
+      if (cancelled) return;
       if (event.type === "enter") setDragging(event.paths.some(isTorrentSource));
       if (event.type === "leave" || event.type === "drop") setDragging(false);
       if (event.type === "drop") {
@@ -198,7 +341,7 @@ export default function App() {
     }));
     void loadSettings().catch(report);
     return () => {
-      liveRef.current = false;
+      cancelled = true;
       cleanup.forEach(stopSafely);
     };
   }, [acceptBatch, handleDroppedSource, loadSettings, openAdd, pullSnapshot, showError]);
@@ -232,18 +375,17 @@ export default function App() {
       const next = { ...settingsRef.current, ...change };
       await desktop.saveSettings(next);
       settingsRef.current = next;
-      if (liveRef.current) setSettings(next);
+      if (mountedRef.current) setSettings(next);
     }).catch(showError);
   }
 
   const toggleTheme = () => saveAppearance({ theme: theme === "dark" ? "light" : "dark" });
   const toggleAccent = () => saveAppearance({ accent: settings.accent === "blue" ? "mono" : "blue" });
   const closeDialog = useCallback(() => {
-    if (pendingPicker.current) {
-      const pending = pendingPicker.current;
-      pendingPicker.current = undefined;
+    const next = pendingPickers.current.shift();
+    if (next) {
       setDroppedSource(undefined);
-      setOverlay({ type: "add", seed: pending, key: ++modalSequence.current });
+      setOverlay({ type: "add", seed: next, key: ++modalSequence.current });
       return;
     }
     setDroppedSource(undefined);
@@ -273,11 +415,15 @@ export default function App() {
       switch (event.key.toLowerCase()) {
         case "k":
           event.preventDefault();
-          if (!busy) setOverlay(current => current?.type === "palette" ? undefined : { type: "palette" });
+          if (busy) break;
+          if (overlay && overlay.type !== "palette") break;
+          setOverlay(current => current?.type === "palette" ? undefined : { type: "palette" });
           break;
         case "n":
           event.preventDefault();
-          if (!busy) openAdd();
+          if (busy) break;
+          if (overlay && overlay.type !== "palette") break;
+          openAdd();
           break;
         case "i":
           event.preventDefault();
@@ -368,7 +514,7 @@ export default function App() {
           const limit = currentLimit === null ? SPEED_CAP : null;
           await desktop.setSpeedLimit(limit);
           settingsRef.current = { ...settingsRef.current, global_speed_limit_bps: limit };
-          if (liveRef.current) setSettings(settingsRef.current);
+          if (mountedRef.current) setSettings(settingsRef.current);
           await pullSnapshot();
         }).catch(showError)} />
       <div className="main-col">
@@ -380,8 +526,9 @@ export default function App() {
           <TransferList items={items} selected={selected?.id} setSelected={id => { setSelectedId(id); setInspectorOpen(true); }}
             onAction={onTransferAction} view={view} preview={preview} loading={!batch && !notice} />
           {inspectorOpen && <Inspector key={selected?.id} transfer={selected} samples={selected ? history[selected.id] ?? emptySamples : emptySamples}
-            preview={preview} onAction={onTransferAction}
-            onFormat={(probe, format) => openAdd({ url: probe.source_url, probe, format })} />}
+            preview={preview} torrentEntry={selected ? torrentFilesMap[selected.id] : undefined}
+            onLoadTorrentFiles={loadTorrentFiles} onSelectTorrentFile={selectTorrentFile}
+            onAction={onTransferAction} onFormat={(probe, format) => openAdd({ url: probe.source_url, probe, format })} />}
         </div>
       </div>
     </div>
@@ -391,6 +538,14 @@ export default function App() {
     </div>}
     {overlay?.type === "add" && <AddDialog key={overlay.key} seed={overlay.seed} droppedSource={droppedSource} settings={settings} onClose={closeDialog}
       onBusyChange={updateBusy} onAdded={(message, id) => {
+        if (id) {
+          setRemoved(previous => {
+            if (!previous.has(id)) return previous;
+            const next = new Set(previous);
+            next.delete(id);
+            return next;
+          });
+        }
         closeDialog();
         setView("all"); setFilter("All"); setSearch(""); setSelectedId(id);
         notify(message);
@@ -398,11 +553,12 @@ export default function App() {
       }} />}
     {overlay?.type === "settings" && <SettingsDialog settings={{ ...settings, global_speed_limit_bps: speedLimit }}
       loadState={settingsLoadState} loadError={settingsError} onRetryLoad={() => void loadSettings().catch(showError)}
-      onClose={closeDialog} onBusyChange={updateBusy} onHibernate={hibernate} onSave={async next => {
+      onClose={closeDialog} onBusyChange={updateBusy} onHibernate={hibernate} onSave={async patch => {
         await enqueueSettings(async () => {
+          const next = { ...settingsRef.current, ...patch };
           await desktop.saveSettings(next);
           settingsRef.current = next;
-          if (liveRef.current) setSettings(next);
+          if (mountedRef.current) setSettings(next);
         });
         closeDialog();
         notify("Settings saved.");

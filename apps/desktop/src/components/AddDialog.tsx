@@ -47,7 +47,7 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
   const [submitting, setSubmitting] = useState(false);
   const [message, setMessage] = useState("");
   const probeRequest = useRef(0);
-  const probeLock = useRef<{ active: boolean; source: string }>({ active: false, source: "" });
+  const activeProbe = useRef<{ id: number; source: string } | null>(null);
   const submitLock = useRef(false);
   const batchProgress = useRef({ pattern: "", count: 0 });
   const appliedDropSeq = useRef(0);
@@ -67,7 +67,7 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
     setLanguages([]);
     setWildcardUrls([]);
     setProbeBusy(false);
-    probeLock.current = { active: false, source: "" };
+    activeProbe.current = null;
     probeRequest.current++;
     batchProgress.current = { pattern: "", count: 0 };
     const next = value.trim();
@@ -76,9 +76,9 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
   }
 
   async function probeSource(value: string) {
-    if (probeLock.current.active && probeLock.current.source === value) return;
+    if (activeProbe.current?.source === value) return;
     const request = ++probeRequest.current;
-    probeLock.current = { active: true, source: value };
+    activeProbe.current = { id: request, source: value };
     setMessage("");
     setProbeBusy(true);
     try {
@@ -98,8 +98,8 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
     } catch (error) {
       if (request === probeRequest.current) setMessage(errorMessage(error));
     } finally {
-      if (request === probeRequest.current) {
-        probeLock.current = { active: false, source: "" };
+      if (activeProbe.current?.id === request) {
+        activeProbe.current = null;
         setProbeBusy(false);
       }
     }
@@ -108,7 +108,11 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
   useEffect(() => {
     const initial = seed.url?.trim();
     if (seed.autoProbe && initial && !isTorrentSource(initial)) void probeSource(initial);
-    return () => { probeRequest.current++; };
+    return () => {
+      probeRequest.current++;
+      activeProbe.current = null;
+      setProbeBusy(false);
+    };
   }, [seed]);
 
   useEffect(() => {

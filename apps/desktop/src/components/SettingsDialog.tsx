@@ -9,7 +9,7 @@ export type SettingsLoadState = "loading" | "ready" | "error";
 
 export function SettingsDialog({ settings, loadState, loadError, onRetryLoad, onClose, onSave, onHibernate, onBusyChange }: {
   settings: AppSettings; loadState: SettingsLoadState; loadError?: string; onRetryLoad: () => void;
-  onClose: () => void; onSave: (next: AppSettings) => Promise<void>;
+  onClose: () => void; onSave: (patch: Partial<AppSettings>) => Promise<void>;
   onHibernate: () => Promise<void>; onBusyChange: (busy: boolean) => void;
 }) {
   const [draft, setDraft] = useState(settings);
@@ -18,20 +18,25 @@ export function SettingsDialog({ settings, loadState, loadError, onRetryLoad, on
   const [ids, setIds] = useState({ chrome: "", edge: "", firefox: "" });
   const [busy, setBusy] = useState("");
   const busyLock = useRef(false);
+  const dirtyFields = useRef<Set<keyof AppSettings>>(new Set());
   const [message, setMessage] = useState("");
   const [problem, setProblem] = useState("");
   const [toolError, setToolError] = useState("");
 
-  const wasReadyRef = useRef(loadState === "ready");
   useEffect(() => {
-    if (loadState !== "ready") {
-      wasReadyRef.current = false;
-      return;
+    if (loadState !== "ready") return;
+    setDraft(previous => {
+      const merged: AppSettings = { ...previous };
+      for (const key of Object.keys(settings) as Array<keyof AppSettings>) {
+        if (!dirtyFields.current.has(key)) {
+          (merged as Record<keyof AppSettings, unknown>)[key] = settings[key];
+        }
+      }
+      return merged;
+    });
+    if (!dirtyFields.current.has("global_speed_limit_bps")) {
+      setLimit(settings.global_speed_limit_bps === null ? "" : String(settings.global_speed_limit_bps / MB));
     }
-    if (wasReadyRef.current) return;
-    wasReadyRef.current = true;
-    setDraft(settings);
-    setLimit(settings.global_speed_limit_bps === null ? "" : String(settings.global_speed_limit_bps / MB));
   }, [loadState, settings]);
 
   useEffect(() => {
@@ -42,6 +47,7 @@ export function SettingsDialog({ settings, loadState, loadError, onRetryLoad, on
   }, []);
 
   function update<K extends keyof AppSettings>(key: K, value: AppSettings[K]) {
+    dirtyFields.current.add(key);
     setDraft(previous => ({ ...previous, [key]: value }));
   }
 
@@ -82,20 +88,30 @@ export function SettingsDialog({ settings, loadState, loadError, onRetryLoad, on
       if (trimmedLimit !== "") {
         const parsed = Number(trimmedLimit);
         const scaled = parsed * MB;
-        if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isFinite(scaled) || scaled > Number.MAX_SAFE_INTEGER) {
+        const rounded = Math.round(scaled);
+        if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isFinite(scaled) || rounded < 1 || rounded > Number.MAX_SAFE_INTEGER) {
           setProblem("Enter a positive finite speed limit in MB/s, or leave blank for unlimited.");
           return;
         }
-        speedLimitBps = Math.round(scaled);
+        speedLimitBps = rounded;
       }
       if (!Number.isInteger(draft.max_concurrent_downloads) || draft.max_concurrent_downloads < 1 || draft.max_concurrent_downloads > 255) {
         setProblem("Enter a whole number between 1 and 255 for max concurrent downloads.");
         return;
       }
+      const patch: Partial<AppSettings> = {};
+      const normalized: AppSettings = {
+        ...draft,
+        ytdlp_path: draft.ytdlp_path?.trim() || null,
+        ffmpeg_path: draft.ffmpeg_path?.trim() || null,
+        default_download_dir: draft.default_download_dir.trim(),
+        global_speed_limit_bps: speedLimitBps,
+      };
+      for (const key of dirtyFields.current) {
+        (patch as Record<keyof AppSettings, unknown>)[key] = normalized[key];
+      }
       void run("save", async () => {
-        await onSave({ ...draft, ytdlp_path: draft.ytdlp_path?.trim() || null, ffmpeg_path: draft.ffmpeg_path?.trim() || null,
-          default_download_dir: draft.default_download_dir.trim(),
-          global_speed_limit_bps: speedLimitBps });
+        await onSave(patch);
       });
     }}>
       {loadState === "loading" && <p className="field-note" role="status">Loading settings…</p>}
@@ -119,7 +135,10 @@ export function SettingsDialog({ settings, loadState, loadError, onRetryLoad, on
           <label className="field">Max concurrent downloads<input required type="number" min={1} max={255} value={draft.max_concurrent_downloads || ""}
             onChange={event => update("max_concurrent_downloads", Number(event.target.value))} /></label>
           <label className="field full-width">Global speed limit in MB/s<input type="number" min={0} max={9_007_199_254} step="any"
-            placeholder="Unlimited" value={limit} onChange={event => setLimit(event.target.value)} /></label>
+            placeholder="Unlimited" value={limit} onChange={event => {
+              dirtyFields.current.add("global_speed_limit_bps");
+              setLimit(event.target.value);
+            }} /></label>
         </div>
         <div className="settings-switches">
           <Switch label="Hibernate to tray on close" checked={draft.close_to_tray_hibernate} onChange={value => update("close_to_tray_hibernate", value)} />

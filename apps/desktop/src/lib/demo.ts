@@ -35,7 +35,7 @@ function threadMap(threadSize: number, progress: number[], speeds: number[] = []
     const fraction = progress[index] ?? 0;
     const speed = speeds[index - 11] ?? 0;
     return {
-      index, start_byte: threadSize * index, end_byte: threadSize * (index + 1) - 1,
+      index, start_byte: threadSize * index, end_byte: threadSize * (index + 1),
       downloaded_bytes: Math.round(threadSize * fraction), speed_bps: speed * MB,
       state: fraction === 1 ? "completed" : speed ? (index < 13 ? "split" : "active") : "pending",
     };
@@ -174,7 +174,7 @@ function refreshRates(advance = false) {
       status: finished ? "completed" : "active", updated_at: finished ? new Date().toISOString() : transfer.updated_at,
       segments: transfer.segments.map(segment => {
         if (segment.state === "completed" || segment.speed_bps === 0) return segment;
-        const length = segment.end_byte - segment.start_byte + 1;
+        const length = segment.end_byte - segment.start_byte;
         const progress = Math.min(length, segment.downloaded_bytes + (advance ? Math.floor(segment.speed_bps * .06 * scale) : 0));
         return {
           ...segment, downloaded_bytes: progress, speed_bps: progress === length ? 0 : segment.speed_bps,
