@@ -1,3 +1,4 @@
+import { StrictMode } from "react";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -126,11 +127,12 @@ describe("workspace and inspector", () => {
     expect(dialog("Add Download").getByRole("button", { name: /1440p QHD/ })).toHaveAttribute("aria-pressed", "true");
   });
 
-  it("uses the sidebar speed cap and quick transfer controls", async () => {
+  it("uses the sidebar speed cap and quick transfer controls and restores re-added removed torrents", async () => {
     const pause = vi.spyOn(desktop, "pauseTransfer").mockResolvedValue();
     const cancel = vi.spyOn(desktop, "cancelTransfer").mockResolvedValue();
     const reveal = vi.spyOn(desktop, "revealInExplorer").mockResolvedValue();
     const cap = vi.spyOn(desktop, "setSpeedLimit").mockResolvedValue();
+    const addTorrentSpy = vi.spyOn(desktop, "addTorrent").mockResolvedValue("blender");
     const user = await start();
     await user.click(screen.getByRole("button", { name: "Unlimited" }));
     expect(cap).toHaveBeenCalledWith(50_000_000);
@@ -142,9 +144,21 @@ describe("workspace and inspector", () => {
     await user.click(within(row(pdf)).getByRole("button", { name: "Remove" }));
     expect(cancel).toHaveBeenCalledWith("design-pdf", false);
     expect(screen.queryByRole("article", { name: pdf })).not.toBeInTheDocument();
+
+    await user.click(within(row(blender)).getByRole("button", { name: /More actions/ }));
+    await user.click(within(row(blender)).getByRole("button", { name: "Remove" }));
+    expect(cancel).toHaveBeenCalledWith("blender", false);
+    expect(screen.queryByRole("article", { name: blender })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Add" }));
+    const sheet = dialog("Add Download");
+    await user.type(sheet.getByRole("textbox", { name: "Download source" }), "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567");
+    await user.click(sheet.getByRole("button", { name: "Download" }));
+    expect(addTorrentSpy).toHaveBeenCalled();
+    expect(row(blender)).toBeVisible();
   });
 
-  it("handles unassigned segment slots, preserves pending torrent file updates across tabs, and gates http auto-probe", async () => {
+  it("uses exclusive end_byte, preserves pending torrent file updates across Inspector remounts, and clears stale Media state on URL refresh", async () => {
     const latest = demo.snapshot();
     const singleSegHttp = {
       ...latest.transfers[1],
@@ -153,14 +167,22 @@ describe("workspace and inspector", () => {
         {
           index: 0,
           start_byte: 0,
-          end_byte: 5_599_999_999,
-          downloaded_bytes: 3_000_000_000,
+          end_byte: 10,
+          downloaded_bytes: 10,
+          speed_bps: 0,
+          state: "completed" as const,
+        },
+        {
+          index: 1,
+          start_byte: 10,
+          end_byte: 20,
+          downloaded_bytes: 5,
           speed_bps: 12_000_000,
           state: "active" as const,
         },
       ],
     };
-    vi.spyOn(desktop, "getSnapshot").mockResolvedValue({
+    const getSnap = vi.spyOn(desktop, "getSnapshot").mockResolvedValue({
       ...latest,
       transfers: [singleSegHttp, ...latest.transfers.filter(item => item.id !== singleSegHttp.id)],
     });
@@ -174,12 +196,26 @@ describe("workspace and inspector", () => {
 
     await user.click(within(row(ubuntu)).getByRole("button", { name: /Inspect/ }));
     await user.click(inspector().getByRole("tab", { name: "Segments" }));
-    expect(inspector().getAllByText("Idle")).toHaveLength(15);
-    expect(inspector().queryByText("Done")).not.toBeInTheDocument();
+    expect(inspector().getAllByText("Idle")).toHaveLength(14);
+    expect(inspector().getAllByText("Done")).toHaveLength(1);
+    expect(inspector().getByRole("progressbar", { name: "T01 progress" })).toHaveAttribute("aria-valuenow", "100");
 
     await user.click(inspector().getByRole("tab", { name: "Media" }));
     expect(probeSpy).not.toHaveBeenCalled();
-    expect(inspector().getByRole("button", { name: "Probe Media Streams" })).toBeVisible();
+    await user.click(inspector().getByRole("button", { name: "Probe Media Streams" }));
+    expect(await inspector().findByRole("button", { name: /2160p 4K/ })).toBeVisible();
+
+    getSnap.mockResolvedValue({
+      ...latest,
+      transfers: [{ ...singleSegHttp, source_url: "https://releases.ubuntu.com/26.04/refreshed.iso" },
+        ...latest.transfers.filter(item => item.id !== singleSegHttp.id)],
+    });
+    vi.spyOn(desktop, "refreshDownloadUrl").mockResolvedValue();
+    await user.click(inspector().getByRole("button", { name: "Refresh URL" }));
+    const refDlg = dialog("Refresh Expired Link");
+    await user.type(refDlg.getByLabelText("New URL"), "https://releases.ubuntu.com/26.04/refreshed.iso");
+    await user.click(refDlg.getByRole("button", { name: "Refresh URL" }));
+    expect(await inspector().findByRole("button", { name: "Probe Media Streams" })).toBeVisible();
 
     await user.click(within(row(blender)).getByRole("button", { name: /Inspect/ }));
     await user.click(inspector().getByRole("tab", { name: "Torrent Files" }));
@@ -188,7 +224,8 @@ describe("workspace and inspector", () => {
     await user.click(textures);
     expect(selectSpy).toHaveBeenCalledWith("blender", [0, 2, 3]);
 
-    await user.click(inspector().getByRole("tab", { name: "Overview" }));
+    await user.keyboard("{Control>}i{/Control}");
+    await user.keyboard("{Control>}i{/Control}");
     await user.click(inspector().getByRole("tab", { name: "Torrent Files" }));
     expect(listSpy).toHaveBeenCalledTimes(1);
     expect(inspector().getByRole("checkbox", { name: /Studio_Textures/ })).not.toBeChecked();
@@ -422,19 +459,21 @@ describe("appearance, settings and transfer dialogs", () => {
     expect(await screen.findByText("Settings saved.")).toBeVisible();
   });
 
-  it("refreshes a link with optional request fields and reports checksum results", async () => {
+  it("refreshes an HTTP link with optional request fields, excludes Refresh URL on media, and reports checksum results", async () => {
     const refresh = vi.spyOn(desktop, "refreshDownloadUrl").mockResolvedValue();
     const verify = vi.spyOn(desktop, "verifyTransferChecksum").mockResolvedValueOnce(false).mockResolvedValueOnce(true);
     const user = await start();
+    expect(inspector().queryByRole("button", { name: "Refresh URL" })).not.toBeInTheDocument();
+    await user.click(within(row(ubuntu)).getByRole("button", { name: /Inspect/ }));
     await user.click(inspector().getByRole("button", { name: "Refresh URL" }));
     const refreshDialog = dialog("Refresh Expired Link");
-    await user.type(refreshDialog.getByLabelText("New URL"), "https://example.org/new.mp4");
+    await user.type(refreshDialog.getByLabelText("New URL"), "https://example.org/new.iso");
     await user.click(refreshDialog.getByText("Request options"));
     await user.type(refreshDialog.getByLabelText("Referrer"), "https://example.org/");
-    await user.type(refreshDialog.getByLabelText("HTTP headers"), "Accept: video/mp4");
+    await user.type(refreshDialog.getByLabelText("HTTP headers"), "Accept: application/octet-stream");
     await user.click(refreshDialog.getByRole("button", { name: "Refresh URL" }));
-    expect(refresh).toHaveBeenCalledWith({ transfer_id: "alpine", new_url: "https://example.org/new.mp4",
-      headers: { Accept: "video/mp4" }, referrer: "https://example.org/" });
+    expect(refresh).toHaveBeenCalledWith({ transfer_id: "ubuntu", new_url: "https://example.org/new.iso",
+      headers: { Accept: "application/octet-stream" }, referrer: "https://example.org/" });
     expect(await screen.findByText("Download link refreshed.")).toBeVisible();
 
     await user.click(within(row(pdf)).getByRole("button", { name: "SHA-256" }));
@@ -456,7 +495,7 @@ describe("appearance, settings and transfer dialogs", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
-  it("prevents settings overwrite on startup failure and serializes limit + theme updates", async () => {
+  it("prevents settings overwrite on startup failure, rejects fractional-zero limits, clears toast on retry, and preserves queued limit edits", async () => {
     const getSettingsSpy = vi.spyOn(desktop, "getSettings").mockRejectedValue(new Error("Settings unreadable"));
     const saveSpy = vi.spyOn(desktop, "saveSettings").mockResolvedValue();
     const user = await start();
@@ -472,8 +511,9 @@ describe("appearance, settings and transfer dialogs", () => {
     getSettingsSpy.mockResolvedValue({ ...demo.getSettings(), theme: "dark", accent: "blue" });
     await user.click(settingsDlg.getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(settingsDlg.getByRole("button", { name: "Save Settings" })).toBeEnabled());
+    expect(screen.queryByText("Settings unreadable")).not.toBeInTheDocument();
 
-    fireEvent.change(settingsDlg.getByLabelText("Global speed limit in MB/s"), { target: { value: "-5" } });
+    fireEvent.change(settingsDlg.getByLabelText("Global speed limit in MB/s"), { target: { value: "0.0000004" } });
     fireEvent.submit(settingsDlg.getByRole("button", { name: "Save Settings" }).closest("form")!);
     expect(settingsDlg.getByRole("alert")).toHaveTextContent("positive finite speed limit");
     expect(saveSpy).not.toHaveBeenCalled();
@@ -482,52 +522,72 @@ describe("appearance, settings and transfer dialogs", () => {
     let resolveCap!: () => void;
     vi.spyOn(desktop, "setSpeedLimit").mockImplementation(() => new Promise<void>(resolve => { resolveCap = resolve; }));
     await user.click(screen.getByRole("button", { name: "Unlimited" }));
-    await user.click(screen.getByRole("button", { name: "Graphite" }));
-    expect(saveSpy).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    const openSettingsDlg = dialog("Settings & Browser Integration");
+    await user.click(openSettingsDlg.getByRole("switch", { name: "Monitor clipboard" }));
     act(() => resolveCap());
+    await user.click(openSettingsDlg.getByRole("button", { name: "Save Settings" }));
     await waitFor(() => expect(saveSpy).toHaveBeenCalledWith(expect.objectContaining({
-      theme: "light",
+      monitor_clipboard: true,
       global_speed_limit_bps: 50_000_000,
     })));
   });
 
-  it("guards duplicate submits, preserves error/draft across picker & drop, and ignores bracket query params as wildcards", async () => {
+  it("handles StrictMode auto-probe, routes local wildcard torrents vs https .torrent URLs, preserves FIFO pickers, and protects open modals on Ctrl+K/N", async () => {
     let rejectAdd!: (err: Error) => void;
     const httpSpy = vi.spyOn(desktop, "addHttpDownload").mockImplementation(
       () => new Promise<string>((_resolve, reject) => { rejectAdd = reject; }),
     );
+    const torrentSpy = vi.spyOn(desktop, "addTorrent").mockResolvedValue("torrent-id");
     const expandSpy = vi.spyOn(desktop, "expandWildcardUrls");
+    const probeSpy = vi.spyOn(desktop, "probeMedia");
     let dropHandler!: (event: { type: string; paths: string[] }) => void;
     vi.spyOn(desktop, "onFileDrop").mockImplementation(async handler => {
       dropHandler = handler as unknown as typeof dropHandler;
       return () => Promise.reject(new Error("teardown ignored"));
     });
-    const user = await start();
+    const user = userEvent.setup();
+    render(<StrictMode><App /></StrictMode>);
+    await screen.findByRole("progressbar", { name: alpine + " progress" });
+
+    act(() => openPicker(mediaUrl));
+    const probedSheet = dialog("Add Download");
+    expect(await probedSheet.findByRole("button", { name: /2160p 4K/ })).toBeVisible();
+    expect(probeSpy).toHaveBeenCalled();
+    await user.click(probedSheet.getByRole("button", { name: "Cancel" }));
 
     await user.click(screen.getByRole("button", { name: "Add" }));
     const sheet = dialog("Add Download");
-    await user.type(sheet.getByRole("textbox", { name: "Download source" }), "https://api.example.com/items?filter[name]=1");
-    expect(sheet.queryByText("Wildcard Batch Preview")).not.toBeInTheDocument();
-    expect(expandSpy).not.toHaveBeenCalled();
-
+    await user.type(sheet.getByRole("textbox", { name: "Download source" }), "https://example.org/file.torrent");
     await user.clear(sheet.getByLabelText("Save folder"));
     await user.type(sheet.getByLabelText("Save folder"), "E:\\Custom");
     const downloadBtn = sheet.getByRole("button", { name: "Download" });
     fireEvent.click(downloadBtn);
     fireEvent.click(downloadBtn);
     expect(httpSpy).toHaveBeenCalledTimes(1);
+    expect(torrentSpy).not.toHaveBeenCalled();
 
-    act(() => openPicker("https://example.org/queued.mp4"));
+    await user.keyboard("{Control>}k{/Control}");
+    expect(screen.queryByRole("dialog", { name: "Command Palette" })).not.toBeInTheDocument();
+    await user.keyboard("{Control>}n{/Control}");
+    expect(sheet.getByDisplayValue("E:\\Custom")).toBeVisible();
+
+    act(() => openPicker("https://example.org/queued-1.mp4"));
+    act(() => openPicker("https://example.org/queued-2.mp4"));
     act(() => rejectAdd(new Error("Network down")));
     expect(await sheet.findByRole("alert")).toHaveTextContent("Network down");
-    expect(sheet.getByDisplayValue("E:\\Custom")).toBeVisible();
 
-    act(() => dropHandler({ type: "drop", paths: ["D:\\Downloads\\dropped.torrent"] }));
-    expect(sheet.getByRole("textbox", { name: "Download source" })).toHaveValue("D:\\Downloads\\dropped.torrent");
-    expect(sheet.getByDisplayValue("E:\\Custom")).toBeVisible();
+    act(() => dropHandler({ type: "drop", paths: ["C:\\Downloads\\Clip [1-2].torrent"] }));
+    expect(sheet.getByRole("textbox", { name: "Download source" })).toHaveValue("C:\\Downloads\\Clip [1-2].torrent");
+    expect(sheet.queryByText("Wildcard Batch Preview")).not.toBeInTheDocument();
+    expect(expandSpy).not.toHaveBeenCalled();
+    await user.click(sheet.getByRole("button", { name: "Download" }));
+    expect(torrentSpy).toHaveBeenCalledWith(expect.objectContaining({ source: "C:\\Downloads\\Clip [1-2].torrent" }));
 
-    await user.click(sheet.getByRole("button", { name: "Cancel" }));
-    const queuedSheet = await screen.findByRole("dialog", { name: "Add Download" });
-    expect(within(queuedSheet).getByRole("textbox", { name: "Download source" })).toHaveValue("https://example.org/queued.mp4");
+    const firstQueued = await screen.findByRole("dialog", { name: "Add Download" });
+    expect(within(firstQueued).getByRole("textbox", { name: "Download source" })).toHaveValue("https://example.org/queued-1.mp4");
+    await user.click(within(firstQueued).getByRole("button", { name: "Cancel" }));
+    const secondQueued = await screen.findByRole("dialog", { name: "Add Download" });
+    expect(within(secondQueued).getByRole("textbox", { name: "Download source" })).toHaveValue("https://example.org/queued-2.mp4");
   });
 });

@@ -77,14 +77,15 @@ describe("Tauri v2 adapter", () => {
     await emit("slipstream://telemetry", batch);
     await emit("slipstream://open-picker", { url: "magnet:?xt=example" });
     await emit("slipstream://open-picker", { url: null });
+    await emit("slipstream://open-picker", { url: 123 });
     expect(telemetry).toHaveBeenCalledWith(batch);
-    expect(picker.mock.calls).toEqual([["magnet:?xt=example"], [null]]);
+    expect(picker.mock.calls).toEqual([["magnet:?xt=example"], [null], [null]]);
     await offTelemetry();
     await offPicker();
     await emit("slipstream://telemetry", batch);
     await emit("slipstream://open-picker", { url: "https://unused.example.org" });
     expect(telemetry).toHaveBeenCalledOnce();
-    expect(picker).toHaveBeenCalledTimes(2);
+    expect(picker).toHaveBeenCalledTimes(3);
   });
 
   it("guards native window controls and passes native drop paths through", async () => {
