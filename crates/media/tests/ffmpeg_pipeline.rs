@@ -284,6 +284,63 @@ async fn real_ffmpeg_pipeline() {
     assert_eq!(video_streams[0]["disposition"]["attached_pic"], 0);
     assert_eq!(video_streams[1]["disposition"]["attached_pic"], 1);
 
+    // Re-remux an MP4 that already contains an attached_pic stream; -select_streams V
+    // must ignore the prior cover art so the replacement cover stays at v:1.
+    let reembedded = pipeline
+        .remux(
+            &mp4,
+            "reembedded.mp4",
+            MediaContainer::Mp4,
+            &LocalMediaOptions {
+                cover_art: Some(cover.clone()),
+                subtitles: Vec::new(),
+                source_url: Some("https://user:secret@example.com/watch?v=1".into()),
+                ..LocalMediaOptions::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let details = probe(&ffprobe, &["-show_streams"], &reembedded).await;
+    let re_video_streams: Vec<_> = details["streams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|stream| stream["codec_type"] == "video")
+        .collect();
+    assert_eq!(re_video_streams.len(), 2);
+    assert_eq!(re_video_streams[0]["codec_name"], "h264");
+    assert_eq!(re_video_streams[0]["disposition"]["attached_pic"], 0);
+    assert_eq!(re_video_streams[1]["disposition"]["attached_pic"], 1);
+    #[cfg(windows)]
+    {
+        let mut ads = reembedded.as_os_str().to_owned();
+        ads.push(":Zone.Identifier");
+        let marker = fs::read_to_string(PathBuf::from(ads)).unwrap();
+        assert_eq!(
+            marker,
+            "[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=https://example.com/watch?v=1\r\n"
+        );
+    }
+
+    // M4a remux has subtitle_codec == None and maps only 0:a:0 + cover art (v:0).
+    let m4a_cover = pipeline
+        .remux(
+            &input,
+            "cover-only.m4a",
+            MediaContainer::M4a,
+            &LocalMediaOptions {
+                cover_art: Some(cover.clone()),
+                ..LocalMediaOptions::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let details = probe(&ffprobe, &["-show_streams"], &m4a_cover).await;
+    assert_eq!(stream(&details, "audio")["codec_name"], "aac");
+    assert_eq!(stream(&details, "video")["disposition"]["attached_pic"], 1);
+
     let pinned_tools = MediaToolchain::discover_ffmpeg_only(ToolchainConfig {
         ffmpeg_path: Some(ffmpeg_bin.path.clone()),
         expected_ffmpeg_sha256: Some(ffmpeg_bin.sha256.clone()),

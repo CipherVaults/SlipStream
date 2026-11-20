@@ -280,17 +280,15 @@ impl MediaPipeline {
         progress: Option<&Sender<MediaProgressEvent>>,
     ) -> Result<Vec<PathBuf>, MediaError> {
         validate_http_url(&request.url)?;
-        let filename = request
-            .filename
-            .as_deref()
-            .map(sanitize_filename)
-            .transpose()?;
-        if let Some(filename) = filename.as_deref() {
-            validate_filename(filename)?;
-        }
         let playlist = options.playlist || request.playlist_items.is_some();
         let binary = self.tools.require_ytdlp()?;
         let preset = download_audio_preset(request)?;
+        let filename = prevalidate_download_filename(
+            request.filename.as_deref(),
+            preset,
+            request.target_container,
+            playlist,
+        )?;
         let mut builder =
             BuildYtDlpArgs::download(playlist).ffmpeg_location(&self.tools.ffmpeg().path)?;
         if let Some(format) = request
@@ -318,6 +316,7 @@ impl MediaPipeline {
         let stage = Stage::create(&save_dir).await?;
         emit(progress, MediaProgressEvent::Probing).await;
         let probe = crate::probe_url(&self.tools, &request.url, ProbeOptions { playlist }).await?;
+        validate_probe_matches_mode(playlist, &probe, &request.url)?;
         emit(
             progress,
             MediaProgressEvent::Downloading(DownloadProgress::default()),
@@ -479,17 +478,15 @@ impl MediaPipeline {
             }
             args.input(&cover)?;
         }
-        let cover_video_index = if options.cover_art.is_some() {
-            match conversion {
-                Conversion::Remux(_) => match self.tools.ffprobe() {
+        let cover_video_index =
+            if options.cover_art.is_some() && subtitle_codec(container).is_some() {
+                match self.tools.ffprobe() {
                     Some(ffprobe) => count_video_streams(ffprobe, &input).await.unwrap_or(1),
                     None => 1,
-                },
-                Conversion::Audio(_) | Conversion::PcmIntermediate => 0,
-            }
-        } else {
-            0
-        };
+                }
+            } else {
+                0
+            };
         conversion.configure(&mut args, options, cover_video_index);
         options.metadata.apply(&mut args)?;
         if options.normalize_audio {
@@ -601,16 +598,20 @@ impl Conversion {
 }
 
 async fn count_video_streams(ffprobe: &ResolvedBinary, input: &Path) -> Option<usize> {
+    let demuxer = local_demuxer(input).ok()?;
     let mut cmd = command(&ffprobe.path, "ffprobe");
     cmd.args([
         "-v",
         "error",
+        "-f",
+        demuxer,
         "-select_streams",
-        "v",
+        "V",
         "-show_entries",
         "stream=index",
         "-of",
         "csv=p=0",
+        "--",
     ])
     .arg(input);
     let output = crate::toolchain::capture(
@@ -966,6 +967,44 @@ async fn check_destination(save_dir: &Path, path: &Path) -> Result<(), MediaErro
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(MediaError::io("inspect destination", path, err)),
     }
+}
+
+fn prevalidate_download_filename(
+    raw_filename: Option<&str>,
+    preset: Option<AudioPreset>,
+    target_container: Option<MediaContainer>,
+    playlist: bool,
+) -> Result<Option<String>, MediaError> {
+    let Some(raw) = raw_filename else {
+        return Ok(None);
+    };
+    let sanitized = sanitize_filename(raw)?;
+    validate_filename(&sanitized)?;
+    let precheck_ext = preset
+        .map(|p| container_extension(audio_container(p)))
+        .or_else(|| target_container.map(container_extension))
+        .unwrap_or("webm");
+    download_filename(
+        Some(&sanitized),
+        "download",
+        precheck_ext,
+        playlist.then_some(1),
+    )?;
+    Ok(Some(sanitized))
+}
+
+fn validate_probe_matches_mode(
+    playlist: bool,
+    probe: &slipstream_protocol::MediaProbeResult,
+    url: &str,
+) -> Result<(), MediaError> {
+    if !playlist && probe.is_playlist {
+        return Err(MediaError::argument(
+            "playlist URL requires playlist mode",
+            url,
+        ));
+    }
+    Ok(())
 }
 
 fn is_known_media_extension(ext: &str) -> bool {
@@ -1331,6 +1370,46 @@ mod tests {
             }
             .percent(0),
             Some(100.0)
+        );
+    }
+
+    #[test]
+    fn rejects_overlong_download_filename_and_unexpected_playlist() {
+        let too_long = "a".repeat(200);
+        assert!(matches!(
+            prevalidate_download_filename(Some(&too_long), None, None, false),
+            Err(MediaError::Path(
+                slipstream_protocol::PathSecurityError::TooLong
+            ))
+        ));
+        let exact = "a".repeat(196);
+        assert_eq!(
+            prevalidate_download_filename(Some(&exact), None, Some(MediaContainer::Mp4), false)
+                .unwrap()
+                .as_deref(),
+            Some(exact.as_str())
+        );
+
+        let playlist_probe = slipstream_protocol::MediaProbeResult {
+            title: "Playlist".into(),
+            source_url: "https://example.com/playlist?list=PL1".into(),
+            extractor: "youtube:tab".into(),
+            duration_seconds: None,
+            thumbnail_url: None,
+            is_playlist: true,
+            playlist_count: Some(2),
+            formats: Vec::new(),
+            subtitles: Vec::new(),
+        };
+        assert!(matches!(
+            validate_probe_matches_mode(false, &playlist_probe, &playlist_probe.source_url),
+            Err(MediaError::InvalidArgument {
+                kind: "playlist URL requires playlist mode",
+                ..
+            })
+        ));
+        assert!(
+            validate_probe_matches_mode(true, &playlist_probe, &playlist_probe.source_url).is_ok()
         );
     }
 }

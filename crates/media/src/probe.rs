@@ -22,7 +22,9 @@ pub async fn probe_url(
     url: &str,
     options: ProbeOptions,
 ) -> Result<MediaProbeResult, MediaError> {
-    let args = BuildYtDlpArgs::probe(options.playlist).build(url)?;
+    let args = BuildYtDlpArgs::probe(options.playlist)
+        .ffmpeg_location(&tools.ffmpeg().path)?
+        .build(url)?;
     let binary = tools.require_ytdlp()?;
     let mut cmd = command(&binary.path, "yt-dlp");
     cmd.args(args);
@@ -175,13 +177,16 @@ fn parse_format(value: &Value) -> Option<MediaFormatOption> {
     let mut has_audio = audio_codec.is_some()
         || (!acodec_none
             && (value["abr"].as_f64().is_some_and(|abr| abr > 0.0) || has_ext("audio_ext")));
-    if !has_video && !has_audio && !vcodec_none && !acodec_none && !raw_ext.is_empty() {
+    if !has_video && !has_audio && !raw_ext.is_empty() {
         let is_audio_ext = matches!(
             raw_ext.to_ascii_lowercase().as_str(),
             "mp3" | "m4a" | "aac" | "opus" | "ogg" | "oga" | "flac" | "wav" | "mka"
         );
-        has_audio = is_audio_ext;
-        has_video = !is_audio_ext;
+        if is_audio_ext && !acodec_none {
+            has_audio = true;
+        } else if !is_audio_ext && !vcodec_none {
+            has_video = true;
+        }
     }
     if !has_video && !has_audio {
         return None;
@@ -479,6 +484,25 @@ mod tests {
         assert!(generic_direct.formats[0].has_video);
         assert!(!generic_direct.formats[0].is_audio_only);
         assert_eq!(generic_direct.formats[0].label, "Video · MP4");
+        let sparse = parse_ytdlp_probe_json(
+            r#"{"extractor":"youtube","formats":[
+                {"format_id":"140","ext":"m4a","vcodec":"none","acodec":null},
+                {"format_id":"137","ext":"mp4","vcodec":null,"acodec":"none"},
+                {"format_id":"bad-audio","ext":"m4a","vcodec":null,"acodec":"none"},
+                {"format_id":"bad-video","ext":"mp4","vcodec":"none","acodec":"none"}
+            ]}"#,
+            URL,
+        )
+        .unwrap();
+        assert_eq!(sparse.formats.len(), 2);
+        assert!(sparse
+            .formats
+            .iter()
+            .any(|f| f.format_id == "140" && f.is_audio_only && f.has_audio));
+        assert!(sparse
+            .formats
+            .iter()
+            .any(|f| f.format_id == "137" && f.has_video && !f.is_audio_only));
         assert!(parse_ytdlp_probe_json("[]", URL).is_err());
         assert!(parse_ytdlp_probe_json("{}", "file:///clip.mp4").is_err());
     }

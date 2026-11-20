@@ -7,6 +7,8 @@ use crate::MediaError;
 const YTDLP_FLAGS: &[&str] = &[
     "--ignore-config",
     "--no-config-locations",
+    "--no-cache-dir",
+    "--no-exec",
     "--no-warnings",
     "--dump-single-json",
     "--no-playlist",
@@ -48,6 +50,7 @@ const FFMPEG_FLAGS: &[&str] = &[
     "-vn",
     "-af",
     "-f",
+    "--",
 ];
 
 pub(crate) const DOWNLOAD_PROGRESS_PREFIX: &str = "SLIPSTREAM|";
@@ -312,7 +315,13 @@ impl BuildYtDlpArgs {
 
     fn base() -> Self {
         let mut builder = Self { args: Vec::new() };
-        for flag in ["--ignore-config", "--no-config-locations", "--no-warnings"] {
+        for flag in [
+            "--ignore-config",
+            "--no-config-locations",
+            "--no-cache-dir",
+            "--no-exec",
+            "--no-warnings",
+        ] {
             builder.flag(flag);
         }
         builder
@@ -382,6 +391,7 @@ impl BuildFfmpegArgs {
     fn output(mut self, path: &Path, muxer: &'static str) -> Result<Vec<OsString>, MediaError> {
         validate_local_path(path)?;
         self.option("-f", muxer);
+        self.flag("--");
         self.args.push(path.into());
         Ok(self.args)
     }
@@ -582,10 +592,20 @@ mod tests {
                     .windows(2)
                     .any(|pair| pair[0] == flag && pair[1] == expected));
             }
+            for flag in [
+                "--ignore-config",
+                "--no-config-locations",
+                "--no-cache-dir",
+                "--no-exec",
+            ] {
+                assert!(args.iter().any(|arg| arg == flag), "{flag}");
+            }
         }
         assert!(validate_format_id("bestvideo+bestaudio/best").is_ok());
         let probe = BuildYtDlpArgs::probe(true).build(url).unwrap();
         assert!(probe.iter().any(|arg| arg == "--flat-playlist"));
+        assert!(probe.iter().any(|arg| arg == "--no-cache-dir"));
+        assert!(probe.iter().any(|arg| arg == "--no-exec"));
         assert!(!probe.iter().any(|arg| arg == "--no-playlist"));
     }
 
@@ -649,8 +669,8 @@ mod tests {
             .any(|pair| pair == ["-f", "mov", "-i", filename]));
         assert!(args.windows(2).any(|pair| pair == ["-af", LOUDNORM_FILTER]));
         assert_eq!(
-            args[args.len() - 3..],
-            ["-f", "matroska", "東京建築_4K_HDR.mkv"]
+            args[args.len() - 4..],
+            ["-f", "matroska", "--", "東京建築_4K_HDR.mkv"]
         );
         #[cfg(windows)]
         assert!(validate_local_path(Path::new(r"\\?\C:\Downloads\ملف_تجريبي.mp4")).is_ok());

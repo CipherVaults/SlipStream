@@ -292,7 +292,8 @@ pub(crate) fn command(path: &Path, tool: &str) -> Command {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .kill_on_drop(true)
+        .env_remove("FFREPORT");
     if tool == YTDLP.name {
         cmd.env("YTDLP_NO_PLUGINS", "1");
     }
