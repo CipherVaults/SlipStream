@@ -193,7 +193,7 @@ pub(crate) fn validate_output(base: &Path, output: &Path) -> Result<(), TorrentE
     reject_existing_links(output)
 }
 
-fn reject_existing_links(path: &Path) -> Result<(), TorrentError> {
+pub(crate) fn reject_existing_links(path: &Path) -> Result<(), TorrentError> {
     // A symlink or junction already present on disk can also redirect a safe relative path.
     for ancestor in path.ancestors().filter(|path| path.is_absolute()) {
         match fs::symlink_metadata(ancestor) {

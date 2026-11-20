@@ -686,6 +686,54 @@ async fn rejects_oversized_and_non_regular_torrent_sources() {
         Err(TorrentError::Metadata(_))
     ));
 
+    #[cfg(windows)]
+    {
+        let ads_path = format!("{}:stream", oversized_path.display());
+        assert!(matches!(
+            manager
+                .add_torrent(AddTorrentRequest {
+                    source: ads_path,
+                    save_dir: None,
+                    selected_file_indices: None,
+                    sequential: false,
+                })
+                .await,
+            Err(TorrentError::PathSecurity(_))
+        ));
+        assert!(matches!(
+            manager
+                .add_torrent(AddTorrentRequest {
+                    source: "C:relative.torrent".into(),
+                    save_dir: None,
+                    selected_file_indices: None,
+                    sequential: false,
+                })
+                .await,
+            Err(TorrentError::PathSecurity(_))
+        ));
+
+        let real_dir = tempdir().unwrap();
+        let valid_bytes = build_v1_single_file_torrent("ok.bin", b"hello", PIECE as u32).unwrap();
+        fs::write(real_dir.path().join("ok.torrent"), &valid_bytes).unwrap();
+        let junction_path = src_dir.path().join("linked_dir");
+        create_junction(&junction_path, real_dir.path());
+        assert!(matches!(
+            manager
+                .add_torrent(AddTorrentRequest {
+                    source: junction_path
+                        .join("ok.torrent")
+                        .to_string_lossy()
+                        .into_owned(),
+                    save_dir: None,
+                    selected_file_indices: None,
+                    sequential: false,
+                })
+                .await,
+            Err(TorrentError::PathSecurity(_))
+        ));
+        let _ = fs::remove_dir(&junction_path);
+    }
+
     assert!(manager.list_snapshots().is_empty());
     manager.shutdown().await;
 }
@@ -774,4 +822,163 @@ async fn shutdown_preserves_uploads_and_remove_recovers_after_delete_failure() {
     }
 
     leech.shutdown().await;
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remove_rejects_ancestor_junction_without_deleting_outside_file() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let save_dir = tempdir().unwrap();
+    let outside_dir = tempdir().unwrap();
+    let outside_secret = outside_dir.path().join("secret.bin");
+    fs::write(&outside_secret, b"keep-safe").unwrap();
+
+    let payload = b"test-data";
+    let manifest =
+        build_v1_multi_file_torrent("pack", &[("sub/secret.bin", payload)], PIECE as u32).unwrap();
+    let manager = TorrentManager::new(local_config(save_dir.path()))
+        .await
+        .unwrap();
+    let id = manager
+        .add_torrent_bytes(
+            &manifest,
+            TorrentAddOptions {
+                start_paused: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    manager.wait_until_initialized(&id, WAIT).await.unwrap();
+
+    let sub_dir = save_dir.path().join("sub");
+    let target_file = sub_dir.join("secret.bin");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x1 | 0x2)
+        .open(&target_file)
+        .unwrap();
+    // First remove detaches librqbit handle while file stays locked on disk.
+    assert!(manager.remove(&id, true).await.is_err());
+    drop(lock);
+
+    // Swap `save_dir/sub` for a junction pointing to `outside_dir`.
+    fs::remove_file(&target_file).unwrap();
+    fs::remove_dir(&sub_dir).unwrap();
+    create_junction(&sub_dir, outside_dir.path());
+
+    assert!(matches!(
+        manager.remove(&id, true).await,
+        Err(TorrentError::PathSecurity(_))
+    ));
+    assert_eq!(fs::read(&outside_secret).unwrap(), b"keep-safe");
+
+    // Restore a regular file so remove can finish cleanly.
+    fs::remove_dir(&sub_dir).unwrap();
+    manager.remove(&id, true).await.unwrap();
+    manager.shutdown().await;
+}
+
+#[cfg(windows)]
+fn create_junction(junction: &Path, target: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateFileW(
+            lp_file_name: *const u16,
+            dw_desired_access: u32,
+            dw_share_mode: u32,
+            lp_security_attributes: *const std::ffi::c_void,
+            dw_creation_disposition: u32,
+            dw_flags_and_attributes: u32,
+            h_template_file: *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void;
+        fn DeviceIoControl(
+            h_device: *mut std::ffi::c_void,
+            dw_io_control_code: u32,
+            lp_in_buffer: *const std::ffi::c_void,
+            n_in_buffer_size: u32,
+            lp_out_buffer: *mut std::ffi::c_void,
+            n_out_buffer_size: u32,
+            lp_bytes_returned: *mut u32,
+            lp_overlapped: *mut std::ffi::c_void,
+        ) -> i32;
+        fn CloseHandle(h_object: *mut std::ffi::c_void) -> i32;
+    }
+
+    fs::create_dir_all(junction).unwrap();
+    let target_abs = std::path::absolute(target).unwrap();
+    let print_str = target_abs.to_string_lossy();
+    let sub_str = if let Some(rest) = print_str.strip_prefix(r"\\?\") {
+        format!(r"\??\{rest}")
+    } else {
+        format!(r"\??\{print_str}")
+    };
+    let sub_utf16: Vec<u16> = sub_str.encode_utf16().collect();
+    let print_utf16: Vec<u16> = print_str.encode_utf16().collect();
+
+    let sub_bytes = (sub_utf16.len() * 2) as u16;
+    let print_bytes = (print_utf16.len() * 2) as u16;
+    let reparse_data_len = 8u16 + sub_bytes + 2 + print_bytes + 2;
+
+    let mut buf = Vec::with_capacity(8 + reparse_data_len as usize);
+    buf.extend_from_slice(&0xA000_0003u32.to_le_bytes()); // IO_REPARSE_TAG_MOUNT_POINT
+    buf.extend_from_slice(&reparse_data_len.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+    buf.extend_from_slice(&0u16.to_le_bytes()); // SubstituteNameOffset
+    buf.extend_from_slice(&sub_bytes.to_le_bytes());
+    buf.extend_from_slice(&(sub_bytes + 2).to_le_bytes()); // PrintNameOffset
+    buf.extend_from_slice(&print_bytes.to_le_bytes());
+    for unit in &sub_utf16 {
+        buf.extend_from_slice(&unit.to_le_bytes());
+    }
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    for unit in &print_utf16 {
+        buf.extend_from_slice(&unit.to_le_bytes());
+    }
+    buf.extend_from_slice(&0u16.to_le_bytes());
+
+    let wide_junction: Vec<u16> = junction
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide_junction.as_ptr(),
+            0x4000_0000,     // GENERIC_WRITE
+            0x1 | 0x2 | 0x4, // FILE_SHARE_*
+            ptr::null(),
+            3,                         // OPEN_EXISTING
+            0x0200_0000 | 0x0020_0000, // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+            ptr::null_mut(),
+        )
+    };
+    assert_ne!(
+        handle, -1isize as *mut std::ffi::c_void,
+        "CreateFileW failed"
+    );
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            0x0009_00A4, // FSCTL_SET_REPARSE_POINT
+            buf.as_ptr().cast(),
+            buf.len() as u32,
+            ptr::null_mut(),
+            0,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(handle) };
+    assert_ne!(
+        ok,
+        0,
+        "DeviceIoControl FSCTL_SET_REPARSE_POINT failed: {}",
+        std::io::Error::last_os_error()
+    );
 }
