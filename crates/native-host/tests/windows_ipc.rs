@@ -3,7 +3,7 @@
 use slipstream_native_host::{
     framing::{read_frame_async, write_frame_async},
     manifest::{Browser, DEFAULT_FIREFOX_ID},
-    pipe::{DefaultPipeHandler, PipeClient, PipeServer},
+    pipe::{DefaultPipeHandler, PipeClient, PipeRequestHandler, PipeServer, PipeTimeouts},
     registry::{host_key, install_hosts, uninstall_hosts},
     security::{current_user_sid, pipe_name_for_sid, pipe_sddl},
     token::SessionToken,
@@ -259,4 +259,86 @@ fn installs_and_uninstalls_four_isolated_hkcu_keys() {
     for browser in Browser::ALL {
         assert!(registry_path(&host_key(&base.0, browser)).is_none());
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_auth_timeouts_evict_stalled_clients_and_slow_handlers() {
+    struct SlowOrLargeHandler;
+    impl PipeRequestHandler for SlowOrLargeHandler {
+        async fn handle(&self, request: Request) -> Response {
+            match request {
+                Request::Ping => {
+                    tokio::time::sleep(Duration::from_millis(450)).await;
+                    Response::Ack {
+                        ok: true,
+                        message: None,
+                    }
+                }
+                Request::GetStatus => Response::Ack {
+                    ok: true,
+                    message: Some("x".repeat(512 * 1024)),
+                },
+                _ => Response::Error {
+                    code: "unsupported".into(),
+                    message: "unsupported".into(),
+                },
+            }
+        }
+    }
+
+    timeout(Duration::from_secs(10), async {
+        let sid = current_user_sid().unwrap();
+        let pipe_name = format!(
+            "{}.timeout.{}",
+            pipe_name_for_sid(&sid),
+            uuid::Uuid::new_v4()
+        );
+        let directory = TempDirectory::new();
+        let token_path = directory.0.join("session.token");
+        let timeouts = PipeTimeouts {
+            auth: Duration::from_millis(200),
+            read: Duration::from_millis(250),
+            write: Duration::from_millis(150),
+            handler: Duration::from_millis(120),
+        };
+        let server = PipeServer::bind(&pipe_name, &token_path)
+            .unwrap()
+            .with_timeouts(timeouts);
+        let (shutdown, stop) = oneshot::channel::<()>();
+        let task = tokio::spawn(server.run(SlowOrLargeHandler, async {
+            let _ = stop.await;
+        }));
+        let token = SessionToken::read(&token_path).unwrap();
+
+        // 1. Slow handler times out cleanly with request_timeout.
+        let client = PipeClient::connect(&pipe_name, &token, "slow")
+            .await
+            .unwrap();
+        let (client, resp) = client.request(&Request::Ping).await.unwrap();
+        assert!(matches!(
+            resp,
+            Response::Error { code, .. } if code == "request_timeout"
+        ));
+
+        // 2. Idle authenticated client is evicted after read timeout.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let stale = client.request(&Request::Ping).await;
+        assert!(stale.is_err());
+
+        // 3. Unauthenticated silent client is evicted after auth timeout.
+        let mut silent = ClientOptions::new().open(&pipe_name).unwrap();
+        assert!(matches!(
+            read_frame_async::<Response>(&mut silent).await.unwrap(),
+            Some(Response::Error { code, .. }) if code == "authentication_failed"
+        ));
+
+        shutdown.send(()).unwrap();
+        timeout(Duration::from_millis(500), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    })
+    .await
+    .unwrap();
 }

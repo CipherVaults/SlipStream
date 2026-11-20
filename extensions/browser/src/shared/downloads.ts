@@ -51,6 +51,28 @@ export function blockedSite(url: URL | undefined, settings: InterceptionSettings
   return matchesSite(url, settings.excludedSites) || matchesSite(url, settings.mutedSites);
 }
 
+export function canAttributeTab(
+  item: { referrer?: string; incognito?: boolean; cookieStoreId?: string },
+  tab: { url?: string; incognito?: boolean; cookieStoreId?: string } | undefined,
+): boolean {
+  if (!tab) return false;
+  if (typeof item.incognito === "boolean" && typeof tab.incognito === "boolean" && item.incognito !== tab.incognito) {
+    return false;
+  }
+  if (item.cookieStoreId && tab.cookieStoreId && item.cookieStoreId !== tab.cookieStoreId) {
+    return false;
+  }
+  const referrer = httpUrl(item.referrer);
+  const activeOrigin = httpUrl(tab.url)?.origin;
+  return !referrer || activeOrigin === referrer.origin;
+}
+
+export function sameDownloadOrigin(item: { url: string; finalUrl?: string }): boolean {
+  const initial = httpUrl(item.url);
+  const resolved = httpUrl(item.finalUrl || item.url);
+  return Boolean(initial && resolved && initial.origin === resolved.origin);
+}
+
 export function shouldIntercept(
   item: { url: string; finalUrl?: string; filename: string; fileSize: number; referrer?: string },
   settings: InterceptionSettings,

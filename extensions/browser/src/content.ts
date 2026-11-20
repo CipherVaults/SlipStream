@@ -2,14 +2,15 @@ import { extension as api } from "./shared/browser";
 import { blockedSite, defaults, downloadLinks, httpUrl, readSettings } from "./shared/downloads";
 import { createMediaPill } from "./shared/pill";
 import { APPEARANCE_KEY, readAppearance, SETTINGS_KEY, type ActionResult, type BrowserMessage } from "./shared/state";
+import { StreamNavigationState } from "./shared/streams";
 
 const systemTheme = matchMedia("(prefers-color-scheme: dark)");
 const pills = new Map<HTMLVideoElement, ReturnType<typeof createMediaPill>>();
+const navigation = new StreamNavigationState(location.href);
 let appearance = readAppearance(undefined);
 let settings = defaults;
 let scheduled = false;
 let altHeld = false;
-let streamUrl: string | undefined;
 
 function send<T>(message: BrowserMessage): Promise<T> {
   return api.runtime.sendMessage(message);
@@ -43,9 +44,14 @@ document.addEventListener("visibilitychange", () => {
 });
 
 function updateStream(): void {
+  const hrefAtRequest = location.href;
   void send<{ url?: string }>({ kind: "stream" }).then((reply) => {
-    streamUrl = reply?.url;
+    navigation.update(hrefAtRequest, location.href, reply?.url);
   }).catch(() => {});
+}
+
+function syncNavigation(): void {
+  if (navigation.sync(location.href)) updateStream();
 }
 
 api.runtime.onMessage.addListener((message, sender, reply) => {
@@ -58,6 +64,7 @@ updateStream();
 const resizeObserver = new ResizeObserver(schedule);
 
 function layout(): void {
+  syncNavigation();
   const page = httpUrl(location.href);
   const enabled = page && !blockedSite(page, settings);
   for (const [video, pill] of pills) {
@@ -87,7 +94,7 @@ function layout(): void {
       pill = createMediaPill(document, async (action, event) => {
         if (!event.isTrusted) return { ok: false };
         // Adaptive video elements often use blob: URLs. Recover the HTTP manifest observed in that tab.
-        const url = httpUrl(video.currentSrc || video.src)?.href ?? streamUrl ?? location.href;
+        const url = navigation.resolveTarget(video.currentSrc || video.src, location.href);
         return send<ActionResult>({ kind: "media", action, url, links: action === "links" ? collectLinks() : undefined });
       });
       pills.set(video, pill);
@@ -113,6 +120,14 @@ function schedule(): void {
 new MutationObserver(schedule).observe(document.documentElement, { childList: true, subtree: true });
 addEventListener("scroll", schedule, { capture: true, passive: true });
 addEventListener("resize", schedule);
+addEventListener("popstate", () => {
+  syncNavigation();
+  schedule();
+});
+addEventListener("hashchange", () => {
+  syncNavigation();
+  schedule();
+});
 document.addEventListener("fullscreenchange", schedule);
 document.addEventListener("loadedmetadata", schedule, true);
 systemTheme.addEventListener("change", schedule);

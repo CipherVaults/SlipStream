@@ -56,6 +56,24 @@ export class NativeClient {
     }
   }
 
+  wake(): void {
+    if (!this.port) {
+      if (this.retryTimer !== undefined) {
+        clearTimeout(this.retryTimer);
+        this.retryTimer = undefined;
+      }
+      this.start();
+      return;
+    }
+    const statusQueued = this.pending?.request.type === "get_status"
+      || this.queue.some((entry) => entry.request.type === "get_status");
+    if (!statusQueued) {
+      clearTimeout(this.pollTimer);
+      this.pollTimer = undefined;
+      void this.poll();
+    }
+  }
+
   send(request: NativeBridgeRequest): Promise<NativeBridgeResponse> {
     if (!this.state.connected) return Promise.resolve(disconnected);
     return this.enqueue(request);

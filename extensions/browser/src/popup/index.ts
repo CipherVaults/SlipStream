@@ -2,7 +2,7 @@ import type { TransferSnapshot } from "@slipstream/ipc-types";
 import { extension as api } from "../shared/browser";
 import { readSettings } from "../shared/downloads";
 import {
-  applyAppearance, emptyState, formatSpeed, ratio, readState, SETTINGS_KEY, STATE_KEY,
+  applyAppearance, emptyState, formatSpeed, isRefreshableHttpTransfer, ratio, readState, SETTINGS_KEY, STATE_KEY,
   type ActionResult, type BridgeState, type BrowserMessage, type PopupAction,
 } from "../shared/state";
 import "../shared/theme.css";
@@ -99,7 +99,7 @@ function render(): void {
   badge.dataset.connected = String(state.connected);
   const items = state.batch?.transfers ?? [];
   if (refreshId) {
-    const eligible = items.filter(({ kind, status }) => kind === "http" && !["completed", "canceled"].includes(status));
+    const eligible = items.filter(isRefreshableHttpTransfer);
     const signature = JSON.stringify(eligible.map(({ id, filename }) => [id, filename]));
     if (refreshOptions !== signature) {
       const selected = refreshSelect.value;
@@ -139,6 +139,12 @@ void api.storage.session.get(STATE_KEY).then((values) => {
   state = readState(values[STATE_KEY]);
   render();
 }).catch(render);
+void api.runtime.sendMessage({ kind: "wake" } satisfies BrowserMessage).then((reply?: { ok?: boolean; state?: unknown }) => {
+  if (reply?.state) {
+    state = readState(reply.state);
+    render();
+  }
+}).catch(() => {});
 
 if (refreshId) {
   element("dashboard").hidden = true;

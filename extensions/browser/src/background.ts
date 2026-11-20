@@ -1,10 +1,16 @@
 import type { NativeBridgeRequest, NativeBridgeResponse } from "@slipstream/ipc-types";
 import { extension as api } from "./shared/browser";
-import { blockedSite, defaults, downloadLinks, httpUrl, magnetUri, matchesSite, readSettings, safeFilename, shouldIntercept, type InterceptionSettings } from "./shared/downloads";
+import {
+  blockedSite, canAttributeTab, defaults, downloadLinks, httpUrl, magnetUri, matchesSite,
+  readSettings, safeFilename, sameDownloadOrigin, shouldIntercept, type InterceptionSettings,
+} from "./shared/downloads";
 import { NativeClient } from "./shared/native";
 import { ObservedNetwork } from "./shared/network";
-import { APPEARANCE_KEY, readState, SETTINGS_KEY, STATE_KEY, type ActionResult, type BrowserMessage, type MediaAction } from "./shared/state";
-import { isMediaStream, mediaMime } from "./shared/streams";
+import {
+  APPEARANCE_KEY, isRefreshableHttpTransfer, readState, SETTINGS_KEY, STATE_KEY,
+  type ActionResult, type BrowserMessage, type MediaAction,
+} from "./shared/state";
+import { isMediaStream, mediaMime, selectPillFormatId } from "./shared/streams";
 
 const popupUrl = api.runtime.getURL("popup.html");
 const refreshKey = (id: string) => "refresh:" + id;
@@ -98,23 +104,29 @@ api.downloads.onCreated.addListener((item) => {
       api.downloads.search({ id: item.id }),
     ]);
     if (!current || current.state !== "in_progress" || current.paused) return;
-    const referrer = httpUrl(current.referrer);
-    const activeOrigin = httpUrl(active?.url)?.origin;
-    const tab = !referrer || activeOrigin === referrer.origin ? active : undefined;
+    const downloadContext = current as typeof current & { cookieStoreId?: string };
+    const tabContext = active as (typeof active & { cookieStoreId?: string }) | undefined;
+    const tab = canAttributeTab(downloadContext, tabContext) ? active : undefined;
     if (!shouldIntercept(current, settings, {
       connected: native.state.connected,
       altHeld: tab?.id !== undefined && heldAlt.has(tab.id),
       tabUrl: tab?.url,
     })) return;
-    // A tab-less download cannot be attributed to an observed authenticated request.
-    const sourceTab = referrer ? tab : undefined;
+    // A tab-less or cross-origin redirected download cannot carry the previous origin's headers.
+    const sourceTab = httpUrl(current.referrer) && sameDownloadOrigin(current) ? tab : undefined;
     const response = await handoffHttp(current.finalUrl || current.url, sourceTab, safeFilename(current.filename));
     if (response.type === "transfer_created") await api.downloads.cancel(item.id);
   })().catch(report);
 });
 
-function result(response: NativeBridgeResponse): ActionResult {
+function result(
+  response: NativeBridgeResponse,
+  expected: ReadonlyArray<NativeBridgeResponse["type"]> = ["ack", "transfer_created"],
+): ActionResult {
   if (response.type === "error") return { ok: false, message: response.message };
+  if (!expected.includes(response.type)) {
+    return { ok: false, message: "Unexpected response from SlipStream." };
+  }
   if (response.type === "ack") return { ok: response.ok, message: response.message ?? undefined };
   return { ok: true };
 }
@@ -154,7 +166,7 @@ async function mediaAction(action: MediaAction, source: string, links: unknown[]
   const observed = network.stream(tab.id!, tab.url);
   const url = candidate?.href ?? observed?.url ?? page.href;
   if (blockedSite(httpUrl(url), settings)) return { ok: false, message: "SlipStream is disabled for this site." };
-  if (action === "picker") return result(await native.send({ type: "open_desktop_window", open_picker_url: url }));
+  if (action === "picker") return result(await native.send({ type: "open_desktop_window", open_picker_url: url }), ["ack"]);
 
   const audio = action === "mp3_320" || action === "flac" ? action : undefined;
   let formatId: string | undefined;
@@ -162,10 +174,9 @@ async function mediaAction(action: MediaAction, source: string, links: unknown[]
     const expectedHeight = action === "4k" ? 2160 : 1080;
     const response = await native.send({ type: "probe_media", url });
     if (response.type !== "media_probed") {
-      return response.type === "error" ? result(response) : { ok: false, message: "SlipStream returned no formats." };
+      return response.type === "error" ? result(response, ["media_probed"]) : { ok: false, message: "SlipStream returned no formats." };
     }
-    const formats = response.probe.formats.filter((format) => format.has_video && format.height === expectedHeight);
-    formatId = (formats.find((format) => format.has_audio) ?? formats[0])?.format_id;
+    formatId = selectPillFormatId(response.probe, expectedHeight);
     if (!formatId) return { ok: false, message: "That quality is unavailable. Open the format picker for more options." };
   }
   return result(await native.send({
@@ -174,7 +185,7 @@ async function mediaAction(action: MediaAction, source: string, links: unknown[]
       url, format_id: formatId, audio_only_preset: audio,
       embed_subtitles_langs: [], lossless_remux: !audio, normalize_audio: false,
     },
-  }));
+  }), ["transfer_created", "ack"]);
 }
 
 const actions = new Set<MediaAction>(["4k", "1080p", "mp3_320", "flac", "picker", "mute", "links"]);
@@ -198,6 +209,11 @@ api.runtime.onMessage.addListener((message: BrowserMessage, sender, reply) => {
   }
 
   const fromPopup = sender.url?.split(/[?#]/, 1)[0] === popupUrl;
+  if (fromPopup && message.kind === "wake") {
+    native.wake();
+    reply({ ok: true, state: native.state });
+    return;
+  }
   let response: Promise<ActionResult> | undefined;
   if (message.kind === "media" && hasPage && actions.has(message.action) && typeof message.url === "string") {
     response = settingsReady.then(() => mediaAction(
@@ -206,10 +222,10 @@ api.runtime.onMessage.addListener((message: BrowserMessage, sender, reply) => {
   } else if (fromPopup && message.kind === "desktop") {
     const request = message.request;
     if (request?.type === "open_desktop_window") {
-      response = native.send({ type: request.type }).then(result);
+      response = native.send({ type: request.type }).then((res) => result(res, ["ack"]));
     } else if ((request?.type === "pause_transfer" || request?.type === "resume_transfer")
       && typeof request.transfer_id === "string") {
-      response = native.send({ type: request.type, transfer_id: request.transfer_id }).then(result);
+      response = native.send({ type: request.type, transfer_id: request.transfer_id }).then((res) => result(res, ["ack"]));
     }
   } else if (fromPopup && message.kind === "save-settings") {
     response = updateSettings(() => readSettings(message.settings)).then(() => ({ ok: true, message: "Settings saved." }));
@@ -228,13 +244,13 @@ async function refreshDownload(id: string, transferId: string): Promise<ActionRe
   const key = refreshKey(id);
   const entry = (await api.storage.session.get(key))[key] as RefreshIntent | undefined;
   if (!entry || Date.now() > entry.expires) return { ok: false, message: "This refresh link expired. Open it again from the context menu." };
-  const transfer = native.state.batch?.transfers.find((transfer) => transfer.id === transferId && transfer.kind === "http");
-  if (!transfer) return { ok: false, message: "Select an HTTP transfer to refresh." };
+  const transfer = native.state.batch?.transfers.find((item) => item.id === transferId && isRefreshableHttpTransfer(item));
+  if (!transfer) return { ok: false, message: "Select an active or failed HTTP transfer to refresh." };
   const tab = entry.tabId === undefined ? undefined : await api.tabs.get(entry.tabId).catch(() => undefined);
   const headers = entry.origin === httpUrl(tab?.url)?.origin ? network.headers(tab?.id, entry.url, tab?.url) : {};
   const response = result(await native.send({ type: "refresh_download_url", request: {
     transfer_id: transferId, new_url: entry.url, headers, referrer: headers.Referer,
-  } }));
+  } }), ["ack"]);
   if (response.ok) await api.storage.session.remove(key);
   return response;
 }

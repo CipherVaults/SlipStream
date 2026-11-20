@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+// @vitest-environment-options { "url": "https://media.example/watch?v=1" }
 import type { NativeBridgeRequest, NativeBridgeResponse, TransferSnapshot } from "@slipstream/ipc-types";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import popupHtml from "../../popup.html?raw";
@@ -189,6 +190,31 @@ describe("NativeClient reconnect and polling", () => {
     vi.advanceTimersByTime(500);
     expect(ports).toHaveLength(2);
     expect(ports[1].posted[0]).toEqual({ type: "get_status" });
+
+    // wake() cancels remaining backoff when disconnected and refreshes immediately when connected.
+    ports[1].emitDisconnect();
+    expect(ports).toHaveLength(2);
+    client.wake();
+    expect(ports).toHaveLength(3);
+    expect(ports[2].posted[0]).toEqual({ type: "get_status" });
+
+    ports[2].emitMessage({
+      type: "status",
+      theme: "dark",
+      accent: "blue",
+      batch: {
+        aggregate_down_bps: 0,
+        aggregate_up_bps: 0,
+        active_count: 0,
+        active_threads: 0,
+        speed_limit_bps: null,
+        transfers: [],
+        timestamp: "2026-11-20T00:00:01Z",
+      },
+    });
+    await Promise.resolve();
+    client.wake();
+    expect(ports[2].posted.filter((req) => req.type === "get_status")).toHaveLength(2);
   });
 });
 
@@ -255,9 +281,69 @@ describe("toolbar popup", () => {
     openBtn.click();
     await Promise.resolve();
     await Promise.resolve();
+    expect(sent[0]).toEqual({ kind: "wake" });
     expect(sent).toContainEqual({
       kind: "desktop",
       request: { type: "open_desktop_window" },
     });
+  });
+});
+
+describe("SPA navigation stream cache invalidation", () => {
+  it("clears stale streamUrl and refreshes on SPA navigation before dispatching", async () => {
+    vi.resetModules();
+    const sent: unknown[] = [];
+    let currentStream: string | undefined = "https://cdn.example/video-1.m3u8";
+    const storageListeners: Array<(...args: unknown[]) => void> = [];
+    (globalThis as Record<string, unknown>).ResizeObserver = class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    };
+    Object.defineProperty(window, "matchMedia", {
+      writable: true,
+      value: vi.fn(() => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() })),
+    });
+    window.history.replaceState({}, "", "/watch?v=1");
+    (globalThis as Record<string, unknown>).chrome = {
+      runtime: {
+        id: "ext-test-id",
+        sendMessage: vi.fn(async (msg: { kind?: string }) => {
+          sent.push(msg);
+          if (msg.kind === "stream") return { url: currentStream };
+          return { ok: true };
+        }),
+        onMessage: { addListener: vi.fn() },
+      },
+      storage: {
+        local: { get: vi.fn(async () => ({})) },
+        onChanged: { addListener: vi.fn((fn: (...args: unknown[]) => void) => storageListeners.push(fn)) },
+      },
+    };
+    const attachShadow = vi.spyOn(Element.prototype, "attachShadow");
+    const video = document.createElement("video");
+    Object.defineProperty(video, "getBoundingClientRect", {
+      value: () => ({ left: 0, top: 0, right: 640, bottom: 360, width: 640, height: 360 }),
+    });
+    document.body.append(video);
+
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      cb(0);
+      return 1;
+    });
+    await import("../content");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(attachShadow).toHaveBeenCalledWith({ mode: "closed" });
+    currentStream = undefined;
+    window.history.pushState({}, "", "/watch?v=2");
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sent.filter((msg) => typeof msg === "object" && msg !== null && (msg as { kind?: string }).kind === "stream")).toHaveLength(2);
+    delete (globalThis as Record<string, unknown>).ResizeObserver;
+    vi.unstubAllGlobals();
   });
 });

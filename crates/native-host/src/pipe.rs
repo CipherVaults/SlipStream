@@ -16,6 +16,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite},
     net::windows::named_pipe::{ClientOptions, NamedPipeClient, NamedPipeServer},
     sync::watch,
     task::JoinSet,
@@ -36,9 +37,31 @@ use windows_sys::Win32::{
 };
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+const IO_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
+const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 const CONCURRENT_CLIENTS: usize = 64;
+
+#[derive(Debug, Clone, Copy)]
+pub struct PipeTimeouts {
+    pub auth: Duration,
+    pub read: Duration,
+    pub write: Duration,
+    pub handler: Duration,
+}
+
+impl Default for PipeTimeouts {
+    fn default() -> Self {
+        Self {
+            auth: AUTH_TIMEOUT,
+            read: IDLE_READ_TIMEOUT,
+            write: IO_WRITE_TIMEOUT,
+            handler: HANDLER_TIMEOUT,
+        }
+    }
+}
 
 pub fn error_response(code: &str, message: &str) -> NativeBridgeResponse {
     NativeBridgeResponse::Error {
@@ -121,6 +144,7 @@ pub struct PipeServer {
     sid: String,
     listener: NamedPipeServer,
     token: Arc<SessionToken>,
+    timeouts: PipeTimeouts,
 }
 
 impl PipeServer {
@@ -136,7 +160,13 @@ impl PipeServer {
             sid,
             listener,
             token: Arc::new(token),
+            timeouts: PipeTimeouts::default(),
         })
+    }
+
+    pub fn with_timeouts(mut self, timeouts: PipeTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
     }
 
     pub async fn run(
@@ -164,7 +194,13 @@ impl PipeServer {
                         Err(error) => break Err(error),
                     };
                     let client = std::mem::replace(&mut self.listener, next);
-                    clients.spawn(serve_client(client, self.token.clone(), handler.clone(), stop.subscribe()));
+                    clients.spawn(serve_client(
+                        client,
+                        self.token.clone(),
+                        handler.clone(),
+                        stop.subscribe(),
+                        self.timeouts,
+                    ));
                 }
             }
         };
@@ -182,15 +218,26 @@ impl PipeServer {
 }
 
 async fn serve_client(
-    mut stream: NamedPipeServer,
+    stream: NamedPipeServer,
+    token: Arc<SessionToken>,
+    handler: Arc<impl PipeRequestHandler>,
+    stop: watch::Receiver<bool>,
+    timeouts: PipeTimeouts,
+) {
+    serve_stream(stream, token, handler, stop, timeouts).await;
+}
+
+async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
     token: Arc<SessionToken>,
     handler: Arc<impl PipeRequestHandler>,
     mut stop: watch::Receiver<bool>,
+    timeouts: PipeTimeouts,
 ) {
     let first = tokio::select! {
         biased;
         _ = stop.changed() => return,
-        first = timeout(AUTH_TIMEOUT, read_frame_async::<NativeBridgeRequest>(&mut stream)) => first,
+        first = timeout(timeouts.auth, read_frame_async::<NativeBridgeRequest>(&mut stream)) => first,
     };
     let (authenticated, response) = match first {
         Ok(Ok(Some(NativeBridgeRequest::Authenticate {
@@ -214,7 +261,10 @@ async fn serve_client(
         reject(stream, response).await;
         return;
     }
-    if write_frame_async(&mut stream, &response).await.is_err() {
+    if !matches!(
+        timeout(timeouts.write, write_frame_async(&mut stream, &response)).await,
+        Ok(Ok(()))
+    ) {
         return;
     }
 
@@ -222,24 +272,20 @@ async fn serve_client(
         let request = tokio::select! {
             biased;
             _ = stop.changed() => return,
-            request = read_frame_async::<NativeBridgeRequest>(&mut stream) => request,
+            request = timeout(timeouts.read, read_frame_async::<NativeBridgeRequest>(&mut stream)) => request,
         };
-        let response = match request {
-            Ok(Some(NativeBridgeRequest::Authenticate { .. })) => error_response(
-                "already_authenticated",
-                "Connection is already authenticated",
-            ),
-            Ok(Some(request)) => handler.handle(request).await,
-            Ok(None) => return,
-            Err(error)
+        let request = match request {
+            Ok(Ok(Some(request))) => request,
+            Ok(Ok(None)) | Err(_) => return,
+            Ok(Err(error))
                 if matches!(
                     error.kind(),
                     io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
                 ) =>
             {
-                return
+                return;
             }
-            Err(_) => {
+            Ok(Err(_)) => {
                 reject(
                     stream,
                     error_response("invalid_frame", "Invalid native messaging frame"),
@@ -248,26 +294,45 @@ async fn serve_client(
                 return;
             }
         };
-        match write_frame_async(&mut stream, &response).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+        let response = match request {
+            NativeBridgeRequest::Authenticate { .. } => error_response(
+                "already_authenticated",
+                "Connection is already authenticated",
+            ),
+            request => {
+                let handled = tokio::select! {
+                    biased;
+                    _ = stop.changed() => return,
+                    handled = timeout(timeouts.handler, handler.handle(request)) => handled,
+                };
+                match handled {
+                    Ok(response) => response,
+                    Err(_) => error_response("request_timeout", "Daemon request timed out"),
+                }
+            }
+        };
+        match timeout(timeouts.write, write_frame_async(&mut stream, &response)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if error.kind() == io::ErrorKind::InvalidData => {
                 let response = error_response(
                     "response_too_large",
                     "Response exceeds the native messaging limit",
                 );
-                if write_frame_async(&mut stream, &response).await.is_err() {
+                if !matches!(
+                    timeout(timeouts.write, write_frame_async(&mut stream, &response)).await,
+                    Ok(Ok(()))
+                ) {
                     return;
                 }
             }
-            Err(_) => return,
+            Ok(Err(_)) | Err(_) => return,
         }
     }
 }
 
-async fn reject(mut stream: NamedPipeServer, response: NativeBridgeResponse) {
+async fn reject<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, response: NativeBridgeResponse) {
     // Let the peer read the error before closing the Windows pipe instance.
     let _ = timeout(Duration::from_millis(300), async {
-        use tokio::io::AsyncReadExt;
         write_frame_async(&mut stream, &response).await?;
         let _ = stream.read(&mut [0]).await?;
         Ok::<_, io::Error>(())
@@ -344,4 +409,52 @@ async fn exchange(
     read_frame_async(stream)
         .await?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "pipe disconnected"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stalled_write_times_out_and_releases_stream() {
+        let token = Arc::new(SessionToken::generate().unwrap());
+        let handler = Arc::new(DefaultPipeHandler);
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let timeouts = PipeTimeouts {
+            auth: Duration::from_millis(200),
+            read: Duration::from_millis(200),
+            write: Duration::from_millis(50),
+            handler: Duration::from_millis(200),
+        };
+        // 64-byte duplex buffer stalls any response larger than 64 bytes if the peer stops reading.
+        let (server_io, mut client_io) = tokio::io::duplex(64);
+        let server_task = tokio::spawn(serve_stream(
+            server_io,
+            token.clone(),
+            handler,
+            stop_rx,
+            timeouts,
+        ));
+
+        let auth = NativeBridgeRequest::Authenticate {
+            token: token.as_str().to_owned(),
+            client_id: "stalled-writer".into(),
+        };
+        write_frame_async(&mut client_io, &auth).await.unwrap();
+        assert!(matches!(
+            read_frame_async::<NativeBridgeResponse>(&mut client_io)
+                .await
+                .unwrap(),
+            Some(NativeBridgeResponse::Ack { ok: true, .. })
+        ));
+
+        // Request Status (>64 bytes) and deliberately never read from client_io.
+        write_frame_async(&mut client_io, &NativeBridgeRequest::GetStatus)
+            .await
+            .unwrap();
+        timeout(Duration::from_millis(400), server_task)
+            .await
+            .expect("server task should exit promptly after write timeout")
+            .unwrap();
+    }
 }

@@ -1,4 +1,4 @@
-import type { AccentMode, NativeBridgeResponse, TelemetryBatch, ThemeMode } from "@slipstream/ipc-types";
+import type { AccentMode, NativeBridgeResponse, TelemetryBatch, ThemeMode, TransferSnapshot } from "@slipstream/ipc-types";
 import type { InterceptionSettings } from "./downloads";
 
 export type Status = Extract<NativeBridgeResponse, { type: "status" }>;
@@ -34,10 +34,15 @@ export type PopupAction =
 export type BrowserMessage =
   | { kind: "alt"; held: boolean }
   | { kind: "stream" }
+  | { kind: "wake" }
   | { kind: "media"; action: MediaAction; url: string; links?: string[] }
   | { kind: "desktop"; request: PopupAction }
   | { kind: "save-settings"; settings: InterceptionSettings }
   | { kind: "refresh"; id: string; transferId: string };
+
+export function isRefreshableHttpTransfer(transfer: Pick<TransferSnapshot, "kind" | "status">): boolean {
+  return transfer.kind === "http" && transfer.status !== "completed" && transfer.status !== "canceled";
+}
 
 export interface ActionResult {
   ok: boolean;
