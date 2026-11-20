@@ -82,7 +82,7 @@ pub fn validate_safe_filename_component(raw: &str) -> Result<&str, PathSecurityE
     if raw == "." || raw == ".." {
         return Err(PathSecurityError::Traversal);
     }
-    if raw.bytes().len() > MAX_FILENAME_BYTES {
+    if raw.len() > MAX_FILENAME_BYTES {
         return Err(PathSecurityError::TooLong);
     }
     if raw.ends_with('.') || raw.ends_with(' ') || raw.starts_with(' ') {
@@ -136,7 +136,10 @@ pub fn sanitize_filename(raw: &str) -> Result<String, PathSecurityError> {
     if trimmed == "." || trimmed == ".." {
         return Err(PathSecurityError::Traversal);
     }
-    if trimmed.chars().any(|c| c.is_control() || is_windows_forbidden_char(c)) {
+    if trimmed
+        .chars()
+        .any(|c| c.is_control() || is_windows_forbidden_char(c))
+    {
         return Err(PathSecurityError::InvalidCharacter);
     }
     if is_reserved_windows_device(trimmed) {
@@ -150,7 +153,10 @@ pub fn sanitize_filename(raw: &str) -> Result<String, PathSecurityError> {
 
 /// Converts a human media/page title into a safe Windows filename with the requested extension.
 /// Unlike `sanitize_filename`, punctuation like `:` or `/` in video titles is replaced cleanly.
-pub fn sanitize_title_to_filename(title: &str, extension: &str) -> Result<String, PathSecurityError> {
+pub fn sanitize_title_to_filename(
+    title: &str,
+    extension: &str,
+) -> Result<String, PathSecurityError> {
     let ext = validate_safe_filename_component(extension.trim_start_matches('.'))?;
     let mut cleaned = String::with_capacity(title.len());
     for ch in title.chars() {
@@ -414,22 +420,36 @@ mod tests {
         assert!(validate_http_url("javascript:alert(1)").is_err());
         assert!(validate_http_url("smb://10.0.0.1/share/x").is_err());
 
-        assert!(is_private_or_loopback_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
-        assert!(is_private_or_loopback_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 5, 2))));
-        assert!(is_private_or_loopback_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))));
-        assert!(is_private_or_loopback_ip(IpAddr::V4(Ipv4Addr::new(100, 64, 1, 1))));
+        assert!(is_private_or_loopback_ip(IpAddr::V4(Ipv4Addr::new(
+            127, 0, 0, 1
+        ))));
+        assert!(is_private_or_loopback_ip(IpAddr::V4(Ipv4Addr::new(
+            10, 0, 5, 2
+        ))));
+        assert!(is_private_or_loopback_ip(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 169, 254
+        ))));
+        assert!(is_private_or_loopback_ip(IpAddr::V4(Ipv4Addr::new(
+            100, 64, 1, 1
+        ))));
         assert!(is_private_or_loopback_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
         assert!(is_private_or_loopback_ip(IpAddr::V6(
             "::ffff:127.0.0.1".parse().unwrap()
         )));
-        assert!(!is_private_or_loopback_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+        assert!(!is_private_or_loopback_ip(IpAddr::V4(Ipv4Addr::new(
+            1, 1, 1, 1
+        ))));
     }
 
     #[test]
     fn validates_magnet_uris() {
-        let valid = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Blender+Assets";
+        let valid =
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Blender+Assets";
         let meta = validate_magnet_uri(valid).unwrap();
-        assert_eq!(meta.info_hash_hex, "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(
+            meta.info_hash_hex,
+            "0123456789abcdef0123456789abcdef01234567"
+        );
         assert_eq!(meta.display_name.as_deref(), Some("Blender Assets"));
 
         assert!(validate_magnet_uri("magnet:?xt=urn:btih:invalid").is_err());
