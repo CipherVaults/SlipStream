@@ -100,7 +100,11 @@ describe("download interception", () => {
 
   it("rejects incognito, container, and cross-origin redirect header attribution", () => {
     expect(canAttributeTab({ referrer: "https://source.example/p", incognito: true }, { url: "https://source.example/p", incognito: false })).toBe(false);
+    expect(canAttributeTab({ referrer: "https://source.example/p", incognito: true }, { url: "https://source.example/p" })).toBe(false);
+    expect(canAttributeTab({ referrer: "https://source.example/p" }, { url: "https://source.example/p", incognito: false })).toBe(false);
     expect(canAttributeTab({ referrer: "https://source.example/p", cookieStoreId: "firefox-container-1" }, { url: "https://source.example/p", cookieStoreId: "firefox-default" })).toBe(false);
+    expect(canAttributeTab({ referrer: "https://source.example/p", cookieStoreId: "firefox-default" }, { url: "https://source.example/p" })).toBe(false);
+    expect(canAttributeTab({ referrer: "https://source.example/p" }, { url: "https://source.example/p", cookieStoreId: "firefox-default" })).toBe(false);
     expect(canAttributeTab({ referrer: "https://source.example/p", incognito: true, cookieStoreId: "firefox-container-1" }, { url: "https://source.example/p", incognito: true, cookieStoreId: "firefox-container-1" })).toBe(true);
     expect(sameDownloadOrigin({ url: "https://source.example/start", finalUrl: "https://cdn.example/file.zip" })).toBe(false);
     expect(sameDownloadOrigin({ url: "https://source.example/start", finalUrl: "https://source.example/file.zip" })).toBe(true);
@@ -138,6 +142,18 @@ describe("adaptive pill format selection and TTL cache eviction", () => {
       formats: baseProbe.formats.filter((f) => !f.has_audio),
     };
     expect(selectPillFormatId(silentProbe, 2160)).toBe("313");
+    const longId = "x".repeat(250);
+    const shortId = "y".repeat(246);
+    const boundaryProbe: MediaProbeResult = {
+      ...baseProbe,
+      formats: [
+        { ...baseProbe.formats[0], format_id: longId },
+        { ...baseProbe.formats[0], format_id: shortId },
+        baseProbe.formats[3],
+      ],
+    };
+    expect(selectPillFormatId(boundaryProbe, 2160)).toBe(`${shortId}+bestaudio`);
+    expect(selectPillFormatId({ ...boundaryProbe, formats: [{ ...baseProbe.formats[0], format_id: longId }, baseProbe.formats[3]] }, 2160)).toBe(longId);
     expect(selectPillFormatId({ ...baseProbe, formats: [] }, 2160)).toBeUndefined();
   });
 
@@ -165,13 +181,16 @@ describe("adaptive pill format selection and TTL cache eviction", () => {
     expect(isRefreshableHttpTransfer({ kind: "media", status: "failed" })).toBe(false);
   });
 
-  it("clears stale streamUrl across SPA navigations and ignores late replies", () => {
+  it("clears stale streamUrl across SPA navigations and ignores late A->B->A replies", () => {
     const nav = new StreamNavigationState("https://media.example/watch?v=1");
-    nav.update("https://media.example/watch?v=1", "https://media.example/watch?v=1", "https://cdn.example/v1.m3u8");
+    const epochA1 = nav.epoch;
+    nav.update(epochA1, "https://media.example/watch?v=1", "https://media.example/watch?v=1", "https://cdn.example/v1.m3u8");
     expect(nav.resolveTarget("blob:https://media.example/abc", "https://media.example/watch?v=1")).toBe("https://cdn.example/v1.m3u8");
 
     expect(nav.resolveTarget("blob:https://media.example/def", "https://media.example/watch?v=2")).toBe("https://media.example/watch?v=2");
-    nav.update("https://media.example/watch?v=1", "https://media.example/watch?v=2", "https://cdn.example/v1.m3u8");
+    expect(nav.resolveTarget("blob:https://media.example/ghi", "https://media.example/watch?v=1")).toBe("https://media.example/watch?v=1");
+    // Even after returning to ?v=1, an in-flight reply from the earlier visit (epochA1) is dropped.
+    nav.update(epochA1, "https://media.example/watch?v=1", "https://media.example/watch?v=1", "https://cdn.example/v1.m3u8");
     expect(nav.streamUrl).toBeUndefined();
   });
 });

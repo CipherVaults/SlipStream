@@ -56,10 +56,10 @@ export function canAttributeTab(
   tab: { url?: string; incognito?: boolean; cookieStoreId?: string } | undefined,
 ): boolean {
   if (!tab) return false;
-  if (typeof item.incognito === "boolean" && typeof tab.incognito === "boolean" && item.incognito !== tab.incognito) {
+  if ((item.incognito !== undefined || tab.incognito !== undefined) && item.incognito !== tab.incognito) {
     return false;
   }
-  if (item.cookieStoreId && tab.cookieStoreId && item.cookieStoreId !== tab.cookieStoreId) {
+  if ((item.cookieStoreId !== undefined || tab.cookieStoreId !== undefined) && item.cookieStoreId !== tab.cookieStoreId) {
     return false;
   }
   const referrer = httpUrl(item.referrer);

@@ -45,18 +45,25 @@ export function scopedHeaders(
   return result;
 }
 
+const MAX_FORMAT_ID_LEN = 256;
+const BEST_AUDIO_SUFFIX = "+bestaudio";
+
 export function selectPillFormatId(probe: MediaProbeResult, expectedHeight: 2160 | 1080): string | undefined {
-  const formats = probe.formats.filter((format) => format.has_video && format.height === expectedHeight);
-  const selected = formats.find((format) => format.has_audio) ?? formats[0];
-  if (!selected) return undefined;
-  if (!selected.has_audio && probe.formats.some((format) => format.has_audio)) {
-    return `${selected.format_id}+bestaudio`;
+  const formats = probe.formats.filter(
+    (format) => format.has_video && format.height === expectedHeight && format.format_id.length <= MAX_FORMAT_ID_LEN,
+  );
+  const muxed = formats.find((format) => format.has_audio);
+  if (muxed) return muxed.format_id;
+  if (probe.formats.some((format) => format.has_audio)) {
+    const combinable = formats.find((format) => (format.format_id + BEST_AUDIO_SUFFIX).length <= MAX_FORMAT_ID_LEN);
+    if (combinable) return combinable.format_id + BEST_AUDIO_SUFFIX;
   }
-  return selected.format_id;
+  return formats[0]?.format_id;
 }
 
 export class StreamNavigationState {
   streamUrl: string | undefined;
+  epoch = 0;
   private lastHref: string;
 
   constructor(initialHref: string) {
@@ -67,11 +74,12 @@ export class StreamNavigationState {
     if (currentHref === this.lastHref) return false;
     this.lastHref = currentHref;
     this.streamUrl = undefined;
+    this.epoch += 1;
     return true;
   }
 
-  update(hrefAtRequest: string, currentHref: string, observedUrl: string | undefined): void {
-    if (hrefAtRequest === currentHref) {
+  update(epochAtRequest: number, hrefAtRequest: string, currentHref: string, observedUrl: string | undefined): void {
+    if (epochAtRequest === this.epoch && hrefAtRequest === currentHref) {
       this.streamUrl = observedUrl;
     }
   }

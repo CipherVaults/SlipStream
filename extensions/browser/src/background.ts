@@ -30,6 +30,7 @@ api.storage.onChanged.addListener((values, area) => {
 let appearance = "";
 let stateWrites: Promise<unknown> = Promise.resolve();
 const native = new NativeClient((state) => {
+  network.prune();
   stateWrites = stateWrites.then(async () => {
     await api.storage.session.set({ [STATE_KEY]: state });
     const { theme, accent } = state;
@@ -51,7 +52,10 @@ function report(error: unknown): void {
 }
 
 api.alarms.onAlarm.addListener(({ name }) => {
-  if (name === "slipstream-connect") native.start();
+  if (name === "slipstream-connect") {
+    network.prune();
+    native.start();
+  }
 });
 api.alarms.create("slipstream-connect", { periodInMinutes: 1 });
 native.start();

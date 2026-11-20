@@ -287,6 +287,62 @@ describe("toolbar popup", () => {
       request: { type: "open_desktop_window" },
     });
   });
+
+  it("never lets delayed session.get or wake hydration clobber fresher storage.onChanged updates", async () => {
+    vi.resetModules();
+    const bodyMatch = /<body>([\s\S]*)<\/body>/i.exec(popupHtml);
+    document.body.innerHTML = bodyMatch ? bodyMatch[1] : "";
+    let resolveSession!: (val: Record<string, unknown>) => void;
+    let resolveWake!: (val: unknown) => void;
+    const onChangedListeners: Array<(changes: Record<string, { newValue?: unknown }>, area: string) => void> = [];
+    (globalThis as Record<string, unknown>).chrome = {
+      runtime: {
+        sendMessage: vi.fn(() => new Promise((resolve) => { resolveWake = resolve; })),
+      },
+      storage: {
+        onChanged: {
+          addListener: vi.fn((fn: (changes: Record<string, { newValue?: unknown }>, area: string) => void) => {
+            onChangedListeners.push(fn);
+          }),
+        },
+        session: { get: vi.fn(() => new Promise((resolve) => { resolveSession = resolve; })) },
+        local: { get: vi.fn(async () => ({})) },
+      },
+    };
+    Object.defineProperty(window, "matchMedia", {
+      writable: true,
+      value: vi.fn(() => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() })),
+    });
+
+    await import("../popup/index");
+    onChangedListeners[0]({
+      [STATE_KEY]: {
+        newValue: {
+          connected: true,
+          theme: "dark",
+          accent: "blue",
+          batch: {
+            aggregate_down_bps: 4096,
+            aggregate_up_bps: 0,
+            active_count: 1,
+            active_threads: 4,
+            speed_limit_bps: null,
+            transfers: [makeTransfer()],
+            timestamp: "2026-11-20T00:00:00Z",
+          },
+        },
+      },
+    }, "session");
+    expect(document.getElementById("connection")?.textContent).toBe("Connected");
+
+    resolveSession({ [STATE_KEY]: { connected: false, theme: "light", accent: "mono", batch: null } });
+    resolveWake({ ok: true, state: { connected: false, theme: "light", accent: "mono", batch: null } });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(document.getElementById("connection")?.textContent).toBe("Connected");
+    expect(document.documentElement.dataset.theme).toBe("dark");
+  });
 });
 
 describe("SPA navigation stream cache invalidation", () => {

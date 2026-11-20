@@ -128,22 +128,27 @@ function render(): void {
   openDesktop.disabled = !state.connected || commands.has("open_desktop_window");
 }
 
+let hasStoragePush = false;
+let wakeResolved = false;
+
 openDesktop.addEventListener("click", () => desktop({ type: "open_desktop_window" }));
 theme.addEventListener("change", render);
 api.storage.onChanged.addListener((changes, area) => {
   if (area !== "session" || !(STATE_KEY in changes)) return;
+  hasStoragePush = true;
   state = readState(changes[STATE_KEY].newValue);
   render();
 });
 void api.storage.session.get(STATE_KEY).then((values) => {
+  if (hasStoragePush || wakeResolved) return;
   state = readState(values[STATE_KEY]);
   render();
 }).catch(render);
 void api.runtime.sendMessage({ kind: "wake" } satisfies BrowserMessage).then((reply?: { ok?: boolean; state?: unknown }) => {
-  if (reply?.state) {
-    state = readState(reply.state);
-    render();
-  }
+  if (hasStoragePush || !reply?.state) return;
+  wakeResolved = true;
+  state = readState(reply.state);
+  render();
 }).catch(() => {});
 
 if (refreshId) {

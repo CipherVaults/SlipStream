@@ -45,8 +45,9 @@ document.addEventListener("visibilitychange", () => {
 
 function updateStream(): void {
   const hrefAtRequest = location.href;
+  const epochAtRequest = navigation.epoch;
   void send<{ url?: string }>({ kind: "stream" }).then((reply) => {
-    navigation.update(hrefAtRequest, location.href, reply?.url);
+    navigation.update(epochAtRequest, hrefAtRequest, location.href, reply?.url);
   }).catch(() => {});
 }
 
