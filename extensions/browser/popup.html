@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-accent="blue">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SlipStream</title>
+  </head>
+  <body>
+    <main>
+      <header class="header">
+        <h1>SlipStream</h1>
+        <span id="connection" class="connection" role="status">Disconnected</span>
+      </header>
+      <section id="refresh-panel" hidden>
+        <h2>Refresh expired link</h2>
+        <form id="refresh-form">
+          <label>Download <select id="refresh-transfer" required></select></label>
+          <button type="submit">Refresh link</button>
+        </form>
+      </section>
+      <div id="dashboard">
+        <dl class="throughput">
+          <div><dt>Download</dt><dd id="down">—</dd></div>
+          <div><dt>Upload</dt><dd id="up">—</dd></div>
+        </dl>
+        <section class="downloads" aria-labelledby="downloads-heading">
+          <div class="section-title"><h2 id="downloads-heading">Transfers</h2><span id="active-count"></span></div>
+          <p id="empty">Open SlipStream on your desktop to connect.</p>
+          <ul id="transfers"></ul>
+        </section>
+        <button id="open-desktop" type="button">Open Desktop App</button>
+        <details id="preferences">
+          <summary>Interception settings</summary>
+          <form id="settings">
+            <label class="checkbox"><input type="checkbox" id="enabled"> Intercept downloads</label>
+            <label>File extensions<input id="extensions" placeholder="zip, mp4, iso"></label>
+            <label>Minimum size (MiB)<input id="min-size" type="number" min="0" step="any" required></label>
+            <label>Excluded sites<input id="excluded" placeholder="example.com"></label>
+            <label>Muted sites<input id="muted" placeholder="example.com"></label>
+            <button type="submit">Save settings</button>
+          </form>
+        </details>
+      </div>
+      <p id="feedback" role="status"></p>
+    </main>
+    <script type="module" src="/src/popup/index.ts"></script>
+  </body>
+</html>
