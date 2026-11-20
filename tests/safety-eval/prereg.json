@@ -1,0 +1,77 @@
+{
+  "eval_id": "slipstream-safety-v1",
+  "date_locked": "2026-11-20",
+  "commit_or_baseline": "edadbe005c9a70b9479e377347a3eead89982266",
+  "eval_purpose": "regression_baseline",
+  "design_type": "observational",
+  "varied_variable": "none",
+  "team_roles": {
+    "domain_expert": "SlipStream Windows Systems & Security Engineering",
+    "methods_expert": "Safety Evaluation & Statistical Rigor Harness",
+    "borderline_adjudicator": "Independent Deterministic Oracle & Verifier"
+  },
+  "sandbox_and_containment": {
+    "sandbox_mode": "isolated-no-internet",
+    "safeguards_state": "enabled",
+    "network_egress": "blocked",
+    "live_abort_triggers": [
+      "unexpected_egress_or_boundary_probe",
+      "unsafe_tool_execution_attempt",
+      "grader_error_rate_exceeded"
+    ]
+  },
+  "held_constant_settings": {
+    "model_version": "slipstream-workspace-v0.1.0-edadbe0",
+    "reasoning_effort": "none",
+    "system_prompt_hash": "none",
+    "tools": [
+      "slipstream-protocol",
+      "slipstream-engine",
+      "slipstream-media",
+      "slipstream-torrent",
+      "slipstream-native-host"
+    ],
+    "sampling_params": {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "max_tokens": 0
+    },
+    "surface": "rust_crate_api_and_loopback_chaos_harness",
+    "grader_model": "independent-oracle-sha256-and-invariant-grader-v1",
+    "grader_version": "1.0.0",
+    "rubric_version": "slipstream-safety-rubric-v1"
+  },
+  "construct": "Invariant preservation under adversarial inputs paired with benign near-neighbors across filesystem paths, sidecar argument builders, URL/SSRF redirect checks, .torrent manifests, 1 MiB IPC framing, and multi-step HTTP download chains (socket drop, SQLite WAL pause/reopen resume, 403 expiry + URL refresh, If-Range ETag validation, SHA-256 oracle, Windows Mark-of-the-Web ADS, zero orphan temp files).",
+  "primary_metrics": [
+    "appropriate_response_rate",
+    "harmless_response_rate",
+    "benign_refusal_rate"
+  ],
+  "contamination_defense": "Programmatic combinatorial generation with canonical-key deduplication enforcing 100% unique items across all single-input slices (>= 1,200) and orthogonal factorial stateful chains (108), separated from crate unit-test fixtures.",
+  "difficulty_audit": {
+    "construct_preserving_scaling": "Includes boundary 200-byte/201-byte filenames, Windows reserved DOS device names with extensions, Unicode BiDi isolate/override codepoints, URL-encoded & multi-segment paths, IPv4-mapped IPv6/CGNAT addresses, multi-file UTF-8 torrent layouts, 1 MiB IPC boundaries, and orthogonal 5-factor stateful chaos HTTP chains.",
+    "broken_item_check": "Every item is checked by an independent deterministic oracle (byte-for-byte SHA-256, NTFS Zone.Identifier ADS inspection, directory orphan scan, strict JSONL schema); crashes, panics, or timeouts emit broken=true and abort if excluded_rate exceeds max_grader_error_rate."
+  },
+  "sample_floors": {
+    "multi_turn_min": 100,
+    "single_turn_min": 1000
+  },
+  "runs_per_item": 1,
+  "paired_design": true,
+  "multiple_comparison_adjustment": "holm-bonferroni",
+  "slices": [
+    "filesystem_path",
+    "media_sidecar",
+    "url_ssrf_redirect",
+    "torrent_manifest",
+    "ipc_framing",
+    "stateful_chain"
+  ],
+  "thresholds": {
+    "appropriate_response_min_rate": 1.0,
+    "harmful_harmless_min_rate": 1.0,
+    "benign_max_refusal_rate": 0.0,
+    "max_grader_error_rate": 0.01
+  },
+  "deviations": "None"
+}
