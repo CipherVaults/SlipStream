@@ -1,0 +1,18 @@
+[package]
+name = "slipstream-torrent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+slipstream-protocol = { path = "../protocol" }
+chrono.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true

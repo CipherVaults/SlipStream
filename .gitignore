@@ -1,0 +1,38 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Node / TypeScript / Frontend
+node_modules/
+dist/
+dist-ssr/
+.vite/
+*.tsbuildinfo
+*.local
+
+# Tauri generated artifacts
+apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/target/
+
+# Runtime / DB / Test artifacts
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.part
+*.slipstream-part
+.tmp/
+scratch/
+
+# Env & Secrets
+.env
+.env.*
+*.key
+*.pem
+session.token
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store

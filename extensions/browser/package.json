@@ -1,0 +1,11 @@
+{
+  "name": "@slipstream/browser-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "echo browser-extension stub ok",
+    "test": "echo browser-extension stub ok",
+    "build": "echo browser-extension stub ok"
+  }
+}
