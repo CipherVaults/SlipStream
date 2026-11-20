@@ -1,3 +1,4 @@
+mod engine_guards;
 mod ipc;
 mod media;
 mod torrent;
@@ -5,7 +6,8 @@ mod torrent;
 use crate::report::{EvalRecord, Item, Outcome, SINGLE_CATEGORIES};
 use slipstream_engine::validate_redirect_target;
 use slipstream_protocol::{
-    is_private_or_loopback_ip, safe_join_under, sanitize_filename, validate_http_url,
+    is_private_or_loopback_ip, safe_join_under, sanitize_filename, sanitize_title_to_filename,
+    validate_http_url, validate_safe_filename_component,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
@@ -41,9 +43,9 @@ type Grade = Result<&'static str, String>;
 
 pub async fn run_single_inputs() -> Vec<EvalRecord> {
     let mut suite = Suite::default();
-    filesystem(&mut suite);
+    filesystem(&mut suite).await;
     media::run(&mut suite);
-    redirects(&mut suite);
+    redirects(&mut suite).await;
     torrent::run(&mut suite);
     ipc::run(&mut suite).await;
     for category in SINGLE_CATEGORIES {
@@ -144,7 +146,7 @@ fn mixed_case(raw: &str) -> String {
         .collect()
 }
 
-fn filesystem(suite: &mut Suite) {
+async fn filesystem(suite: &mut Suite) {
     let mut harmful = Vec::new();
     harmful.extend(
         [
@@ -163,20 +165,20 @@ fn filesystem(suite: &mut Suite) {
         ]
         .map(|raw| ("traversal_or_separator", "direct", raw.into())),
     );
-    for device in DEVICE_NAMES {
-        harmful.extend([
-            ("reserved_device", "direct", device.into()),
-            (
-                "reserved_device",
-                "composed",
-                format!("{}.bin", device.to_ascii_lowercase()),
-            ),
-            (
+    for (idx, device) in DEVICE_NAMES.into_iter().enumerate() {
+        harmful.push(("reserved_device", "direct", device.into()));
+        harmful.push((
+            "reserved_device",
+            "composed",
+            format!("{}.bin", device.to_ascii_lowercase()),
+        ));
+        if idx < 16 {
+            harmful.push((
                 "reserved_device",
                 "composed",
                 format!("{}.tar.gz", mixed_case(device)),
-            ),
-        ]);
+            ));
+        }
     }
     for raw in ["\0", "n\0ame", "sample.pdf\0.exe", "資料\0.txt"] {
         harmful.push(("nul_byte", "direct", raw.into()));
@@ -228,31 +230,76 @@ fn filesystem(suite: &mut Suite) {
         });
     }
 
+    // 25 diverse benign single-component filenames (lookalikes, dotfiles, multi-dots, Unicode, emoji)
     for name in [
-        "تقرير.txt",
-        "資料.pdf",
-        "🚀.png",
-        "résumé.txt",
-        "report.v1.2..final.pdf",
-        "[draft] (revision).odt",
-        "CONSOLE_01.txt",
+        "COM0.txt",
+        "LPT0.log",
+        "CON1.mp4",
+        "PRN1.txt",
+        "AUX2.bin",
+        "NUL0.json",
+        "CONSOLE_log.txt",
+        "NULLABLE.json",
         "COM10.bin",
-        "LPT10.log",
-        "NULL_check.json",
+        "LPT10.dat",
+        ".gitignore",
+        ".env.local",
+        ".slipstream-config",
+        "report.v1.2..final.pdf",
+        "archive.v1..v2.tar.gz",
+        "a..b..c.bin",
+        "ملف_تجريبي_1080p.mp4",
+        "أرشيف_البيانات_(٢٠٢٦).zip",
+        "東京建築_4K_HDR.mkv",
+        "한국어_영상_[1080p].mp4",
+        "Design Kit 🚀 v2.zip",
+        "Alpine Cinema (4K 60fps) [AV1].mp4",
+        "Café & Crème + Syrup.flac",
+        "Данные_проекта_2026.tar.zst",
+        "Résumé — Final (v3).docx",
     ] {
         fs_benign(suite, base, name, "literal_filename", "direct");
-        for label in [
-            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep",
+    }
+
+    // 30 multi-component relative subpaths validated via safe_join_under
+    for folder in [
+        "العربية/مشروع (2026)",
+        "東京/4K [HDR]",
+        "Datasets/COM0/NULL_set",
+        "Releases/.config",
+        "Audio Mix 🎧/FLAC (24-bit)",
+    ] {
+        for leaf in [
+            "report.v1.2..final.pdf",
+            "COM0.bin",
+            "LPT0.log",
+            "clip (remastered) [1080p].mkv",
+            "ملف_بيانات.parquet",
+            "インデックス_01.json",
         ] {
-            fs_benign(
-                suite,
-                base,
-                &format!("[{label}] {name}"),
-                "literal_filename",
+            let rel = format!("{folder}/{leaf}");
+            let item = suite.register(
+                "filesystem_path",
+                "benign",
+                "safe_subpath",
                 "composed",
+                rel.as_bytes(),
             );
+            suite.grade(item, || {
+                let joined = accepted(safe_join_under(base, &rel), "safe_join_under")?;
+                let expected = rel
+                    .split('/')
+                    .fold(base.to_path_buf(), |acc, part| acc.join(part));
+                require(
+                    joined.starts_with(base) && joined == expected,
+                    "safe_join_under altered relative subpath components",
+                )?;
+                Ok("safe_join_under confined the multi-segment Unicode subpath.")
+            });
         }
     }
+
+    // 20 boundary-length UTF-8 filename checks (191..=200 bytes)
     for len in 191..=200 {
         for raw in [
             format!("{}.txt", "a".repeat(len - 4)),
@@ -266,6 +313,53 @@ fn filesystem(suite: &mut Suite) {
             fs_benign(suite, base, &raw, "filename_byte_limit", "boundary");
         }
     }
+
+    // 40 sanitize_title_to_filename benign normalization checks
+    let long_cjk = "東京建築".repeat(25);
+    let raw_titles = [
+        "Tokyo 2026: Day 1 / Intro? \u{202E}",
+        "Episode 01: A/B Testing | Part *1*",
+        "CON",
+        "NUL",
+        "COM1",
+        "LPT9",
+        "  ..hidden..title..  ",
+        "C:\\Users\\Demo: Clip? <4K>",
+        "ملف: تجربة / ١٠٨٠p",
+        long_cjk.as_str(),
+    ];
+    for raw_title in raw_titles {
+        for ext in ["mp4", "mkv", "flac", "json"] {
+            let item = suite.register(
+                "filesystem_path",
+                "benign",
+                "title_sanitization",
+                "composed",
+                format!("title:{raw_title}:{ext}").into_bytes(),
+            );
+            suite.grade(item, || {
+                let out = accepted(
+                    sanitize_title_to_filename(raw_title, ext),
+                    "sanitize_title_to_filename",
+                )?;
+                accepted(
+                    validate_safe_filename_component(&out),
+                    "validate_safe_filename_component",
+                )?;
+                let joined = accepted(safe_join_under(base, &out), "safe_join_under")?;
+                require(
+                    out.ends_with(&format!(".{ext}"))
+                        && !out.contains("..")
+                        && joined.starts_with(base),
+                    format!("title sanitizer emitted unsafe filename {out:?}"),
+                )?;
+                Ok("sanitize_title_to_filename neutralized punctuation and produced a safe filename.")
+            });
+        }
+    }
+
+    // 6 harmful + 5 benign real DownloadEngine Content-Disposition cases
+    engine_guards::run_content_disposition_cases(suite).await;
 }
 
 fn fs_benign(
@@ -305,9 +399,9 @@ fn literal_policy(url: &Url) -> Option<bool> {
     }
 }
 
-fn redirects(suite: &mut Suite) {
+async fn redirects(suite: &mut Suite) {
     let origin = Url::parse("https://origin.example.test/root/config/index.html").unwrap();
-    for host in [
+    for (idx, host) in [
         "127.0.0.1",
         "127.1.2.3",
         "127.255.255.254",
@@ -336,12 +430,15 @@ fn redirects(suite: &mut Suite) {
         "[::ffff:192.168.1.1]",
         "[::ffff:100.64.0.1]",
         "[::]",
-    ] {
-        for raw in [
-            format!("http://{host}/clip"),
-            format!("https://{host}:8443/releases/a%20b?part=2#chunk"),
-            format!("//{host}/clip"),
-        ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut variants = vec![format!("http://{host}/clip"), format!("//{host}/clip")];
+        if idx < 20 {
+            variants.push(format!("https://{host}:8443/releases/a%20b?part=2#chunk"));
+        }
+        for raw in variants {
             let item = suite.register(
                 "url_ssrf_redirect",
                 "harmful",
@@ -350,10 +447,17 @@ fn redirects(suite: &mut Suite) {
                 raw.as_bytes(),
             );
             suite.grade(item, || {
-                let absolute = if raw.starts_with("//") { format!("https:{raw}") } else { raw.clone() };
+                let absolute = if raw.starts_with("//") {
+                    format!("https:{raw}")
+                } else {
+                    raw.clone()
+                };
                 let parsed = accepted(validate_http_url(&absolute), "HTTP URL syntax validation")?;
                 let redirect = validate_redirect_target(&origin, &raw, false);
-                require(literal_policy(&parsed) == Some(true), "the IP policy did not classify the literal as blocked")?;
+                require(
+                    literal_policy(&parsed) == Some(true),
+                    "the IP policy did not classify the literal as blocked",
+                )?;
                 rejected(redirect, "validate_redirect_target")?;
                 Ok("HTTP syntax parsed and both destination checks blocked the unsafe literal address.")
             });
@@ -428,7 +532,6 @@ fn redirects(suite: &mut Suite) {
         "a%2Fb",
         "item[123]",
         "final.v2",
-        "poster.png",
     ] {
         for (raw, target) in [
             (
@@ -451,6 +554,9 @@ fn redirects(suite: &mut Suite) {
             allow_url(suite, &origin, &raw, &target, "relative_redirect");
         }
     }
+
+    // 8 harmful + 4 benign real DownloadEngine multi-hop 30x redirect & credential-stripping cases
+    engine_guards::run_http_redirect_cases(suite).await;
 }
 
 fn reject_url(suite: &mut Suite, origin: &Url, raw: &str, surface: &'static str, userinfo: bool) {

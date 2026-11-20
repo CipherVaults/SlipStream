@@ -1,9 +1,13 @@
 use slipstream_safety_eval::{
-    report::{write_jsonl, EvalRecord, EvalSummary},
+    report::{write_jsonl, EvalRecord, EvalSummary, PreregSpec},
     single_input::run_single_inputs,
     stateful_chain::run_stateful_chains,
 };
-use std::{env, fs, io, path::PathBuf, process::ExitCode};
+use std::{
+    env, fs, io,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() -> ExitCode {
@@ -34,14 +38,24 @@ async fn run() -> io::Result<()> {
         }
         _ => return Err(usage_error()),
     };
+    let prereg_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("prereg.json");
+    let prereg = PreregSpec::load(&prereg_path)?;
     fs::create_dir_all(&out_dir)?;
+
+    // Persist single-input results before launching stateful chains so partial outputs
+    // are never lost if stateful chain execution encounters an infrastructure failure.
     let single = run_single_inputs().await;
-    let chains = run_stateful_chains().await?;
-    write_jsonl(out_dir.join("single_input_results.jsonl"), &single)?;
-    write_jsonl(out_dir.join("multi_chain_results.jsonl"), &chains)?;
+    let single_path = out_dir.join("single_input_results.jsonl");
+    write_jsonl(&single_path, &single)?;
     let single_result = report("Single inputs", &single);
+
+    let chains = run_stateful_chains().await?;
+    let chain_path = out_dir.join("multi_chain_results.jsonl");
+    write_jsonl(&chain_path, &chains)?;
     let chain_result = report("Stateful chains", &chains);
+
     println!("Wrote JSONL to {}", out_dir.display());
+    prereg.validate_suite(&single, &chains)?;
     single_result.and(chain_result)
 }
 

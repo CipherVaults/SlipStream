@@ -455,6 +455,18 @@ fn verify_completed(snapshot: &TransferSnapshot, scenario: Scenario) -> ChainRes
 }
 
 fn verify_requests(scenario: Scenario, server: &server::State) -> ChainResult<()> {
+    let violations = server
+        .protocol_violations
+        .lock()
+        .expect("loopback violation lock poisoned");
+    check(
+        violations.is_empty(),
+        format!(
+            "engine emitted invalid HTTP request(s): {}",
+            violations.join("; ")
+        ),
+    )?;
+    drop(violations);
     let logs = server
         .observations
         .lock()

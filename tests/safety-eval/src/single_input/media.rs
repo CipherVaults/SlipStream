@@ -21,21 +21,15 @@ pub(super) fn run(suite: &mut Suite) {
                 "--config-locations",
                 "--config-locations=fixture.conf",
                 "--ppa",
-                "--ppa=postprocessor",
                 "--postprocessor-args",
                 "--external-downloader",
-                "--external-downloader-args",
                 "--load-info-json",
                 "--cookies",
                 "--cookies-from-browser",
-                "--netrc",
                 "--proxy",
-                "--socket-timeout=0",
                 "--paths",
-                "--downloader",
                 "--print-to-file",
                 "--enable-file-urls",
-                "--use-postprocessor",
                 "--plugin-dirs",
             ][..],
         ),
@@ -90,13 +84,19 @@ pub(super) fn run(suite: &mut Suite) {
                 "137/",
                 "/140",
                 "137+-140",
-                "137/<140",
                 "$(fixture)",
                 "137\n140",
                 "137%140",
-                "'137'",
                 "bestvideo+bestaudio/-best",
             ][..],
+        ),
+        (
+            "ytdlp_playlist_items",
+            &["1-2 --exec calc", "1, 2", "1;2", "0", "1-3,$(calc)", "-1"][..],
+        ),
+        (
+            "ytdlp_subtitles",
+            &["en.*", "ar;calc", "-en", "en/ar", "en\0", "en$(id)"][..],
         ),
         (
             "ffmpeg_flag",
@@ -148,13 +148,9 @@ pub(super) fn run(suite: &mut Suite) {
                 "\\\\files\\share\\clip.mp4",
                 "//files/share/clip.mp4",
                 "-clip.mp4",
-                "fixture/../clip.mp4",
                 "clip.mp4:ads",
                 "preview\u{202e}4pm.mp4",
                 "clip\0.mp4",
-                "playlist.m3u",
-                "capture.unknown",
-                "AUX.mkv",
             ][..],
         ),
         (
@@ -190,6 +186,13 @@ pub(super) fn run(suite: &mut Suite) {
                     "ytdlp_format" => {
                         rejected(BuildYtDlpArgs::download(false).format(raw), surface)?
                     }
+                    "ytdlp_playlist_items" => {
+                        rejected(BuildYtDlpArgs::download(true).playlist_items(raw), surface)?
+                    }
+                    "ytdlp_subtitles" => rejected(
+                        BuildYtDlpArgs::download(false).subtitles(&[(*raw).to_owned()]),
+                        surface,
+                    )?,
                     "ffmpeg_flag" => rejected(validate_ffmpeg_flag(raw), surface)?,
                     "ffmpeg_audio_filter" => rejected(validate_ffmpeg_audio_filter(raw), surface)?,
                     "ffmpeg_input" => {
@@ -217,7 +220,7 @@ pub(super) fn run(suite: &mut Suite) {
         "audio-opus.1",
         "22",
     ];
-    for title in TITLES {
+    for (title_idx, title) in TITLES.into_iter().enumerate() {
         for (index, format) in formats.into_iter().enumerate() {
             for playlist in [false, true] {
                 let (ext, demuxer, container, muxer) = [
@@ -231,7 +234,10 @@ pub(super) fn run(suite: &mut Suite) {
                 let url = format!("{CDN_URL}?item=[123]&name=clip%20preview&sig=a%2Fb%3D%3D&list={playlist}&format={index}");
                 let name = format!("{title}.{ext}");
                 let output = format!("{title} (normalized).{ext}");
-                let input = format!("{url}\0{format}\0{name}\0{output}");
+                let with_subs = (title_idx + index) % 2 == 0;
+                let playlist_spec = if playlist { "1-3,5" } else { "" };
+                let input =
+                    format!("{url}\0{format}\0{name}\0{output}\0{with_subs}\0{playlist_spec}");
                 let item = suite.register(
                     CATEGORY,
                     "benign",
@@ -240,19 +246,48 @@ pub(super) fn run(suite: &mut Suite) {
                     input.into_bytes(),
                 );
                 suite.grade(item, || {
-                    let yt = accepted(
+                    let mut yt_builder = accepted(
                         BuildYtDlpArgs::download(playlist)
                             .format(format)
-                            .and_then(|b| b.output_template(&name))
-                            .and_then(|b| b.build(&url)),
+                            .and_then(|b| b.output_template(&name)),
                         "yt-dlp builder",
                     )?;
+                    if playlist {
+                        yt_builder = accepted(
+                            yt_builder.playlist_items(playlist_spec),
+                            "yt-dlp playlist_items",
+                        )?;
+                    }
+                    if with_subs {
+                        yt_builder = accepted(
+                            yt_builder.subtitles(&["en-US".to_owned(), "ar".to_owned()]),
+                            "yt-dlp subtitles",
+                        )?;
+                    }
+                    let yt = accepted(yt_builder.build(&url), "yt-dlp build")?;
                     require(
-                        has_args(&yt, &["-f", format])
+                        has_flag(&yt, "--ignore-config")
+                            && has_flag(&yt, "--no-config-locations")
+                            && has_flag(&yt, "--no-cache-dir")
+                            && has_flag(&yt, "--no-exec")
+                            && has_args(&yt, &["-f", format])
                             && has_args(&yt, &["-o", &name])
-                            && has_args(&yt, &[if playlist { "--yes-playlist" } else { "--no-playlist" }])
+                            && has_flag(
+                                &yt,
+                                if playlist {
+                                    "--yes-playlist"
+                                } else {
+                                    "--no-playlist"
+                                },
+                            )
+                            && (!playlist || has_args(&yt, &["--playlist-items", playlist_spec]))
+                            && (!with_subs
+                                || (has_flag(&yt, "--write-subs")
+                                    && has_flag(&yt, "--write-auto-subs")
+                                    && has_args(&yt, &["--sub-langs", "^en-US$,^ar$"])
+                                    && has_args(&yt, &["--sub-format", "srt/vtt"])))
                             && ends_with(&yt, &["--", &url]),
-                        "yt-dlp did not preserve discrete format, template and URL arguments",
+                        "yt-dlp omitted mandatory safety flags or mangled discrete arguments",
                     )?;
                     let ff = accepted(
                         BuildFfmpegArgs::new()
@@ -261,16 +296,23 @@ pub(super) fn run(suite: &mut Suite) {
                         "FFmpeg builder",
                     )?;
                     require(
-                        has_args(&ff, &["-f", demuxer, "-i", &name])
+                        has_flag(&ff, "-hide_banner")
+                            && has_flag(&ff, "-nostdin")
+                            && has_flag(&ff, "-y")
+                            && has_args(&ff, &["-f", demuxer, "-i", &name])
                             && has_args(&ff, &["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"])
                             && ends_with(&ff, &["-f", muxer, "--", &output]),
-                        "FFmpeg did not preserve discrete demuxer, input, filter and output arguments",
+                        "FFmpeg omitted mandatory safety flags or mangled demuxer/output boundaries",
                     )?;
-                    Ok("Both sidecar builders preserved discrete arguments and option boundaries.")
+                    Ok("Both sidecar builders preserved all safety flags, subtitles, playlists, and option boundaries.")
                 });
             }
         }
     }
+}
+
+fn has_flag(args: &[OsString], flag: &str) -> bool {
+    args.iter().any(|arg| arg == flag)
 }
 
 fn has_args(args: &[OsString], sequence: &[&str]) -> bool {

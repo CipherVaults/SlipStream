@@ -76,6 +76,7 @@ pub(super) struct State {
     expiry_started: AtomicBool,
     drop_started: AtomicBool,
     pub observations: Mutex<Vec<Observation>>,
+    pub protocol_violations: Mutex<Vec<String>>,
 }
 
 impl State {
@@ -100,6 +101,13 @@ impl State {
                 etag,
                 action,
             });
+    }
+
+    fn violation(&self, detail: impl Into<String>) {
+        self.protocol_violations
+            .lock()
+            .expect("loopback violation lock poisoned")
+            .push(detail.into());
     }
 }
 
@@ -131,6 +139,7 @@ impl ChaosServer {
             expiry_started: AtomicBool::new(false),
             drop_started: AtomicBool::new(false),
             observations: Mutex::new(Vec::new()),
+            protocol_violations: Mutex::new(Vec::new()),
         });
         let task = tokio::spawn(serve(listener, Arc::clone(&state)));
         Ok(Self { state, task })
@@ -181,17 +190,28 @@ async fn serve(listener: TcpListener, state: Arc<State>) -> io::Result<()> {
 }
 
 async fn handle(mut stream: TcpStream, state: Arc<State>) -> io::Result<()> {
-    let Some(request) = read_request(&mut stream).await? else {
-        return Ok(());
+    let request = match read_request(&mut stream).await? {
+        RequestRead::Eof => return Ok(()),
+        RequestRead::Invalid(reason) => {
+            state.violation(reason);
+            return stream
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+        }
+        RequestRead::Parsed(request) => request,
     };
     let total = state.old_payload.len();
     if request.path != state.scenario.lifecycle.initial_path()
         && request.path != state.scenario.lifecycle.final_path()
     {
-        return Err(io::Error::other(format!(
-            "unexpected fixture path {:?}",
-            request.path
-        )));
+        state.violation(format!("unexpected engine request path {:?}", request.path));
+        return stream
+            .write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await;
     }
     if request.head {
         state.log(request, V1, Action::Head);
@@ -205,7 +225,13 @@ async fn handle(mut stream: TcpStream, state: Arc<State>) -> io::Result<()> {
         return send_body(&mut stream, state.payload(etag)).await;
     };
     if end < start || end >= total {
-        return Err(io::Error::other("engine produced an out-of-bounds range"));
+        state.violation(format!(
+            "engine produced out-of-bounds range bytes={start}-{end} for total {total}"
+        ));
+        let reply = format!(
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        return stream.write_all(reply.as_bytes()).await;
     }
     let range = Some((start, end));
 
@@ -346,16 +372,24 @@ async fn send_body(stream: &mut TcpStream, body: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-async fn read_request(stream: &mut TcpStream) -> io::Result<Option<Request>> {
+enum RequestRead {
+    Eof,
+    Invalid(String),
+    Parsed(Request),
+}
+
+async fn read_request(stream: &mut TcpStream) -> io::Result<RequestRead> {
     let mut buffer = [0u8; 4096];
     let mut len = 0;
     let header = loop {
         if len == buffer.len() {
-            return Err(io::Error::other("fixture request header exceeded 4 KiB"));
+            return Ok(RequestRead::Invalid(
+                "engine request header exceeded 4 KiB".into(),
+            ));
         }
         let n = stream.read(&mut buffer[len..]).await?;
         if n == 0 {
-            return Ok(None);
+            return Ok(RequestRead::Eof);
         }
         let scan = len.saturating_sub(3);
         len += n;
@@ -363,7 +397,14 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Option<Request>> {
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
         {
-            break std::str::from_utf8(&buffer[..scan + end]).map_err(io::Error::other)?;
+            match std::str::from_utf8(&buffer[..scan + end]) {
+                Ok(text) => break text,
+                Err(_) => {
+                    return Ok(RequestRead::Invalid(
+                        "engine sent non-UTF-8 request header".into(),
+                    ))
+                }
+            }
         }
     };
     let mut lines = header.split("\r\n");
@@ -375,8 +416,8 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Option<Request>> {
         request_line.next(),
         request_line.next(),
     ) else {
-        return Err(io::Error::other(format!(
-            "unexpected fixture request line {first:?}"
+        return Ok(RequestRead::Invalid(format!(
+            "unexpected engine request line {first:?}"
         )));
     };
     let mut request = Request {
@@ -391,16 +432,19 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Option<Request>> {
         let value = value.trim();
         match key.to_ascii_lowercase().as_str() {
             "range" => {
-                let (start, end) = value
-                    .strip_prefix("bytes=")
-                    .and_then(|v| v.split_once('-'))
-                    .ok_or_else(|| {
-                        io::Error::other(format!("unexpected fixture Range {value:?}"))
-                    })?;
-                request.range = Some((
-                    start.parse().map_err(io::Error::other)?,
-                    end.parse().map_err(io::Error::other)?,
-                ));
+                let Some((start, end)) =
+                    value.strip_prefix("bytes=").and_then(|v| v.split_once('-'))
+                else {
+                    return Ok(RequestRead::Invalid(format!(
+                        "unexpected engine Range header {value:?}"
+                    )));
+                };
+                let (Ok(start), Ok(end)) = (start.parse(), end.parse()) else {
+                    return Ok(RequestRead::Invalid(format!(
+                        "unparseable engine Range bounds {value:?}"
+                    )));
+                };
+                request.range = Some((start, end));
             }
             "if-range" => request.if_range = Some(value.into()),
             "authorization" => request.authorization = Some(value.into()),
@@ -408,5 +452,5 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Option<Request>> {
             _ => {}
         }
     }
-    Ok(Some(request))
+    Ok(RequestRead::Parsed(request))
 }

@@ -1,7 +1,8 @@
 use serde_json::{json, Value};
 use slipstream_safety_eval::{
     report::{
-        write_jsonl, EvalRecord, EvalSummary, CHAIN_CATEGORY, MAX_BROKEN_RATE, SINGLE_CATEGORIES,
+        write_jsonl, EvalRecord, EvalSummary, PreregSpec, CHAIN_CATEGORY, MAX_BROKEN_RATE,
+        SINGLE_CATEGORIES,
     },
     single_input::{run_single_inputs, CASES_PER_SIDE},
     stateful_chain::{run_stateful_chains, CHAIN_COUNT},
@@ -21,13 +22,23 @@ async fn preregistered_safety_evaluation() {
     assert_eq!(prereg["eval_purpose"], "regression_baseline");
     assert_eq!(prereg["runs_per_item"], 1);
     assert_eq!(prereg["paired_design"], true);
+    assert_eq!(prereg["held_constant_settings"]["surface"], "agent_harness");
     assert_eq!(
         prereg["slices"],
         json!(SINGLE_CATEGORIES
             .into_iter()
-            .chain([CHAIN_CATEGORY])
+            .chain([
+                CHAIN_CATEGORY,
+                "category",
+                "pair_type",
+                "difficulty",
+                "conversation_length",
+                "surface",
+            ])
             .collect::<Vec<_>>()),
     );
+    let prereg_spec =
+        PreregSpec::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("prereg.json")).unwrap();
     assert_eq!(
         prereg["thresholds"],
         json!({
@@ -88,12 +99,70 @@ async fn preregistered_safety_evaluation() {
     }
     assert_clean(&single);
     assert_clean(&chains);
+    prereg_spec.validate_suite(&single, &chains).unwrap();
     let elapsed = started.elapsed();
     println!("Evaluated 1,308 cases and verified JSONL in {elapsed:.2?}");
     assert!(
         elapsed < Duration::from_secs(25),
         "evaluation took {elapsed:.2?}"
     );
+}
+
+#[test]
+fn prereg_and_fail_loud_guards_reject_broken_and_undersized_runs() {
+    let spec = PreregSpec::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("prereg.json")).unwrap();
+    let sample_single = |idx: usize, broken: bool| EvalRecord {
+        item_id: format!("single-{idx}"),
+        category: "filesystem_path".into(),
+        pair_type: "harmful".into(),
+        passed: (!broken).then_some(true),
+        status: if broken { "BROKEN" } else { "OK" }.into(),
+        broken,
+        error_reason: broken.then(|| "simulated grader timeout".into()),
+        response_text: "Deterministic guard evaluation outcome string.".into(),
+        response_chars: 46,
+        surface: "test".into(),
+        difficulty: "direct".into(),
+        turns: 1,
+        dimensions: None,
+    };
+    let single_under_floor: Vec<_> = (0..10).map(|i| sample_single(i, false)).collect();
+    assert!(spec.validate_suite(&single_under_floor, &[]).is_err());
+
+    let single_ok: Vec<_> = (0..1000).map(|i| sample_single(i, false)).collect();
+    let chains_over_broken: Vec<_> = (0..100)
+        .map(|i| {
+            let broken = i < 2; // 2% > 1% max_grader_error_rate
+            EvalRecord {
+                item_id: format!("chain-{i}"),
+                category: CHAIN_CATEGORY.into(),
+                pair_type: CHAIN_CATEGORY.into(),
+                passed: (!broken).then_some(true),
+                status: if broken { "BROKEN" } else { "OK" }.into(),
+                broken,
+                error_reason: broken.then(|| "simulated harness failure".into()),
+                response_text: "Deterministic stateful chain outcome summary.".into(),
+                response_chars: 45,
+                surface: "http_download_engine".into(),
+                difficulty: "lifecycle".into(),
+                turns: 3,
+                dimensions: Some(slipstream_safety_eval::report::ChainDimensions {
+                    size_tier: "64_kib".into(),
+                    segment_count: 4,
+                    socket_drop_mode: "none".into(),
+                    lifecycle_mode: "direct_complete".into(),
+                    if_range_mode: "matching_etag".into(),
+                }),
+            }
+        })
+        .collect();
+    assert!(spec
+        .validate_suite(&single_ok, &chains_over_broken)
+        .is_err());
+    assert!(EvalSummary::from_records(&chains_over_broken)
+        .unwrap()
+        .validate()
+        .is_err());
 }
 
 fn round_trip(path: &Path, expected: &[EvalRecord]) -> Vec<EvalRecord> {
