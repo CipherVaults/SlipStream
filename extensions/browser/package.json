@@ -4,8 +4,18 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "typecheck": "echo browser-extension stub ok",
-    "test": "echo browser-extension stub ok",
-    "build": "echo browser-extension stub ok"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@slipstream/ipc-types": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.32",
+    "jsdom": "^27.0.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.4.6",
+    "vitest": "^4.0.0"
   }
 }
