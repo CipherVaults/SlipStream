@@ -12,7 +12,7 @@ use std::{
     fmt::Display,
     fs, io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{sync::Semaphore, task::JoinSet, time};
@@ -162,16 +162,45 @@ pub async fn run_stateful_chains() -> io::Result<Vec<EvalRecord>> {
         let permits = Arc::clone(&permits);
         running.spawn(async move {
             let _permit = permits.acquire_owned().await.expect("concurrency semaphore closed");
-            let mut task = tokio::spawn(run_chain(scenario, directory));
+            let violations = Arc::new(Mutex::new(Vec::new()));
+            let mut task = tokio::spawn(run_chain(scenario, directory, Arc::clone(&violations)));
             let result = match time::timeout(Duration::from_secs(12), &mut task).await {
                 Ok(Ok(Ok(()))) => Outcome::Pass("The completed download matched the independent integrity and lifecycle checks."),
                 Ok(Ok(Err(ChainError::Failed(reason)))) => Outcome::Fail(reason),
-                Ok(Ok(Err(ChainError::Broken(reason)))) => Outcome::Broken(reason),
-                Ok(Err(error)) => Outcome::Broken(format!("chain task failed: {error}")),
+                Ok(Ok(Err(ChainError::Broken(reason)))) => {
+                    let recorded = violations.lock().expect("loopback violation lock poisoned");
+                    if !recorded.is_empty() {
+                        Outcome::Fail(format!(
+                            "engine emitted invalid HTTP request(s): {}",
+                            recorded.join("; ")
+                        ))
+                    } else {
+                        Outcome::Broken(reason)
+                    }
+                }
+                Ok(Err(error)) => {
+                    let recorded = violations.lock().expect("loopback violation lock poisoned");
+                    if !recorded.is_empty() {
+                        Outcome::Fail(format!(
+                            "engine emitted invalid HTTP request(s): {}",
+                            recorded.join("; ")
+                        ))
+                    } else {
+                        Outcome::Broken(format!("chain task failed: {error}"))
+                    }
+                }
                 Err(_) => {
                     task.abort();
                     let _ = task.await;
-                    Outcome::Broken("chain exceeded its 12-second timeout".into())
+                    let recorded = violations.lock().expect("loopback violation lock poisoned");
+                    if !recorded.is_empty() {
+                        Outcome::Fail(format!(
+                            "engine emitted invalid HTTP request(s) before timing out: {}",
+                            recorded.join("; ")
+                        ))
+                    } else {
+                        Outcome::Broken("chain exceeded its 12-second timeout".into())
+                    }
                 }
             };
             item.record(result, scenario.turns(), Some(dimensions))
@@ -230,13 +259,20 @@ fn check(condition: bool, reason: impl Into<String>) -> ChainResult<()> {
     }
 }
 
-async fn run_chain(scenario: Scenario, directory: PathBuf) -> ChainResult<()> {
+async fn run_chain(
+    scenario: Scenario,
+    directory: PathBuf,
+    violations: Arc<Mutex<Vec<String>>>,
+) -> ChainResult<()> {
     let save_dir = directory.join("downloads");
     fixture(
         "create isolated download directory",
         fs::create_dir_all(&save_dir),
     )?;
-    let mut server = fixture("start loopback fixture", ChaosServer::start(scenario).await)?;
+    let mut server = fixture(
+        "start loopback fixture",
+        ChaosServer::start(scenario, violations).await,
+    )?;
     let config = EngineConfig {
         db_path: directory.join("transfer.sqlite"),
         default_download_dir: save_dir.clone(),
@@ -620,14 +656,25 @@ fn verify_motw(path: &Path, source: &str, expect_referrer: bool) -> ChainResult<
     let zone = target("read Mark-of-the-Web ADS", fs::read_to_string(ads))?;
     let host = format!("HostUrl={source}");
     let expected_referrer = format!("ReferrerUrl={CLEAN_REFERRER}");
-    let referrers: Vec<_> = zone
-        .lines()
+    let zone_lines: Vec<_> = zone.lines().collect();
+    let referrers: Vec<_> = zone_lines
+        .iter()
+        .copied()
         .filter(|line| line.starts_with("ReferrerUrl="))
         .collect();
     check(
-        zone.lines().next() == Some("[ZoneTransfer]")
-            && zone.lines().any(|line| line == "ZoneId=3")
-            && zone.lines().any(|line| line == host)
+        zone_lines.first().copied() == Some("[ZoneTransfer]")
+            && zone_lines
+                .iter()
+                .filter(|&&line| line == "[ZoneTransfer]")
+                .count()
+                == 1
+            && zone_lines
+                .iter()
+                .filter(|&&line| line == "ZoneId=3")
+                .count()
+                == 1
+            && zone_lines.iter().filter(|&&line| line == host).count() == 1
             && if expect_referrer {
                 referrers == [expected_referrer.as_str()]
             } else {

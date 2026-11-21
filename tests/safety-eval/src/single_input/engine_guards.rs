@@ -134,12 +134,19 @@ fn verify_motw_ads(path: &Path, expected_host_url: &str) -> Result<(), String> {
     let expected_host = format!("HostUrl={expected_host_url}");
     let zone_lines: Vec<_> = zone.lines().collect();
     if zone_lines.first().copied() != Some("[ZoneTransfer]")
-        || zone_lines.iter().filter(|&&l| l == "[ZoneTransfer]").count() != 1
+        || zone_lines
+            .iter()
+            .filter(|&&l| l == "[ZoneTransfer]")
+            .count()
+            != 1
         || zone_lines.iter().filter(|&&l| l == "ZoneId=3").count() != 1
         || zone_lines.iter().filter(|&&l| l == expected_host).count() != 1
         || zone_lines.iter().any(|l| l.starts_with("ReferrerUrl="))
     {
-        return Err(format!("unexpected MotW ADS on {}: {zone:?}", path.display()));
+        return Err(format!(
+            "unexpected MotW ADS on {}: {zone:?}",
+            path.display()
+        ));
     }
     Ok(())
 }
@@ -571,8 +578,10 @@ pub(super) async fn run_http_redirect_cases(suite: &mut Suite) {
                     .filter(|r| r.path == "/bounce")
                     .collect();
                 let origin_reqs = origin_server.requests_since(origin_mark);
-                let final_reqs: Vec<_> =
-                    origin_reqs.iter().filter(|r| r.path == "/final-ok").collect();
+                let final_reqs: Vec<_> = origin_reqs
+                    .iter()
+                    .filter(|r| r.path == "/final-ok")
+                    .collect();
                 let initial_reqs: Vec<_> = origin_reqs
                     .iter()
                     .filter(|r| r.path == "/cross-start")
@@ -587,9 +596,9 @@ pub(super) async fn run_http_redirect_cases(suite: &mut Suite) {
                         .all(|r| sensitive.iter().all(|h| !r.headers.contains_key(*h)));
                 let saw_initial = !initial_reqs.is_empty()
                     && initial_reqs.iter().all(|r| {
-                        sensitive.iter().all(|h| {
-                            r.headers.get(*h).map(String::as_str) == Some("secret-token")
-                        })
+                        sensitive
+                            .iter()
+                            .all(|h| r.headers.get(*h).map(String::as_str) == Some("secret-token"))
                     });
                 let bytes_ok = fs::read(cross_dir.join("cross.bin")).ok().as_deref()
                     == Some(payload.as_slice());
@@ -686,12 +695,9 @@ pub(super) async fn run_http_redirect_cases(suite: &mut Suite) {
                 Ok(snap) => {
                     let reqs = origin_server.requests_since(origin_mark);
                     let traversed_ok = match surface {
-                        "engine_302_10hop_boundary" => {
-                            (0..=10)
-                                .rev()
-                                .all(|h| reqs.iter().any(|r| r.path == format!("/hop/{h}")))
-                                && reqs.iter().any(|r| r.path == "/final-ok")
-                        }
+                        "engine_302_10hop_boundary" => (0..=10)
+                            .rev()
+                            .all(|h| reqs.iter().any(|r| r.path == format!("/hop/{h}"))),
                         "engine_302_relative_chain" => ["/rel-start", "/assets/step2", "/final-ok"]
                             .iter()
                             .all(|p| reqs.iter().any(|r| r.path == *p)),

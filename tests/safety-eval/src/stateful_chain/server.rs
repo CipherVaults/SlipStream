@@ -76,7 +76,7 @@ pub(super) struct State {
     expiry_started: AtomicBool,
     drop_started: AtomicBool,
     pub observations: Mutex<Vec<Observation>>,
-    pub protocol_violations: Mutex<Vec<String>>,
+    pub protocol_violations: Arc<Mutex<Vec<String>>>,
 }
 
 impl State {
@@ -117,7 +117,10 @@ pub(super) struct ChaosServer {
 }
 
 impl ChaosServer {
-    pub async fn start(scenario: Scenario) -> io::Result<Self> {
+    pub async fn start(
+        scenario: Scenario,
+        protocol_violations: Arc<Mutex<Vec<String>>>,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let (release, _) = watch::channel(false);
         let (pending_cutoff, _) = watch::channel(None);
@@ -139,7 +142,7 @@ impl ChaosServer {
             expiry_started: AtomicBool::new(false),
             drop_started: AtomicBool::new(false),
             observations: Mutex::new(Vec::new()),
-            protocol_violations: Mutex::new(Vec::new()),
+            protocol_violations,
         });
         let task = tokio::spawn(serve(listener, Arc::clone(&state)));
         Ok(Self { state, task })
@@ -213,6 +216,17 @@ async fn handle(mut stream: TcpStream, state: Arc<State>) -> io::Result<()> {
             )
             .await;
     }
+    if let Some((start, end)) = request.range {
+        if end < start || end >= total {
+            state.violation(format!(
+                "engine produced out-of-bounds range bytes={start}-{end} for total {total}"
+            ));
+            let reply = format!(
+                "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            return stream.write_all(reply.as_bytes()).await;
+        }
+    }
     if request.head {
         state.log(request, V1, Action::Head);
         return send_header(&mut stream, V1, total, None).await;
@@ -224,15 +238,6 @@ async fn handle(mut stream: TcpStream, state: Arc<State>) -> io::Result<()> {
         send_header(&mut stream, etag, total, None).await?;
         return send_body(&mut stream, state.payload(etag)).await;
     };
-    if end < start || end >= total {
-        state.violation(format!(
-            "engine produced out-of-bounds range bytes={start}-{end} for total {total}"
-        ));
-        let reply = format!(
-            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        );
-        return stream.write_all(reply.as_bytes()).await;
-    }
     let range = Some((start, end));
 
     if request.path == "/expired" {
@@ -389,7 +394,12 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<RequestRead> {
         }
         let n = stream.read(&mut buffer[len..]).await?;
         if n == 0 {
-            return Ok(RequestRead::Eof);
+            if len == 0 {
+                return Ok(RequestRead::Eof);
+            }
+            return Ok(RequestRead::Invalid(
+                "engine closed connection before terminating HTTP headers".into(),
+            ));
         }
         let scan = len.saturating_sub(3);
         len += n;
@@ -428,10 +438,26 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<RequestRead> {
         authorization: None,
         referer: None,
     };
-    for (key, value) in lines.filter_map(|line| line.split_once(':')) {
-        let value = value.trim();
+    let mut seen_range = false;
+    for line in lines {
+        let Some((raw_key, raw_value)) = line.split_once(':') else {
+            return Ok(RequestRead::Invalid(format!(
+                "malformed engine HTTP header line {line:?}"
+            )));
+        };
+        let key = raw_key.trim();
+        if key.is_empty() || raw_key.bytes().any(|b| b.is_ascii_whitespace()) {
+            return Ok(RequestRead::Invalid(format!(
+                "invalid engine HTTP header name {raw_key:?}"
+            )));
+        }
+        let value = raw_value.trim();
         match key.to_ascii_lowercase().as_str() {
             "range" => {
+                if seen_range {
+                    return Ok(RequestRead::Invalid("duplicate engine Range header".into()));
+                }
+                seen_range = true;
                 let Some((start, end)) =
                     value.strip_prefix("bytes=").and_then(|v| v.split_once('-'))
                 else {

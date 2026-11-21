@@ -316,19 +316,26 @@ async fn filesystem(suite: &mut Suite) {
 
     // 40 sanitize_title_to_filename benign normalization checks
     let long_cjk = "東京建築".repeat(25);
-    let raw_titles = [
-        "Tokyo 2026: Day 1 / Intro? \u{202E}",
-        "Episode 01: A/B Testing | Part *1*",
-        "CON",
-        "NUL",
-        "COM1",
-        "LPT9",
-        "  ..hidden..title..  ",
-        "C:\\Users\\Demo: Clip? <4K>",
-        "ملف: تجربة / ١٠٨٠p",
-        long_cjk.as_str(),
+    let expected_cjk = format!("{}東", "東京建築".repeat(16));
+    let raw_titles: [(&str, &str); 10] = [
+        (
+            "Tokyo 2026: Day 1 / Intro? \u{202E}",
+            "Tokyo 2026_ Day 1 _ Intro_",
+        ),
+        (
+            "Episode 01: A/B Testing | Part *1*",
+            "Episode 01_ A_B Testing _ Part _1_",
+        ),
+        ("CON", "_CON"),
+        ("NUL", "_NUL"),
+        ("COM1", "_COM1"),
+        ("LPT9", "_LPT9"),
+        ("  ..hidden..title..  ", "hidden.title"),
+        ("C:\\Users\\Demo: Clip? <4K>", "C__Users_Demo_ Clip_ _4K_"),
+        ("ملف: تجربة / ١٠٨٠p", "ملف_ تجربة _ ١٠٨٠p"),
+        (long_cjk.as_str(), expected_cjk.as_str()),
     ];
-    for raw_title in raw_titles {
+    for (raw_title, expected_stem) in raw_titles {
         for ext in ["mp4", "mkv", "flac", "json"] {
             let item = suite.register(
                 "filesystem_path",
@@ -347,13 +354,15 @@ async fn filesystem(suite: &mut Suite) {
                     "validate_safe_filename_component",
                 )?;
                 let joined = accepted(safe_join_under(base, &out), "safe_join_under")?;
+                let expected_filename = format!("{expected_stem}.{ext}");
                 require(
-                    out.ends_with(&format!(".{ext}"))
+                    out == expected_filename
+                        && joined == base.join(&expected_filename)
                         && !out.contains("..")
                         && joined.starts_with(base),
-                    format!("title sanitizer emitted unsafe filename {out:?}"),
+                    format!("title sanitizer returned {out:?}, expected {expected_filename:?}"),
                 )?;
-                Ok("sanitize_title_to_filename neutralized punctuation and produced a safe filename.")
+                Ok("sanitize_title_to_filename produced the exact expected sanitized filename.")
             });
         }
     }

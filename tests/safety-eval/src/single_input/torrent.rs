@@ -462,7 +462,8 @@ fn run_integrity_corruption_cases(suite: &mut Suite, base: &Path) {
     let two_piece_payload = vec![0x42u8; PIECE_LENGTH + 512];
     let v2_control = encode_independent_v2(&[(vec!["layer.bin"], &two_piece_payload)], "v2-ctrl");
     let small_payload = vec![0x11u8; 64];
-    let v2_small_control = encode_independent_v2(&[(vec!["small.bin"], &small_payload)], "v2-sctrl");
+    let v2_small_control =
+        encode_independent_v2(&[(vec!["small.bin"], &small_payload)], "v2-sctrl");
 
     let leaf_hashes: Vec<[u8; 32]> = two_piece_payload
         .chunks(PIECE_LENGTH)
@@ -488,7 +489,7 @@ fn run_integrity_corruption_cases(suite: &mut Suite, base: &Path) {
             (b"piece length", RawBencode::Int(PIECE_LENGTH as i64)),
         ])
     };
-    let mut layer_cases: Vec<(&'static str, Vec<u8>, &'static [u8])> = Vec::new();
+    let mut layer_cases: Vec<(&'static str, Vec<u8>, &[u8])> = Vec::new();
     let mut flip_first = valid_layer.clone();
     flip_first[0] ^= 0x01;
     layer_cases.push((

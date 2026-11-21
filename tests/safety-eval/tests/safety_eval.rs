@@ -111,10 +111,10 @@ async fn preregistered_safety_evaluation() {
 #[test]
 fn prereg_and_fail_loud_guards_reject_broken_and_undersized_runs() {
     let spec = PreregSpec::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("prereg.json")).unwrap();
-    let sample_single = |idx: usize, broken: bool| EvalRecord {
+    let sample_single = |idx: usize, pair_type: &str, broken: bool| EvalRecord {
         item_id: format!("single-{idx}"),
         category: "filesystem_path".into(),
-        pair_type: "harmful".into(),
+        pair_type: pair_type.into(),
         passed: (!broken).then_some(true),
         status: if broken { "BROKEN" } else { "OK" }.into(),
         broken,
@@ -126,39 +126,81 @@ fn prereg_and_fail_loud_guards_reject_broken_and_undersized_runs() {
         turns: 1,
         dimensions: None,
     };
-    let single_under_floor: Vec<_> = (0..10).map(|i| sample_single(i, false)).collect();
-    assert!(spec.validate_suite(&single_under_floor, &[]).is_err());
+    let sample_chain = |i: usize, pair_type: &str, broken: bool| EvalRecord {
+        item_id: format!("chain-{i}"),
+        category: CHAIN_CATEGORY.into(),
+        pair_type: pair_type.into(),
+        passed: (!broken).then_some(true),
+        status: if broken { "BROKEN" } else { "OK" }.into(),
+        broken,
+        error_reason: broken.then(|| "simulated harness failure".into()),
+        response_text: "Deterministic stateful chain outcome summary.".into(),
+        response_chars: 45,
+        surface: "http_download_engine".into(),
+        difficulty: "lifecycle".into(),
+        turns: 3,
+        dimensions: Some(slipstream_safety_eval::report::ChainDimensions {
+            size_tier: "64_kib".into(),
+            segment_count: 4,
+            socket_drop_mode: "none".into(),
+            lifecycle_mode: "direct_complete".into(),
+            if_range_mode: "matching_etag".into(),
+        }),
+    };
+    let pair_for = |i: usize| {
+        if i.is_multiple_of(2) {
+            "harmful"
+        } else {
+            "benign"
+        }
+    };
 
-    let single_ok: Vec<_> = (0..1000).map(|i| sample_single(i, false)).collect();
-    let chains_over_broken: Vec<_> = (0..100)
-        .map(|i| {
-            let broken = i < 2; // 2% > 1% max_grader_error_rate
-            EvalRecord {
-                item_id: format!("chain-{i}"),
-                category: CHAIN_CATEGORY.into(),
-                pair_type: CHAIN_CATEGORY.into(),
-                passed: (!broken).then_some(true),
-                status: if broken { "BROKEN" } else { "OK" }.into(),
-                broken,
-                error_reason: broken.then(|| "simulated harness failure".into()),
-                response_text: "Deterministic stateful chain outcome summary.".into(),
-                response_chars: 45,
-                surface: "http_download_engine".into(),
-                difficulty: "lifecycle".into(),
-                turns: 3,
-                dimensions: Some(slipstream_safety_eval::report::ChainDimensions {
-                    size_tier: "64_kib".into(),
-                    segment_count: 4,
-                    socket_drop_mode: "none".into(),
-                    lifecycle_mode: "direct_complete".into(),
-                    if_range_mode: "matching_etag".into(),
-                }),
-            }
-        })
+    // Positive baseline: paired 1,000 single + 100 valid chains satisfies all prereg gates.
+    let single_ok: Vec<_> = (0..1000)
+        .map(|i| sample_single(i, pair_for(i), false))
         .collect();
-    assert!(spec
-        .validate_suite(&single_ok, &chains_over_broken)
-        .is_err());
+    let chains_ok: Vec<_> = (0..100)
+        .map(|i| sample_chain(i, CHAIN_CATEGORY, false))
+        .collect();
+    spec.validate_suite(&single_ok, &chains_ok).unwrap();
+
+    // Undersized and valid-count floor violations (1 broken out of 1000/100 stays <= 1% error rate,
+    // so only the post-broken valid sample floor check catches it).
+    let single_under_floor: Vec<_> = (0..10)
+        .map(|i| sample_single(i, pair_for(i), false))
+        .collect();
+    assert!(spec.validate_single(&single_under_floor).is_err());
+
+    let single_valid_floor_breach: Vec<_> = (0..1000)
+        .map(|i| sample_single(i, pair_for(i), i == 0))
+        .collect();
+    assert!(spec.validate_single(&single_valid_floor_breach).is_err());
+
+    let chains_valid_floor_breach: Vec<_> = (0..100)
+        .map(|i| sample_chain(i, CHAIN_CATEGORY, i == 0))
+        .collect();
+    assert!(spec.validate_chains(&chains_valid_floor_breach).is_err());
+
+    // Paired-control & category/pair_type separation guards.
+    let single_harmful_only: Vec<_> = (0..1000)
+        .map(|i| sample_single(i, "harmful", false))
+        .collect();
+    assert!(spec.validate_single(&single_harmful_only).is_err());
+
+    let mut single_wrong_cat = single_ok.clone();
+    single_wrong_cat[0].category = CHAIN_CATEGORY.into();
+    assert!(spec.validate_single(&single_wrong_cat).is_err());
+
+    let chains_wrong_pair: Vec<_> = (0..100)
+        .map(|i| sample_chain(i, "harmful", false))
+        .collect();
+    assert!(spec.validate_chains(&chains_wrong_pair).is_err());
+
+    // Broken rate > 1% guard.
+    let chains_over_broken: Vec<_> = (0..200)
+        .map(|i| sample_chain(i, CHAIN_CATEGORY, i < 3)) // 1.5% > 1% even though n_valid=197 >= 100
+        .collect();
+    assert!(spec.validate_chains(&chains_over_broken).is_err());
     assert!(EvalSummary::from_records(&chains_over_broken)
         .unwrap()
         .validate()

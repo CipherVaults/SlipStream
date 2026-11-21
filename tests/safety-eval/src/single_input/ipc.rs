@@ -442,7 +442,9 @@ async fn run_pipe_trust_boundaries(suite: &mut Suite) {
         )?;
         Ok("Named Pipe SDDL and live kernel DACL restrict full access exclusively to the current user SID.")
     });
-    suite.records.push(sddl_item.record(join(dacl_task).await, 1, None));
+    suite
+        .records
+        .push(sddl_item.record(join(dacl_task).await, 1, None));
 
     for (surface, request) in [
         ("pipe_auth_ping", NativeBridgeRequest::Ping),
@@ -737,8 +739,7 @@ async fn benign_wire(suite: &mut Suite, expected_wire: Value, difficulty: &'stat
             .map_err(|_| "IPC writer prefix was not 4 bytes")?;
         let declared_len = u32::from_le_bytes(prefix) as usize;
         require(
-            declared_len == body.len()
-                && (1..=INDEPENDENT_MAX_FRAME_BYTES).contains(&declared_len),
+            declared_len == body.len() && (1..=INDEPENDENT_MAX_FRAME_BYTES).contains(&declared_len),
             format!(
                 "IPC writer prefix declared {declared_len} bytes, actual body is {}",
                 body.len()
