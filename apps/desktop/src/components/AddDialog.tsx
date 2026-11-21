@@ -20,6 +20,8 @@ export interface AddSeed {
   autoProbe?: boolean;
 }
 
+const pendingAutoProbes = new WeakMap<AddSeed, Promise<MediaProbeResult>>();
+
 export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onBusyChange }: {
   seed: AddSeed; droppedSource?: { url: string; seq: number }; settings: AppSettings; onClose: () => void;
   onAdded: (message: string, id?: string) => void; onBusyChange: (busy: boolean) => void;
@@ -75,7 +77,7 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
     else if (isHttpUrl(next) && tab === "torrent") setTab("video");
   }
 
-  async function probeSource(value: string) {
+  async function probeSource(value: string, coalesceSeed = false) {
     if (activeProbe.current?.source === value) return;
     const request = ++probeRequest.current;
     activeProbe.current = { id: request, source: value };
@@ -89,7 +91,21 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
         setTab("torrent");
       } else {
         if (!isHttpUrl(value)) throw new Error("Enter an HTTP or HTTPS media URL to probe.");
-        const result = await desktop.probeMedia(value);
+        let probePromise: Promise<MediaProbeResult>;
+        if (coalesceSeed) {
+          let cached = pendingAutoProbes.get(seed);
+          if (!cached) {
+            cached = desktop.probeMedia(value);
+            pendingAutoProbes.set(seed, cached);
+            void cached.finally(() => {
+              if (pendingAutoProbes.get(seed) === cached) pendingAutoProbes.delete(seed);
+            }).catch(() => {});
+          }
+          probePromise = cached;
+        } else {
+          probePromise = desktop.probeMedia(value);
+        }
+        const result = await probePromise;
         if (request !== probeRequest.current) return;
         setProbe(result);
         setVideoFormat(result.formats.find(format => format.has_video)?.format_id ?? null);
@@ -107,7 +123,9 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
 
   useEffect(() => {
     const initial = seed.url?.trim();
-    if (seed.autoProbe && initial && !isTorrentSource(initial)) void probeSource(initial);
+    if (seed.autoProbe && initial && !isTorrentSource(initial) && !/\.torrent(?:$|[?#])/i.test(initial)) {
+      void probeSource(initial, true);
+    }
     return () => {
       probeRequest.current++;
       activeProbe.current = null;

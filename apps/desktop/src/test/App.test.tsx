@@ -1,4 +1,5 @@
 import { StrictMode } from "react";
+import { clearMocks, mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -133,6 +134,7 @@ describe("workspace and inspector", () => {
     const reveal = vi.spyOn(desktop, "revealInExplorer").mockResolvedValue();
     const cap = vi.spyOn(desktop, "setSpeedLimit").mockResolvedValue();
     const addTorrentSpy = vi.spyOn(desktop, "addTorrent").mockResolvedValue("blender");
+    const listSpy = vi.spyOn(desktop, "listTorrentFiles");
     const user = await start();
     await user.click(screen.getByRole("button", { name: "Unlimited" }));
     expect(cap).toHaveBeenCalledWith(50_000_000);
@@ -145,6 +147,11 @@ describe("workspace and inspector", () => {
     expect(cancel).toHaveBeenCalledWith("design-pdf", false);
     expect(screen.queryByRole("article", { name: pdf })).not.toBeInTheDocument();
 
+    await user.click(within(row(blender)).getByRole("button", { name: /Inspect/ }));
+    await user.click(inspector().getByRole("tab", { name: "Torrent Files" }));
+    expect(await inspector().findByRole("checkbox", { name: /Studio_Textures/ })).toBeVisible();
+    expect(listSpy).toHaveBeenCalledTimes(1);
+
     await user.click(within(row(blender)).getByRole("button", { name: /More actions/ }));
     await user.click(within(row(blender)).getByRole("button", { name: "Remove" }));
     expect(cancel).toHaveBeenCalledWith("blender", false);
@@ -156,6 +163,24 @@ describe("workspace and inspector", () => {
     await user.click(sheet.getByRole("button", { name: "Download" }));
     expect(addTorrentSpy).toHaveBeenCalled();
     expect(row(blender)).toBeVisible();
+    await user.click(inspector().getByRole("tab", { name: "Torrent Files" }));
+    expect(await inspector().findByRole("checkbox", { name: /Studio_Textures/ })).toBeVisible();
+    expect(listSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries unresolved magnet errors on return to Torrent Files", async () => {
+    const listSpy = vi.spyOn(desktop, "listTorrentFiles")
+      .mockRejectedValueOnce(new Error("Metadata pending"))
+      .mockResolvedValueOnce([{ index: 0, relative_path: "Resolved_File.bin", size_bytes: 10_000_000, downloaded_bytes: 0, selected: true }]);
+    const user = await start();
+    await user.click(within(row(blender)).getByRole("button", { name: /Inspect/ }));
+    await user.click(inspector().getByRole("tab", { name: "Torrent Files" }));
+    expect(await inspector().findByRole("alert")).toHaveTextContent("Metadata pending");
+
+    await user.click(inspector().getByRole("tab", { name: "Overview" }));
+    await user.click(inspector().getByRole("tab", { name: "Torrent Files" }));
+    expect(await inspector().findByRole("checkbox", { name: /Resolved_File\.bin/ })).toBeChecked();
+    expect(listSpy).toHaveBeenCalledTimes(2);
   });
 
   it("uses exclusive end_byte, preserves pending torrent file updates across Inspector remounts, and clears stale Media state on URL refresh", async () => {
@@ -495,27 +520,39 @@ describe("appearance, settings and transfer dialogs", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
-  it("prevents settings overwrite on startup failure, rejects fractional-zero limits, clears toast on retry, and preserves queued limit edits", async () => {
-    const getSettingsSpy = vi.spyOn(desktop, "getSettings").mockRejectedValue(new Error("Settings unreadable"));
+  it("prevents settings overwrite on startup failure, rejects fractional-zero limits & >32 concurrent, clears earlier toast on retry, and preserves queued limit edits", async () => {
+    const getSettingsSpy = vi.spyOn(desktop, "getSettings")
+      .mockRejectedValueOnce(new Error("Startup error"))
+      .mockRejectedValueOnce(new Error("Click error"))
+      .mockRejectedValueOnce(new Error("Secondary error"));
     const saveSpy = vi.spyOn(desktop, "saveSettings").mockResolvedValue();
     const user = await start();
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("Settings unreadable");
+    expect(await screen.findByRole("alert")).toHaveTextContent("Startup error");
     await user.click(screen.getByRole("button", { name: "Graphite" }));
     expect(saveSpy).not.toHaveBeenCalled();
 
     await user.click(screen.getByRole("button", { name: "Settings" }));
     const settingsDlg = dialog("Settings & Browser Integration");
+    expect(await settingsDlg.findByText("Secondary error")).toBeVisible();
     expect(settingsDlg.getByRole("button", { name: "Save Settings" })).toBeDisabled();
 
     getSettingsSpy.mockResolvedValue({ ...demo.getSettings(), theme: "dark", accent: "blue" });
     await user.click(settingsDlg.getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(settingsDlg.getByRole("button", { name: "Save Settings" })).toBeEnabled());
-    expect(screen.queryByText("Settings unreadable")).not.toBeInTheDocument();
+    expect(screen.queryByText("Startup error")).not.toBeInTheDocument();
+    expect(screen.queryByText("Click error")).not.toBeInTheDocument();
+    expect(screen.queryByText("Secondary error")).not.toBeInTheDocument();
 
     fireEvent.change(settingsDlg.getByLabelText("Global speed limit in MB/s"), { target: { value: "0.0000004" } });
     fireEvent.submit(settingsDlg.getByRole("button", { name: "Save Settings" }).closest("form")!);
     expect(settingsDlg.getByRole("alert")).toHaveTextContent("positive finite speed limit");
+    expect(saveSpy).not.toHaveBeenCalled();
+
+    fireEvent.change(settingsDlg.getByLabelText("Global speed limit in MB/s"), { target: { value: "" } });
+    fireEvent.change(settingsDlg.getByLabelText("Max concurrent downloads"), { target: { value: "64" } });
+    fireEvent.submit(settingsDlg.getByRole("button", { name: "Save Settings" }).closest("form")!);
+    expect(settingsDlg.getByRole("alert")).toHaveTextContent("between 1 and 32");
     expect(saveSpy).not.toHaveBeenCalled();
     await user.click(settingsDlg.getByRole("button", { name: "Cancel" }));
 
@@ -533,7 +570,7 @@ describe("appearance, settings and transfer dialogs", () => {
     })));
   });
 
-  it("handles StrictMode auto-probe, routes local wildcard torrents vs https .torrent URLs, preserves FIFO pickers, and protects open modals on Ctrl+K/N", async () => {
+  it("handles StrictMode auto-probe without duplicate IPC, skips autoProbe on https .torrent, handles pre-commit picker bursts, and protects open modals on Ctrl+K/N", async () => {
     let rejectAdd!: (err: Error) => void;
     const httpSpy = vi.spyOn(desktop, "addHttpDownload").mockImplementation(
       () => new Promise<string>((_resolve, reject) => { rejectAdd = reject; }),
@@ -553,8 +590,20 @@ describe("appearance, settings and transfer dialogs", () => {
     act(() => openPicker(mediaUrl));
     const probedSheet = dialog("Add Download");
     expect(await probedSheet.findByRole("button", { name: /2160p 4K/ })).toBeVisible();
-    expect(probeSpy).toHaveBeenCalled();
+    expect(probeSpy).toHaveBeenCalledTimes(1);
     await user.click(probedSheet.getByRole("button", { name: "Cancel" }));
+
+    act(() => {
+      openPicker("https://example.org/ubuntu.torrent");
+      openPicker("https://example.org/burst-2.mp4");
+    });
+    const burstSheet = dialog("Add Download");
+    expect(burstSheet.getByRole("textbox", { name: "Download source" })).toHaveValue("https://example.org/ubuntu.torrent");
+    expect(probeSpy).toHaveBeenCalledTimes(1);
+    await user.click(burstSheet.getByRole("button", { name: "Cancel" }));
+    const burst2Sheet = await screen.findByRole("dialog", { name: "Add Download" });
+    expect(within(burst2Sheet).getByRole("textbox", { name: "Download source" })).toHaveValue("https://example.org/burst-2.mp4");
+    await user.click(within(burst2Sheet).getByRole("button", { name: "Cancel" }));
 
     await user.click(screen.getByRole("button", { name: "Add" }));
     const sheet = dialog("Add Download");
@@ -589,5 +638,35 @@ describe("appearance, settings and transfer dialogs", () => {
     await user.click(within(firstQueued).getByRole("button", { name: "Cancel" }));
     const secondQueued = await screen.findByRole("dialog", { name: "Add Download" });
     expect(within(secondQueued).getByRole("textbox", { name: "Download source" })).toHaveValue("https://example.org/queued-2.mp4");
+  });
+
+  it("refreshes canonical backend settings from get_settings after save_settings in Tauri mode", async () => {
+    let backendSettings = { ...demo.getSettings(), default_download_dir: "D:\\Downloads" };
+    mockWindows("main");
+    mockIPC((cmd, args) => {
+      if (cmd === "get_snapshot") return demo.snapshot();
+      if (cmd === "get_settings") return backendSettings;
+      if (cmd === "get_toolchain_status") return demo.toolchain();
+      if (cmd === "save_settings") {
+        const submitted = (args as { settings: typeof backendSettings }).settings;
+        backendSettings = { ...submitted, default_download_dir: "D:\\Canonical\\Downloads" };
+        return undefined;
+      }
+      return undefined;
+    }, { shouldMockEvents: true });
+    try {
+      const user = await start();
+      await user.click(screen.getByRole("button", { name: "Settings" }));
+      const settingsDlg = dialog("Settings & Browser Integration");
+      await user.clear(settingsDlg.getByLabelText("Default download folder"));
+      await user.type(settingsDlg.getByLabelText("Default download folder"), "D:\\Downloads\\..\\Canonical\\Downloads");
+      await user.click(settingsDlg.getByRole("button", { name: "Save Settings" }));
+      expect(await screen.findByText("Settings saved.")).toBeVisible();
+      expect(screen.getByTitle("D:\\Canonical\\Downloads")).toBeVisible();
+    } finally {
+      clearMocks();
+      Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+      Reflect.deleteProperty(window, "__TAURI_EVENT_PLUGIN_INTERNALS__");
+    }
   });
 });

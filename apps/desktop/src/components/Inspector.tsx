@@ -205,18 +205,26 @@ export function Inspector({ transfer, samples, preview, torrentEntry, onLoadTorr
     });
   }
 
+  const prevTabRef = useRef<InspectorTab>(tab);
+  const prevTotalBytesRef = useRef<number | null>(transfer?.total_bytes ?? null);
+
   useEffect(() => {
+    const enteringDetails = tab === "details" && prevTabRef.current !== "details";
+    const metadataUpdated = (transfer?.total_bytes ?? null) !== prevTotalBytesRef.current;
+    prevTabRef.current = tab;
+    prevTotalBytesRef.current = transfer?.total_bytes ?? null;
     if (tab !== "details" || !transferId || !transferKind) return;
     if (transferKind === "torrent") {
-      if (!torrentEntry || torrentEntry.status === "idle") {
-        onLoadTorrentFiles(transferId, false);
+      if (!torrentEntry || torrentEntry.status === "idle"
+        || (torrentEntry.status === "error" && (enteringDetails || metadataUpdated))) {
+        onLoadTorrentFiles(transferId, torrentEntry?.status === "error");
       }
       return;
     }
     if (transferKind === "media") {
       probeCurrentMedia(false);
     }
-  }, [tab, transferId, transferKind, transferUrl, torrentEntry?.status, onLoadTorrentFiles]);
+  }, [tab, transferId, transferKind, transferUrl, transfer?.total_bytes, torrentEntry?.status, onLoadTorrentFiles]);
 
   if (!transfer) return <aside className="inspector" aria-label="Transfer inspector"><p className="empty-state">Select a transfer to inspect.</p></aside>;
   const torrent = transfer.kind === "torrent";

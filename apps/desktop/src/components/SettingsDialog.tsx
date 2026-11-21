@@ -95,8 +95,8 @@ export function SettingsDialog({ settings, loadState, loadError, onRetryLoad, on
         }
         speedLimitBps = rounded;
       }
-      if (!Number.isInteger(draft.max_concurrent_downloads) || draft.max_concurrent_downloads < 1 || draft.max_concurrent_downloads > 255) {
-        setProblem("Enter a whole number between 1 and 255 for max concurrent downloads.");
+      if (!Number.isInteger(draft.max_concurrent_downloads) || draft.max_concurrent_downloads < 1 || draft.max_concurrent_downloads > 32) {
+        setProblem("Enter a whole number between 1 and 32 for max concurrent downloads.");
         return;
       }
       const patch: Partial<AppSettings> = {};
@@ -132,7 +132,7 @@ export function SettingsDialog({ settings, loadState, loadError, onRetryLoad, on
           <label className="field">Max connections<select value={draft.default_connections} onChange={event => update("default_connections", Number(event.target.value))}>
             {Array.from({ length: 32 }, (_, index) => <option key={index}>{index + 1}</option>)}
           </select></label>
-          <label className="field">Max concurrent downloads<input required type="number" min={1} max={255} value={draft.max_concurrent_downloads || ""}
+          <label className="field">Max concurrent downloads<input required type="number" min={1} max={32} value={draft.max_concurrent_downloads || ""}
             onChange={event => update("max_concurrent_downloads", Number(event.target.value))} /></label>
           <label className="field full-width">Global speed limit in MB/s<input type="number" min={0} max={9_007_199_254} step="any"
             placeholder="Unlimited" value={limit} onChange={event => {
