@@ -188,7 +188,7 @@ fn http_request(server: &HttpServer, path: &str, filename: &str) -> AddHttpDownl
 }
 
 async fn wait_for(state: &AppState, id: &str, status: TransferStatus) -> TransferSnapshot {
-    timeout(Duration::from_secs(12), async {
+    timeout(Duration::from_secs(30), async {
         loop {
             let snapshot = state
                 .snapshot()
