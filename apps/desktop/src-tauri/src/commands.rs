@@ -140,10 +140,11 @@ pub(crate) async fn install_browser_hosts(
         .resource_dir()
         .map_err(|error| error.to_string())?;
     let manifests = state.data_dir().join("native-messaging");
+    let base_key = state.registry_base_key().to_owned();
     tokio::task::spawn_blocking(move || {
         let executable = tools::native_host_executable(&resource_dir)?;
         let paths = tools::install_browser_hosts_into(
-            slipstream_native_host::registry::DEFAULT_BASE_KEY,
+            &base_key,
             &manifests,
             &executable,
             chrome_id.as_deref(),

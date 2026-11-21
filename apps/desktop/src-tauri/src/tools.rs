@@ -40,10 +40,129 @@ pub struct ToolchainStatus {
     pub native_hosts_installed: bool,
 }
 
+pub(crate) fn resolve_tool_from_path(name: &str, path_env: Option<&OsStr>) -> Option<PathBuf> {
+    path_env
+        .into_iter()
+        .flat_map(env::split_paths)
+        .filter(|dir| dir.is_absolute() && canonical_directory(dir).is_ok())
+        .find_map(|dir| canonical_exe(&dir.join(name)).ok())
+}
+
+pub(crate) fn resolve_required_tool(
+    configured: Option<&str>,
+    name: &str,
+    path_env: Option<&OsStr>,
+) -> io::Result<PathBuf> {
+    if let Some(raw) = configured.map(str::trim).filter(|s| !s.is_empty()) {
+        return canonical_exe(Path::new(raw));
+    }
+    resolve_tool_from_path(name, path_env)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{name} was not found")))
+}
+
+fn resolve_optional_ffprobe(
+    sibling_dir: Option<&Path>,
+    path_env: Option<&OsStr>,
+) -> io::Result<Option<PathBuf>> {
+    if let Some(dir) = sibling_dir {
+        let candidate = dir.join("ffprobe.exe");
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => return canonical_exe(&candidate).map(Some),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    for dir in path_env
+        .into_iter()
+        .flat_map(env::split_paths)
+        .filter(|dir| dir.is_absolute())
+    {
+        let candidate = dir.join("ffprobe.exe");
+        if canonical_directory(&dir).is_ok() {
+            match fs::symlink_metadata(&candidate) {
+                Ok(_) => return canonical_exe(&candidate).map(Some),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            }
+        } else if candidate.is_file() {
+            return Err(invalid(
+                "ffprobe directory on PATH contains a reparse point",
+            ));
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) fn hardened_toolchain_config_with_path(
+    settings: &AppSettings,
+    path_env: Option<&OsStr>,
+) -> io::Result<ToolchainConfig> {
+    let ytdlp = resolve_required_tool(settings.ytdlp_path.as_deref(), "yt-dlp.exe", path_env)?;
+    let ffmpeg = resolve_required_tool(settings.ffmpeg_path.as_deref(), "ffmpeg.exe", path_env)?;
+    let ffprobe = resolve_optional_ffprobe(ffmpeg.parent(), path_env)?;
+    Ok(ToolchainConfig {
+        ytdlp_path: Some(ytdlp),
+        ffmpeg_path: Some(ffmpeg),
+        ffprobe_path: ffprobe,
+        ..ToolchainConfig::default()
+    })
+}
+
+pub(crate) fn hardened_toolchain_config(settings: &AppSettings) -> io::Result<ToolchainConfig> {
+    let path_env = env::var_os("PATH");
+    hardened_toolchain_config_with_path(settings, path_env.as_deref())
+}
+
+pub(crate) async fn discover_media_toolchain(
+    settings: AppSettings,
+) -> std::result::Result<MediaToolchain, String> {
+    let config = tokio::task::spawn_blocking(move || hardened_toolchain_config(&settings))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    MediaToolchain::discover(config)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 pub(crate) async fn toolchain_status(settings: &AppSettings, base_key: &str) -> ToolchainStatus {
-    let config = ToolchainConfig::from(settings);
-    let discovery = MediaToolchain::discover(config.clone()).await;
-    let (ytdlp, ffmpeg) = if let Ok(tools) = discovery {
+    let settings = settings.clone();
+    let (ytdlp_bin, ffmpeg_bin, ffprobe_res) = tokio::task::spawn_blocking(move || {
+        let path_env = env::var_os("PATH");
+        let ytdlp = resolve_required_tool(
+            settings.ytdlp_path.as_deref(),
+            "yt-dlp.exe",
+            path_env.as_deref(),
+        )
+        .ok();
+        let ffmpeg = resolve_required_tool(
+            settings.ffmpeg_path.as_deref(),
+            "ffmpeg.exe",
+            path_env.as_deref(),
+        )
+        .ok();
+        let ffprobe = match ffmpeg.as_deref() {
+            Some(exe) => resolve_optional_ffprobe(exe.parent(), path_env.as_deref()),
+            None => Ok(None),
+        };
+        (ytdlp, ffmpeg, ffprobe)
+    })
+    .await
+    .unwrap_or((None, None, Ok(None)));
+
+    let discovered = match (&ytdlp_bin, &ffmpeg_bin, ffprobe_res) {
+        (Some(ytdlp), Some(ffmpeg), Ok(ffprobe)) => MediaToolchain::discover(ToolchainConfig {
+            ytdlp_path: Some(ytdlp.clone()),
+            ffmpeg_path: Some(ffmpeg.clone()),
+            ffprobe_path: ffprobe,
+            ..ToolchainConfig::default()
+        })
+        .await
+        .ok(),
+        _ => None,
+    };
+
+    let (ytdlp, ffmpeg) = if let Some(tools) = discovered {
         (
             tools
                 .ytdlp()
@@ -54,8 +173,18 @@ pub(crate) async fn toolchain_status(settings: &AppSettings, base_key: &str) -> 
         // The shared toolchain requires FFmpeg even for yt-dlp. Probe each
         // binary alone here when the full toolchain cannot be constructed.
         tokio::join!(
-            probe_version(config.ytdlp_path.as_deref(), "yt-dlp.exe", "--version"),
-            probe_version(config.ffmpeg_path.as_deref(), "ffmpeg.exe", "-version"),
+            async {
+                match ytdlp_bin {
+                    Some(path) => probe_version(&path, "--version").await,
+                    None => None,
+                }
+            },
+            async {
+                match ffmpeg_bin {
+                    Some(path) => probe_version(&path, "-version").await,
+                    None => None,
+                }
+            },
         )
     };
     let fields = |binary: Option<(PathBuf, String)>| {
@@ -76,15 +205,8 @@ pub(crate) async fn toolchain_status(settings: &AppSettings, base_key: &str) -> 
     }
 }
 
-async fn probe_version(path: Option<&Path>, name: &str, flag: &str) -> Option<(PathBuf, String)> {
-    let path = match path {
-        Some(path) => canonical_exe(path).ok()?,
-        None => env::var_os("PATH")
-            .iter()
-            .flat_map(env::split_paths)
-            .filter(|dir| dir.is_absolute() && canonical_directory(dir).is_ok())
-            .find_map(|dir| canonical_exe(&dir.join(name)).ok())?,
-    };
+async fn probe_version(path: &Path, flag: &str) -> Option<(PathBuf, String)> {
+    let path = canonical_exe(path).ok()?;
     validate_local_path(&path).ok()?;
     let mut child = Command::new(&path)
         .arg(flag)

@@ -5,7 +5,7 @@ use crate::{
         local_drive_path, reveal_action, RevealAction,
     },
     settings::{normalize, torrent_rate},
-    tools::{explorer_executable, native_hosts_installed},
+    tools::{explorer_executable, hardened_toolchain_config_with_path, native_hosts_installed},
     ToolchainStatus,
 };
 use serde_json::{json, Value};
@@ -359,4 +359,57 @@ fn expands_wildcards_and_clamps_only_torrent_limits() {
     assert_eq!(torrent_rate(Some(16_384)), Some(16_384));
     assert_eq!(torrent_rate(Some(128_000)), Some(128_000));
     assert_eq!(torrent_rate(Some(u64::MAX)), Some(u64::from(u32::MAX)));
+}
+
+#[test]
+fn hardened_toolchain_rejects_junctions_and_ignores_junction_path_entries() {
+    let temp = TempDir::new();
+    let safe_dir = temp.0.join("safe");
+    let outside_dir = temp.0.join("outside");
+    let junction_dir = temp.0.join("junction");
+    fs::create_dir(&safe_dir).unwrap();
+    fs::create_dir(&outside_dir).unwrap();
+    directory_junction(&junction_dir, &outside_dir);
+
+    for dir in [&safe_dir, &outside_dir] {
+        fs::write(dir.join("yt-dlp.exe"), b"exe").unwrap();
+        fs::write(dir.join("ffmpeg.exe"), b"exe").unwrap();
+    }
+
+    let safe_path_env = env::join_paths([&junction_dir, &safe_dir]).unwrap();
+
+    // Configured junction tool must fail immediately without falling back to PATH.
+    let bad_configured = AppSettings {
+        ytdlp_path: Some(
+            junction_dir
+                .join("yt-dlp.exe")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        ffmpeg_path: Some(safe_dir.join("ffmpeg.exe").to_string_lossy().into_owned()),
+        ..AppSettings::default()
+    };
+    assert!(hardened_toolchain_config_with_path(&bad_configured, Some(&safe_path_env)).is_err());
+
+    // PATH-only lookup with only a junction directory must fail.
+    let junction_only_env = env::join_paths([&junction_dir]).unwrap();
+    let auto_settings = AppSettings::default();
+    assert!(hardened_toolchain_config_with_path(&auto_settings, Some(&junction_only_env)).is_err());
+
+    // Mixed PATH skips the junction directory and resolves the canonical safe binaries.
+    let resolved =
+        hardened_toolchain_config_with_path(&auto_settings, Some(&safe_path_env)).unwrap();
+    assert_eq!(
+        resolved.ytdlp_path.unwrap(),
+        fs::canonicalize(safe_dir.join("yt-dlp.exe")).unwrap()
+    );
+    assert_eq!(
+        resolved.ffmpeg_path.unwrap(),
+        fs::canonicalize(safe_dir.join("ffmpeg.exe")).unwrap()
+    );
+    assert_eq!(resolved.ffprobe_path, None);
+
+    // An ffprobe.exe inside a junctioned PATH entry must also be rejected rather than passed as None.
+    fs::write(outside_dir.join("ffprobe.exe"), b"exe").unwrap();
+    assert!(hardened_toolchain_config_with_path(&auto_settings, Some(&safe_path_env)).is_err());
 }

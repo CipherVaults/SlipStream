@@ -1,11 +1,12 @@
-use crate::paths::{canonical_directory, confined_target, invalid};
-use chrono::Utc;
-use slipstream_media::{
-    DownloadOptions, MediaPipeline, MediaProgressEvent, MediaToolchain, ToolchainConfig,
+use crate::{
+    paths::{canonical_directory, confined_target, invalid},
+    tools::discover_media_toolchain,
 };
+use chrono::Utc;
+use slipstream_media::{DownloadOptions, MediaPipeline, MediaProgressEvent};
 use slipstream_protocol::{
-    safe_join_under, sanitize_filename, validate_http_url, AddMediaDownloadRequest, TransferKind,
-    TransferSnapshot, TransferStatus, UI_SEGMENT_COUNT,
+    safe_join_under, sanitize_filename, validate_http_url, AddMediaDownloadRequest, AppSettings,
+    TransferKind, TransferSnapshot, TransferStatus, UI_SEGMENT_COUNT,
 };
 use std::{
     fs, io,
@@ -121,7 +122,7 @@ impl MediaJob {
 
     pub(crate) async fn start(
         self: &Arc<Self>,
-        config: ToolchainConfig,
+        settings: AppSettings,
         scans: mpsc::Sender<ScanRequest>,
     ) -> Result<(), String> {
         let mut run = self.run.lock().await;
@@ -146,12 +147,21 @@ impl MediaJob {
         }
         let (stop, stopped) = watch::channel(false);
         let job = self.clone();
-        let task = tokio::spawn(async move { job.download(config, scans, stopped).await });
+        let task = tokio::spawn(async move { job.download(settings, scans, stopped).await });
         *run = Some(MediaRun { stop, task });
         Ok(())
     }
 
     pub(crate) async fn stop(&self, status: TransferStatus) -> Result<(), String> {
+        self.stop_with(status, status == TransferStatus::Canceled)
+            .await
+    }
+
+    pub(crate) async fn shutdown(&self) -> Result<(), String> {
+        self.stop_with(TransferStatus::Paused, true).await
+    }
+
+    async fn stop_with(&self, status: TransferStatus, allow_finished: bool) -> Result<(), String> {
         let mut run = self.run.lock().await;
         if let Some(current) = run.as_mut() {
             current.stop.send_replace(true);
@@ -165,7 +175,7 @@ impl MediaJob {
             snapshot.status,
             TransferStatus::Completed | TransferStatus::Canceled
         ) {
-            if status == TransferStatus::Paused {
+            if !allow_finished {
                 return Err("transfer has already finished".into());
             }
         } else {
@@ -180,13 +190,13 @@ impl MediaJob {
 
     async fn download(
         &self,
-        config: ToolchainConfig,
+        settings: AppSettings,
         scans: mpsc::Sender<ScanRequest>,
         mut stopped: watch::Receiver<bool>,
     ) {
         let (tx, mut rx) = mpsc::channel(16);
         let result = {
-            let operation = self.stage_download(config, tx);
+            let operation = self.stage_download(settings, tx);
             tokio::pin!(operation);
             loop {
                 tokio::select! {
@@ -241,12 +251,10 @@ impl MediaJob {
 
     async fn stage_download(
         &self,
-        config: ToolchainConfig,
+        settings: AppSettings,
         progress: mpsc::Sender<MediaProgressEvent>,
     ) -> Result<(StagingDir, Vec<PathBuf>), String> {
-        let tools = MediaToolchain::discover(config)
-            .await
-            .map_err(|error| error.to_string())?;
+        let tools = discover_media_toolchain(settings).await?;
         let path = self
             .directory
             .join(format!(".slipstream-media-{}", Uuid::new_v4()));

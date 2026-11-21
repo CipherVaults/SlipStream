@@ -11,9 +11,14 @@ use slipstream_torrent::TorrentManagerConfig;
 use std::{
     env, fs,
     future::Future,
+    os::windows::{
+        fs::{MetadataExt, OpenOptionsExt},
+        io::AsRawHandle,
+    },
     path::{Path, PathBuf},
     pin::Pin,
     process::Command,
+    ptr::null_mut,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
@@ -27,7 +32,17 @@ use tokio::{
     time::{sleep, timeout},
 };
 use uuid::Uuid;
-use windows_sys::Win32::System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER};
+use windows_sys::Win32::{
+    Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    },
+    System::{
+        Ioctl::FSCTL_SET_REPARSE_POINT,
+        Registry::{RegDeleteTreeW, HKEY_CURRENT_USER},
+        SystemServices::IO_REPARSE_TAG_MOUNT_POINT,
+        IO::DeviceIoControl,
+    },
+};
 
 const TEST_HASH: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
 
@@ -572,6 +587,7 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
     );
     state.set_speed_limit(None).await.unwrap();
 
+    assert_eq!(state.registry_base_key(), registry_key.0);
     assert!(matches!(
         bridge
             .request(Request::OpenDesktopWindow {
@@ -587,7 +603,10 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
         })
         .await;
     assert!(ui.events.lock().unwrap().is_empty());
-    state.window_ready().unwrap();
+    let generation = state.window_generation();
+    state.window_ready(generation.wrapping_add(1)).unwrap();
+    assert!(ui.events.lock().unwrap().is_empty());
+    state.window_ready(generation).unwrap();
     assert_eq!(
         *ui.events.lock().unwrap(),
         vec![OpenPickerEvent {
@@ -608,7 +627,8 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
     .await
     .unwrap();
     ui.visible.store(false, Ordering::SeqCst);
-    state.window_loading();
+    let stale_generation = state.window_generation();
+    let current_generation = state.window_loading();
     sleep(Duration::from_millis(80)).await;
     let checks = ui.presence_checks.load(Ordering::SeqCst);
     let emissions = ui.snapshots.lock().unwrap().len();
@@ -622,7 +642,9 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
         })
         .await;
     assert_eq!(ui.events.lock().unwrap().len(), 2);
-    state.window_ready().unwrap();
+    state.window_ready(stale_generation).unwrap();
+    assert_eq!(ui.events.lock().unwrap().len(), 2);
+    state.window_ready(current_generation).unwrap();
     assert_eq!(
         ui.events.lock().unwrap().last().unwrap().url.as_deref(),
         Some(magnet.as_str())
@@ -772,5 +794,190 @@ async fn settings_reload_and_rebase_an_empty_torrent_manager() {
     assert_eq!(state.settings().default_connections, 32);
     assert_eq!(state.settings().max_concurrent_downloads, 1);
     assert_eq!(state.snapshot().await.speed_limit_bps, Some(1024));
+    state.shutdown().await.unwrap();
+}
+
+fn directory_junction(link: &Path, destination: &Path) {
+    fs::create_dir(link).unwrap();
+    let destination = fs::canonicalize(destination).unwrap();
+    let raw = destination.to_string_lossy();
+    let drive = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    let substitute: Vec<u16> = format!(r"\??\{drive}").encode_utf16().collect();
+    let print: Vec<u16> = drive.encode_utf16().collect();
+    let substitute_len = (substitute.len() * 2) as u16;
+    let print_len = (print.len() * 2) as u16;
+    let mut buffer = Vec::new();
+    buffer.extend(IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+    for value in [
+        8 + substitute_len + print_len + 4,
+        0,
+        0,
+        substitute_len,
+        substitute_len + 2,
+        print_len,
+    ] {
+        buffer.extend(value.to_le_bytes());
+    }
+    for unit in substitute.into_iter().chain([0]).chain(print).chain([0]) {
+        buffer.extend(unit.to_le_bytes());
+    }
+    let handle = fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(link)
+        .unwrap();
+    let mut returned = 0;
+    let result = unsafe {
+        DeviceIoControl(
+            handle.as_raw_handle(),
+            FSCTL_SET_REPARSE_POINT,
+            buffer.as_ptr().cast(),
+            buffer.len() as u32,
+            null_mut(),
+            0,
+            &mut returned,
+            null_mut(),
+        )
+    };
+    assert_ne!(result, 0, "{}", std::io::Error::last_os_error());
+    assert_ne!(
+        fs::symlink_metadata(link).unwrap().file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT,
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn completed_media_shutdown_ssrf_guard_and_reparse_tool_rejection() {
+    let temp = TempDir::new();
+    let downloads = temp.0.join("Downloads");
+    let safe_bin = temp.0.join("safe-bin");
+    let mutable_bin = temp.0.join("mutable-bin");
+    fs::create_dir_all(&safe_bin).unwrap();
+    fs::create_dir_all(&mutable_bin).unwrap();
+
+    let built_exe = media_tool_fixture(&safe_bin).await;
+    let mutable_exe = mutable_bin.join("media-tool.exe");
+    fs::copy(&built_exe, &mutable_exe).unwrap();
+
+    let settings = installed_settings(&temp.0, &downloads);
+    let pipe = format!(r"\\.\pipe\SlipStream.DesktopMediaGuards.{}", Uuid::new_v4());
+    let registry_key = RegistryKey::isolated();
+    let mut strict_options = options(&pipe, &registry_key.0);
+    strict_options.allow_loopback = false;
+
+    let state = AppState::start(temp.0.clone(), Arc::new(FakeUi::default()), strict_options)
+        .await
+        .unwrap();
+
+    state
+        .save_settings(AppSettings {
+            ytdlp_path: Some(mutable_exe.to_string_lossy().into_owned()),
+            ffmpeg_path: Some(mutable_exe.to_string_lossy().into_owned()),
+            ..settings.clone()
+        })
+        .await
+        .unwrap();
+
+    for blocked in [
+        "http://127.0.0.1:8080/video",
+        "http://[::1]:8080/video",
+        "http://localhost:8080/video",
+        "http://169.254.169.254/latest/meta-data",
+        "http://100.64.0.1/video",
+        "http://[::ffff:127.0.0.1]/video",
+    ] {
+        assert!(state.probe_media(blocked).await.is_err(), "{blocked}");
+        assert!(
+            state
+                .add_media_download(AddMediaDownloadRequest {
+                    url: blocked.into(),
+                    format_id: None,
+                    audio_only_preset: None,
+                    target_container: None,
+                    embed_subtitles_langs: Vec::new(),
+                    lossless_remux: false,
+                    normalize_audio: false,
+                    save_dir: None,
+                    filename: None,
+                    playlist_items: None,
+                })
+                .await
+                .is_err(),
+            "{blocked}"
+        );
+    }
+
+    // Swap a previously validated tool directory into a directory junction (TOCTOU).
+    fs::remove_dir_all(&mutable_bin).unwrap();
+    directory_junction(&mutable_bin, &safe_bin);
+
+    let status = state.get_toolchain_status().await;
+    assert_eq!(status.ytdlp_path, None);
+    assert_eq!(status.ffmpeg_path, None);
+    assert!(state
+        .probe_media("https://example.com/video")
+        .await
+        .is_err());
+    let rejected_media = state
+        .add_media_download(AddMediaDownloadRequest {
+            url: "https://example.com/video".into(),
+            format_id: None,
+            audio_only_preset: None,
+            target_container: None,
+            embed_subtitles_langs: Vec::new(),
+            lossless_remux: false,
+            normalize_audio: false,
+            save_dir: None,
+            filename: None,
+            playlist_items: None,
+        })
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let snap = state
+                .snapshot()
+                .await
+                .transfers
+                .into_iter()
+                .find(|item| item.id == rejected_media)
+                .unwrap();
+            assert_ne!(snap.status, TransferStatus::Completed);
+            if snap.status == TransferStatus::Failed {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    state.cancel_transfer(&rejected_media, true).await.unwrap();
+
+    // Restore clean canonical binaries, complete a media download, and shut down
+    // while the completed media job remains in AppState.
+    state
+        .save_settings(AppSettings {
+            ytdlp_path: Some(built_exe.to_string_lossy().into_owned()),
+            ffmpeg_path: Some(built_exe.to_string_lossy().into_owned()),
+            ..settings
+        })
+        .await
+        .unwrap();
+    let media_id = state
+        .add_media_download(AddMediaDownloadRequest {
+            url: "https://example.com/video".into(),
+            format_id: Some("18".into()),
+            audio_only_preset: None,
+            target_container: None,
+            embed_subtitles_langs: Vec::new(),
+            lossless_remux: false,
+            normalize_audio: false,
+            save_dir: None,
+            filename: Some("done.mp4".into()),
+            playlist_items: None,
+        })
+        .await
+        .unwrap();
+    wait_for(&state, &media_id, TransferStatus::Completed).await;
     state.shutdown().await.unwrap();
 }

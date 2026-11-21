@@ -6,7 +6,7 @@ use std::{
     mem::size_of,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
     time::Duration,
@@ -31,7 +31,6 @@ pub(crate) struct DesktopUi {
     app: AppHandle,
     present: AtomicBool,
     destroying: watch::Sender<bool>,
-    page_generation: AtomicU64,
 }
 
 impl DesktopUi {
@@ -40,7 +39,6 @@ impl DesktopUi {
             app,
             present: AtomicBool::new(false),
             destroying: watch::channel(false).0,
-            page_generation: AtomicU64::new(0),
         }
     }
 
@@ -49,8 +47,7 @@ impl DesktopUi {
         let window = if let Some(window) = self.app.get_webview_window(MAIN) {
             window
         } else {
-            self.page_generation.fetch_add(1, Ordering::AcqRel);
-            state.window_loading();
+            let _ = state.window_loading();
             let config = self
                 .app
                 .config()
@@ -81,8 +78,7 @@ impl DesktopUi {
         if let Some(window) = self.app.get_webview_window(MAIN) {
             self.destroying.send_replace(true);
             self.present.store(false, Ordering::Release);
-            self.page_generation.fetch_add(1, Ordering::AcqRel);
-            self.app.state::<Arc<AppState>>().window_loading();
+            let _ = self.app.state::<Arc<AppState>>().window_loading();
             if let Err(error) = window.destroy() {
                 self.destroying.send_replace(false);
                 if self.app.get_webview_window(MAIN).is_some() {
@@ -172,9 +168,9 @@ impl UiBridge for DesktopUi {
             return;
         }
         if let Some(window) = self.app.get_webview_window(MAIN) {
-            let ui = self.app.state::<Arc<DesktopUi>>().inner().clone();
             let state = self.app.state::<Arc<AppState>>().inner().clone();
-            page_finished(window, ui, state);
+            let generation = state.window_generation();
+            page_finished(window, state, generation);
         }
     }
 
@@ -252,14 +248,11 @@ fn quit_from_shell(app: &AppHandle) {
     tauri::async_runtime::spawn(async move { state.quit().await });
 }
 
-fn page_finished(window: WebviewWindow, ui: Arc<DesktopUi>, state: Arc<AppState>) {
-    let generation = ui.page_generation.load(Ordering::Acquire);
+fn page_finished(window: WebviewWindow, state: Arc<AppState>, generation: u64) {
     tauri::async_runtime::spawn(async move {
         let fast_until = tokio::time::Instant::now() + Duration::from_secs(3);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        while ui.page_generation.load(Ordering::Acquire) == generation
-            && tokio::time::Instant::now() < deadline
-        {
+        while state.window_generation() == generation && tokio::time::Instant::now() < deadline {
             // Finished can arrive before React's effect has subscribed. Query
             // the Tauri v2 event registration before handing over pending URLs.
             let (tx, rx) = oneshot::channel();
@@ -279,10 +272,8 @@ fn page_finished(window: WebviewWindow, ui: Arc<DesktopUi>, state: Arc<AppState>
                 .await
                 .is_ok_and(|answer| answer == Ok(true));
             if subscribed {
-                if ui.page_generation.load(Ordering::Acquire) == generation {
-                    if let Err(error) = state.window_ready() {
-                        tracing::warn!(%error, "could not open the picker");
-                    }
+                if let Err(error) = state.window_ready(generation) {
+                    tracing::warn!(%error, "could not open the picker");
                 }
                 return;
             }
@@ -330,16 +321,15 @@ pub(crate) fn run() {
                 return;
             }
             let app = webview.app_handle();
-            let ui = app.state::<Arc<DesktopUi>>();
             let state = app.state::<Arc<AppState>>();
             match payload.event() {
                 PageLoadEvent::Started => {
-                    ui.page_generation.fetch_add(1, Ordering::AcqRel);
-                    state.window_loading();
+                    let _ = state.window_loading();
                 }
                 PageLoadEvent::Finished => {
                     if let Some(window) = app.get_webview_window(MAIN) {
-                        page_finished(window, ui.inner().clone(), state.inner().clone());
+                        let generation = state.window_generation();
+                        page_finished(window, state.inner().clone(), generation);
                     }
                 }
             }
@@ -392,8 +382,7 @@ pub(crate) fn run() {
             } if label == MAIN => {
                 let ui = app.state::<Arc<DesktopUi>>();
                 ui.present.store(false, Ordering::Release);
-                ui.page_generation.fetch_add(1, Ordering::AcqRel);
-                state.window_loading();
+                let _ = state.window_loading();
                 ui.destroying.send_replace(false);
             }
             _ => {}

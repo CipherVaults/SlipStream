@@ -5,20 +5,24 @@ use crate::{
         local_drive_path, reveal_action, RevealAction,
     },
     settings::{normalize, read_json, torrent_rate, write_json_atomically, SETTINGS_FILE},
-    tools::{defender_executable, explorer_executable, toolchain_status, ToolchainStatus},
+    tools::{
+        defender_executable, discover_media_toolchain, explorer_executable, toolchain_status,
+        ToolchainStatus,
+    },
 };
 use serde::{Deserialize, Serialize};
 use slipstream_engine::{DownloadEngine, EngineConfig, EngineEvent};
-use slipstream_media::{probe_url, MediaToolchain, ProbeOptions};
+use slipstream_media::{probe_url, ProbeOptions};
 use slipstream_native_host::{
     pipe::{error_response, PipeRequestHandler, PipeServer},
     registry::DEFAULT_BASE_KEY,
     security::default_pipe_name,
 };
 use slipstream_protocol::{
-    validate_http_url, validate_magnet_uri, AddHttpDownloadRequest, AddMediaDownloadRequest,
-    AddTorrentRequest, AppSettings, MediaProbeResult, NativeBridgeRequest, NativeBridgeResponse,
-    RefreshDownloadUrlRequest, TelemetryBatch, TorrentFileEntry, TransferSnapshot, TransferStatus,
+    is_private_or_loopback_ip, validate_http_url, validate_magnet_uri, AddHttpDownloadRequest,
+    AddMediaDownloadRequest, AddTorrentRequest, AppSettings, MediaProbeResult, NativeBridgeRequest,
+    NativeBridgeResponse, RefreshDownloadUrlRequest, TelemetryBatch, TorrentFileEntry,
+    TransferSnapshot, TransferStatus,
 };
 use slipstream_torrent::{TorrentManager, TorrentManagerConfig};
 use std::{
@@ -80,6 +84,7 @@ struct TorrentSession {
 
 #[derive(Default)]
 struct Picker {
+    generation: u64,
     ready: bool,
     pending: VecDeque<OpenPickerEvent>,
 }
@@ -87,6 +92,7 @@ struct Picker {
 pub struct AppState {
     data_dir: PathBuf,
     registry_base_key: String,
+    allow_loopback: bool,
     ui: Arc<dyn UiBridge>,
     engine: DownloadEngine,
     torrent: AsyncRwLock<TorrentSession>,
@@ -173,6 +179,7 @@ impl AppState {
         let state = Arc::new(Self {
             data_dir,
             registry_base_key,
+            allow_loopback: options.allow_loopback,
             ui,
             engine,
             torrent: AsyncRwLock::new(torrent),
@@ -234,6 +241,10 @@ impl AppState {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    pub fn registry_base_key(&self) -> &str {
+        &self.registry_base_key
     }
 
     pub fn settings(&self) -> AppSettings {
@@ -395,22 +406,16 @@ impl AppState {
     }
 
     pub async fn probe_media(&self, url: &str) -> Result<MediaProbeResult> {
-        let url = validate_http_url(url).map_err(message)?;
-        let tools = MediaToolchain::discover(&self.settings())
+        let (url, playlist) = validate_media_url(url, self.allow_loopback)?;
+        let tools = discover_media_toolchain(self.settings()).await?;
+        probe_url(&tools, &url, ProbeOptions { playlist })
             .await
-            .map_err(message)?;
-        probe_url(
-            &tools,
-            url.as_str(),
-            ProbeOptions {
-                playlist: url.query_pairs().any(|(key, _)| key == "list"),
-            },
-        )
-        .await
-        .map_err(message)
+            .map_err(message)
     }
 
-    pub async fn add_media_download(&self, request: AddMediaDownloadRequest) -> Result<String> {
+    pub async fn add_media_download(&self, mut request: AddMediaDownloadRequest) -> Result<String> {
+        let (url, _) = validate_media_url(&request.url, self.allow_loopback)?;
+        request.url = url;
         let _operation = self.operation().await?;
         let settings = self.settings();
         let raw_dir = PathBuf::from(
@@ -426,7 +431,7 @@ impl AppState {
             .map_err(message)?;
         let job = Arc::new(MediaJob::new(request, directory)?);
         let id = job.snapshot().id;
-        job.start((&settings).into(), self.scans.clone()).await?;
+        job.start(settings, self.scans.clone()).await?;
         self.media.write().unwrap().insert(id.clone(), job);
         Ok(id)
     }
@@ -480,9 +485,8 @@ impl AppState {
 
     pub async fn set_torrent_files(&self, id: &str, indices: Vec<usize>) -> Result<()> {
         let _operation = self.operation().await?;
-        self.torrent
-            .read()
-            .await
+        let torrent = self.torrent.write().await;
+        torrent
             .manager
             .set_selected_files(id, &indices)
             .await
@@ -515,8 +519,7 @@ impl AppState {
         if self.http_snapshot(id).is_some() {
             self.engine.resume_transfer(id).await.map_err(message)?;
         } else if let Some(job) = self.media_job(id) {
-            job.start((&self.settings()).into(), self.scans.clone())
-                .await?;
+            job.start(self.settings(), self.scans.clone()).await?;
         } else {
             self.torrent
                 .read()
@@ -703,22 +706,39 @@ impl AppState {
         self.flush_picker()
     }
 
-    pub fn window_loading(&self) {
-        self.picker.lock().unwrap().ready = false;
+    pub fn window_loading(&self) -> u64 {
+        let mut picker = self.picker.lock().unwrap();
+        picker.generation += 1;
+        picker.ready = false;
+        let generation = picker.generation;
+        drop(picker);
         self.window_changed.notify_one();
+        generation
     }
 
-    pub fn window_ready(&self) -> Result<()> {
-        self.picker.lock().unwrap().ready = true;
+    pub fn window_generation(&self) -> u64 {
+        self.picker.lock().unwrap().generation
+    }
+
+    pub fn window_ready(&self, generation: u64) -> Result<()> {
+        let mut picker = self.picker.lock().unwrap();
+        if picker.generation != generation {
+            return Ok(());
+        }
+        picker.ready = true;
         self.window_changed.notify_one();
-        self.flush_picker()
+        Self::flush_locked(&*self.ui, &mut picker)
     }
 
     fn flush_picker(&self) -> Result<()> {
         let mut picker = self.picker.lock().unwrap();
-        if picker.ready && self.ui.has_main_window() {
+        Self::flush_locked(&*self.ui, &mut picker)
+    }
+
+    fn flush_locked(ui: &dyn UiBridge, picker: &mut Picker) -> Result<()> {
+        if picker.ready && ui.has_main_window() {
             while let Some(event) = picker.pending.front() {
-                self.ui.emit_open_picker(event)?;
+                ui.emit_open_picker(event)?;
                 picker.pending.pop_front();
             }
         }
@@ -754,7 +774,7 @@ impl AppState {
         let _operation = self.operations.lock().await;
         let jobs: Vec<_> = self.media.read().unwrap().values().cloned().collect();
         for job in jobs {
-            if let Err(failure) = job.stop(TransferStatus::Paused).await {
+            if let Err(failure) = job.shutdown().await {
                 error = Some(failure);
             }
         }
@@ -882,6 +902,34 @@ impl PipeRequestHandler for NativeHandler {
     }
 }
 
+fn check_media_ip(ip: std::net::IpAddr, allow_loopback: bool) -> Result<()> {
+    let mapped = matches!(ip, std::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some());
+    if mapped || (is_private_or_loopback_ip(ip) && !(allow_loopback && ip.is_loopback())) {
+        return Err("disallowed private or loopback IP address".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_media_url(raw: &str, allow_loopback: bool) -> Result<(String, bool)> {
+    let url = validate_http_url(raw).map_err(message)?;
+    if let Some(host) = url.host_str() {
+        let stripped = host
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(host);
+        if let Ok(ip) = stripped.parse::<std::net::IpAddr>() {
+            check_media_ip(ip, allow_loopback)?;
+        } else if !allow_loopback
+            && (host.eq_ignore_ascii_case("localhost")
+                || host.to_ascii_lowercase().ends_with(".localhost"))
+        {
+            return Err("disallowed loopback host".into());
+        }
+    }
+    let playlist = url.query_pairs().any(|(key, _)| key == "list");
+    Ok((url.as_str().to_owned(), playlist))
+}
+
 fn created(transfer_id: String) -> NativeBridgeResponse {
     NativeBridgeResponse::TransferCreated { transfer_id }
 }
@@ -944,12 +992,14 @@ async fn watch_completions(
 ) {
     let stopped = stopped_signal(stop);
     tokio::pin!(stopped);
-    let mut next_torrent_check = Instant::now();
+    let mut pending_http = HashMap::new();
+    let mut next_completion_check = Instant::now();
     loop {
-        let check_torrents = !state.torrent_completions.lock().unwrap().is_empty();
+        let check_completions =
+            !state.torrent_completions.lock().unwrap().is_empty() || !pending_http.is_empty();
         let timer = async {
-            if check_torrents {
-                tokio::time::sleep_until(next_torrent_check).await;
+            if check_completions {
+                tokio::time::sleep_until(next_completion_check).await;
             } else {
                 pending::<()>().await;
             }
@@ -959,18 +1009,19 @@ async fn watch_completions(
             _ = &mut stopped => return,
             _ = state.torrent_changed.notified() => {}
             _ = timer => {
-                scan_torrent_completions(&state).await;
-                next_torrent_check = Instant::now() + Duration::from_secs(1);
+                retry_http_completions(&state, &state.scans, &mut seen_http, &mut pending_http);
+                scan_torrent_completions(&state, &state.scans).await;
+                next_completion_check = Instant::now() + Duration::from_secs(1);
             }
             event = http.recv() => match event {
                 Ok(EngineEvent::StatusChanged { transfer_id, status: TransferStatus::Completed }) => {
                     if let Some(snapshot) = state.http_snapshot(&transfer_id) {
-                        scan_http_completion(&state, &mut seen_http, snapshot);
+                        scan_http_completion(&state, &state.scans, &mut seen_http, &mut pending_http, snapshot);
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     for snapshot in state.engine.snapshots().into_iter().filter(|s| s.status == TransferStatus::Completed) {
-                        scan_http_completion(&state, &mut seen_http, snapshot);
+                        scan_http_completion(&state, &state.scans, &mut seen_http, &mut pending_http, snapshot);
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
@@ -980,21 +1031,64 @@ async fn watch_completions(
     }
 }
 
-fn scan_http_completion(state: &AppState, seen: &mut HashSet<String>, snapshot: TransferSnapshot) {
-    if seen.insert(snapshot.id.clone())
-        && !state.dismissed_http.read().unwrap().contains(&snapshot.id)
-        && state.settings.read().unwrap().auto_defender_scan
-    {
-        if let Err(error) = state
-            .scans
-            .try_send((snapshot.save_dir.into(), vec![snapshot.filename]))
-        {
-            tracing::debug!(%error, "could not enqueue HTTP Defender scan");
+fn try_enqueue_http_scan(
+    state: &AppState,
+    scans: &mpsc::Sender<ScanRequest>,
+    seen: &mut HashSet<String>,
+    snapshot: &TransferSnapshot,
+) -> bool {
+    if seen.contains(&snapshot.id) || state.dismissed_http.read().unwrap().contains(&snapshot.id) {
+        return true;
+    }
+    if !state.settings.read().unwrap().auto_defender_scan {
+        seen.insert(snapshot.id.clone());
+        return true;
+    }
+    match scans.try_send((
+        snapshot.save_dir.clone().into(),
+        vec![snapshot.filename.clone()],
+    )) {
+        Ok(()) => {
+            seen.insert(snapshot.id.clone());
+            true
         }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::debug!(transfer_id = %snapshot.id, "could not enqueue HTTP Defender scan");
+            false
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => true,
     }
 }
 
-async fn scan_torrent_completions(state: &AppState) {
+fn scan_http_completion(
+    state: &AppState,
+    scans: &mpsc::Sender<ScanRequest>,
+    seen: &mut HashSet<String>,
+    pending: &mut HashMap<String, TransferSnapshot>,
+    snapshot: TransferSnapshot,
+) {
+    if try_enqueue_http_scan(state, scans, seen, &snapshot) {
+        pending.remove(&snapshot.id);
+    } else {
+        pending.insert(snapshot.id.clone(), snapshot);
+    }
+}
+
+fn retry_http_completions(
+    state: &AppState,
+    scans: &mpsc::Sender<ScanRequest>,
+    seen: &mut HashSet<String>,
+    pending: &mut HashMap<String, TransferSnapshot>,
+) {
+    pending.retain(|id, snapshot| {
+        if state.http_snapshot(id).is_none() {
+            return false;
+        }
+        !try_enqueue_http_scan(state, scans, seen, snapshot)
+    });
+}
+
+async fn scan_torrent_completions(state: &AppState, scans: &mpsc::Sender<ScanRequest>) {
     let torrent = state.torrent.read().await;
     let mut pending = state.torrent_completions.lock().unwrap();
     let mut scanned = state.torrent_scanned_files.lock().unwrap();
@@ -1008,18 +1102,25 @@ async fn scan_torrent_completions(state: &AppState) {
         }
         if state.settings.read().unwrap().auto_defender_scan {
             if let Ok(files) = torrent.manager.list_files(id) {
-                let already = scanned.entry(id.clone()).or_default();
+                let already = scanned.get(id);
                 let paths: Vec<String> = files
                     .into_iter()
-                    .filter(|file| file.selected && already.insert(file.relative_path.clone()))
+                    .filter(|file| {
+                        file.selected
+                            && already.is_none_or(|set| !set.contains(&file.relative_path))
+                    })
                     .map(|file| file.relative_path)
                     .collect();
                 if !paths.is_empty() {
-                    if let Err(error) = state
-                        .scans
-                        .try_send((report.snapshot.save_dir.into(), paths))
-                    {
-                        tracing::debug!(%error, "could not enqueue torrent Defender scan");
+                    match scans.try_send((report.snapshot.save_dir.into(), paths.clone())) {
+                        Ok(()) => {
+                            scanned.entry(id.clone()).or_default().extend(paths);
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tracing::debug!(transfer_id = %id, "could not enqueue torrent Defender scan");
+                            return true;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => return false,
                     }
                 }
             }
@@ -1082,5 +1183,291 @@ async fn scan_completed(
                 Err(_) => tracing::warn!("Windows Defender scan timed out"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slipstream_torrent::TorrentAddOptions;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    use uuid::Uuid;
+    use windows_sys::Win32::System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER};
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("slipstream-daemon-unit-{}", Uuid::new_v4()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct IsolatedReg(String);
+
+    impl IsolatedReg {
+        fn new() -> Self {
+            Self(format!(r"Software\SlipStreamDaemonUnit-{}", Uuid::new_v4()))
+        }
+    }
+
+    impl Drop for IsolatedReg {
+        fn drop(&mut self) {
+            let wide: Vec<_> = self.0.encode_utf16().chain([0]).collect();
+            unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, wide.as_ptr()) };
+        }
+    }
+
+    struct NullUi;
+
+    impl UiBridge for NullUi {
+        fn show_main_window(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn emit_telemetry(&self, _batch: &TelemetryBatch) -> Result<()> {
+            Ok(())
+        }
+
+        fn emit_open_picker(&self, _event: &OpenPickerEvent) -> Result<()> {
+            Ok(())
+        }
+
+        fn has_main_window(&self) -> bool {
+            false
+        }
+
+        fn request_quit(&self) {}
+    }
+
+    #[test]
+    fn validate_media_url_blocks_private_and_respects_allow_loopback() {
+        for loopback in [
+            "http://127.0.0.1:8080/video",
+            "http://[::1]:8080/video",
+            "http://2130706433/video",
+            "http://localhost/video",
+            "http://sub.localhost/video",
+        ] {
+            assert!(validate_media_url(loopback, false).is_err(), "{loopback}");
+            assert!(validate_media_url(loopback, true).is_ok(), "{loopback}");
+        }
+        for blocked_always in [
+            "http://169.254.169.254/latest/meta-data",
+            "http://100.64.0.1/video",
+            "http://192.168.1.1/video",
+            "http://10.0.0.1/video",
+            "http://0.0.0.0/video",
+            "http://[::ffff:127.0.0.1]/video",
+            "http://[fe80::1]/video",
+            "http://[fc00::1]/video",
+        ] {
+            assert!(
+                validate_media_url(blocked_always, false).is_err(),
+                "{blocked_always}"
+            );
+            assert!(
+                validate_media_url(blocked_always, true).is_err(),
+                "{blocked_always}"
+            );
+        }
+        assert_eq!(
+            validate_media_url("https://example.com/watch?v=1&list=PL1", false).unwrap(),
+            ("https://example.com/watch?v=1&list=PL1".into(), true)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scan_queues_preserve_pending_transfers_when_defender_channel_is_full() {
+        let temp = TestDir::new();
+        let downloads = temp.0.join("Downloads");
+        std::fs::create_dir(&downloads).unwrap();
+        let settings = AppSettings {
+            default_download_dir: downloads.to_string_lossy().into_owned(),
+            auto_defender_scan: true,
+            ..AppSettings::default()
+        };
+        std::fs::write(
+            temp.0.join(SETTINGS_FILE),
+            serde_json::to_vec(&settings).unwrap(),
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/item.bin", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    while !buf.ends_with(b"\r\n\r\n") {
+                        let Ok(byte) = stream.read_u8().await else {
+                            return;
+                        };
+                        buf.push(byte);
+                    }
+                    let req = String::from_utf8_lossy(&buf);
+                    if req.starts_with("HEAD ") {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n")
+                            .await;
+                    } else if let Some(range) = req.lines().find_map(|line| {
+                        let (k, v) = line.split_once(':')?;
+                        k.eq_ignore_ascii_case("range").then_some(v.trim())
+                    }) {
+                        let (a, b) = range
+                            .strip_prefix("bytes=")
+                            .unwrap()
+                            .split_once('-')
+                            .unwrap();
+                        let a: usize = a.parse().unwrap();
+                        let b: usize = b.parse().unwrap();
+                        let hdr = format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {a}-{b}/4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", b - a + 1);
+                        let _ = stream.write_all(hdr.as_bytes()).await;
+                        let _ = stream.write_all(&b"test"[a..=b]).await;
+                    } else {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntest")
+                            .await;
+                    }
+                });
+            }
+        });
+
+        let reg = IsolatedReg::new();
+        let pipe = format!(r"\\.\pipe\SlipStream.DaemonScanTest.{}", Uuid::new_v4());
+        let state = AppState::start(
+            temp.0.clone(),
+            Arc::new(NullUi),
+            DaemonOptions {
+                pipe_name: Some(pipe),
+                allow_loopback: true,
+                registry_base_key: Some(reg.0.clone()),
+                torrent: TorrentManagerConfig {
+                    enable_dht: false,
+                    enable_trackers: false,
+                    listen_port_range: None,
+                    ..TorrentManagerConfig::default()
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        let http_id = state
+            .add_http_download(AddHttpDownloadRequest {
+                url,
+                filename: Some("http.bin".into()),
+                save_dir: None,
+                max_connections: Some(1),
+                queue_id: None,
+                headers: HashMap::new(),
+                referrer: None,
+                expected_sha256: None,
+            })
+            .await
+            .unwrap();
+        let http_snap = timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(snap) = state.http_snapshot(&http_id) {
+                    if snap.status == TransferStatus::Completed {
+                        return snap;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        std::fs::write(downloads.join("torrent.bin"), b"test").unwrap();
+        let mut manifest =
+            b"d4:infod6:lengthi4e4:name11:torrent.bin12:piece lengthi16384e6:pieces20:".to_vec();
+        manifest.extend([
+            0xa9, 0x4a, 0x8f, 0xe5, 0xcc, 0xb1, 0x9b, 0xa6, 0x1c, 0x4c, 0x08, 0x73, 0xd3, 0x91,
+            0xe9, 0x87, 0x98, 0x2f, 0xbb, 0xd3,
+        ]);
+        manifest.extend(b"ee");
+        let torrent_id = {
+            let torrent = state.torrent.read().await;
+            let id = torrent
+                .manager
+                .add_torrent_bytes(
+                    &manifest,
+                    TorrentAddOptions {
+                        overwrite: true,
+                        ..TorrentAddOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+            torrent
+                .manager
+                .wait_until_completed(&id, Duration::from_secs(10))
+                .await
+                .unwrap();
+            id
+        };
+        state
+            .torrent_completions
+            .lock()
+            .unwrap()
+            .insert(torrent_id.clone());
+
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send((downloads.clone(), vec!["blocker".into()]))
+            .unwrap();
+
+        let mut seen_http = HashSet::new();
+        let mut pending_http = HashMap::new();
+        scan_http_completion(&state, &tx, &mut seen_http, &mut pending_http, http_snap);
+        assert!(!seen_http.contains(&http_id));
+        assert!(pending_http.contains_key(&http_id));
+
+        scan_torrent_completions(&state, &tx).await;
+        assert!(state
+            .torrent_completions
+            .lock()
+            .unwrap()
+            .contains(&torrent_id));
+        assert!(!state
+            .torrent_scanned_files
+            .lock()
+            .unwrap()
+            .contains_key(&torrent_id));
+
+        assert_eq!(rx.recv().await.unwrap().1, vec!["blocker".to_owned()]);
+
+        retry_http_completions(&state, &tx, &mut seen_http, &mut pending_http);
+        assert_eq!(rx.try_recv().unwrap().1, vec!["http.bin".to_owned()]);
+        assert!(seen_http.contains(&http_id));
+        assert!(pending_http.is_empty());
+
+        scan_torrent_completions(&state, &tx).await;
+        assert_eq!(rx.try_recv().unwrap().1, vec!["torrent.bin".to_owned()]);
+        assert!(!state
+            .torrent_completions
+            .lock()
+            .unwrap()
+            .contains(&torrent_id));
+        assert!(state
+            .torrent_scanned_files
+            .lock()
+            .unwrap()
+            .get(&torrent_id)
+            .is_some_and(|files| files.contains("torrent.bin")));
+
+        server.abort();
+        state.shutdown().await.unwrap();
     }
 }
