@@ -738,6 +738,50 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
 }
 
 #[tokio::test]
+async fn pipe_status_redacts_desktop_transfer_details() {
+    let temp = TempDir::new();
+    let downloads = temp.0.join("Downloads");
+    installed_settings(&temp.0, &downloads);
+    let pipe = format!(r"\\.\pipe\SlipStream.DesktopStatus.{}", Uuid::new_v4());
+    let registry_key = RegistryKey::isolated();
+    let state = AppState::start(
+        temp.0.clone(),
+        Arc::new(FakeUi::default()),
+        options(&pipe, &registry_key.0),
+    )
+    .await
+    .unwrap();
+    let token = SessionToken::read(&temp.0.join("session.token")).unwrap();
+    let mut bridge = Bridge(Some(
+        PipeClient::connect(&pipe, &token, "desktop-integration")
+            .await
+            .unwrap(),
+    ));
+
+    let server = HttpServer::start().await;
+    let signed_path = "signed?token=private#fragment";
+    let id = state
+        .add_http_download(http_request(&server, signed_path, "signed.bin"))
+        .await
+        .unwrap();
+    let Response::Status { batch, .. } = bridge.request(Request::GetStatus).await else {
+        panic!("expected browser status");
+    };
+    assert_eq!(batch.transfers[0].id, id);
+    assert_eq!(batch.transfers[0].source_url, server.url("signed"));
+    assert!(batch.transfers[0].save_dir.is_empty());
+
+    let desktop = state.snapshot().await;
+    assert_eq!(desktop.transfers[0].id, id);
+    assert_eq!(desktop.transfers[0].source_url, server.url(signed_path));
+    assert_eq!(
+        fs::canonicalize(&desktop.transfers[0].save_dir).unwrap(),
+        fs::canonicalize(downloads).unwrap()
+    );
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn settings_reload_and_rebase_an_empty_torrent_manager() {
     let temp = TempDir::new();
     let old_dir = temp.0.join("old");
@@ -782,7 +826,10 @@ async fn settings_reload_and_rebase_an_empty_torrent_manager() {
     let batch = state.snapshot().await;
     assert_eq!(batch.speed_limit_bps, Some(1024));
     assert_eq!(batch.transfers[0].id, torrent);
-    assert_eq!(Path::new(&batch.transfers[0].save_dir), new_dir);
+    assert_eq!(
+        fs::canonicalize(&batch.transfers[0].save_dir).unwrap(),
+        fs::canonicalize(new_dir).unwrap()
+    );
     state.shutdown().await.unwrap();
     let state = AppState::start(
         temp.0.clone(),

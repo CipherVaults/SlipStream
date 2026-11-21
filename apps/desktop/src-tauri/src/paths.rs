@@ -2,7 +2,7 @@ use slipstream_protocol::{safe_join_under, validate_safe_filename_component};
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
-    io::{self, Read},
+    io::{self, Read, Write},
     mem::size_of,
     os::windows::{
         ffi::OsStringExt,
@@ -20,7 +20,7 @@ use windows_sys::Win32::{
     Storage::FileSystem::{
         FileDispositionInfo, GetFinalPathNameByHandleW, SetFileInformationByHandle, DELETE,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
     },
 };
 
@@ -258,6 +258,13 @@ fn file_for_operation(path: &Path, delete: bool) -> io::Result<File> {
         .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
+    if path.as_os_str() != opened_file_path(&file)? {
+        return Err(invalid("transfer path changed during open"));
+    }
+    Ok(file)
+}
+
+fn opened_file_path(file: &File) -> io::Result<OsString> {
     let metadata = file.metadata()?;
     if !metadata.is_file() || reparse(&metadata) {
         return Err(invalid("expected a regular non-reparse file"));
@@ -274,10 +281,38 @@ fn file_for_operation(path: &Path, delete: bool) -> io::Result<File> {
     if written == 0 || written >= needed {
         return Err(io::Error::last_os_error());
     }
-    if path.as_os_str() != OsString::from_wide(&buffer[..written as usize]) {
+    Ok(OsString::from_wide(&buffer[..written as usize]))
+}
+
+#[cfg(windows)]
+pub(crate) fn write_zone_identifier(root: &Path, relative: &str) -> io::Result<()> {
+    let path = existing_file(root, relative)?;
+    let base = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&path)?;
+    if path.as_os_str() != opened_file_path(&base)? {
         return Err(invalid("transfer path changed during open"));
     }
-    Ok(file)
+    let mut stream = path.into_os_string();
+    stream.push(":Zone.Identifier");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&stream)?;
+    let opened = opened_file_path(&file)?;
+    if opened != stream {
+        stream.push(":$DATA");
+        if opened != stream {
+            return Err(invalid("transfer stream path changed during open"));
+        }
+    }
+    file.set_len(0)?;
+    file.write_all(b"[ZoneTransfer]\r\nZoneId=3\r\n")
 }
 
 pub(crate) fn delete_files(root: &Path, paths: &[String]) -> io::Result<()> {

@@ -20,7 +20,9 @@ use chrono::Utc;
 use http::{filename_from_url, sanitize_http_url_credentials, Http, Source};
 use limiter::Limiter;
 use serde::{Deserialize, Serialize};
-use slipstream_protocol::{safe_join_under, sanitize_filename, TransferKind, UI_SEGMENT_COUNT};
+use slipstream_protocol::{
+    safe_join_under, sanitize_filename, validate_http_url, TransferKind, UI_SEGMENT_COUNT,
+};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -658,6 +660,19 @@ fn save_status(
     // Keep the intent in SQLite if publishing Completed fails after a move.
     if status == TransferStatus::Completed {
         record.commit_digest = None;
+    } else if status == TransferStatus::Canceled {
+        record.headers.clear();
+        record.referrer = None;
+        record.source_url = validate_http_url(&record.source_url).map_or_else(
+            |_| String::new(),
+            |mut url| {
+                let _ = url.set_username("");
+                let _ = url.set_password(None);
+                url.set_query(None);
+                url.set_fragment(None);
+                url.into()
+            },
+        );
     }
     let segment_state = if status == TransferStatus::Failed {
         SegmentState::Error

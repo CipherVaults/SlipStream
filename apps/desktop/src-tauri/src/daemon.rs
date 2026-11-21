@@ -2,7 +2,7 @@ use crate::{
     media_jobs::{MediaJob, ScanRequest},
     paths::{
         build_defender_scan_args, decode_sha256, delete_files, ensure_safe_directory, hash_file,
-        local_drive_path, reveal_action, RevealAction,
+        local_drive_path, reveal_action, write_zone_identifier, RevealAction,
     },
     settings::{normalize, read_json, torrent_rate, write_json_atomically, SETTINGS_FILE},
     tools::{
@@ -106,11 +106,17 @@ pub struct AppState {
     window_changed: Notify,
     torrent_changed: Notify,
     torrent_completions: Mutex<HashSet<String>>,
-    torrent_scanned_files: Mutex<HashMap<String, HashSet<String>>>,
+    torrent_completed_files: Mutex<HashMap<String, TorrentCompletedFiles>>,
     scans: mpsc::Sender<ScanRequest>,
     stop: watch::Sender<bool>,
     tasks: AsyncMutex<Option<Vec<JoinHandle<()>>>>,
     quitting: AtomicBool,
+}
+
+#[derive(Default)]
+struct TorrentCompletedFiles {
+    marked: HashSet<String>,
+    scanned: HashSet<String>,
 }
 
 fn message(error: impl Display) -> String {
@@ -196,7 +202,7 @@ impl AppState {
             window_changed: Notify::new(),
             torrent_changed: Notify::new(),
             torrent_completions: Mutex::default(),
-            torrent_scanned_files: Mutex::default(),
+            torrent_completed_files: Mutex::default(),
             scans,
             stop,
             tasks: AsyncMutex::new(Some(Vec::new())),
@@ -594,7 +600,7 @@ impl AppState {
                 .await
                 .map_err(message)?;
             self.torrent_completions.lock().unwrap().remove(id);
-            self.torrent_scanned_files.lock().unwrap().remove(id);
+            self.torrent_completed_files.lock().unwrap().remove(id);
         }
         self.verified.write().unwrap().remove(id);
         Ok(())
@@ -823,8 +829,13 @@ impl AppState {
             Ping => {}
             GetStatus => {
                 let settings = self.settings();
+                let mut batch = self.snapshot().await;
+                for transfer in &mut batch.transfers {
+                    transfer.source_url = browser_source_url(&transfer.source_url);
+                    transfer.save_dir = String::new();
+                }
                 return Ok(NativeBridgeResponse::Status {
-                    batch: self.snapshot().await,
+                    batch,
                     theme: settings.theme,
                     accent: settings.accent,
                 });
@@ -902,6 +913,24 @@ impl PipeRequestHandler for NativeHandler {
     }
 }
 
+fn browser_source_url(raw: &str) -> String {
+    if let Ok(mut url) = validate_http_url(raw) {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url.set_query(None);
+        url.set_fragment(None);
+        url.into()
+    } else if raw
+        .trim()
+        .split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("magnet"))
+    {
+        "magnet:".into()
+    } else {
+        String::new()
+    }
+}
+
 fn check_media_ip(ip: std::net::IpAddr, allow_loopback: bool) -> Result<()> {
     let mapped = matches!(ip, std::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some());
     if mapped || (is_private_or_loopback_ip(ip) && !(allow_loopback && ip.is_loopback())) {
@@ -913,6 +942,7 @@ fn check_media_ip(ip: std::net::IpAddr, allow_loopback: bool) -> Result<()> {
 pub(crate) fn validate_media_url(raw: &str, allow_loopback: bool) -> Result<(String, bool)> {
     let url = validate_http_url(raw).map_err(message)?;
     if let Some(host) = url.host_str() {
+        let host = host.trim_end_matches('.');
         let stripped = host
             .strip_prefix('[')
             .and_then(|s| s.strip_suffix(']'))
@@ -1089,44 +1119,80 @@ fn retry_http_completions(
 }
 
 async fn scan_torrent_completions(state: &AppState, scans: &mpsc::Sender<ScanRequest>) {
-    let torrent = state.torrent.read().await;
-    let mut pending = state.torrent_completions.lock().unwrap();
-    let mut scanned = state.torrent_scanned_files.lock().unwrap();
-    pending.retain(|id| {
-        let Ok(report) = torrent.manager.stats(id) else {
-            scanned.remove(id);
-            return false;
-        };
-        if !report.finished {
-            return true;
-        }
-        if state.settings.read().unwrap().auto_defender_scan {
-            if let Ok(files) = torrent.manager.list_files(id) {
-                let already = scanned.get(id);
-                let paths: Vec<String> = files
-                    .into_iter()
-                    .filter(|file| {
-                        file.selected
-                            && already.is_none_or(|set| !set.contains(&file.relative_path))
-                    })
-                    .map(|file| file.relative_path)
-                    .collect();
-                if !paths.is_empty() {
-                    match scans.try_send((report.snapshot.save_dir.into(), paths.clone())) {
-                        Ok(()) => {
-                            scanned.entry(id.clone()).or_default().extend(paths);
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            tracing::debug!(transfer_id = %id, "could not enqueue torrent Defender scan");
-                            return true;
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => return false,
-                    }
+    let mut completed = Vec::new();
+    {
+        let torrent = state.torrent.read().await;
+        let mut pending = state.torrent_completions.lock().unwrap();
+        let mut completed_files = state.torrent_completed_files.lock().unwrap();
+        pending.retain(|id| {
+            let Ok(report) = torrent.manager.stats(id) else {
+                completed_files.remove(id);
+                return false;
+            };
+            if !report.finished {
+                return true;
+            }
+            let Ok(files) = torrent.manager.list_files(id) else {
+                return false;
+            };
+            let recorded = completed_files.entry(id.clone()).or_default();
+            let mut to_mark = Vec::new();
+            let mut to_scan = Vec::new();
+            let auto_scan = state.settings.read().unwrap().auto_defender_scan;
+            for path in files
+                .into_iter()
+                .filter(|file| file.selected)
+                .map(|file| file.relative_path)
+            {
+                if recorded.marked.insert(path.clone()) {
+                    to_mark.push(path.clone());
+                }
+                if auto_scan && !recorded.scanned.contains(&path) {
+                    to_scan.push(path);
                 }
             }
+            let mut retry = false;
+            let scan = if to_scan.is_empty() {
+                None
+            } else {
+                match scans.clone().try_reserve_owned() {
+                    Ok(permit) => {
+                        recorded.scanned.extend(to_scan.iter().cloned());
+                        Some((permit, to_scan))
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::debug!(transfer_id = %id, "could not enqueue torrent Defender scan");
+                        retry = true;
+                        None
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => None,
+                }
+            };
+            if !to_mark.is_empty() || scan.is_some() {
+                completed.push((id.clone(), PathBuf::from(report.snapshot.save_dir), to_mark, scan));
+            }
+            retry
+        });
+    }
+    if completed.is_empty() {
+        return;
+    }
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        for (id, root, to_mark, scan) in completed {
+            for path in to_mark {
+                if let Err(error) = write_zone_identifier(&root, &path) {
+                    tracing::debug!(transfer_id = %id, %error, "could not write torrent Zone.Identifier");
+                }
+            }
+            if let Some((permit, to_scan)) = scan {
+                permit.send((root, to_scan));
+            }
         }
-        false
-    });
+    })
+    .await
+    {
+        tracing::debug!(%error, "torrent completion worker failed");
+    }
 }
 
 async fn scan_completed(
@@ -1252,13 +1318,28 @@ mod tests {
     }
 
     #[test]
+    fn browser_status_source_url_strips_private_details() {
+        assert_eq!(
+            browser_source_url("https://user:pass@example.com:8443/a%20b?token=private#fragment"),
+            "https://example.com:8443/a%20b"
+        );
+        assert_eq!(
+            browser_source_url("magnet:?tr=https://example.com"),
+            "magnet:"
+        );
+        assert!(browser_source_url(r"C:\private\example.torrent").is_empty());
+    }
+
+    #[test]
     fn validate_media_url_blocks_private_and_respects_allow_loopback() {
         for loopback in [
             "http://127.0.0.1:8080/video",
             "http://[::1]:8080/video",
             "http://2130706433/video",
             "http://localhost/video",
+            "http://localhost./video",
             "http://sub.localhost/video",
+            "http://api.localhost./video",
         ] {
             assert!(validate_media_url(loopback, false).is_err(), "{loopback}");
             assert!(validate_media_url(loopback, true).is_ok(), "{loopback}");
@@ -1440,11 +1521,16 @@ mod tests {
             .lock()
             .unwrap()
             .contains(&torrent_id));
-        assert!(!state
-            .torrent_scanned_files
+        assert!(state
+            .torrent_completed_files
             .lock()
             .unwrap()
-            .contains_key(&torrent_id));
+            .get(&torrent_id)
+            .is_some_and(|files| files.scanned.is_empty()));
+        assert_eq!(
+            std::fs::read(downloads.join("torrent.bin:Zone.Identifier")).unwrap(),
+            b"[ZoneTransfer]\r\nZoneId=3\r\n"
+        );
 
         assert_eq!(rx.recv().await.unwrap().1, vec!["blocker".to_owned()]);
 
@@ -1461,11 +1547,11 @@ mod tests {
             .unwrap()
             .contains(&torrent_id));
         assert!(state
-            .torrent_scanned_files
+            .torrent_completed_files
             .lock()
             .unwrap()
             .get(&torrent_id)
-            .is_some_and(|files| files.contains("torrent.bin")));
+            .is_some_and(|files| files.scanned.contains("torrent.bin")));
 
         server.abort();
         state.shutdown().await.unwrap();

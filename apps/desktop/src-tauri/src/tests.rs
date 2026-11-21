@@ -2,7 +2,7 @@ use crate::{
     expand_wildcard_urls, install_browser_hosts_into,
     paths::{
         build_defender_scan_args, decode_sha256, delete_files, ensure_safe_directory, hash_file,
-        local_drive_path, reveal_action, RevealAction,
+        local_drive_path, reveal_action, write_zone_identifier, RevealAction,
     },
     settings::{normalize, torrent_rate},
     tools::{explorer_executable, hardened_toolchain_config_with_path, native_hosts_installed},
@@ -151,6 +151,24 @@ fn explorer_and_defender_args_preserve_discrete_paths() {
 }
 
 #[test]
+fn zone_identifier_marks_a_confined_file() {
+    let temp = TempDir::new();
+    let file = temp.0.join("torrent.bin");
+    let stream = temp.0.join("torrent.bin:Zone.Identifier");
+    fs::write(&file, b"test").unwrap();
+    fs::write(
+        &stream,
+        b"[ZoneTransfer]\r\nZoneId=1\r\nHostUrl=https://example.com\r\n",
+    )
+    .unwrap();
+
+    write_zone_identifier(&temp.0, "torrent.bin").unwrap();
+
+    assert_eq!(fs::read(stream).unwrap(), b"[ZoneTransfer]\r\nZoneId=3\r\n");
+    assert_eq!(fs::read(file).unwrap(), b"test");
+}
+
+#[test]
 fn traversal_and_links_are_rejected_for_every_file_operation() {
     let temp = TempDir::new();
     let root = temp.0.join("downloads");
@@ -186,9 +204,11 @@ fn traversal_and_links_are_rejected_for_every_file_operation() {
         assert!(build_defender_scan_args(&root, bad).is_err(), "{bad}");
         assert!(hash_file(&root, bad).is_err(), "{bad}");
         assert!(delete_files(&root, &[bad.into()]).is_err(), "{bad}");
+        assert!(write_zone_identifier(&root, bad).is_err(), "{bad}");
     }
     assert!(reveal_action(&junction, Some("secret.bin")).is_err());
     assert_eq!(fs::read(&protected).unwrap(), b"private");
+    assert!(!outside.join("secret.bin:Zone.Identifier").exists());
 }
 
 #[test]

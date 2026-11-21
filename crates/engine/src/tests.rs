@@ -588,6 +588,50 @@ async fn changed_if_range_restarts_all_workers_with_new_bytes_and_size() {
 }
 
 #[tokio::test]
+async fn cancel_transfer_scrubs_persisted_request_credentials() {
+    let data = payload(64 * KIB, 6);
+    let (_release, hold) = watch::channel(false);
+    let server = Server::new(move |req| {
+        let mut reply = Reply::resource(req, &data, "\"cancel\"");
+        if req.method == "GET" && req.range() != Some(0..1) {
+            reply.body_gate = Some(hold.clone());
+        }
+        reply
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let config = dir.config();
+    let engine = DownloadEngine::new(config.clone()).await.unwrap();
+    let signed_url = server.url("/signed.bin?token=private#fragment");
+    let mut download = request(signed_url.clone(), None, 1);
+    download.headers = [("Authorization".into(), "Bearer private".into())].into();
+    download.referrer = Some("https://example.com/source?token=private".into());
+    let id = engine.add_http_download(download).await.unwrap();
+    let active = wait_for(&engine, &id, |snapshot| {
+        snapshot.status == TransferStatus::Active
+    })
+    .await;
+    assert_eq!(active.source_url, signed_url);
+
+    engine.cancel_transfer(&id).await.unwrap();
+    engine.shutdown().await.unwrap();
+
+    let engine = DownloadEngine::new(config.clone()).await.unwrap();
+    let canceled = engine.snapshot(&id).unwrap();
+    assert_eq!(canceled.status, TransferStatus::Canceled);
+    assert_eq!(canceled.source_url, server.url("/signed.bin"));
+    let records = Database::open(&config.db_path)
+        .unwrap()
+        .transfers()
+        .unwrap();
+    let (record, _) = records.iter().find(|(record, _)| record.id == id).unwrap();
+    assert!(record.headers.is_empty());
+    assert_eq!(record.referrer, None);
+    assert_eq!(record.source_url, canceled.source_url);
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn refresh_failed_url_preserves_bytes_and_sends_new_credentials() {
     let data = payload(512 * KIB, 6);
     let source = Arc::clone(&data);
