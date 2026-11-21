@@ -117,7 +117,7 @@ export function SettingsDialog({ settings, loadState, loadError, onRetryLoad, on
       {loadState === "loading" && <p className="field-note" role="status">Loading settings…</p>}
       {loadState === "error" && <div className="inline-error" role="alert">
         <p>{loadError || "Failed to load saved settings."}</p>
-        <button type="button" className="btn-ghost form-button" onClick={onRetryLoad}>Retry</button>
+        <button type="button" className="btn-ghost form-button" onClick={() => { setProblem(""); onRetryLoad(); }}>Retry</button>
       </div>}
       <fieldset className="dialog-fields" disabled={Boolean(busy) || !ready}>
         <div className="fields-grid">
@@ -178,7 +178,7 @@ export function SettingsDialog({ settings, loadState, loadError, onRetryLoad, on
         </section>
       </fieldset>
       {message && <p role="status" className="integrity-ok">{message}</p>}
-      {problem && <p role="alert" className="inline-error">{problem}</p>}
+      {problem && problem !== loadError && <p role="alert" className="inline-error">{problem}</p>}
       <div className="sheet-footer align-right"><div className="sheet-foot-btns">
         <button className="btn-ghost form-button" type="button" onClick={onClose} disabled={Boolean(busy)}>Cancel</button>
         <button className="btn-primary" type="submit" disabled={Boolean(busy) || !ready}><Save size={14} />{busy === "save" ? "Saving…" : "Save Settings"}</button>

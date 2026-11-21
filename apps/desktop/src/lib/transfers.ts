@@ -67,6 +67,15 @@ export function isTorrentSource(input: string) {
   return /^magnet:\?/i.test(input) || (!/^https?:\/\//i.test(input) && /\.torrent$/i.test(input));
 }
 
+export function isRemoteTorrentUrl(input: string) {
+  if (!isHttpUrl(input)) return false;
+  try {
+    return /\.torrent$/i.test(new URL(input).pathname);
+  } catch {
+    return false;
+  }
+}
+
 export function isWildcard(input: string) {
   if (!/^https?:\/\//i.test(input)) return false;
   const withoutIpv6Host = input.replace(/^(https?:\/\/(?:[^/@]+@)?)\[[\da-f:.]+\]/i, "$1localhost");

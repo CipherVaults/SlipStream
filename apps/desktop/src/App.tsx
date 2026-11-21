@@ -10,7 +10,7 @@ import { TransferList, type OnTransferAction } from "./components/TransferList";
 import { IconButton } from "./components/ui";
 import { DEFAULT_SETTINGS } from "./lib/demo";
 import { desktop, isTauri } from "./lib/tauri";
-import { errorMessage, isDownloadSource, isRunning, isTorrentSource, MB, SPEED_CAP } from "./lib/transfers";
+import { errorMessage, isDownloadSource, isRemoteTorrentUrl, isRunning, isTorrentSource, MB, SPEED_CAP } from "./lib/transfers";
 import type { AppSettings, TelemetryBatch, TorrentFileEntry, TransferSnapshot } from "./types/ipc";
 
 type Overlay = { type: "add"; seed: AddSeed; key: number } | { type: "settings" } | { type: "palette" }
@@ -78,6 +78,7 @@ export default function App() {
   const torrentQueuesRef = useRef(new Map<string, Promise<void>>());
   const torrentPendingRef = useRef(new Map<string, number>());
   const torrentLatestFilesRef = useRef(new Map<string, TorrentFileEntry[]>());
+  const torrentGenRef = useRef(new Map<string, number>());
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [overlay, setOverlay] = useState<Overlay>();
   const [droppedSource, setDroppedSource] = useState<{ url: string; seq: number }>();
@@ -113,7 +114,14 @@ export default function App() {
   const showError = useCallback((error: unknown) => setNotice({ tone: "error", message: errorMessage(error) }), []);
   const notify = (message: string) => setNotice({ tone: "ok", message });
 
+  const bumpTorrentGen = useCallback((transferId: string) => {
+    const nextGen = (torrentGenRef.current.get(transferId) ?? 0) + 1;
+    torrentGenRef.current.set(transferId, nextGen);
+    return nextGen;
+  }, []);
+
   const clearTorrentCache = useCallback((transferId: string) => {
+    bumpTorrentGen(transferId);
     torrentLatestFilesRef.current.delete(transferId);
     if ((torrentPendingRef.current.get(transferId) ?? 0) === 0) {
       torrentPendingRef.current.delete(transferId);
@@ -125,7 +133,7 @@ export default function App() {
       delete next[transferId];
       return next;
     });
-  }, []);
+  }, [bumpTorrentGen]);
 
   const loadSettings = useCallback(async () => {
     if (settingsLoadedRef.current) return settingsRef.current;
@@ -183,6 +191,7 @@ export default function App() {
     );
     if (staleIds.length > 0) {
       for (const id of staleIds) {
+        bumpTorrentGen(id);
         torrentLatestFilesRef.current.delete(id);
         torrentPendingRef.current.delete(id);
         torrentQueuesRef.current.delete(id);
@@ -198,7 +207,7 @@ export default function App() {
     setHistory(previous => Object.fromEntries(next.transfers.map(transfer => [
       transfer.id, [...(previous[transfer.id] ?? []).slice(1 - sampleCount), transfer.download_speed_bps],
     ])));
-  }, []);
+  }, [bumpTorrentGen]);
 
   const pullSnapshot = useCallback(async () => {
     const before = eventVersion.current;
@@ -232,6 +241,7 @@ export default function App() {
     const existing = torrentFilesRef.current[transferId];
     if (!force && existing && (existing.status === "loading" || existing.status === "ready")) return;
     if ((torrentPendingRef.current.get(transferId) ?? 0) > 0) return;
+    const gen = torrentGenRef.current.get(transferId) ?? 0;
 
     setTorrentFilesMap(previous => ({
       ...previous,
@@ -244,7 +254,7 @@ export default function App() {
     }));
 
     void desktop.listTorrentFiles(transferId).then(files => {
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || (torrentGenRef.current.get(transferId) ?? 0) !== gen) return;
       if ((torrentPendingRef.current.get(transferId) ?? 0) > 0) return;
       torrentLatestFilesRef.current.set(transferId, files);
       setTorrentFilesMap(previous => ({
@@ -257,7 +267,7 @@ export default function App() {
         },
       }));
     }, error => {
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || (torrentGenRef.current.get(transferId) ?? 0) !== gen) return;
       setTorrentFilesMap(previous => ({
         ...previous,
         [transferId]: {
@@ -274,6 +284,7 @@ export default function App() {
   const selectTorrentFile = useCallback((transferId: string, index: number, checked: boolean) => {
     const currentFiles = torrentLatestFilesRef.current.get(transferId) ?? torrentFilesRef.current[transferId]?.files;
     if (!currentFiles) return;
+    const gen = torrentGenRef.current.get(transferId) ?? 0;
     const nextFiles = currentFiles.map(file => file.index === index ? { ...file, selected: checked } : file);
     torrentLatestFilesRef.current.set(transferId, nextFiles);
     const nextPending = (torrentPendingRef.current.get(transferId) ?? 0) + 1;
@@ -295,6 +306,7 @@ export default function App() {
       try {
         await desktop.setTorrentFiles(transferId, indices);
       } catch (error) {
+        if ((torrentGenRef.current.get(transferId) ?? 0) !== gen) return;
         if (mountedRef.current) {
           const msg = errorMessage(error);
           setTorrentFilesMap(previous => ({
@@ -311,7 +323,9 @@ export default function App() {
         try {
           if ((torrentPendingRef.current.get(transferId) ?? 0) <= 1) {
             const fresh = await desktop.listTorrentFiles(transferId);
-            if (mountedRef.current && (torrentPendingRef.current.get(transferId) ?? 0) <= 1) {
+            if (mountedRef.current
+              && (torrentGenRef.current.get(transferId) ?? 0) === gen
+              && (torrentPendingRef.current.get(transferId) ?? 0) <= 1) {
               torrentLatestFilesRef.current.set(transferId, fresh);
               setTorrentFilesMap(previous => ({
                 ...previous,
@@ -330,11 +344,27 @@ export default function App() {
       } finally {
         const remaining = Math.max(0, (torrentPendingRef.current.get(transferId) ?? 1) - 1);
         torrentPendingRef.current.set(transferId, remaining);
-        if (mountedRef.current && remaining === 0) {
-          setTorrentFilesMap(previous => previous[transferId] ? {
-            ...previous,
-            [transferId]: { ...previous[transferId], saving: false },
-          } : previous);
+        if (remaining === 0) {
+          const sameGen = (torrentGenRef.current.get(transferId) ?? 0) === gen;
+          const stillPresent = latest.current?.transfers.some(transfer => transfer.id === transferId) ?? true;
+          if (!sameGen || !stillPresent) {
+            torrentLatestFilesRef.current.delete(transferId);
+            torrentPendingRef.current.delete(transferId);
+            torrentQueuesRef.current.delete(transferId);
+            if (mountedRef.current) {
+              setTorrentFilesMap(previous => {
+                if (!(transferId in previous)) return previous;
+                const next = { ...previous };
+                delete next[transferId];
+                return next;
+              });
+            }
+          } else if (mountedRef.current) {
+            setTorrentFilesMap(previous => previous[transferId] ? {
+              ...previous,
+              [transferId]: { ...previous[transferId], saving: false },
+            } : previous);
+          }
         }
       }
     });
@@ -406,9 +436,30 @@ export default function App() {
 
   async function persistAndSyncSettings(next: AppSettings) {
     await desktop.saveSettings(next);
-    const synced = isTauri() ? await desktop.getSettings().catch(() => next) : next;
-    settingsRef.current = synced;
-    if (mountedRef.current) setSettings(synced);
+    if (!isTauri()) {
+      settingsRef.current = next;
+      if (mountedRef.current) setSettings(next);
+      return;
+    }
+    try {
+      const synced = await desktop.getSettings();
+      settingsRef.current = synced;
+      if (mountedRef.current) setSettings(synced);
+    } catch (error) {
+      settingsLoadedRef.current = false;
+      settingsLoadRef.current = null;
+      const detail = errorMessage(error);
+      const refreshMsg = "Settings saved, but failed to refresh canonical settings: " + detail;
+      settingsErrorMessagesRef.current.add(refreshMsg);
+      settingsErrorMessagesRef.current.add(detail);
+      settingsRef.current = next;
+      if (mountedRef.current) {
+        setSettings(next);
+        setSettingsLoadState("error");
+        setSettingsError(refreshMsg);
+      }
+      throw new Error(refreshMsg);
+    }
   }
 
   function saveAppearance(change: Partial<AppSettings>) {
@@ -445,23 +496,23 @@ export default function App() {
   useEffect(() => {
     function handleKey(event: KeyboardEvent) {
       if (event.defaultPrevented || event.repeat) return;
-      if (event.key === "Escape" && overlay) {
+      if (event.key === "Escape" && overlayRef.current) {
         event.preventDefault();
-        if (!busy) closeDialog();
+        if (!busyRef.current) closeDialog();
         return;
       }
       if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
       switch (event.key.toLowerCase()) {
         case "k":
           event.preventDefault();
-          if (busy) break;
-          if (overlay && overlay.type !== "palette") break;
+          if (busyRef.current) break;
+          if (overlayRef.current && overlayRef.current.type !== "palette") break;
           commitOverlay(current => current?.type === "palette" ? undefined : { type: "palette" });
           break;
         case "n":
           event.preventDefault();
-          if (busy) break;
-          if (overlay && overlay.type !== "palette") break;
+          if (busyRef.current) break;
+          if (overlayRef.current && overlayRef.current.type !== "palette") break;
           openAdd();
           break;
         case "i":
@@ -472,7 +523,7 @@ export default function App() {
     }
     document.addEventListener("keydown", handleKey);
     return () => document.removeEventListener("keydown", handleKey);
-  }, [overlay, busy, openAdd, closeDialog, commitOverlay]);
+  }, [openAdd, closeDialog, commitOverlay]);
 
   const onTransferAction: OnTransferAction = (action, transfer) => {
     if (action === "refresh" || action === "verify") {
@@ -518,7 +569,7 @@ export default function App() {
     }
     const content = event.dataTransfer.getData("text/uri-list") || event.dataTransfer.getData("text/plain");
     const source = content.split(/\r?\n/).map(line => line.trim()).find(isDownloadSource);
-    if (source) handleDroppedSource(source, !isTorrentSource(source) && !/\.torrent(?:$|[?#])/i.test(source));
+    if (source) handleDroppedSource(source, !isTorrentSource(source) && !isRemoteTorrentUrl(source));
     else if (content || event.dataTransfer.files.length) showError("Drop an HTTP, HTTPS, or magnet link, or a .torrent file.");
   }
 

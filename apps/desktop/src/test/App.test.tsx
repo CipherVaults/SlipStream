@@ -183,6 +183,107 @@ describe("workspace and inspector", () => {
     expect(listSpy).toHaveBeenCalledTimes(2);
   });
 
+  it("auto-retries magnet files when total_bytes resolves mid-load", async () => {
+    const baseSnap = demo.snapshot();
+    const unresolved = {
+      ...baseSnap.transfers.find(item => item.id === "blender")!,
+      total_bytes: null,
+      downloaded_bytes: 0,
+    };
+    const resolvedSnap = {
+      ...baseSnap,
+      timestamp: new Date(Date.parse(baseSnap.timestamp) + 1000).toISOString(),
+    };
+    vi.spyOn(desktop, "getSnapshot").mockResolvedValue({
+      ...baseSnap,
+      transfers: baseSnap.transfers.map(item => (item.id === "blender" ? unresolved : item)),
+    });
+    let rejectFirst!: (error: Error) => void;
+    const listSpy = vi.spyOn(desktop, "listTorrentFiles")
+      .mockImplementationOnce(() => new Promise((_, reject) => { rejectFirst = reject; }))
+      .mockResolvedValueOnce([{ index: 0, relative_path: "Resolved_MidLoad.bin", size_bytes: 5_000_000, downloaded_bytes: 0, selected: true }]);
+
+    const user = await start();
+    await user.click(within(row(blender)).getByRole("button", { name: /Inspect/ }));
+    await user.click(inspector().getByRole("tab", { name: "Torrent Files" }));
+    await waitFor(() => expect(listSpy).toHaveBeenCalledTimes(1));
+
+    act(() => pushTelemetry(resolvedSnap));
+    act(() => rejectFirst(new Error("Metadata pending")));
+
+    expect(await inspector().findByRole("checkbox", { name: /Resolved_MidLoad\.bin/ })).toBeChecked();
+    expect(listSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("discards stale listTorrentFiles across re-add and purges vanished setTorrentFiles entries on settle", async () => {
+    const baseSnap = demo.snapshot();
+    const t0 = Date.parse(baseSnap.timestamp);
+    const snapWithoutBlender = {
+      ...baseSnap,
+      timestamp: new Date(t0 + 1000).toISOString(),
+      transfers: baseSnap.transfers.filter(item => item.id !== "blender"),
+    };
+    const snapReadded = {
+      ...baseSnap,
+      timestamp: new Date(t0 + 2000).toISOString(),
+    };
+    const snapDroppedAgain = {
+      ...baseSnap,
+      timestamp: new Date(t0 + 3000).toISOString(),
+      transfers: baseSnap.transfers.filter(item => item.id !== "blender"),
+    };
+    const snapRestored = {
+      ...baseSnap,
+      timestamp: new Date(t0 + 4000).toISOString(),
+    };
+
+    const getSnapSpy = vi.spyOn(desktop, "getSnapshot").mockResolvedValue(baseSnap);
+    vi.spyOn(desktop, "addTorrent").mockResolvedValue("blender");
+
+    let resolveStaleList!: (files: Awaited<ReturnType<typeof desktop.listTorrentFiles>>) => void;
+    let resolveSet!: () => void;
+    vi.spyOn(desktop, "setTorrentFiles").mockImplementation(() => new Promise<void>(resolve => { resolveSet = resolve; }));
+
+    const listSpy = vi.spyOn(desktop, "listTorrentFiles")
+      .mockImplementationOnce(() => new Promise(resolve => { resolveStaleList = resolve; }))
+      .mockResolvedValueOnce([{ index: 0, relative_path: "Fresh_Readded.bin", size_bytes: 8_000_000, downloaded_bytes: 0, selected: true }])
+      .mockResolvedValueOnce([{ index: 0, relative_path: "After_Vanish.bin", size_bytes: 9_000_000, downloaded_bytes: 0, selected: true }]);
+
+    const user = await start();
+    await user.click(within(row(blender)).getByRole("button", { name: /Inspect/ }));
+    await user.click(inspector().getByRole("tab", { name: "Torrent Files" }));
+    await waitFor(() => expect(listSpy).toHaveBeenCalledTimes(1));
+
+    act(() => pushTelemetry(snapWithoutBlender));
+    expect(screen.queryByRole("article", { name: blender })).not.toBeInTheDocument();
+
+    getSnapSpy.mockResolvedValue(snapReadded);
+    await user.click(screen.getByRole("button", { name: "Add" }));
+    const sheet = dialog("Add Download");
+    await user.type(sheet.getByRole("textbox", { name: "Download source" }), "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567");
+    await user.click(sheet.getByRole("button", { name: "Download" }));
+    expect(row(blender)).toBeVisible();
+
+    await user.click(inspector().getByRole("tab", { name: "Torrent Files" }));
+    const freshCheckbox = await inspector().findByRole("checkbox", { name: /Fresh_Readded\.bin/ });
+    expect(freshCheckbox).toBeChecked();
+
+    act(() => resolveStaleList([{ index: 0, relative_path: "Stale_Old.bin", size_bytes: 1_000, downloaded_bytes: 0, selected: false }]));
+    expect(inspector().queryByRole("checkbox", { name: /Stale_Old\.bin/ })).not.toBeInTheDocument();
+    expect(inspector().getByRole("checkbox", { name: /Fresh_Readded\.bin/ })).toBeChecked();
+
+    await user.click(freshCheckbox);
+    act(() => pushTelemetry(snapDroppedAgain));
+    expect(screen.queryByRole("article", { name: blender })).not.toBeInTheDocument();
+    await act(async () => { resolveSet(); });
+
+    act(() => pushTelemetry(snapRestored));
+    await user.click(within(row(blender)).getByRole("button", { name: /Inspect/ }));
+    await user.click(inspector().getByRole("tab", { name: "Torrent Files" }));
+    expect(await inspector().findByRole("checkbox", { name: /After_Vanish\.bin/ })).toBeChecked();
+    expect(listSpy).toHaveBeenCalledTimes(3);
+  });
+
   it("uses exclusive end_byte, preserves pending torrent file updates across Inspector remounts, and clears stale Media state on URL refresh", async () => {
     const latest = demo.snapshot();
     const singleSegHttp = {
@@ -663,6 +764,90 @@ describe("appearance, settings and transfer dialogs", () => {
       await user.click(settingsDlg.getByRole("button", { name: "Save Settings" }));
       expect(await screen.findByText("Settings saved.")).toBeVisible();
       expect(screen.getByTitle("D:\\Canonical\\Downloads")).toBeVisible();
+    } finally {
+      clearMocks();
+      Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+      Reflect.deleteProperty(window, "__TAURI_EVENT_PLUGIN_INTERNALS__");
+    }
+  });
+
+  it("guards pre-commit shortcuts via synchronous overlayRef/busyRef and restricts remote torrent detection to URL pathname", async () => {
+    let rejectAdd!: (error: Error) => void;
+    vi.spyOn(desktop, "addHttpDownload").mockImplementation(
+      () => new Promise<string>((_resolve, reject) => { rejectAdd = reject; }),
+    );
+    const probeSpy = vi.spyOn(desktop, "probeMedia");
+    const user = await start();
+
+    const torrentQueryUrl = "https://example.org/watch?v=1&caption=sample.torrent#sample.torrent";
+    act(() => {
+      openPicker(torrentQueryUrl);
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true }));
+    });
+    expect(screen.queryByRole("dialog", { name: "Command Palette" })).not.toBeInTheDocument();
+    const probedDialog = dialog("Add Download");
+    expect(probedDialog.getByRole("textbox", { name: "Download source" })).toHaveValue(torrentQueryUrl);
+    expect(await probedDialog.findByRole("button", { name: /2160p 4K/ })).toBeVisible();
+    expect(probeSpy).toHaveBeenCalledWith(torrentQueryUrl);
+    await user.click(probedDialog.getByRole("button", { name: "Cancel" }));
+
+    await user.click(screen.getByRole("button", { name: "Add" }));
+    const sheet = dialog("Add Download");
+    await user.click(sheet.getByRole("tab", { name: "Audio Only" }));
+    expect(sheet.getByRole("tab", { name: "Audio Only" })).toHaveAttribute("aria-selected", "true");
+    await user.type(sheet.getByRole("textbox", { name: "Download source" }), "https://example.org/ubuntu.torrent");
+    expect(sheet.getByRole("tab", { name: "Video" })).toHaveAttribute("aria-selected", "true");
+    expect(sheet.getByText(/Direct HTTP download/)).toBeVisible();
+
+    const downloadBtn = sheet.getByRole("button", { name: "Download" });
+    act(() => {
+      fireEvent.click(downloadBtn);
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    });
+    expect(dialog("Add Download")).toBeTruthy();
+
+    await act(async () => { rejectAdd(new Error("Timed out")); });
+    expect(await sheet.findByRole("alert")).toHaveTextContent("Timed out");
+    await user.click(sheet.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("reports post-save get_settings failure without claiming success and allows Retry recovery in Tauri mode", async () => {
+    let getSettingsCalls = 0;
+    const initialSettings = { ...demo.getSettings(), default_download_dir: "D:\\Downloads" };
+    const recoveredSettings = { ...initialSettings, default_download_dir: "D:\\Recovered\\Downloads" };
+    mockWindows("main");
+    mockIPC(cmd => {
+      if (cmd === "get_snapshot") return demo.snapshot();
+      if (cmd === "get_toolchain_status") return demo.toolchain();
+      if (cmd === "save_settings") return undefined;
+      if (cmd === "get_settings") {
+        getSettingsCalls++;
+        if (getSettingsCalls === 1) return initialSettings;
+        if (getSettingsCalls === 2) throw new Error("Disk unreadable");
+        return recoveredSettings;
+      }
+      return undefined;
+    }, { shouldMockEvents: true });
+    try {
+      const user = await start();
+      await user.click(screen.getByRole("button", { name: "Settings" }));
+      const settingsDlg = dialog("Settings & Browser Integration");
+      await user.clear(settingsDlg.getByLabelText("Default download folder"));
+      await user.type(settingsDlg.getByLabelText("Default download folder"), "D:\\Edited\\Downloads");
+      await user.click(settingsDlg.getByRole("button", { name: "Save Settings" }));
+
+      expect(await settingsDlg.findByRole("alert")).toHaveTextContent(
+        "Settings saved, but failed to refresh canonical settings: Disk unreadable",
+      );
+      expect(screen.queryByText("Settings saved.")).not.toBeInTheDocument();
+      expect(settingsDlg.getByRole("button", { name: "Save Settings" })).toBeDisabled();
+
+      await user.click(settingsDlg.getByRole("button", { name: "Retry" }));
+      await waitFor(() => expect(settingsDlg.getByRole("button", { name: "Save Settings" })).toBeEnabled());
+      expect(settingsDlg.queryByRole("alert")).not.toBeInTheDocument();
+      expect(getSettingsCalls).toBe(3);
+      expect(screen.getByTitle("D:\\Recovered\\Downloads")).toBeVisible();
     } finally {
       clearMocks();
       Reflect.deleteProperty(window, "__TAURI_INTERNALS__");

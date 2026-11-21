@@ -206,18 +206,28 @@ export function Inspector({ transfer, samples, preview, torrentEntry, onLoadTorr
   }
 
   const prevTabRef = useRef<InspectorTab>(tab);
-  const prevTotalBytesRef = useRef<number | null>(transfer?.total_bytes ?? null);
+  const requestTotalBytesRef = useRef<{ transferId: string; totalBytes: number | null } | null>(null);
+
+  const requestTorrentFiles = (force: boolean) => {
+    if (!transferId) return;
+    requestTotalBytesRef.current = { transferId, totalBytes: transfer?.total_bytes ?? null };
+    onLoadTorrentFiles(transferId, force);
+  };
 
   useEffect(() => {
     const enteringDetails = tab === "details" && prevTabRef.current !== "details";
-    const metadataUpdated = (transfer?.total_bytes ?? null) !== prevTotalBytesRef.current;
     prevTabRef.current = tab;
-    prevTotalBytesRef.current = transfer?.total_bytes ?? null;
     if (tab !== "details" || !transferId || !transferKind) return;
     if (transferKind === "torrent") {
-      if (!torrentEntry || torrentEntry.status === "idle"
-        || (torrentEntry.status === "error" && (enteringDetails || metadataUpdated))) {
-        onLoadTorrentFiles(transferId, torrentEntry?.status === "error");
+      const currentBytes = transfer?.total_bytes ?? null;
+      const switchedTorrent = requestTotalBytesRef.current?.transferId !== transferId;
+      const metadataChangedSinceRequest = requestTotalBytesRef.current !== null
+        && requestTotalBytesRef.current.transferId === transferId
+        && requestTotalBytesRef.current.totalBytes !== currentBytes;
+      if (!torrentEntry || torrentEntry.status === "idle") {
+        requestTorrentFiles(false);
+      } else if (torrentEntry.status === "error" && (enteringDetails || switchedTorrent || metadataChangedSinceRequest)) {
+        requestTorrentFiles(true);
       }
       return;
     }
@@ -248,7 +258,7 @@ export function Inspector({ transfer, samples, preview, torrentEntry, onLoadTorr
       {tab === "overview" && <Overview transfer={transfer} samples={samples} preview={preview} onAction={onAction} />}
       {tab === "segments" && <Segments transfer={transfer} />}
       {tab === "details" && <Details transfer={transfer} preview={preview} torrentEntry={torrentEntry} mediaState={mediaState}
-        onLoadTorrent={() => onLoadTorrentFiles(transfer.id, true)}
+        onLoadTorrent={() => requestTorrentFiles(true)}
         onSelectFile={(index, checked) => onSelectTorrentFile(transfer.id, index, checked)}
         onProbeMedia={() => probeCurrentMedia(true)} onFormat={onFormat} />}
     </Tabs>

@@ -2,7 +2,7 @@ import { Download, Folder, Link2, Upload } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import mediaArtwork from "../assets/media-sheet.svg";
 import { desktop, isTauri } from "../lib/tauri";
-import { bytes, clock, errorMessage, isHttpUrl, isTorrentSource, isWildcard, sourceName } from "../lib/transfers";
+import { bytes, clock, errorMessage, isHttpUrl, isRemoteTorrentUrl, isTorrentSource, isWildcard, sourceName } from "../lib/transfers";
 import type { AppSettings, AudioPreset, MediaFormatOption, MediaProbeResult } from "../types/ipc";
 import { Dialog, FormatRow, Switch, Tabs } from "./ui";
 
@@ -29,7 +29,8 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
   const native = isTauri();
   const [url, setUrl] = useState(seed.url ?? "");
   const [tab, setTab] = useState<AddTab>(() => seed.format?.is_audio_only ? "audio"
-    : isTorrentSource(seed.url ?? "") || isWildcard(seed.url ?? "") ? "torrent" : "video");
+    : isRemoteTorrentUrl(seed.url ?? "") ? "video"
+      : isTorrentSource(seed.url ?? "") || isWildcard(seed.url ?? "") ? "torrent" : "video");
   const [probe, setProbe] = useState<MediaProbeResult | undefined>(seed.probe);
   const [videoFormat, setVideoFormat] = useState<string | null>(seed.format?.is_audio_only ? null : seed.format?.format_id ?? null);
   const [audio, setAudio] = useState<{ preset: AudioPreset } | { format: string }>(
@@ -74,6 +75,7 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
     batchProgress.current = { pattern: "", count: 0 };
     const next = value.trim();
     if (isTorrentSource(next) || isWildcard(next)) setTab("torrent");
+    else if (isRemoteTorrentUrl(next)) setTab("video");
     else if (isHttpUrl(next) && tab === "torrent") setTab("video");
   }
 
@@ -123,7 +125,7 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
 
   useEffect(() => {
     const initial = seed.url?.trim();
-    if (seed.autoProbe && initial && !isTorrentSource(initial) && !/\.torrent(?:$|[?#])/i.test(initial)) {
+    if (seed.autoProbe && initial && !isTorrentSource(initial) && !isRemoteTorrentUrl(initial)) {
       void probeSource(initial, true);
     }
     return () => {
