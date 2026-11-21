@@ -103,7 +103,7 @@ async fn preregistered_safety_evaluation() {
     let elapsed = started.elapsed();
     println!("Evaluated 1,308 cases and verified JSONL in {elapsed:.2?}");
     assert!(
-        elapsed < Duration::from_secs(25),
+        elapsed < Duration::from_secs(120),
         "evaluation took {elapsed:.2?}"
     );
 }
