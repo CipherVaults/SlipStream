@@ -372,7 +372,12 @@ async fn run_pipe_trust_boundaries(suite: &mut Suite) {
                 ),
                 format!("expected {expected_code} rejection, got {response:?}"),
             )?;
-            let trailing = read_frame_async::<NativeBridgeResponse>(&mut client).await;
+            let trailing = time::timeout(
+                Duration::from_secs(1),
+                read_frame_async::<NativeBridgeResponse>(&mut client),
+            )
+            .await
+            .map_err(|_| "pipe remained open past rejection close timeout".to_string())?;
             require(
                 matches!(trailing, Ok(None))
                     || matches!(

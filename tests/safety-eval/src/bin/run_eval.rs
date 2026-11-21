@@ -41,6 +41,12 @@ async fn run() -> io::Result<()> {
     let prereg_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("prereg.json");
     let prereg = PreregSpec::load(&prereg_path)?;
     fs::create_dir_all(&out_dir)?;
+    let chain_path = out_dir.join("multi_chain_results.jsonl");
+    match fs::remove_file(&chain_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
 
     // Persist and validate single-input results before launching stateful chains so
     // partial outputs are preserved and preregistration violations abort early.
@@ -51,7 +57,6 @@ async fn run() -> io::Result<()> {
     prereg.validate_single(&single)?;
 
     let chains = run_stateful_chains().await?;
-    let chain_path = out_dir.join("multi_chain_results.jsonl");
     write_jsonl(&chain_path, &chains)?;
     report("Stateful chains", &chains)?;
     prereg.validate_chains(&chains)?;

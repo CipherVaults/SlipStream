@@ -126,6 +126,29 @@ fn count_files_strict(dir: &Path) -> Result<usize, String> {
     }
 }
 
+fn count_non_dir_files_recursive(dir: &Path) -> Result<usize, String> {
+    match fs::read_dir(dir) {
+        Ok(entries) => {
+            let mut count = 0usize;
+            for entry in entries {
+                let entry = entry
+                    .map_err(|e| format!("failed reading dir entry in {}: {e}", dir.display()))?;
+                let file_type = entry
+                    .file_type()
+                    .map_err(|e| format!("failed reading file type in {}: {e}", dir.display()))?;
+                if file_type.is_dir() {
+                    count += count_non_dir_files_recursive(&entry.path())?;
+                } else {
+                    count += 1;
+                }
+            }
+            Ok(count)
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(format!("failed reading dir {}: {err}", dir.display())),
+    }
+}
+
 #[cfg(windows)]
 fn verify_motw_ads(path: &Path, expected_host_url: &str) -> Result<(), String> {
     let mut ads = path.as_os_str().to_os_string();
@@ -133,14 +156,24 @@ fn verify_motw_ads(path: &Path, expected_host_url: &str) -> Result<(), String> {
     let zone = fs::read_to_string(&ads).map_err(|e| format!("read MotW ADS failed: {e}"))?;
     let expected_host = format!("HostUrl={expected_host_url}");
     let zone_lines: Vec<_> = zone.lines().collect();
+    let zone_ids: Vec<_> = zone_lines
+        .iter()
+        .copied()
+        .filter(|l| l.starts_with("ZoneId="))
+        .collect();
+    let host_urls: Vec<_> = zone_lines
+        .iter()
+        .copied()
+        .filter(|l| l.starts_with("HostUrl="))
+        .collect();
     if zone_lines.first().copied() != Some("[ZoneTransfer]")
         || zone_lines
             .iter()
             .filter(|&&l| l == "[ZoneTransfer]")
             .count()
             != 1
-        || zone_lines.iter().filter(|&&l| l == "ZoneId=3").count() != 1
-        || zone_lines.iter().filter(|&&l| l == expected_host).count() != 1
+        || zone_ids != ["ZoneId=3"]
+        || host_urls != [expected_host.as_str()]
         || zone_lines.iter().any(|l| l.starts_with("ReferrerUrl="))
     {
         return Err(format!(
@@ -318,6 +351,8 @@ pub(super) async fn run_content_disposition_cases(suite: &mut Suite) {
     let temp = TempDir::new("slipstream-eval-cd");
     let config = temp.engine_config("cd");
     let save_dir = config.default_download_dir.clone();
+    let bad_root = save_dir.join("harmful-cd");
+    let benign_root = save_dir.join("benign-cd");
     let engine = DownloadEngine::new(config).await.expect("open cd engine");
 
     for (index, (path, expected_sub)) in [
@@ -338,7 +373,7 @@ pub(super) async fn run_content_disposition_cases(suite: &mut Suite) {
             "composed",
             format!("cd-harmful:{path}").into_bytes(),
         );
-        let sub_dir = save_dir.join(format!("bad-{index}"));
+        let sub_dir = bad_root.join(format!("case-{index}")).join("leaf");
         let outcome = match engine
             .add_http_download(AddHttpDownloadRequest {
                 save_dir: Some(sub_dir.to_string_lossy().into_owned()),
@@ -347,14 +382,14 @@ pub(super) async fn run_content_disposition_cases(suite: &mut Suite) {
             .await
         {
             Ok(id) => match wait_terminal(&engine, &id).await {
-                Ok(snap) => match count_files_strict(&sub_dir) {
+                Ok(snap) => match count_non_dir_files_recursive(&save_dir) {
                     Ok(count) => {
                         let msg = snap.error_message.unwrap_or_default().to_ascii_lowercase();
                         if snap.status == TransferStatus::Failed
                             && msg.contains(expected_sub)
                             && count == 0
                         {
-                            Outcome::Pass("DownloadEngine rejected unsafe Content-Disposition and wrote zero files.")
+                            Outcome::Pass("DownloadEngine rejected unsafe Content-Disposition and wrote zero files anywhere under the isolation root.")
                         } else {
                             Outcome::Fail(format!(
                                 "unsafe Content-Disposition was not blocked cleanly: status={:?}, msg={msg:?}, files={count}",
@@ -388,7 +423,7 @@ pub(super) async fn run_content_disposition_cases(suite: &mut Suite) {
             "composed",
             format!("cd-benign:{path}:{expected_name}").into_bytes(),
         );
-        let sub_dir = save_dir.join(format!("good-{index}"));
+        let sub_dir = benign_root.join(format!("good-{index}"));
         let req_url = server.url(path);
         let outcome = match engine
             .add_http_download(AddHttpDownloadRequest {
@@ -435,7 +470,7 @@ pub(super) async fn run_http_redirect_cases(suite: &mut Suite) {
     let target_server = LoopbackServer::start(move |path| match path {
         "/bounce" => StaticReply::redirect("302 Found", &origin_url_for_target.lock().unwrap()),
         "/referer-landing" => StaticReply::ok(payload_rel.clone()),
-        _ => StaticReply::redirect("302 Found", "http://10.0.0.1/blocked"),
+        _ => StaticReply::not_found(),
     })
     .await;
 

@@ -657,6 +657,16 @@ fn verify_motw(path: &Path, source: &str, expect_referrer: bool) -> ChainResult<
     let host = format!("HostUrl={source}");
     let expected_referrer = format!("ReferrerUrl={CLEAN_REFERRER}");
     let zone_lines: Vec<_> = zone.lines().collect();
+    let zone_ids: Vec<_> = zone_lines
+        .iter()
+        .copied()
+        .filter(|line| line.starts_with("ZoneId="))
+        .collect();
+    let host_urls: Vec<_> = zone_lines
+        .iter()
+        .copied()
+        .filter(|line| line.starts_with("HostUrl="))
+        .collect();
     let referrers: Vec<_> = zone_lines
         .iter()
         .copied()
@@ -669,12 +679,8 @@ fn verify_motw(path: &Path, source: &str, expect_referrer: bool) -> ChainResult<
                 .filter(|&&line| line == "[ZoneTransfer]")
                 .count()
                 == 1
-            && zone_lines
-                .iter()
-                .filter(|&&line| line == "ZoneId=3")
-                .count()
-                == 1
-            && zone_lines.iter().filter(|&&line| line == host).count() == 1
+            && zone_ids == ["ZoneId=3"]
+            && host_urls == [host.as_str()]
             && if expect_referrer {
                 referrers == [expected_referrer.as_str()]
             } else {
