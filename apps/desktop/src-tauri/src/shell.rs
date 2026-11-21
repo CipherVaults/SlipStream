@@ -294,6 +294,7 @@ pub(crate) fn run() {
         )
         .try_init();
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             commands::get_snapshot,
             commands::add_http_download,
@@ -315,6 +316,8 @@ pub(crate) fn run() {
             commands::get_toolchain_status,
             commands::install_browser_hosts,
             commands::hibernate_to_tray,
+            commands::check_for_updates,
+            commands::install_update,
         ])
         .on_page_load(|webview, payload| {
             if webview.label() != MAIN {

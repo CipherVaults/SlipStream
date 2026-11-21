@@ -1,0 +1,186 @@
+name: SlipStream Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and publish (defaults to ref_name when triggered by tag push)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch" -and "${{ inputs.tag }}" -ne "") {
+            "${{ inputs.tag }}"
+          } else {
+            "${{ github.ref_name }}"
+          }
+          $version = $tag.TrimStart("v")
+          Write-Output "tag=$tag" >> $env:GITHUB_OUTPUT
+          Write-Output "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: Install workspace dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Typecheck, test, and build frontend and browser extensions
+        run: |
+          pnpm -r typecheck
+          pnpm -r test
+          pnpm -r build
+
+      - name: Verify Rust formatting and lints
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build Native Messaging host (release)
+        run: cargo build --release -p slipstream-native-host
+
+      - name: Build signed NSIS installer and updater artifacts
+        working-directory: apps/desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: npx --yes @tauri-apps/cli@2 build --bundles nsis --config src-tauri/tauri.release.conf.json
+
+      - name: Package release assets, latest.json, and SHA256SUMS.txt
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $out = "release-assets"
+          New-Item -ItemType Directory -Force $out | Out-Null
+
+          $nsisDir = "target/release/bundle/nsis"
+          $setup = Get-ChildItem -LiteralPath $nsisDir -Filter "*-setup.exe" | Where-Object { $_.Name -notlike "*.sig" } | Select-Object -First 1
+          if (-not $setup) { throw "NSIS setup.exe missing under $nsisDir" }
+          $sig = Get-Item -LiteralPath "$($setup.FullName).sig" -ErrorAction SilentlyContinue
+          if (-not $sig) { throw "Updater .sig missing for $($setup.FullName)" }
+
+          Copy-Item -LiteralPath $setup.FullName -Destination (Join-Path $out $setup.Name) -Force
+          Copy-Item -LiteralPath $sig.FullName -Destination (Join-Path $out $sig.Name) -Force
+
+          # Portable Windows x64 ZIP
+          $portableStage = Join-Path $out "portable-stage"
+          New-Item -ItemType Directory -Force $portableStage | Out-Null
+          Copy-Item "target/release/slipstream-desktop.exe" $portableStage -Force
+          Copy-Item "target/release/slipstream-native-host.exe" $portableStage -Force
+          Copy-Item "README.md" $portableStage -Force
+          Copy-Item "CHANGELOG.md" $portableStage -Force
+          $portableZip = Join-Path $out "SlipStream-$env:RELEASE_VERSION-windows-x64-portable.zip"
+          Compress-Archive -Path "$portableStage\*" -DestinationPath $portableZip -CompressionLevel Optimal -Force
+          Remove-Item -LiteralPath $portableStage -Recurse -Force
+
+          # Cross-browser MV3 extension ZIPs
+          $chromeZip = Join-Path $out "slipstream-extension-$env:RELEASE_VERSION-chrome-edge-brave.zip"
+          Compress-Archive -Path "extensions/browser/dist/chrome/*" -DestinationPath $chromeZip -CompressionLevel Optimal -Force
+          $firefoxZip = Join-Path $out "slipstream-extension-$env:RELEASE_VERSION-firefox.zip"
+          Compress-Archive -Path "extensions/browser/dist/firefox/*" -DestinationPath $firefoxZip -CompressionLevel Optimal -Force
+
+          # Tauri v2 updater latest.json manifest
+          $sigContent = (Get-Content -Raw -LiteralPath $sig.FullName).Trim()
+          $manifest = @{
+            version = $env:RELEASE_VERSION
+            notes = "SlipStream $env:RELEASE_TAG — segmented HTTP engine, yt-dlp/FFmpeg media pipeline, BitTorrent/Magnet, SID-ACL Native Pipe browser extension, and dual Graphite/Porcelain desktop UI."
+            pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = @{
+              "windows-x86_64" = @{
+                signature = $sigContent
+                url = "https://github.com/$env:REPO/releases/download/$env:RELEASE_TAG/$($setup.Name)"
+              }
+            }
+          } | ConvertTo-Json -Depth 6
+          [System.IO.File]::WriteAllText((Join-Path (Resolve-Path $out) "latest.json"), $manifest + "`n", [System.Text.UTF8Encoding]::new($false))
+
+          # Checksums
+          $files = Get-ChildItem -LiteralPath $out -File | Where-Object { $_.Name -ne "SHA256SUMS.txt" } | Sort-Object Name
+          $lines = foreach ($f in $files) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $f.FullName).Hash.ToLowerInvariant()
+            "$hash *$($f.Name)"
+          }
+          [System.IO.File]::WriteAllLines((Join-Path (Resolve-Path $out) "SHA256SUMS.txt"), $lines, [System.Text.UTF8Encoding]::new($false))
+
+          Get-ChildItem -LiteralPath $out | Format-Table Name, Length
+
+      - name: Extract changelog notes and publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $setup = Get-ChildItem -LiteralPath "release-assets" -Filter "*-setup.exe" | Where-Object { $_.Name -notlike "*.sig" } | Select-Object -First 1
+          $setupName = $setup.Name
+          $template = @'
+          # SlipStream __TAG__
+
+          High-speed Windows 10/11 download manager built with **Rust**, **Tauri v2**, **React 19**, and a **Manifest V3** browser extension.
+
+          ## Downloads
+          - **Installer (Recommended, Signed Auto-Update):** `__SETUP__` (bundles `bin/slipstream-native-host.exe`)
+          - **Portable:** `SlipStream-__VER__-windows-x64-portable.zip`
+          - **Browser Extension (Chrome / Edge / Brave):** `slipstream-extension-__VER__-chrome-edge-brave.zip`
+          - **Browser Extension (Firefox):** `slipstream-extension-__VER__-firefox.zip`
+          - **Updater & Verification:** `latest.json`, `__SETUP__.sig`, `SHA256SUMS.txt`
+
+          ## Full Changelog
+          '@
+          $notes = $template.Replace("__TAG__", $env:RELEASE_TAG).Replace("__VER__", $env:RELEASE_VERSION).Replace("__SETUP__", $setupName)
+          $changelog = Get-Content -Raw "CHANGELOG.md"
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) "RELEASE_NOTES.md"), $notes + "`n`n" + $changelog, [System.Text.UTF8Encoding]::new($false))
+
+          $assets = @(Get-ChildItem -LiteralPath "release-assets" -File | ForEach-Object { $_.FullName })
+          $ErrorActionPreference = "Continue"
+          gh release view $env:RELEASE_TAG -R $env:REPO 2>$null | Out-Null
+          $exists = ($LASTEXITCODE -eq 0)
+          $ErrorActionPreference = "Stop"
+
+          if ($exists) {
+            gh release upload $env:RELEASE_TAG @assets --clobber -R $env:REPO
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            gh release edit $env:RELEASE_TAG --title "SlipStream $env:RELEASE_TAG" --notes-file RELEASE_NOTES.md -R $env:REPO
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            gh release create $env:RELEASE_TAG @assets --title "SlipStream $env:RELEASE_TAG" --notes-file RELEASE_NOTES.md -R $env:REPO
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }

@@ -4,7 +4,7 @@ import { getCurrentWebview, type DragDropEvent } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type {
   AddHttpDownloadRequest, AddMediaDownloadRequest, AddTorrentRequest, AppSettings, MediaProbeResult,
-  RefreshDownloadUrlRequest, TelemetryBatch, ToolchainStatus, TorrentFileEntry,
+  RefreshDownloadUrlRequest, TelemetryBatch, ToolchainStatus, TorrentFileEntry, UpdateStatus,
 } from "../types/ipc";
 import { demo } from "./demo";
 
@@ -52,6 +52,8 @@ export const desktop = {
     command<string[]>("install_browser_hosts", { chrome_id, edge_id, firefox_id },
       () => demo.installHosts([chrome_id, edge_id, firefox_id])),
   hibernateToTray: () => command<void>("hibernate_to_tray", undefined, () => undefined),
+  checkForUpdates: () => command<UpdateStatus>("check_for_updates", undefined, demo.checkForUpdates),
+  installUpdate: () => command<boolean>("install_update", undefined, demo.installUpdate),
 
   async onTelemetry(handler: (batch: TelemetryBatch) => void) {
     return isTauri() ? listen<TelemetryBatch>("slipstream://telemetry", event => handler(event.payload))

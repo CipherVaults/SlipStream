@@ -140,6 +140,14 @@ export interface AddTorrentRequest {
 export type ThemeMode = "system" | "dark" | "light";
 export type AccentMode = "blue" | "mono";
 
+export interface UpdateStatus {
+  available: boolean;
+  current_version: string;
+  version?: string | null;
+  notes?: string | null;
+  pub_date?: string | null;
+}
+
 export interface AppSettings {
   theme: ThemeMode;
   accent: AccentMode;

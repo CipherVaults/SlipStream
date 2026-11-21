@@ -1,10 +1,11 @@
 use crate::{shell::DesktopUi, tools, AppState, ToolchainStatus};
 use slipstream_protocol::{
     AddHttpDownloadRequest, AddMediaDownloadRequest, AddTorrentRequest, AppSettings,
-    MediaProbeResult, RefreshDownloadUrlRequest, TelemetryBatch, TorrentFileEntry,
+    MediaProbeResult, RefreshDownloadUrlRequest, TelemetryBatch, TorrentFileEntry, UpdateStatus,
 };
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
+use tauri_plugin_updater::UpdaterExt;
 
 type Daemon<'a> = State<'a, Arc<AppState>>;
 type Result<T> = std::result::Result<T, String>;
@@ -161,6 +162,58 @@ pub(crate) async fn install_browser_hosts(
     .await
     .map_err(|error| error.to_string())?
     .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) async fn check_for_updates(app: AppHandle) -> Result<UpdateStatus> {
+    let current_version = app.package_info().version.to_string();
+    let update = app
+        .updater()
+        .map_err(|error| error.to_string())?
+        .check()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    Ok(match update {
+        Some(update) => UpdateStatus {
+            available: true,
+            current_version,
+            version: Some(update.version),
+            notes: update.body,
+            pub_date: update.date.map(|date| date.to_string()),
+        },
+        None => UpdateStatus {
+            available: false,
+            current_version,
+            version: None,
+            notes: None,
+            pub_date: None,
+        },
+    })
+}
+
+#[tauri::command]
+pub(crate) async fn install_update(app: AppHandle, state: Daemon<'_>) -> Result<bool> {
+    let Some(update) = app
+        .updater()
+        .map_err(|error| error.to_string())?
+        .check()
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(false);
+    };
+
+    let bytes = update
+        .download(|_, _| {}, || {})
+        .await
+        .map_err(|error| error.to_string())?;
+    state.shutdown().await?;
+    // On Windows, the updater exits SlipStream and NSIS relaunches it after installing.
+    update.install(bytes).map_err(|error| {
+        format!("Could not install the update. Restart SlipStream to resume downloads. {error}")
+    })?;
+    Ok(true)
 }
 
 #[tauri::command(rename_all = "snake_case")]

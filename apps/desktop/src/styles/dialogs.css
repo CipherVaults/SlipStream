@@ -391,6 +391,9 @@ html[data-theme="light"] .sheet-card {
 .integration-status { display: flex; justify-content: space-between; align-items: center; gap: 7px; }
 .integration-status span { display: flex; align-items: center; gap: 4px; }
 .integration-status .integrity-ok { color: var(--green); }
+.settings-about { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.settings-update-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+.settings-update-notes { white-space: pre-wrap; overflow-wrap: anywhere; }
 .compact-sheet { width: 460px; }
 .dialog-filename { color: var(--dialog-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .palette-sheet { width: 530px; }

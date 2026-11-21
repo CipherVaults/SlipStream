@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import { demo } from "../lib/demo";
 import { desktop } from "../lib/tauri";
-import type { TelemetryBatch } from "../types/ipc";
+import type { TelemetryBatch, UpdateStatus } from "../types/ipc";
 
 const alpine = "Alpine_Cinema_4K_60fps.mp4";
 const ubuntu = "Ubuntu-26.04-desktop-amd64.iso";
@@ -649,6 +649,57 @@ describe("appearance, settings and transfer dialogs", () => {
       default_connections: 24, global_speed_limit_bps: 25_500_000, monitor_clipboard: true,
     }));
     expect(await screen.findByText("Settings saved.")).toBeVisible();
+  });
+
+  it("shows About & Updates and blocks other settings actions while checking", async () => {
+    let resolveCheck!: (status: UpdateStatus) => void;
+    const check = vi.spyOn(desktop, "checkForUpdates").mockImplementation(
+      () => new Promise<UpdateStatus>(resolve => { resolveCheck = resolve; }),
+    );
+    const user = await start();
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    const settings = dialog("Settings & Browser Integration");
+    const about = within(settings.getByRole("region", { name: "About & Updates" }));
+
+    expect(about.getByText("SlipStream v1.0.0")).toBeVisible();
+    expect(about.getByText("CipherVaults · Windows 10/11 · MIT License")).toBeVisible();
+    expect(about.getByText("Signed NSIS Auto-Update (GitHub Releases)")).toBeVisible();
+    await user.click(about.getByRole("button", { name: "Check for Updates" }));
+    expect(check).toHaveBeenCalledOnce();
+    expect(about.getByRole("button", { name: "Checking…" })).toBeDisabled();
+    expect(settings.getByRole("button", { name: "Save Settings" })).toBeDisabled();
+    expect(settings.getByRole("button", { name: "Cancel" })).toBeDisabled();
+
+    await act(async () => resolveCheck({ available: false, current_version: "1.0.0" }));
+    expect(about.getByRole("status")).toHaveTextContent("Up to date (v1.0.0).");
+    expect(about.queryByRole("button", { name: "Install & Restart" })).not.toBeInTheDocument();
+    expect(settings.getByRole("button", { name: "Save Settings" })).toBeEnabled();
+  });
+
+  it("offers an available update with release details and invokes Install & Restart", async () => {
+    vi.spyOn(desktop, "checkForUpdates").mockResolvedValue({
+      available: true, current_version: "1.0.0", version: "1.1.0",
+      notes: "Improved download recovery.", pub_date: "2026-11-21 0:00:00.0 +00:00:00",
+    });
+    const install = vi.spyOn(desktop, "installUpdate")
+      .mockRejectedValueOnce(new Error("Update signature verification failed"))
+      .mockResolvedValueOnce(true);
+    const save = vi.spyOn(desktop, "saveSettings");
+    const user = await start();
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    const settings = dialog("Settings & Browser Integration");
+    const about = within(settings.getByRole("region", { name: "About & Updates" }));
+
+    await user.click(about.getByRole("button", { name: "Check for Updates" }));
+    expect(about.getByRole("status")).toHaveTextContent("Update v1.1.0 available.");
+    expect(about.getByText("Improved download recovery.")).toBeVisible();
+    expect(about.getByText("Released 2026-11-21")).toBeVisible();
+    await user.click(about.getByRole("button", { name: "Install & Restart" }));
+    expect(await settings.findByRole("alert")).toHaveTextContent("Update signature verification failed");
+    await user.click(about.getByRole("button", { name: "Install & Restart" }));
+    expect(install).toHaveBeenCalledTimes(2);
+    expect(save).not.toHaveBeenCalled();
+    expect(settings.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("refreshes an HTTP link with optional request fields, excludes Refresh URL on media, and reports checksum results", async () => {

@@ -53,6 +53,12 @@ describe("Tauri v2 adapter", () => {
     await desktop.getToolchainStatus();
     await desktop.installBrowserHosts("chrome", null, "firefox@example.org");
     await desktop.hibernateToTray();
+
+    const update = { available: true, current_version: "1.0.0", version: "1.1.0" };
+    invoke.mockResolvedValueOnce(update).mockResolvedValueOnce(true);
+    await expect(desktop.checkForUpdates()).resolves.toEqual(update);
+    await expect(desktop.installUpdate()).resolves.toBe(true);
+
     expect(invoke.mock.calls).toEqual([
       ["get_snapshot", {}], ["add_http_download", { request: http }],
       ["expand_wildcard_urls", { pattern: "https://example.org/[1-3].zip" }],
@@ -63,7 +69,7 @@ describe("Tauri v2 adapter", () => {
       ["set_speed_limit", { limit_bps: null }], ["verify_transfer_checksum", { transfer_id: id, expected_sha256: digest }],
       ["reveal_in_explorer", { transfer_id: id }], ["get_settings", {}], ["save_settings", { settings: DEFAULT_SETTINGS }],
       ["get_toolchain_status", {}], ["install_browser_hosts", { chrome_id: "chrome", edge_id: null, firefox_id: "firefox@example.org" }],
-      ["hibernate_to_tray", {}],
+      ["hibernate_to_tray", {}], ["check_for_updates", {}], ["install_update", {}],
     ]);
   });
 
@@ -120,6 +126,14 @@ describe("Tauri v2 adapter", () => {
 });
 
 describe("browser demo", () => {
+  it("reports the current version and has no updates to install", async () => {
+    await expect(desktop.checkForUpdates()).resolves.toEqual({
+      available: false, current_version: "1.0.0", version: null, notes: null, pub_date: null,
+    });
+    await expect(desktop.installUpdate()).resolves.toBe(false);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
   it("publishes stateful telemetry, expands patterns and supports picker subscriptions", async () => {
     const updates = vi.fn();
     const open = vi.fn();

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "SlipStream",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "identifier": "com.ciphervaults.slipstream",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -31,6 +31,23 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "icon": ["icons/icon.ico"]
+    "icon": ["icons/icon.ico"],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": false
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI3NEQyMDc4MTczMTcxNzkKUldSNWNURVhlQ0JOSjZ6anFKYk5pbVNySFJ0SE1aVkRjYmpIR2JwaURFcFVqNDl3dDNja0dOc3UK",
+      "endpoints": [
+        "https://github.com/CipherVaults/SlipStream/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

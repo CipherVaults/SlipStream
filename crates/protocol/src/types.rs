@@ -223,6 +223,15 @@ pub enum PostQueueAction {
     Shutdown,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateStatus {
+    pub available: bool,
+    pub current_version: String,
+    pub version: Option<String>,
+    pub notes: Option<String>,
+    pub pub_date: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub theme: ThemeMode,

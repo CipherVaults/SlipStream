@@ -1,6 +1,7 @@
+import { version } from "../../package.json";
 import type {
   AddHttpDownloadRequest, AddMediaDownloadRequest, AddTorrentRequest, AppSettings, MediaFormatOption,
-  RefreshDownloadUrlRequest, SegmentSnapshot, TelemetryBatch, ToolchainStatus, TorrentFileEntry, TransferSnapshot,
+  RefreshDownloadUrlRequest, SegmentSnapshot, TelemetryBatch, ToolchainStatus, TorrentFileEntry, TransferSnapshot, UpdateStatus,
 } from "../types/ipc";
 import { MB, SEGMENT_COUNT, isHttpUrl, isRunning, ratio, sourceName } from "./transfers";
 
@@ -324,6 +325,10 @@ export const demo = {
     settings = { ...next };
     refreshRates();
   },
+  checkForUpdates(): UpdateStatus {
+    return { available: false, current_version: version, version: null, notes: null, pub_date: null };
+  },
+  installUpdate() { return false; },
   toolchain(): ToolchainStatus {
     return {
       ytdlp_path: settings.ytdlp_path ?? "C:\\SlipStream\\tools\\yt-dlp.exe", ytdlp_version: "2026.11.17",

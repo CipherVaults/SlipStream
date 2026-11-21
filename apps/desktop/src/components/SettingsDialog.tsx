@@ -1,8 +1,9 @@
-import { Check, Download, Plug, Save, Settings, Timer } from "lucide-react";
+import { Check, Download, Info, Plug, Save, Settings, Timer } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { version } from "../../package.json";
 import { desktop } from "../lib/tauri";
 import { MB, errorMessage } from "../lib/transfers";
-import type { AppSettings, ToolchainStatus } from "../types/ipc";
+import type { AppSettings, ToolchainStatus, UpdateStatus } from "../types/ipc";
 import { Dialog, Switch } from "./ui";
 
 export type SettingsLoadState = "loading" | "ready" | "error";
@@ -15,6 +16,7 @@ export function SettingsDialog({ settings, loadState, loadError, onRetryLoad, on
   const [draft, setDraft] = useState(settings);
   const [limit, setLimit] = useState(settings.global_speed_limit_bps === null ? "" : String(settings.global_speed_limit_bps / MB));
   const [tools, setTools] = useState<ToolchainStatus>();
+  const [updateInfo, setUpdateInfo] = useState<UpdateStatus>();
   const [ids, setIds] = useState({ chrome: "", edge: "", firefox: "" });
   const [busy, setBusy] = useState("");
   const busyLock = useRef(false);
@@ -76,7 +78,14 @@ export function SettingsDialog({ settings, loadState, loadError, onRetryLoad, on
     setToolError("");
   }
 
+  async function installUpdate() {
+    if (!await desktop.installUpdate()) {
+      setUpdateInfo({ available: false, current_version: currentVersion });
+    }
+  }
+
   const ready = loadState === "ready";
+  const currentVersion = updateInfo?.current_version ?? version;
 
   return <Dialog title="Settings & Browser Integration" className="settings-sheet" onClose={onClose} busy={Boolean(busy)}
     header={<Settings className="dialog-symbol" size={19} />}>
@@ -175,6 +184,37 @@ export function SettingsDialog({ settings, loadState, loadError, onRetryLoad, on
             <button type="button" className="btn-ghost form-button"
               onClick={() => void run("install", install)}>{busy === "install" ? "Installing…" : "Install Browser Native Hosts"}</button>
           </div>
+        </section>
+        <section className="settings-group" aria-label="About & Updates">
+          <h3 className="settings-heading"><Info size={14} />About &amp; Updates</h3>
+          <div className="settings-about">
+            <div>
+              <p className="settings-heading tabular">SlipStream v{currentVersion}</p>
+              <p className="field-note">CipherVaults · Windows 10/11 · MIT License</p>
+              <p className="field-note">Signed NSIS Auto-Update (GitHub Releases)</p>
+              <p className="field-note" role="status">
+                {updateInfo && (updateInfo.available
+                  ? <>Update v{updateInfo.version} available.</>
+                  : <>Up to date (v{currentVersion}).</>)}
+              </p>
+            </div>
+            <div className="settings-update-actions">
+              <button type="button" className="btn-ghost form-button"
+                onClick={() => void run("update-check", async () => {
+                  setUpdateInfo(await desktop.checkForUpdates());
+                })}>
+                {busy === "update-check" ? "Checking…" : "Check for Updates"}
+              </button>
+              {updateInfo?.available && <button type="button" className="btn-primary form-button"
+                onClick={() => void run("update-install", installUpdate)}>
+                {busy === "update-install" ? "Installing…" : "Install & Restart"}
+              </button>}
+            </div>
+          </div>
+          {updateInfo?.available && updateInfo.pub_date &&
+            <p className="field-note">Released {updateInfo.pub_date.slice(0, 10)}</p>}
+          {updateInfo?.available && updateInfo.notes &&
+            <p className="field-note settings-update-notes">{updateInfo.notes}</p>}
         </section>
       </fieldset>
       {message && <p role="status" className="integrity-ok">{message}</p>}
