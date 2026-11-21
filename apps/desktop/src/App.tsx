@@ -75,6 +75,7 @@ export default function App() {
   const [torrentFilesMap, setTorrentFilesMap] = useState<Record<string, TorrentFilesEntry>>({});
   const torrentFilesRef = useRef<Record<string, TorrentFilesEntry>>({});
   torrentFilesRef.current = torrentFilesMap;
+  const torrentActiveIdsRef = useRef(new Set<string>());
   const torrentQueuesRef = useRef(new Map<string, Promise<void>>());
   const torrentPendingRef = useRef(new Map<string, number>());
   const torrentLatestFilesRef = useRef(new Map<string, TorrentFileEntry[]>());
@@ -122,10 +123,14 @@ export default function App() {
 
   const clearTorrentCache = useCallback((transferId: string) => {
     bumpTorrentGen(transferId);
+    torrentActiveIdsRef.current.delete(transferId);
     torrentLatestFilesRef.current.delete(transferId);
-    if ((torrentPendingRef.current.get(transferId) ?? 0) === 0) {
-      torrentPendingRef.current.delete(transferId);
-      torrentQueuesRef.current.delete(transferId);
+    torrentPendingRef.current.delete(transferId);
+    torrentQueuesRef.current.delete(transferId);
+    if (transferId in torrentFilesRef.current) {
+      const next = { ...torrentFilesRef.current };
+      delete next[transferId];
+      torrentFilesRef.current = next;
     }
     setTorrentFilesMap(previous => {
       if (!(transferId in previous)) return previous;
@@ -186,28 +191,16 @@ export default function App() {
       });
       return changed ? retained : previous;
     });
-    const staleIds = Object.keys(torrentFilesRef.current).filter(
-      id => !present.has(id) && (torrentPendingRef.current.get(id) ?? 0) === 0,
-    );
-    if (staleIds.length > 0) {
-      for (const id of staleIds) {
-        bumpTorrentGen(id);
-        torrentLatestFilesRef.current.delete(id);
-        torrentPendingRef.current.delete(id);
-        torrentQueuesRef.current.delete(id);
-      }
-      setTorrentFilesMap(previous => {
-        const nextMap = { ...previous };
-        for (const id of staleIds) delete nextMap[id];
-        return nextMap;
-      });
+    const staleIds = Array.from(torrentActiveIdsRef.current).filter(id => !present.has(id));
+    for (const id of staleIds) {
+      clearTorrentCache(id);
     }
     if (duplicate) return;
     setSamples(previous => [...previous.slice(1 - sampleCount), next.aggregate_down_bps]);
     setHistory(previous => Object.fromEntries(next.transfers.map(transfer => [
       transfer.id, [...(previous[transfer.id] ?? []).slice(1 - sampleCount), transfer.download_speed_bps],
     ])));
-  }, [bumpTorrentGen]);
+  }, [clearTorrentCache]);
 
   const pullSnapshot = useCallback(async () => {
     const before = eventVersion.current;
@@ -242,42 +235,52 @@ export default function App() {
     if (!force && existing && (existing.status === "loading" || existing.status === "ready")) return;
     if ((torrentPendingRef.current.get(transferId) ?? 0) > 0) return;
     const gen = torrentGenRef.current.get(transferId) ?? 0;
+    torrentActiveIdsRef.current.add(transferId);
 
-    setTorrentFilesMap(previous => ({
-      ...previous,
-      [transferId]: {
-        status: "loading",
-        files: previous[transferId]?.files,
-        saving: previous[transferId]?.saving ?? false,
-        selectionError: "",
-      },
-    }));
+    setTorrentFilesMap(previous => {
+      if ((torrentGenRef.current.get(transferId) ?? 0) !== gen) return previous;
+      return {
+        ...previous,
+        [transferId]: {
+          status: "loading",
+          files: previous[transferId]?.files,
+          saving: previous[transferId]?.saving ?? false,
+          selectionError: "",
+        },
+      };
+    });
 
     void desktop.listTorrentFiles(transferId).then(files => {
       if (!mountedRef.current || (torrentGenRef.current.get(transferId) ?? 0) !== gen) return;
       if ((torrentPendingRef.current.get(transferId) ?? 0) > 0) return;
       torrentLatestFilesRef.current.set(transferId, files);
-      setTorrentFilesMap(previous => ({
-        ...previous,
-        [transferId]: {
-          status: "ready",
-          files,
-          saving: (torrentPendingRef.current.get(transferId) ?? 0) > 0,
-          selectionError: previous[transferId]?.selectionError ?? "",
-        },
-      }));
+      setTorrentFilesMap(previous => {
+        if ((torrentGenRef.current.get(transferId) ?? 0) !== gen) return previous;
+        return {
+          ...previous,
+          [transferId]: {
+            status: "ready",
+            files,
+            saving: (torrentPendingRef.current.get(transferId) ?? 0) > 0,
+            selectionError: previous[transferId]?.selectionError ?? "",
+          },
+        };
+      });
     }, error => {
       if (!mountedRef.current || (torrentGenRef.current.get(transferId) ?? 0) !== gen) return;
-      setTorrentFilesMap(previous => ({
-        ...previous,
-        [transferId]: {
-          status: "error",
-          files: previous[transferId]?.files,
-          error: errorMessage(error),
-          saving: (torrentPendingRef.current.get(transferId) ?? 0) > 0,
-          selectionError: previous[transferId]?.selectionError ?? "",
-        },
-      }));
+      setTorrentFilesMap(previous => {
+        if ((torrentGenRef.current.get(transferId) ?? 0) !== gen) return previous;
+        return {
+          ...previous,
+          [transferId]: {
+            status: "error",
+            files: previous[transferId]?.files,
+            error: errorMessage(error),
+            saving: (torrentPendingRef.current.get(transferId) ?? 0) > 0,
+            selectionError: previous[transferId]?.selectionError ?? "",
+          },
+        };
+      });
     });
   }, []);
 
@@ -285,91 +288,97 @@ export default function App() {
     const currentFiles = torrentLatestFilesRef.current.get(transferId) ?? torrentFilesRef.current[transferId]?.files;
     if (!currentFiles) return;
     const gen = torrentGenRef.current.get(transferId) ?? 0;
+    torrentActiveIdsRef.current.add(transferId);
     const nextFiles = currentFiles.map(file => file.index === index ? { ...file, selected: checked } : file);
     torrentLatestFilesRef.current.set(transferId, nextFiles);
     const nextPending = (torrentPendingRef.current.get(transferId) ?? 0) + 1;
     torrentPendingRef.current.set(transferId, nextPending);
 
-    setTorrentFilesMap(previous => ({
-      ...previous,
-      [transferId]: {
-        status: "ready",
-        files: nextFiles,
-        saving: true,
-        selectionError: "",
-      },
-    }));
+    setTorrentFilesMap(previous => {
+      if ((torrentGenRef.current.get(transferId) ?? 0) !== gen) return previous;
+      return {
+        ...previous,
+        [transferId]: {
+          status: "ready",
+          files: nextFiles,
+          saving: true,
+          selectionError: "",
+        },
+      };
+    });
 
     const indices = nextFiles.filter(file => file.selected).map(file => file.index);
     const prior = torrentQueuesRef.current.get(transferId) ?? Promise.resolve();
     const nextQueue = prior.then(async () => {
       try {
+        if ((torrentGenRef.current.get(transferId) ?? 0) !== gen) return;
         await desktop.setTorrentFiles(transferId, indices);
       } catch (error) {
         if ((torrentGenRef.current.get(transferId) ?? 0) !== gen) return;
         if (mountedRef.current) {
           const msg = errorMessage(error);
-          setTorrentFilesMap(previous => ({
-            ...previous,
-            [transferId]: {
-              ...previous[transferId],
-              status: "ready",
-              files: previous[transferId]?.files ?? nextFiles,
-              saving: (torrentPendingRef.current.get(transferId) ?? 0) > 1,
-              selectionError: msg,
-            },
-          }));
+          setTorrentFilesMap(previous => {
+            if ((torrentGenRef.current.get(transferId) ?? 0) !== gen) return previous;
+            return {
+              ...previous,
+              [transferId]: {
+                ...previous[transferId],
+                status: "ready",
+                files: previous[transferId]?.files ?? nextFiles,
+                saving: (torrentPendingRef.current.get(transferId) ?? 0) > 1,
+                selectionError: msg,
+              },
+            };
+          });
         }
         try {
-          if ((torrentPendingRef.current.get(transferId) ?? 0) <= 1) {
+          if ((torrentGenRef.current.get(transferId) ?? 0) === gen
+            && (torrentPendingRef.current.get(transferId) ?? 0) <= 1) {
             const fresh = await desktop.listTorrentFiles(transferId);
             if (mountedRef.current
               && (torrentGenRef.current.get(transferId) ?? 0) === gen
               && (torrentPendingRef.current.get(transferId) ?? 0) <= 1) {
               torrentLatestFilesRef.current.set(transferId, fresh);
-              setTorrentFilesMap(previous => ({
-                ...previous,
-                [transferId]: {
-                  status: "ready",
-                  files: fresh,
-                  saving: false,
-                  selectionError: previous[transferId]?.selectionError ?? "",
-                },
-              }));
+              setTorrentFilesMap(previous => {
+                if ((torrentGenRef.current.get(transferId) ?? 0) !== gen) return previous;
+                return {
+                  ...previous,
+                  [transferId]: {
+                    status: "ready",
+                    files: fresh,
+                    saving: false,
+                    selectionError: previous[transferId]?.selectionError ?? "",
+                  },
+                };
+              });
             }
           }
         } catch {
           // Retain optimistic state and keep selectionError visible.
         }
       } finally {
-        const remaining = Math.max(0, (torrentPendingRef.current.get(transferId) ?? 1) - 1);
-        torrentPendingRef.current.set(transferId, remaining);
-        if (remaining === 0) {
-          const sameGen = (torrentGenRef.current.get(transferId) ?? 0) === gen;
-          const stillPresent = latest.current?.transfers.some(transfer => transfer.id === transferId) ?? true;
-          if (!sameGen || !stillPresent) {
-            torrentLatestFilesRef.current.delete(transferId);
-            torrentPendingRef.current.delete(transferId);
-            torrentQueuesRef.current.delete(transferId);
-            if (mountedRef.current) {
+        if ((torrentGenRef.current.get(transferId) ?? 0) === gen) {
+          const remaining = Math.max(0, (torrentPendingRef.current.get(transferId) ?? 1) - 1);
+          torrentPendingRef.current.set(transferId, remaining);
+          if (remaining === 0) {
+            const stillPresent = latest.current?.transfers.some(transfer => transfer.id === transferId) ?? true;
+            if (!stillPresent) {
+              clearTorrentCache(transferId);
+            } else if (mountedRef.current) {
               setTorrentFilesMap(previous => {
-                if (!(transferId in previous)) return previous;
-                const next = { ...previous };
-                delete next[transferId];
-                return next;
+                if ((torrentGenRef.current.get(transferId) ?? 0) !== gen || !previous[transferId]) return previous;
+                return {
+                  ...previous,
+                  [transferId]: { ...previous[transferId], saving: false },
+                };
               });
             }
-          } else if (mountedRef.current) {
-            setTorrentFilesMap(previous => previous[transferId] ? {
-              ...previous,
-              [transferId]: { ...previous[transferId], saving: false },
-            } : previous);
           }
         }
       }
     });
     torrentQueuesRef.current.set(transferId, nextQueue);
-  }, []);
+  }, [clearTorrentCache]);
 
   useEffect(() => {
     let cancelled = false;
@@ -644,7 +653,7 @@ export default function App() {
         void pullSnapshot().catch(showError);
       }} />}
     {overlay?.type === "settings" && <SettingsDialog settings={{ ...settings, global_speed_limit_bps: speedLimit }}
-      loadState={settingsLoadState} loadError={settingsError} onRetryLoad={() => void loadSettings().catch(showError)}
+      loadState={settingsLoadState} loadError={settingsError} onRetryLoad={() => void loadSettings().catch(() => {})}
       onClose={closeDialog} onBusyChange={updateBusy} onHibernate={hibernate} onSave={async patch => {
         await enqueueSettings(async () => {
           const next = { ...settingsRef.current, ...patch };

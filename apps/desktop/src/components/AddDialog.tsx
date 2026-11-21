@@ -29,8 +29,7 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
   const native = isTauri();
   const [url, setUrl] = useState(seed.url ?? "");
   const [tab, setTab] = useState<AddTab>(() => seed.format?.is_audio_only ? "audio"
-    : isRemoteTorrentUrl(seed.url ?? "") ? "video"
-      : isTorrentSource(seed.url ?? "") || isWildcard(seed.url ?? "") ? "torrent" : "video");
+    : isTorrentSource(seed.url ?? "") || isWildcard(seed.url ?? "") ? "torrent" : "video");
   const [probe, setProbe] = useState<MediaProbeResult | undefined>(seed.probe);
   const [videoFormat, setVideoFormat] = useState<string | null>(seed.format?.is_audio_only ? null : seed.format?.format_id ?? null);
   const [audio, setAudio] = useState<{ preset: AudioPreset } | { format: string }>(

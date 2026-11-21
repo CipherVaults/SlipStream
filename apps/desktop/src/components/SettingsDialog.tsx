@@ -117,7 +117,7 @@ export function SettingsDialog({ settings, loadState, loadError, onRetryLoad, on
       {loadState === "loading" && <p className="field-note" role="status">Loading settings…</p>}
       {loadState === "error" && <div className="inline-error" role="alert">
         <p>{loadError || "Failed to load saved settings."}</p>
-        <button type="button" className="btn-ghost form-button" onClick={() => { setProblem(""); onRetryLoad(); }}>Retry</button>
+        <button type="button" className="btn-ghost form-button" onClick={() => { dirtyFields.current.clear(); setProblem(""); onRetryLoad(); }}>Retry</button>
       </div>}
       <fieldset className="dialog-fields" disabled={Boolean(busy) || !ready}>
         <div className="fields-grid">

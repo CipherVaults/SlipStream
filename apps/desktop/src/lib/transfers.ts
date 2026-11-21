@@ -68,7 +68,7 @@ export function isTorrentSource(input: string) {
 }
 
 export function isRemoteTorrentUrl(input: string) {
-  if (!isHttpUrl(input)) return false;
+  if (!isHttpUrl(input) || isWildcard(input)) return false;
   try {
     return /\.torrent$/i.test(new URL(input).pathname);
   } catch {

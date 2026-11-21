@@ -284,6 +284,72 @@ describe("workspace and inspector", () => {
     expect(listSpy).toHaveBeenCalledTimes(3);
   });
 
+  it("cancels queued setTorrentFiles and unblocks fresh file loading across same-ID Remove and re-add", async () => {
+    const baseSnap = demo.snapshot();
+    const blenderCompleted = {
+      ...baseSnap.transfers.find(item => item.id === "blender")!,
+      status: "completed" as const,
+      downloaded_bytes: 2_320_000_000,
+      total_bytes: 2_320_000_000,
+    };
+    const initialSnap = {
+      ...baseSnap,
+      transfers: baseSnap.transfers.map(item => (item.id === "blender" ? blenderCompleted : item)),
+    };
+    const readdedSnap = {
+      ...baseSnap,
+      timestamp: new Date(Date.parse(baseSnap.timestamp) + 1000).toISOString(),
+    };
+    const getSnapSpy = vi.spyOn(desktop, "getSnapshot").mockResolvedValue(initialSnap);
+    vi.spyOn(desktop, "cancelTransfer").mockResolvedValue();
+    vi.spyOn(desktop, "addTorrent").mockResolvedValue("blender");
+
+    let resolveInFlightSet!: () => void;
+    const setSpy = vi.spyOn(desktop, "setTorrentFiles")
+      .mockImplementationOnce(() => new Promise<void>(resolve => { resolveInFlightSet = resolve; }))
+      .mockResolvedValue();
+    const listSpy = vi.spyOn(desktop, "listTorrentFiles")
+      .mockResolvedValueOnce([
+        { index: 0, relative_path: "First.bin", size_bytes: 1_000_000, downloaded_bytes: 1_000_000, selected: true },
+        { index: 1, relative_path: "Second.bin", size_bytes: 2_000_000, downloaded_bytes: 2_000_000, selected: true },
+      ])
+      .mockResolvedValueOnce([
+        { index: 0, relative_path: "Readded_File.bin", size_bytes: 5_000_000, downloaded_bytes: 0, selected: true },
+      ]);
+
+    const user = await start();
+    await user.click(within(row(blender)).getByRole("button", { name: /Inspect/ }));
+    await user.click(inspector().getByRole("tab", { name: "Torrent Files" }));
+    const firstBox = await inspector().findByRole("checkbox", { name: /First\.bin/ });
+    const secondBox = inspector().getByRole("checkbox", { name: /Second\.bin/ });
+
+    // Queue two writes while first stays in-flight
+    await user.click(firstBox);
+    await user.click(secondBox);
+    expect(setSpy).toHaveBeenCalledTimes(1);
+
+    // Remove while writes are pending/queued, then immediately re-add with the same transfer ID
+    await user.click(within(row(blender)).getByRole("button", { name: /More actions/ }));
+    await user.click(within(row(blender)).getByRole("button", { name: "Remove" }));
+    expect(screen.queryByRole("article", { name: blender })).not.toBeInTheDocument();
+
+    getSnapSpy.mockResolvedValue(readdedSnap);
+    await user.click(screen.getByRole("button", { name: "Add" }));
+    const sheet = dialog("Add Download");
+    await user.type(sheet.getByRole("textbox", { name: "Download source" }), "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567");
+    await user.click(sheet.getByRole("button", { name: "Download" }));
+
+    // Fresh load succeeds immediately without getting blocked by old pending count
+    await user.click(inspector().getByRole("tab", { name: "Torrent Files" }));
+    expect(await inspector().findByRole("checkbox", { name: /Readded_File\.bin/ })).toBeChecked();
+    expect(listSpy).toHaveBeenCalledTimes(2);
+
+    // Resolving the old in-flight write neither fires the queued stale write nor wipes the new torrent cache
+    await act(async () => { resolveInFlightSet(); });
+    expect(setSpy).toHaveBeenCalledTimes(1);
+    expect(inspector().getByRole("checkbox", { name: /Readded_File\.bin/ })).toBeChecked();
+  });
+
   it("uses exclusive end_byte, preserves pending torrent file updates across Inspector remounts, and clears stale Media state on URL refresh", async () => {
     const latest = demo.snapshot();
     const singleSegHttp = {
@@ -810,9 +876,19 @@ describe("appearance, settings and transfer dialogs", () => {
     expect(await sheet.findByRole("alert")).toHaveTextContent("Timed out");
     await user.click(sheet.getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    const expandSpy = vi.spyOn(desktop, "expandWildcardUrls").mockResolvedValue([
+      "https://example.org/file_001.torrent",
+      "https://example.org/file_002.torrent",
+    ]);
+    act(() => openPicker("https://example.org/file_[001-002].torrent"));
+    const batchDialog = dialog("Add Download");
+    expect(batchDialog.getByRole("tab", { name: "Torrent / Magnet" })).toHaveAttribute("aria-selected", "true");
+    expect(await batchDialog.findByText("Wildcard Batch Preview")).toBeVisible();
+    expect(expandSpy).toHaveBeenCalledWith("https://example.org/file_[001-002].torrent");
   });
 
-  it("reports post-save get_settings failure without claiming success and allows Retry recovery in Tauri mode", async () => {
+  it("reports post-save get_settings failure without claiming success, clears dirtyFields, and avoids duplicate alerts on Retry in Tauri mode", async () => {
     let getSettingsCalls = 0;
     const initialSettings = { ...demo.getSettings(), default_download_dir: "D:\\Downloads" };
     const recoveredSettings = { ...initialSettings, default_download_dir: "D:\\Recovered\\Downloads" };
@@ -825,6 +901,7 @@ describe("appearance, settings and transfer dialogs", () => {
         getSettingsCalls++;
         if (getSettingsCalls === 1) return initialSettings;
         if (getSettingsCalls === 2) throw new Error("Disk unreadable");
+        if (getSettingsCalls === 3) throw new Error("Retry still offline");
         return recoveredSettings;
       }
       return undefined;
@@ -834,7 +911,7 @@ describe("appearance, settings and transfer dialogs", () => {
       await user.click(screen.getByRole("button", { name: "Settings" }));
       const settingsDlg = dialog("Settings & Browser Integration");
       await user.clear(settingsDlg.getByLabelText("Default download folder"));
-      await user.type(settingsDlg.getByLabelText("Default download folder"), "D:\\Edited\\Downloads");
+      await user.type(settingsDlg.getByLabelText("Default download folder"), "D:\\Downloads\\..\\Edited\\Downloads");
       await user.click(settingsDlg.getByRole("button", { name: "Save Settings" }));
 
       expect(await settingsDlg.findByRole("alert")).toHaveTextContent(
@@ -843,10 +920,17 @@ describe("appearance, settings and transfer dialogs", () => {
       expect(screen.queryByText("Settings saved.")).not.toBeInTheDocument();
       expect(settingsDlg.getByRole("button", { name: "Save Settings" })).toBeDisabled();
 
+      // Failing Retry should surface only the inline alert inside SettingsDialog (no duplicate global toast)
+      await user.click(settingsDlg.getByRole("button", { name: "Retry" }));
+      expect(await settingsDlg.findByRole("alert")).toHaveTextContent("Retry still offline");
+      expect(screen.getAllByRole("alert")).toHaveLength(1);
+
+      // Successful Retry clears stale dirtyFields so the canonical folder populates the input
       await user.click(settingsDlg.getByRole("button", { name: "Retry" }));
       await waitFor(() => expect(settingsDlg.getByRole("button", { name: "Save Settings" })).toBeEnabled());
       expect(settingsDlg.queryByRole("alert")).not.toBeInTheDocument();
-      expect(getSettingsCalls).toBe(3);
+      expect(getSettingsCalls).toBe(4);
+      expect(settingsDlg.getByLabelText("Default download folder")).toHaveValue("D:\\Recovered\\Downloads");
       expect(screen.getByTitle("D:\\Recovered\\Downloads")).toBeVisible();
     } finally {
       clearMocks();
