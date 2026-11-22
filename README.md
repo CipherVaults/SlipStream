@@ -11,12 +11,12 @@ SlipStream combines a multi-segment HTTP download engine, a managed `yt-dlp` + `
 Traditional Windows download managers often expose an unauthenticated localhost HTTP server to intercept browser downloads—allowing arbitrary websites or local scripts to hit control APIs. SlipStream replaces that pattern with **Browser Native Messaging → current-user SID-ACL Windows Named Pipe (`PIPE_REJECT_REMOTE_CLIENTS` + 256-bit `D:P` `session.token`)**, narrowed browser RPC privileges, explicit path/junction confinement, and clean visual restraint.
 
 - **Target OS:** Windows 10 / Windows 11 (`x86_64`)
-- **Organization:** [CipherVaults](https://github.com/CipherVaults/SlipStream)
-- **Current Release:** `v1.0.0` (MIT License)
+- **Public repository** [CipherVaults/SlipStream](https://github.com/CipherVaults/SlipStream)
+- **Release** [v1.1.0](https://github.com/CipherVaults/SlipStream/releases/tag/v1.1.0)
 
 ---
 
-## What We Offer (v1.0.0 Features)
+## Features
 
 ### 1. Segmented HTTP/1.1 & HTTP/2 Engine (`crates/engine`)
 - **Dynamic 1–32 Connections & Mid-Flight Splitting:** Probes Range support (`HEAD` / `GET bytes=0-0`) and splits active workers automatically whenever remaining chunks exceed `512 KiB`.
@@ -26,6 +26,7 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 - **Built-In Integrity & SSRF Hardening:** SHA-256 / MD5 verification, `CheckedDns` IP filtering across up to `10` redirect hops, cross-origin `Cookie` / `Authorization` stripping on redirects, credential scrubbing on HTTP cancel, and Windows NTFS `:Zone.Identifier` (`ZoneId=3`) Mark-of-the-Web preservation.
 
 ### 2. Hardened Media & Format Pipeline (`crates/media`)
+- **Bundled tools** The installer and portable ZIP include yt-dlp 2026.10.26 and the FFmpeg 9.1 Essentials builds of `ffmpeg.exe` and `ffprobe.exe`, with license files in `bin/`. **Settings → Toolchain → Update yt-dlp** resolves a single upstream release, checks the executable against that release’s SHA-256 checksum, and installs it in your per-user tool directory. Settings shows the active versions and sources of all three tools and supports custom paths.
 - **Zero Shell Interpolation:** Invokes `yt-dlp.exe`, `ffmpeg.exe`, and `ffprobe.exe` strictly with discrete argument arrays, allowlisted flags, `--`, forced local FFmpeg demuxers, `YTDLP_NO_PLUGINS=1`, and junction-free canonical `.exe` checks.
 - **Format, Container & Audio Selection:** Structured `4K 2160p60` / codec (`AV1`, `VP9`, `H.264`) / container (`MP4`, `MKV`, `WebM`) selection, lossless stream remuxing, audio extraction (`MP3 320k`, `M4A`, `Opus`, `FLAC`, `WAV`) with optional EBU R128 loudness normalization, subtitle language embedding (`.srt`, `.vtt`, `.ass`, `.ssa`), and playlist item selection.
 - **Isolated Staging & MotW:** Downloads to scoped UUID staging directories, tags outputs with `:Zone.Identifier`, and publishes atomically via non-overwriting `fs::hard_link`.
@@ -36,13 +37,15 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 
 ### 4. Browser Integration (`crates/native-host` + `extensions/browser`)
 - **Cross-Browser MV3:** Supports **Chrome**, **Edge**, **Brave**, and **Firefox** (`slipstream@ciphervaults.com`) using `4`-byte little-endian `1 MiB` Native Messaging framing and per-user `HKCU` registration.
+- **One-click Browser Picker** Choose **Add Extension** or **Open Setup** for your browser in **Settings → Browser Integration**. SlipStream opens the browser’s extension setup page and reveals the bundled extension folder. Chrome, Edge, and Brave share the fixed ID `nikdbkenglojniombimjdkneanmponcp`.
 - **Floating Shadow-DOM Media Pill:** Closed Shadow DOM page overlay for 1-click `4K`, `1080p`, `MP3 320k`, `FLAC`, Format Picker, Mute Site, or Grab All Links—guarded by `event.isTrusted`, top-frame origin verification, and SPA navigation invalidation.
 - **Privacy & Context Isolation:** `downloads.onCreated` honors `Alt`-key bypass, file extensions, size thresholds, muted/excluded sites, and **Incognito / Firefox `cookieStoreId` isolation**. Browser `GetStatus` responses redact desktop query tokens and filesystem paths before leaving the daemon.
 
 ### 5. Dual-Theme Windows Desktop App & Auto-Updater (`apps/desktop`)
 - **Soft Graphite Dark ↔ Porcelain Light:** Live instant theme switching (plus `Follow System` and `Blue` / `Monochrome` accents), 16-segment progress visualizer, `T01–T16` active thread map, throughput sparkline, and `Ctrl+K` / `Ctrl+N` command shortcuts.
 - **Tray-Hibernate Mode & OS Security:** Closes the WebView2 surface cleanly to the Windows system tray while active downloads continue at minimal RAM, reveals completed files via `explorer.exe /select`, and optionally queues Windows Defender (`MpCmdRun.exe`) scans.
-- **Signed NSIS Auto-Updates:** Distributed as a per-user **NSIS installer** (`currentUser`, bundling `slipstream-native-host.exe`) with **Tauri v2 `tauri-plugin-updater`** and **Ed25519 (`minisign`)** verified updates accessible in **Settings → About & Updates**.
+- **Signed NSIS updates** In **Settings → About & Updates**, choose **Automatic on startup** or **Manual only**. An automatic check runs once per app process, including across tray restores. **Check for Updates** is available in either mode. **Install Update & Restart** shows live progress for the signed update. If installation is interrupted after downloads are stopped, quit and reopen SlipStream to resume them.
+- **Native WebView2 lockdown** SlipStream disables default browser context menus, status UI, browser accelerators, and zoom controls before showing the main window, including after restoring it from the tray. Release builds also disable DevTools. **Ctrl+F** selects the download search field, and text editing shortcuts and selection remain available in editable fields. You can also select paths, IDs, and error text where displayed.
 
 ---
 
@@ -55,16 +58,11 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 
 ## Download, Installation & Browser Setup
 
-> Note: SlipStream `v1.0.0` installer and updater assets are published under **GitHub Releases** on `CipherVaults/SlipStream`. While the repository is **Private**, automated in-app updater checks against `github.com/.../releases/latest/download/latest.json` require either public release hosting or authenticated release access.
+1. **Installer** Download `SlipStream_1.1.0_x64-setup.exe` and run the per-user installer. It includes the native messaging host, media tools, and both browser extension builds. [v1.1.0 release assets](https://github.com/CipherVaults/SlipStream/releases/tag/v1.1.0)
+2. **Portable ZIP** Extract `SlipStream-1.1.0-windows-x64-portable.zip` and run `SlipStream.exe`. Keep the extracted `bin/` and `extensions/` directories beside it.
+3. **Browser extension** In **Settings → Browser Integration**, select your browser. For Chrome, Edge, or Brave, enable **Developer mode**, select **Load unpacked**, and choose the revealed folder. In Firefox, choose **Load Temporary Add-on** and select the revealed `manifest.json`. Separate browser extension ZIPs are also available on the release page.
 
-1. **Windows Desktop App (Recommended — Auto-Updating NSIS Installer):**
-   - Download `SlipStream_1.0.0_x64-setup.exe` from the [v1.0.0 Release](https://github.com/CipherVaults/SlipStream/releases/tag/v1.0.0) and run the per-user installer (no UAC elevation required; bundles `slipstream-native-host.exe` in `bin/`).
-   - Or download `SlipStream-1.0.0-windows-x64-portable.zip` for portable use (keep `slipstream-native-host.exe` beside `slipstream-desktop.exe`).
-2. **Optional Media Sidecars:**
-   - Install [`yt-dlp.exe`](https://github.com/yt-dlp/yt-dlp) and [`ffmpeg.exe` / `ffprobe.exe`](https://www.gyan.dev/ffmpeg/builds/) on `PATH`, or configure their exact `.exe` paths under **Settings → Toolchain**.
-3. **Browser Extension:**
-   - **Chrome / Edge / Brave:** Extract `slipstream-extension-1.0.0-chrome-edge-brave.zip`, load unpacked in Developer Mode, copy the generated Extension ID, open SlipStream **Settings → Browser Integration**, paste the ID, and click **Install Browser Native Hosts**.
-   - **Firefox:** Load `slipstream-extension-1.0.0-firefox.zip` (`manifest.json` pinned to `slipstream@ciphervaults.com`) and click **Install Browser Native Hosts** in SlipStream Settings.
+**Upgrading from v1.0.0** SlipStream keeps the valid native messaging IDs already registered for each browser and adds the bundled extension ID. If an older unpacked copy’s ID is missing from the registration, copy the ID from the browser’s extensions page and enter it in **Settings → Browser Integration** for that browser.
 
 ### Building from Source (Windows 10/11)
 
@@ -72,27 +70,35 @@ Prerequisites: **Rust (stable)**, **Node.js 22**, **pnpm 9+**, **VS Build Tools 
 
 ```powershell
 pnpm.cmd install
+if ($LASTEXITCODE -ne 0) { throw 'Workspace dependency installation failed.' }
 pnpm.cmd -r typecheck
+if ($LASTEXITCODE -ne 0) { throw 'Type checking failed.' }
 pnpm.cmd -r test
+if ($LASTEXITCODE -ne 0) { throw 'Frontend tests failed.' }
 pnpm.cmd -r build
+if ($LASTEXITCODE -ne 0) { throw 'Frontend build failed.' }
+cargo fetch --locked --target x86_64-pc-windows-msvc
+if ($LASTEXITCODE -ne 0) { throw 'Rust dependency fetch failed.' }
+$env:CARGO_NET_OFFLINE = 'true'
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo build --release -p slipstream-native-host
-Push-Location apps/desktop
-npx.cmd --yes @tauri-apps/cli@2 build --config src-tauri/tauri.release.conf.json
-Pop-Location
+if ($LASTEXITCODE -ne 0) { throw 'Rust formatting check failed.' }
+cargo clippy --locked --workspace --all-targets -- -D warnings
+if ($LASTEXITCODE -ne 0) { throw 'Clippy failed.' }
+cargo test --locked --workspace
+if ($LASTEXITCODE -ne 0) { throw 'Rust tests failed.' }
+cargo build --locked --release -p slipstream-desktop --features tauri/custom-protocol
 ```
+
+The release workflow smoke-tests pinned media tools in a job with no secrets. The signing job verifies fresh downloads against the same pinned SHA-256 digests and packages the tools, notices, and extensions. The release includes the yt-dlp source tarball alongside the installer and ZIPs. [Release workflow](.github/workflows/release.yml), [third-party notices](THIRD_PARTY_NOTICES.md)
 
 ---
 
-## Roadmap / Planned for v1.1+
+## Roadmap
 
-Items intentionally visible in configuration or planned beyond `v1.0.0`:
 - **HTTP/3 (QUIC) Transport:** Upgrade HTTP engine beyond HTTP/1.1 & HTTP/2 with `reqwest` HTTP/3 support when stabilized.
 - **Active Clipboard Watcher & Power Actions:** Connect `monitor_clipboard` listener and OS `PostQueueAction::{Sleep, Shutdown}` execution in the daemon.
-- **Sidecar SHA-256 Pinning & Authenticode:** Managed binary hash verification UI/manifest for `yt-dlp.exe`/`ffmpeg.exe` and EV/trusted code-signing for installers.
-- **Published Store Extension Listings:** Fixed Web Store / Edge Add-ons / AMO signed extension IDs so Chromium Native Host registration is zero-copy out of the box.
+- **Toolchain integrity and Authenticode** Show tool hashes in Settings and add trusted Windows code-signing for installers.
+- **Browser store listings** Publish the extension to Chrome Web Store, Edge Add-ons, and Firefox Add-ons.
 
 ---
 
@@ -116,4 +122,4 @@ SlipStream/
 
 ## License
 
-Released under the [MIT License](Cargo.toml).
+SlipStream is released under the MIT License. Bundled components have separate licenses. [SlipStream license](Cargo.toml), [third-party notices](THIRD_PARTY_NOTICES.md)

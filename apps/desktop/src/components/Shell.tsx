@@ -2,6 +2,7 @@ import {
   Archive, Check, CircleArrowDown, Clock3, Download, Gauge, Grid2X2, ListOrdered, Magnet,
   Minus, Moon, Music, Plus, Search, Settings, Square, Sun, Video, X,
 } from "lucide-react";
+import type { RefObject } from "react";
 import type { TelemetryBatch, TransferSnapshot } from "../types/ipc";
 import { bytes, fileCategory, isDone, isRunning, speed } from "../lib/transfers";
 import { IconButton } from "./ui";
@@ -78,7 +79,7 @@ export function Sidebar({ view, select, transfers, batch, folder, samples, limit
       </div>
       <div className="disk-row">
         <div className="disk-meta tabular">
-          <span title={folder} className="disk-path">{folder || "Default download folder"}</span>
+          <span title={folder} className="disk-path selectable">{folder || "Default download folder"}</span>
           {preview && <span>{bytes(1.4e12)} free</span>}
         </div>
         <div className="disk-track" aria-hidden="true">{preview && <div className="disk-fill" />}</div>
@@ -94,9 +95,9 @@ export function Sidebar({ view, select, transfers, batch, folder, samples, limit
   </aside>;
 }
 
-export function Toolbar({ search, setSearch, filter, setFilter, theme, accent, toggleTheme, toggleAccent,
+export function Toolbar({ search, searchInputRef, setSearch, filter, setFilter, theme, accent, toggleTheme, toggleAccent,
   openAdd, openPalette, submitSearch, windowAction }: {
-  search: string; setSearch: (value: string) => void; filter: StatusFilter;
+  search: string; searchInputRef: RefObject<HTMLInputElement | null>; setSearch: (value: string) => void; filter: StatusFilter;
   setFilter: (value: StatusFilter) => void; theme: "dark" | "light"; accent: "blue" | "mono";
   toggleTheme: () => void; toggleAccent: () => void; openAdd: () => void; openPalette: () => void;
   submitSearch: () => void; windowAction: (action: "minimize" | "toggleMaximize" | "close") => void;
@@ -104,7 +105,7 @@ export function Toolbar({ search, setSearch, filter, setFilter, theme, accent, t
   return <header className="toolbar" data-tauri-drag-region>
     <form className="search-box" data-tauri-drag-region="false" onSubmit={event => { event.preventDefault(); submitSearch(); }}>
       <Search size={14} />
-      <input type="search" aria-label="Search downloads" placeholder="Paste URL, magnet link, or search…"
+      <input ref={searchInputRef} type="search" aria-label="Search downloads" placeholder="Paste URL, magnet link, or search…"
         value={search} onChange={event => setSearch(event.target.value)} />
       <button type="button" title="Open Command Palette" className="kbd" onClick={openPalette}>Ctrl K</button>
     </form>

@@ -53,11 +53,17 @@ impl DesktopUi {
                 .config()
                 .app
                 .windows
-                .first()
+                .iter()
+                .find(|config| config.label == MAIN)
                 .ok_or_else(|| "missing main window configuration".to_owned())?;
             let window = WebviewWindowBuilder::from_config(&self.app, config)
+                .map(|builder| builder.visible(false))
                 .and_then(WebviewWindowBuilder::build)
                 .map_err(|error| error.to_string())?;
+            if let Err(error) = configure_webview2(&window) {
+                let _ = window.destroy();
+                return Err(error);
+            }
             round_corners(&window);
             window
         };
@@ -177,6 +183,43 @@ impl UiBridge for DesktopUi {
     fn request_quit(&self) {
         self.app.exit(0);
     }
+}
+
+fn configure_webview2(window: &WebviewWindow) -> Result<()> {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2Settings3, ICoreWebView2Settings5,
+    };
+    use windows_core::Interface;
+
+    // Tauri dispatches with_webview inline on the UI thread. Check completion before showing it.
+    let (applied, result) = std::sync::mpsc::channel();
+    window
+        .with_webview(move |webview| {
+            let configure = || -> windows_core::Result<()> {
+                // SAFETY: Tauri supplies the live controller on the WebView's UI thread.
+                unsafe {
+                    let settings = webview.controller().CoreWebView2()?.Settings()?;
+                    settings.SetAreDefaultContextMenusEnabled(false)?;
+                    settings.SetIsStatusBarEnabled(false)?;
+                    settings.SetIsZoomControlEnabled(false)?;
+                    #[cfg(not(debug_assertions))]
+                    settings.SetAreDevToolsEnabled(false)?;
+                    settings
+                        .cast::<ICoreWebView2Settings3>()?
+                        .SetAreBrowserAcceleratorKeysEnabled(false)?;
+                    settings
+                        .cast::<ICoreWebView2Settings5>()?
+                        .SetIsPinchZoomEnabled(false)?;
+                }
+                Ok(())
+            };
+            let _ = applied.send(configure());
+        })
+        .map_err(|error| format!("Could not access the main WebView2 controller: {error}"))?;
+    result
+        .try_recv()
+        .map_err(|_| "Could not apply the main WebView2 settings on the UI thread.".to_owned())?
+        .map_err(|error| format!("Could not configure the main WebView2 settings: {error}"))
 }
 
 fn round_corners(window: &WebviewWindow) {
@@ -354,18 +397,16 @@ pub(crate) fn run() {
             ))
             .map_err(io::Error::other)?;
             #[cfg(not(test))]
-            if let Some(dir) = state.resource_dir() {
-                if let Ok(executable) = crate::tools::native_host_executable(Some(dir)) {
-                    if let Err(error) = crate::tools::install_browser_hosts_into(
-                        state.registry_base_key(),
-                        &state.data_dir().join("native-messaging"),
-                        &executable,
-                        None,
-                        None,
-                        None,
-                    ) {
-                        tracing::warn!(%error, "could not register browser native messaging hosts");
-                    }
+            if let Ok(executable) = crate::tools::native_host_executable(state.resource_dir()) {
+                if let Err(error) = crate::tools::install_browser_hosts_into(
+                    state.registry_base_key(),
+                    &state.data_dir().join("native-messaging"),
+                    &executable,
+                    None,
+                    None,
+                    None,
+                ) {
+                    tracing::warn!(%error, "could not register browser native messaging hosts");
                 }
             }
             app.manage(ui.clone());

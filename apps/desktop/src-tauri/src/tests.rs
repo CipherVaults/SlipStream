@@ -10,15 +10,19 @@ use crate::{
         allowed_ytdlp_release_url, browser_native_host_registered, explorer_executable,
         hardened_toolchain_config_with_dirs, hardened_toolchain_config_with_path, list_browsers,
         native_hosts_installed, open_browser_extension_setup, parse_ffmpeg_version,
-        parse_sha256sums_for_file, parse_ytdlp_version, resolve_bundled_extension_dir_with_roots,
-        resolve_toolchain_with_dirs, update_ytdlp_from_base_url,
+        parse_sha256sums_for_file, parse_ytdlp_version, prepare_browser_extension_setup,
+        resolve_bundled_extension_dir_with_roots, resolve_toolchain_with_dirs,
+        update_ytdlp_from_release, ytdlp_release_download_base,
     },
     ToolchainStatus,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use slipstream_native_host::manifest::{
-    DEFAULT_CHROMIUM_EXTENSION_ID, DEFAULT_CHROMIUM_ORIGIN, DEFAULT_FIREFOX_ID,
+use slipstream_native_host::{
+    manifest::{
+        Browser, DEFAULT_CHROMIUM_EXTENSION_ID, DEFAULT_CHROMIUM_ORIGIN, DEFAULT_FIREFOX_ID,
+    },
+    registry::install_host,
 };
 use slipstream_protocol::{AppSettings, BrowserKind, ToolSource, UpdateMode};
 use std::{
@@ -32,7 +36,7 @@ use std::{
     },
     path::{Path, PathBuf},
     ptr::null_mut,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -239,14 +243,16 @@ fn traversal_and_links_are_rejected_for_every_file_operation() {
 }
 
 #[test]
-fn registers_default_and_custom_browser_ids_in_an_isolated_key() {
+fn startup_migrates_legacy_hosts_and_setup_updates_only_the_selected_browser() {
     let temp = TempDir::new();
     let key = RegistryKey(format!(
         r"Software\SlipStreamDesktopTest-{}",
         Uuid::new_v4()
     ));
-    let exe = env::current_exe().unwrap();
-    assert!(!native_hosts_installed(&key.0));
+    let exe = temp.0.join("slipstream-native-host.exe");
+    fs::File::create(&exe).unwrap();
+    let canonical_exe = fs::canonicalize(&exe).unwrap();
+    assert!(!native_hosts_installed(&key.0, &canonical_exe));
     let kinds = [
         BrowserKind::Chrome,
         BrowserKind::Edge,
@@ -254,8 +260,30 @@ fn registers_default_and_custom_browser_ids_in_an_isolated_key() {
         BrowserKind::Firefox,
     ];
     for kind in kinds {
-        assert!(!browser_native_host_registered(&key.0, kind));
+        assert!(!browser_native_host_registered(
+            &key.0,
+            kind,
+            &canonical_exe
+        ));
     }
+    let legacy_origin = "chrome-extension://abcdefghijklmnopabcdefghijklmnop/";
+    let legacy_firefox = "legacy@example.org";
+    let old = temp.0.join("old");
+    let old_chrome =
+        install_host(&key.0, &old, Browser::Chrome, &exe, &[legacy_origin.into()]).unwrap();
+    let read = |path: &Path| serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap();
+    let mut old_manifest = read(&old_chrome);
+    old_manifest["allowed_origins"] = json!([legacy_origin, "chrome-extension://*/"]);
+    fs::write(&old_chrome, serde_json::to_vec(&old_manifest).unwrap()).unwrap();
+    install_host(
+        &key.0,
+        &old,
+        Browser::Firefox,
+        &exe,
+        &[legacy_firefox.into()],
+    )
+    .unwrap();
+    assert!(!native_hosts_installed(&key.0, &canonical_exe));
     let paths = ["chrome", "edge", "brave", "firefox"].map(|browser| {
         temp.0
             .join(browser)
@@ -265,32 +293,40 @@ fn registers_default_and_custom_browser_ids_in_an_isolated_key() {
         install_browser_hosts_into(&key.0, &temp.0, &exe, Some("  "), Some(""), Some("   "))
             .unwrap();
     assert_eq!(installed, paths);
-    assert!(native_hosts_installed(&key.0));
-    let executable = local_drive_path(&fs::canonicalize(&exe).unwrap()).unwrap();
-    let browsers = list_browsers(&key.0, None);
+    assert!(native_hosts_installed(&key.0, &canonical_exe));
+    let executable = local_drive_path(&canonical_exe).unwrap();
+    let browsers = list_browsers(&key.0, Some(&temp.0));
     for ((kind, path), status) in kinds.into_iter().zip(&paths).zip(browsers) {
-        assert!(browser_native_host_registered(&key.0, kind));
+        assert!(browser_native_host_registered(&key.0, kind, &canonical_exe));
         assert_eq!(status.id, kind);
         assert!(status.native_host_registered);
         let manifest: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(manifest["path"], executable.to_str().unwrap());
         if kind == BrowserKind::Firefox {
             assert_eq!(status.extension_id, DEFAULT_FIREFOX_ID);
-            assert_eq!(manifest["allowed_extensions"], json!([DEFAULT_FIREFOX_ID]));
+            assert_eq!(
+                manifest["allowed_extensions"],
+                json!([legacy_firefox, DEFAULT_FIREFOX_ID])
+            );
         } else {
             assert_eq!(status.extension_id, DEFAULT_CHROMIUM_EXTENSION_ID);
             assert_eq!(
                 manifest["allowed_origins"],
-                json!([DEFAULT_CHROMIUM_ORIGIN])
+                if kind == BrowserKind::Chrome {
+                    json!([legacy_origin, DEFAULT_CHROMIUM_ORIGIN])
+                } else {
+                    json!([DEFAULT_CHROMIUM_ORIGIN])
+                }
             );
         }
     }
     fs::remove_file(&paths[3]).unwrap();
     assert!(!browser_native_host_registered(
         &key.0,
-        BrowserKind::Firefox
+        BrowserKind::Firefox,
+        &canonical_exe,
     ));
-    assert!(native_hosts_installed(&key.0));
+    assert!(native_hosts_installed(&key.0, &canonical_exe));
     assert!(
         install_browser_hosts_into(&key.0, &temp.0, &exe, Some("invalid"), None, None).is_err()
     );
@@ -298,43 +334,96 @@ fn registers_default_and_custom_browser_ids_in_an_isolated_key() {
         install_browser_hosts_into(&key.0, &temp.0, &exe, None, None, Some("https://bad")).is_err()
     );
 
-    let chrome = "abcdefghijklmnopabcdefghijklmnop";
+    let extension = temp.0.join("extensions/chrome");
+    fs::create_dir_all(extension.join("assets")).unwrap();
+    fs::write(extension.join("manifest.json"), b"{}").unwrap();
+    fs::write(extension.join("assets/script.js"), b"export {};").unwrap();
+    let setup_dir = temp.0.join("setup");
+    let untouched = [&paths[0], &paths[1], &paths[2]].map(|path| read(path));
     let edge = "chrome-extension://pppppppppppppppppppppppppppppppp/";
+    prepare_browser_extension_setup(
+        &key.0,
+        &setup_dir,
+        &extension,
+        BrowserKind::Edge,
+        Some(edge.into()),
+        Some(&exe),
+    )
+    .unwrap();
+    assert_eq!(fs::read_dir(&setup_dir).unwrap().count(), 1);
+    assert_eq!(
+        read(&setup_dir.join("edge/com.ciphervaults.slipstream.json"))["allowed_origins"],
+        json!([DEFAULT_CHROMIUM_ORIGIN, edge])
+    );
+    assert_eq!(
+        [&paths[0], &paths[1], &paths[2]].map(|path| read(path)),
+        untouched
+    );
+    assert!(!browser_native_host_registered(
+        &key.0,
+        BrowserKind::Firefox,
+        &canonical_exe
+    ));
+
+    let chrome = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let installed = install_browser_hosts_into(
         &key.0,
         &temp.0,
         &exe,
         Some(chrome),
-        Some(edge),
+        None,
         Some("test@example.org"),
     )
     .unwrap();
     assert_eq!(installed, paths);
-    assert!(native_hosts_installed(&key.0));
+    assert!(native_hosts_installed(&key.0, &canonical_exe));
     for (kind, path) in kinds.into_iter().zip(&paths[..3]) {
         let mut manifest: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(
             manifest["allowed_origins"],
-            json!([format!("chrome-extension://{chrome}/"), edge])
+            match kind {
+                BrowserKind::Chrome => json!([
+                    legacy_origin,
+                    DEFAULT_CHROMIUM_ORIGIN,
+                    format!("chrome-extension://{chrome}/")
+                ]),
+                BrowserKind::Edge => json!([DEFAULT_CHROMIUM_ORIGIN, edge]),
+                _ => json!([DEFAULT_CHROMIUM_ORIGIN]),
+            }
         );
         manifest["allowed_origins"] = json!(["chrome-extension://*/", "https://example.com"]);
         fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        assert!(!browser_native_host_registered(&key.0, kind));
+        assert!(!browser_native_host_registered(
+            &key.0,
+            kind,
+            &canonical_exe
+        ));
     }
     let mut manifest: Value = serde_json::from_slice(&fs::read(&paths[3]).unwrap()).unwrap();
-    assert_eq!(manifest["allowed_extensions"], json!(["test@example.org"]));
-    assert!(browser_native_host_registered(&key.0, BrowserKind::Firefox));
-    manifest["allowed_extensions"] = json!(["*"]);
+    assert_eq!(
+        manifest["allowed_extensions"],
+        json!([DEFAULT_FIREFOX_ID, "test@example.org"])
+    );
+    assert!(browser_native_host_registered(
+        &key.0,
+        BrowserKind::Firefox,
+        &canonical_exe
+    ));
+    manifest["allowed_extensions"] = json!(["test@example.org"]);
     fs::write(&paths[3], serde_json::to_vec(&manifest).unwrap()).unwrap();
     assert!(!browser_native_host_registered(
         &key.0,
-        BrowserKind::Firefox
+        BrowserKind::Firefox,
+        &canonical_exe,
     ));
 
     manifest["allowed_extensions"] = json!([DEFAULT_FIREFOX_ID]);
-    manifest["path"] = json!(temp.0.join("missing.exe"));
+    let unrelated = temp.0.join("unrelated.exe");
+    fs::File::create(&unrelated).unwrap();
+    manifest["path"] = json!(unrelated);
     fs::write(&paths[3], serde_json::to_vec(&manifest).unwrap()).unwrap();
-    assert!(!native_hosts_installed(&key.0));
+    assert!(!native_hosts_installed(&key.0, &canonical_exe));
+    assert!(!list_browsers(&key.0, Some(&temp.0))[3].native_host_registered);
 }
 
 #[test]
@@ -412,10 +501,12 @@ fn toolchain_status_defaults_new_fields_and_preserves_explicit_nulls() {
     assert_eq!(status.ffmpeg_source, ToolSource::Missing);
     assert_eq!(status.ffprobe_source, ToolSource::Missing);
     assert_eq!(status.ffprobe_path, None);
+    assert_eq!(status.ffprobe_version, None);
     json["ytdlp_source"] = json!("missing");
     json["ffmpeg_source"] = json!("missing");
     json["ffprobe_source"] = json!("missing");
     json["ffprobe_path"] = Value::Null;
+    json["ffprobe_version"] = Value::Null;
     assert_eq!(serde_json::to_value(&status).unwrap(), json);
     assert_eq!(
         serde_json::from_value::<ToolchainStatus>(json).unwrap(),
@@ -709,7 +800,11 @@ fn finds_only_reparse_free_extension_directories_with_a_manifest() {
 
     fs::write(development.join("manifest.json"), b"{}").unwrap();
     let clean = |dir: &Path| local_drive_path(&fs::canonicalize(dir).unwrap()).unwrap();
-    assert_eq!(resolve(BrowserKind::Brave), Some(clean(&development)));
+    if cfg!(debug_assertions) {
+        assert_eq!(resolve(BrowserKind::Brave), Some(clean(&development)));
+    } else {
+        assert_eq!(resolve(BrowserKind::Brave), None);
+    }
     fs::write(nested.join("manifest.json"), b"{}").unwrap();
     assert_eq!(resolve(BrowserKind::Edge), Some(clean(&nested)));
     fs::write(packaged.join("manifest.json"), b"{}").unwrap();
@@ -742,7 +837,40 @@ fn browser_setup_rejects_invalid_custom_ids_before_registration() {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
     assert!(!manifests.exists());
-    assert!(!native_hosts_installed(&key.0));
+}
+
+#[test]
+fn nested_extension_reparse_points_are_rejected_before_host_registration() {
+    let temp = TempDir::new();
+    let key = RegistryKey(format!(
+        r"Software\SlipStreamDesktopTest-{}",
+        Uuid::new_v4()
+    ));
+    let exe = temp.0.join("slipstream-native-host.exe");
+    fs::File::create(&exe).unwrap();
+    let manifests = temp.0.join("native-messaging");
+    let extension = temp.0.join("extensions/chrome");
+    let assets = extension.join("assets");
+    fs::create_dir_all(&assets).unwrap();
+    fs::write(extension.join("manifest.json"), b"{}").unwrap();
+    let external = temp.0.join("external");
+    fs::create_dir(&external).unwrap();
+    directory_junction(&assets.join("nested"), &external);
+    let error = prepare_browser_extension_setup(
+        &key.0,
+        &manifests,
+        &extension,
+        BrowserKind::Chrome,
+        None,
+        Some(&exe),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("reparse point"), "{error}");
+    assert!(!manifests.exists());
+    assert!(!native_hosts_installed(
+        &key.0,
+        &fs::canonicalize(&exe).unwrap()
+    ));
 }
 
 #[test]
@@ -763,10 +891,35 @@ fn yt_dlp_checksum_parser_accepts_common_formats_and_rejects_invalid_entries() {
         format!("{hash}  yt-dlp.exe.zip"),
         format!("{hash}  beta/yt-dlp.exe"),
         "deadbeef  yt-dlp.exe".to_owned(),
+        "*./yt-dlp.exe".to_owned(),
+        format!("invalid *./yt-dlp.exe\n{hash}  yt-dlp.exe"),
+        format!("{hash}  yt-dlp.exe\n{hash} *./yt-dlp.exe"),
         format!("{}  yt-dlp.exe", "zz".repeat(32)),
         format!("{hash}  yt-dlp.exe\n{}  yt-dlp.exe", "ff".repeat(32)),
     ] {
         assert!(parse_sha256sums_for_file(&contents, "yt-dlp.exe").is_err());
+    }
+}
+
+#[test]
+fn yt_dlp_latest_release_requires_a_concrete_tag_in_the_upstream_repository() {
+    let url = Url::parse("https://github.com/yt-dlp/yt-dlp/releases/tag/2026.10.26").unwrap();
+    assert_eq!(
+        ytdlp_release_download_base(&url).as_deref(),
+        Some("https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26")
+    );
+    for url in [
+        "https://github.com/yt-dlp/yt-dlp/releases/latest",
+        "https://github.com/someone-else/yt-dlp/releases/tag/2026.10.26",
+        "https://github.com/yt-dlp/yt-dlp/releases/tag/main/other",
+        "https://github.com/yt-dlp/yt-dlp/releases/tag/2026%2f10%2f26",
+        "https://github.com/yt-dlp/yt-dlp/releases/tag/2026.10.26?other=tag",
+        "https://release-assets.githubusercontent.com/yt-dlp/yt-dlp/releases/tag/2026.10.26",
+    ] {
+        assert!(
+            ytdlp_release_download_base(&Url::parse(url).unwrap()).is_none(),
+            "{url}"
+        );
     }
 }
 
@@ -852,7 +1005,13 @@ async fn yt_dlp_update_atomically_replaces_old_file_and_cleans_stale_downloads()
     let temp = TempDir::new();
     let installed = temp.0.join("yt-dlp.exe");
     fs::write(&installed, b"old version").unwrap();
-    fs::write(temp.0.join(".yt-dlp-stale.tmp"), b"partial download").unwrap();
+    let stale = fs::File::create(temp.0.join(".yt-dlp-stale.tmp")).unwrap();
+    stale
+        .set_modified(SystemTime::now() - Duration::from_secs(3601))
+        .unwrap();
+    drop(stale);
+    let active = temp.0.join(".yt-dlp-active.tmp");
+    fs::write(&active, b"active sibling download").unwrap();
     let payload = b"verified test payload";
     let sums = format!("{} *./yt-dlp.exe\n", hex::encode(Sha256::digest(payload)));
     let (base_url, server) = mock_ytdlp_release(vec![
@@ -860,13 +1019,15 @@ async fn yt_dlp_update_atomically_replaces_old_file_and_cleans_stale_downloads()
         ("yt-dlp.exe", release_response(payload)),
     ])
     .await;
-    let (path, version) = update_ytdlp_from_base_url(&base_url, &ytdlp_test_client(), &temp.0)
+    let (path, version) = update_ytdlp_from_release(Some(&base_url), &ytdlp_test_client(), &temp.0)
         .await
         .unwrap();
     server.await.unwrap();
     assert_eq!(path, fs::canonicalize(&installed).unwrap());
     assert!(version.is_empty()); // The payload exercises installation without running an executable.
     assert_eq!(fs::read(installed).unwrap(), payload);
+    assert!(active.is_file());
+    fs::remove_file(active).unwrap();
     assert_no_ytdlp_staging_files(&temp.0);
 }
 
@@ -888,7 +1049,7 @@ async fn yt_dlp_update_rejects_bad_or_missing_checksums_and_preserves_old_file()
         let mut responses = vec![("SHA2-256SUMS", release_response(sums.as_bytes()))];
         responses.extend(payload.map(|bytes| ("yt-dlp.exe", release_response(bytes))));
         let (base_url, server) = mock_ytdlp_release(responses).await;
-        let error = update_ytdlp_from_base_url(&base_url, &ytdlp_test_client(), &temp.0)
+        let error = update_ytdlp_from_release(Some(&base_url), &ytdlp_test_client(), &temp.0)
             .await
             .unwrap_err();
         server.await.unwrap();
@@ -913,7 +1074,7 @@ async fn yt_dlp_update_rejects_http_errors_oversized_responses_and_interrupted_d
     chunked.extend(oversized_sums);
     chunked.extend(b"\r\n0\r\n\r\n");
     let (base_url, server) = mock_ytdlp_release(vec![("SHA2-256SUMS", chunked)]).await;
-    let error = update_ytdlp_from_base_url(&base_url, &ytdlp_test_client(), &bin)
+    let error = update_ytdlp_from_release(Some(&base_url), &ytdlp_test_client(), &bin)
         .await
         .unwrap_err();
     server.await.unwrap();
@@ -941,7 +1102,7 @@ async fn yt_dlp_update_rejects_http_errors_oversized_responses_and_interrupted_d
             ("yt-dlp.exe", response.as_bytes().to_vec()),
         ])
         .await;
-        let error = update_ytdlp_from_base_url(&base_url, &ytdlp_test_client(), &bin)
+        let error = update_ytdlp_from_release(Some(&base_url), &ytdlp_test_client(), &bin)
             .await
             .unwrap_err();
         server.await.unwrap();
@@ -968,7 +1129,7 @@ async fn yt_dlp_update_reports_a_locked_executable_and_removes_staging_file() {
         ("yt-dlp.exe", release_response(payload)),
     ])
     .await;
-    let error = update_ytdlp_from_base_url(&base_url, &ytdlp_test_client(), &temp.0)
+    let error = update_ytdlp_from_release(Some(&base_url), &ytdlp_test_client(), &temp.0)
         .await
         .unwrap_err();
     server.await.unwrap();

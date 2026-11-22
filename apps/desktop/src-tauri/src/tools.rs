@@ -10,19 +10,20 @@ use slipstream_native_host::{
         chromium_origin, valid_firefox_id, Browser, DEFAULT_CHROMIUM_EXTENSION_ID,
         DEFAULT_CHROMIUM_ORIGIN, DEFAULT_FIREFOX_ID,
     },
-    registry::{host_key, install_hosts},
+    registry::{host_key, install_host},
 };
 use slipstream_protocol::{
     AppSettings, BrowserKind, BrowserSetupResult, BrowserStatus, ToolSource, NATIVE_HOST_NAME,
 };
 use std::{
+    collections::HashSet,
     env,
     ffi::{OsStr, OsString},
     fs,
     io::{self, Read},
     os::windows::{
         ffi::{OsStrExt, OsStringExt},
-        fs::MetadataExt,
+        fs::{MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
     process::{Command as StdCommand, Stdio},
@@ -40,8 +41,8 @@ use uuid::Uuid;
 use windows_sys::Win32::{
     Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, ERROR_SUCCESS},
     Storage::FileSystem::{
-        MoveFileExW, FILE_ATTRIBUTE_REPARSE_POINT, MOVEFILE_REPLACE_EXISTING,
-        MOVEFILE_WRITE_THROUGH,
+        MoveFileExW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     },
     System::{
         Registry::{
@@ -64,6 +65,8 @@ pub struct ToolchainStatus {
     pub ffmpeg_source: ToolSource,
     #[serde(default)]
     pub ffprobe_path: Option<String>,
+    #[serde(default)]
+    pub ffprobe_version: Option<String>,
     #[serde(default)]
     pub ffprobe_source: ToolSource,
     pub native_hosts_installed: bool,
@@ -274,7 +277,9 @@ pub(crate) async fn toolchain_status(
             path_env.as_deref(),
         );
         let config = resolution.config(path_env.as_deref()).ok();
-        (resolution, config, native_hosts_installed(&base_key))
+        let executable = native_host_executable(resource_dir.as_deref()).ok();
+        let registered = executable.is_some_and(|exe| native_hosts_installed(&base_key, &exe));
+        (resolution, config, registered)
     })
     .await
     .unwrap_or((
@@ -294,12 +299,16 @@ pub(crate) async fn toolchain_status(
     let ytdlp = resolution.ytdlp.ok().flatten();
     let ffmpeg = resolution.ffmpeg.ok().flatten();
     let ffprobe = resolution.ffprobe.ok().flatten();
-    let (ytdlp_version, ffmpeg_version) = if let Some(tools) = discovered {
+    let (ytdlp_version, ffmpeg_version, ffprobe_version) = if let Some(tools) = discovered {
         (
             tools
                 .ytdlp()
                 .and_then(|binary| parse_ytdlp_version(&binary.version)),
             parse_ffmpeg_version(&tools.ffmpeg().version),
+            ffprobe
+                .as_ref()
+                .and(tools.ffprobe())
+                .and_then(|binary| parse_ffmpeg_version(&binary.version)),
         )
     } else {
         // The shared toolchain requires FFmpeg even for yt-dlp. Probe each
@@ -313,6 +322,12 @@ pub(crate) async fn toolchain_status(
             },
             async {
                 match &ffmpeg {
+                    Some((path, _)) => probe_version(path, "-version", parse_ffmpeg_version).await,
+                    None => None,
+                }
+            },
+            async {
+                match &ffprobe {
                     Some((path, _)) => probe_version(path, "-version", parse_ffmpeg_version).await,
                     None => None,
                 }
@@ -337,6 +352,7 @@ pub(crate) async fn toolchain_status(
         ffmpeg_version,
         ffmpeg_source,
         ffprobe_path,
+        ffprobe_version,
         ffprobe_source,
         native_hosts_installed,
     }
@@ -403,7 +419,7 @@ async fn probe_version(
     parse(&String::from_utf8_lossy(&output))
 }
 
-const YTDLP_RELEASE_BASE: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download";
+const YTDLP_RELEASES: &str = "https://github.com/yt-dlp/yt-dlp/releases";
 const YTDLP_EXE: &str = "yt-dlp.exe";
 const YTDLP_CHECKSUMS: &str = "SHA2-256SUMS";
 const MAX_CHECKSUMS_BYTES: usize = 1024 * 1024;
@@ -427,32 +443,76 @@ pub(crate) fn allowed_ytdlp_release_url(url: &Url) -> bool {
 }
 
 pub(crate) fn parse_sha256sums_for_file(contents: &str, filename: &str) -> io::Result<[u8; 32]> {
+    fn normalize_name(name: &str) -> &str {
+        let name = name.strip_prefix('*').unwrap_or(name);
+        name.strip_prefix("./").unwrap_or(name)
+    }
     let mut found = None;
     for line in contents.lines() {
         let Some((hash, listed_name)) = line.trim().split_once(char::is_whitespace) else {
-            if line.trim() == filename {
+            if normalize_name(line.trim()) == filename {
                 return Err(invalid(format!(
                     "Malformed SHA-256 checksum for {filename}"
                 )));
             }
             continue;
         };
-        let listed_name = listed_name.trim_start();
-        let listed_name = listed_name.strip_prefix('*').unwrap_or(listed_name);
-        if listed_name.strip_prefix("./").unwrap_or(listed_name) != filename {
+        if normalize_name(listed_name.trim_start()) != filename {
             continue;
         }
         let mut digest = [0u8; 32];
         hex::decode_to_slice(hash, &mut digest)
             .map_err(|_| invalid(format!("Malformed SHA-256 checksum for {filename}")))?;
-        if found.is_some_and(|previous| previous != digest) {
+        if found.is_some() {
             return Err(invalid(format!(
-                "Conflicting SHA-256 checksums for {filename}"
+                "Duplicate SHA-256 checksums for {filename}"
             )));
         }
         found = Some(digest);
     }
     found.ok_or_else(|| invalid(format!("SHA-256 checksum for {filename} is missing")))
+}
+
+pub(crate) fn ytdlp_release_download_base(url: &Url) -> Option<String> {
+    if !allowed_ytdlp_release_url(url)
+        || url.host_str() != Some("github.com")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let tag = url.path().strip_prefix("/yt-dlp/yt-dlp/releases/tag/")?;
+    if tag.is_empty()
+        || tag == "."
+        || tag == ".."
+        || !tag
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return None;
+    }
+    Some(format!("{YTDLP_RELEASES}/download/{tag}"))
+}
+
+async fn resolve_latest_ytdlp_release(client: &reqwest::Client) -> Result<String, String> {
+    let response = client
+        .get(format!("{YTDLP_RELEASES}/latest"))
+        .send()
+        .await
+        .map_err(|error| {
+            format!(
+                "Could not resolve the latest yt-dlp release: {}",
+                error.without_url()
+            )
+        })?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Could not resolve the latest yt-dlp release: HTTP {}",
+            response.status()
+        ));
+    }
+    ytdlp_release_download_base(response.url())
+        .ok_or_else(|| "GitHub did not return a valid yt-dlp release tag.".to_owned())
 }
 
 pub(crate) async fn update_ytdlp_managed() -> Result<(PathBuf, String), String> {
@@ -472,15 +532,23 @@ pub(crate) async fn update_ytdlp_managed() -> Result<(PathBuf, String), String> 
         }))
         .build()
         .map_err(|error| format!("Could not initialize the yt-dlp updater: {error}"))?;
-    update_ytdlp_from_base_url(YTDLP_RELEASE_BASE, &client, &directory).await
+    update_ytdlp_from_release(None, &client, &directory).await
 }
 
-pub(crate) async fn update_ytdlp_from_base_url(
-    base_url: &str,
+pub(crate) async fn update_ytdlp_from_release(
+    base_url: Option<&str>,
     client: &reqwest::Client,
     managed_bin_dir: &Path,
 ) -> Result<(PathBuf, String), String> {
     let _update = YTDLP_UPDATE.lock().await;
+    let resolved;
+    let base_url = match base_url {
+        Some(base_url) => base_url,
+        None => {
+            resolved = resolve_latest_ytdlp_release(client).await?;
+            &resolved
+        }
+    };
     let path = install_ytdlp_from_base_url(base_url, client, managed_bin_dir).await?;
     let version = probe_version(&path, "--version", parse_ytdlp_version)
         .await
@@ -521,13 +589,26 @@ fn regular_non_reparse_file(metadata: &fs::Metadata) -> bool {
 }
 
 fn clean_stale_ytdlp_downloads(directory: &Path) -> io::Result<()> {
+    const STALE_DOWNLOAD_AGE: Duration = Duration::from_secs(60 * 60);
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let name = entry.file_name();
-        if name
+        if !name
             .to_str()
             .is_some_and(|name| name.starts_with(".yt-dlp-") && name.ends_with(".tmp"))
-            && regular_non_reparse_file(&fs::symlink_metadata(entry.path())?)
+        {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if regular_non_reparse_file(&metadata)
+            && metadata
+                .modified()?
+                .elapsed()
+                .is_ok_and(|age| age > STALE_DOWNLOAD_AGE)
         {
             match fs::remove_file(entry.path()) {
                 Ok(()) => {}
@@ -678,7 +759,7 @@ pub(crate) fn native_host_executable(resource_dir: Option<&Path>) -> io::Result<
     let executable_dir = current
         .parent()
         .ok_or_else(|| invalid("desktop executable has no parent"))?;
-    let mut dirs = vec![executable_dir.to_owned()];
+    let mut dirs = vec![executable_dir.to_owned(), executable_dir.join("bin")];
     if let Some(dir) = resource_dir {
         dirs.extend([dir.to_owned(), dir.join("bin")]);
     }
@@ -714,41 +795,86 @@ pub fn install_browser_hosts_into(
     edge_id: Option<&str>,
     firefox_id: Option<&str>,
 ) -> io::Result<Vec<PathBuf>> {
+    let registrations = BROWSERS
+        .into_iter()
+        .zip([chrome_id, edge_id, None, firefox_id])
+        .map(|(kind, id)| {
+            let id = id.map(str::trim).filter(|id| !id.is_empty());
+            Ok((kind, custom_allowlist_entry(kind, id)?))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    sync_browser_hosts(base_key, directory, executable, &registrations)
+}
+
+fn sync_browser_hosts(
+    base_key: &str,
+    directory: &Path,
+    executable: &Path,
+    registrations: &[(BrowserKind, Option<String>)],
+) -> io::Result<Vec<PathBuf>> {
+    static REGISTRATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Setup commands and startup sync must merge the same current registry state.
+    let _registration = REGISTRATION
+        .lock()
+        .map_err(|_| io::Error::other("browser host registration lock is unavailable"))?;
     let executable = local_drive_path(&canonical_exe(executable)?)?;
     validate_local_path(&executable).map_err(|error| invalid(error.to_string()))?;
-    let mut origins = Vec::new();
-    for id in [chrome_id, edge_id]
-        .into_iter()
-        .flatten()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-    {
-        let origin = extension_origin(id)?;
-        if !origins.contains(&origin) {
-            origins.push(origin);
-        }
-    }
-    if origins.is_empty() {
-        origins.push(DEFAULT_CHROMIUM_ORIGIN.to_owned());
-    }
-    let firefox = firefox_id
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .unwrap_or(DEFAULT_FIREFOX_ID);
-    if !valid_firefox_id(firefox) {
-        return Err(invalid("expected a valid Firefox extension ID"));
-    }
     let directory = std::path::absolute(directory)?;
-    for browser in Browser::ALL {
-        ensure_safe_directory(&directory.join(browser.directory()))?;
+    for (kind, _) in registrations {
+        ensure_safe_directory(&directory.join(host_browser(*kind).directory()))?;
     }
-    install_hosts(
-        base_key,
-        &directory,
-        &executable,
-        &origins,
-        &[firefox.to_owned()],
-    )
+    registrations
+        .iter()
+        .map(|(kind, custom)| {
+            let (field, default) = browser_allowlist(*kind);
+            let existing = read_browser_host_manifest(base_key, *kind);
+            let mut seen = HashSet::new();
+            let allowlist: Vec<_> = existing
+                .as_ref()
+                .and_then(|json| json[field].as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|value| {
+                    if *kind == BrowserKind::Firefox {
+                        valid_firefox_id(value)
+                    } else {
+                        chromium_origin(value)
+                            .as_deref()
+                            .is_ok_and(|origin| origin == *value)
+                    }
+                })
+                .chain([default])
+                .chain(custom.as_deref())
+                .filter(|value| seen.insert(*value))
+                .map(str::to_owned)
+                .collect();
+            install_host(
+                base_key,
+                &directory,
+                host_browser(*kind),
+                &executable,
+                &allowlist,
+            )
+        })
+        .collect()
+}
+
+fn custom_allowlist_entry(kind: BrowserKind, id: Option<&str>) -> io::Result<Option<String>> {
+    id.map(|id| match kind {
+        BrowserKind::Firefox if valid_firefox_id(id) => Ok(id.to_owned()),
+        BrowserKind::Firefox => Err(invalid("expected a valid Firefox extension ID")),
+        _ => extension_origin(id),
+    })
+    .transpose()
+}
+
+fn browser_allowlist(kind: BrowserKind) -> (&'static str, &'static str) {
+    if kind == BrowserKind::Firefox {
+        ("allowed_extensions", DEFAULT_FIREFOX_ID)
+    } else {
+        ("allowed_origins", DEFAULT_CHROMIUM_ORIGIN)
+    }
 }
 
 fn extension_origin(id: &str) -> io::Result<String> {
@@ -825,74 +951,69 @@ pub(crate) fn detect_browser_executable(kind: BrowserKind) -> Option<PathBuf> {
         BrowserKind::Brave => ("brave.exe", "BraveSoftware/Brave-Browser/Application"),
         BrowserKind::Firefox => ("firefox.exe", "Mozilla Firefox"),
     };
+    let matching_executable = |path: &Path| {
+        let path = canonical_exe(path).ok()?;
+        path.file_name()?.eq_ignore_ascii_case(exe).then_some(path)
+    };
     let key = format!(r"Software\Microsoft\Windows\CurrentVersion\App Paths\{exe}");
     [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE]
         .into_iter()
         .flat_map(|hive| [0, RRF_SUBKEY_WOW6432KEY, RRF_SUBKEY_WOW6464KEY].map(|view| (hive, view)))
         .filter_map(|(hive, view)| registry_default_path(hive, &key, view))
-        .find_map(|path| canonical_exe(&path).ok())
+        .find_map(|path| matching_executable(&path))
         .or_else(|| {
             ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"]
                 .into_iter()
                 .filter_map(env::var_os)
-                .find_map(|dir| canonical_exe(&PathBuf::from(dir).join(location).join(exe)).ok())
+                .find_map(|dir| matching_executable(&PathBuf::from(dir).join(location).join(exe)))
         })
 }
 
-pub(crate) fn browser_native_host_registered(base_key: &str, kind: BrowserKind) -> bool {
+fn read_browser_host_manifest(base_key: &str, kind: BrowserKind) -> Option<serde_json::Value> {
     let key = host_key(base_key, host_browser(kind));
-    let manifest = (|| {
-        let path = registry_default_path(HKEY_CURRENT_USER, &key, 0)?;
-        let parent = canonical_directory(path.parent()?).ok()?;
-        let path = parent.join(path.file_name()?);
-        if !regular_non_reparse_file(&fs::symlink_metadata(&path).ok()?) {
-            return None;
-        }
-        const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
-        let mut data = Vec::new();
-        fs::File::open(path)
-            .ok()?
-            .take(MAX_MANIFEST_BYTES + 1)
-            .read_to_end(&mut data)
-            .ok()?;
-        if data.len() as u64 > MAX_MANIFEST_BYTES {
-            return None;
-        }
-        serde_json::from_slice::<serde_json::Value>(&data).ok()
-    })();
-    manifest.is_some_and(|json| {
-        if json["name"] != NATIVE_HOST_NAME
-            || json["type"] != "stdio"
-            || !json["path"]
-                .as_str()
-                .is_some_and(|path| canonical_exe(Path::new(path)).is_ok())
-        {
-            return false;
-        }
-        let allowed = if kind == BrowserKind::Firefox {
-            "allowed_extensions"
-        } else {
-            "allowed_origins"
-        };
-        json[allowed]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(serde_json::Value::as_str)
-            .any(|id| {
-                if kind == BrowserKind::Firefox {
-                    valid_firefox_id(id)
-                } else {
-                    chromium_origin(id).is_ok()
-                }
-            })
+    let path = registry_default_path(HKEY_CURRENT_USER, &key, 0)?;
+    let parent = canonical_directory(path.parent()?).ok()?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(parent.join(path.file_name()?))
+        .ok()?;
+    if !regular_non_reparse_file(&file.metadata().ok()?) {
+        return None;
+    }
+    const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+    let mut data = Vec::new();
+    file.take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut data)
+        .ok()?;
+    if data.len() as u64 > MAX_MANIFEST_BYTES {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
+    (json["name"] == NATIVE_HOST_NAME && json["type"] == "stdio").then_some(json)
+}
+
+pub(crate) fn browser_native_host_registered(
+    base_key: &str,
+    kind: BrowserKind,
+    executable: &Path,
+) -> bool {
+    let (field, default) = browser_allowlist(kind);
+    read_browser_host_manifest(base_key, kind).is_some_and(|json| {
+        json["path"]
+            .as_str()
+            .and_then(|path| canonical_exe(Path::new(path)).ok())
+            .is_some_and(|path| path == executable)
+            && json[field]
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|entry| entry.as_str() == Some(default)))
     })
 }
 
-pub(crate) fn native_hosts_installed(base_key: &str) -> bool {
+pub(crate) fn native_hosts_installed(base_key: &str, executable: &Path) -> bool {
     BROWSERS
         .into_iter()
-        .any(|kind| browser_native_host_registered(base_key, kind))
+        .any(|kind| browser_native_host_registered(base_key, kind, executable))
 }
 
 fn registry_default_path(hive: HKEY, key: &str, flags: u32) -> Option<PathBuf> {
@@ -945,10 +1066,10 @@ pub(crate) fn resolve_bundled_extension_dir_with_roots(
     kind: BrowserKind,
     exe_dir: Option<&Path>,
     resource_dir: Option<&Path>,
-    manifest_dir: &Path,
+    _manifest_dir: &Path,
 ) -> Option<PathBuf> {
     let (_, _, _, subdir) = browser_metadata(kind);
-    exe_dir
+    let candidates = exe_dir
         .into_iter()
         .map(|dir| dir.join("extensions").join(subdir))
         .chain(resource_dir.into_iter().flat_map(|dir| {
@@ -956,25 +1077,28 @@ pub(crate) fn resolve_bundled_extension_dir_with_roots(
                 dir.join("extensions").join(subdir),
                 dir.join("resources/extensions").join(subdir),
             ]
-        }))
-        .chain(
-            exe_dir
-                .into_iter()
-                .chain([manifest_dir])
-                .flat_map(Path::ancestors)
-                .map(|dir| dir.join("extensions/browser/dist").join(subdir)),
-        )
-        .find_map(|candidate| {
-            let canonical = canonical_directory(&candidate).ok()?;
-            let metadata = fs::symlink_metadata(canonical.join("manifest.json")).ok()?;
-            if !regular_non_reparse_file(&metadata) {
-                return None;
-            }
-            local_drive_path(&canonical).ok()
-        })
+        }));
+    #[cfg(debug_assertions)]
+    let candidates = candidates.chain(
+        exe_dir
+            .into_iter()
+            .chain([_manifest_dir])
+            .flat_map(Path::ancestors)
+            .map(|dir| dir.join("extensions/browser/dist").join(subdir)),
+    );
+    let mut candidates = candidates;
+    candidates.find_map(|candidate| {
+        let canonical = canonical_directory(&candidate).ok()?;
+        let metadata = fs::symlink_metadata(canonical.join("manifest.json")).ok()?;
+        if !regular_non_reparse_file(&metadata) {
+            return None;
+        }
+        local_drive_path(&canonical).ok()
+    })
 }
 
 pub(crate) fn list_browsers(base_key: &str, resource_dir: Option<&Path>) -> Vec<BrowserStatus> {
+    let executable = native_host_executable(resource_dir).ok();
     BROWSERS
         .into_iter()
         .map(|id| {
@@ -983,7 +1107,9 @@ pub(crate) fn list_browsers(base_key: &str, resource_dir: Option<&Path>) -> Vec<
                 id,
                 name: name.to_owned(),
                 installed: detect_browser_executable(id).is_some(),
-                native_host_registered: browser_native_host_registered(base_key, id),
+                native_host_registered: executable
+                    .as_deref()
+                    .is_some_and(|exe| browser_native_host_registered(base_key, id, exe)),
                 extension_url: extension_url.to_owned(),
                 bundled_extension_dir: resolve_bundled_extension_dir(id, resource_dir)
                     .map(|dir| dir.to_string_lossy().into_owned()),
@@ -991,6 +1117,50 @@ pub(crate) fn list_browsers(base_key: &str, resource_dir: Option<&Path>) -> Vec<
             }
         })
         .collect()
+}
+
+fn validate_extension_tree(extension_dir: &Path) -> io::Result<()> {
+    let root = canonical_directory(extension_dir)?;
+    if !regular_non_reparse_file(&fs::symlink_metadata(root.join("manifest.json"))?) {
+        return Err(invalid(
+            "the browser extension manifest is not a regular file",
+        ));
+    }
+    let mut dirs = vec![root];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(invalid(
+                    "the browser extension folder contains a reparse point",
+                ));
+            }
+            if metadata.is_dir() {
+                dirs.push(path);
+            } else if !metadata.is_file() {
+                return Err(invalid(
+                    "the browser extension folder contains a non-regular file",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn prepare_browser_extension_setup(
+    base_key: &str,
+    manifests: &Path,
+    extension_dir: &Path,
+    browser_id: BrowserKind,
+    custom: Option<String>,
+    executable: Option<&Path>,
+) -> io::Result<()> {
+    validate_extension_tree(extension_dir)?;
+    if let Some(executable) = executable {
+        sync_browser_hosts(base_key, manifests, executable, &[(browser_id, custom)])?;
+    }
+    Ok(())
 }
 
 pub(crate) fn open_browser_extension_setup(
@@ -1002,25 +1172,14 @@ pub(crate) fn open_browser_extension_setup(
 ) -> io::Result<BrowserSetupResult> {
     let (name, page, default_id, _) = browser_metadata(browser_id);
     let firefox = browser_id == BrowserKind::Firefox;
-    let extension_id = match custom_extension_id.map(str::trim) {
-        None => default_id.to_owned(),
-        Some(id) if !firefox => extension_origin(id)?
-            .trim_start_matches("chrome-extension://")
-            .trim_end_matches('/')
-            .to_owned(),
-        Some(id) if valid_firefox_id(id) => id.to_owned(),
-        Some(_) => return Err(invalid("expected a valid Firefox extension ID")),
-    };
-    if let Ok(executable) = native_host_executable(resource_dir) {
-        install_browser_hosts_into(
-            base_key,
-            manifests,
-            &executable,
-            (!firefox && custom_extension_id.is_some()).then_some(extension_id.as_str()),
-            None,
-            (firefox && custom_extension_id.is_some()).then_some(extension_id.as_str()),
-        )?;
-    }
+    let custom = custom_allowlist_entry(browser_id, custom_extension_id.map(str::trim))?;
+    let extension_id = custom
+        .as_deref()
+        .map_or(default_id, |id| {
+            id.trim_start_matches("chrome-extension://")
+                .trim_end_matches('/')
+        })
+        .to_owned();
     let extension_dir =
         resolve_bundled_extension_dir(browser_id, resource_dir).ok_or_else(|| {
             io::Error::new(
@@ -1028,26 +1187,38 @@ pub(crate) fn open_browser_extension_setup(
                 format!("The SlipStream extension folder for {name} is missing."),
             )
         })?;
-    StdCommand::new(explorer_executable()?)
-        .arg(&extension_dir)
-        .spawn()
-        .map_err(|error| {
-            io::Error::other(format!(
-                "Could not open the extension folder in File Explorer: {error}"
-            ))
-        })?;
+    let executable = native_host_executable(resource_dir).ok();
+    prepare_browser_extension_setup(
+        base_key,
+        manifests,
+        &extension_dir,
+        browser_id,
+        custom,
+        executable.as_deref(),
+    )?;
+    let revealed_extension_dir = match explorer_executable()
+        .and_then(|exe| StdCommand::new(exe).arg(&extension_dir).spawn())
+    {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(%error, "could not open the extension folder in File Explorer");
+            false
+        }
+    };
     let launched_browser = detect_browser_executable(browser_id)
         .is_some_and(|path| StdCommand::new(path).arg(page).spawn().is_ok());
     let instructions = if firefox {
-        format!("1. Open {page} in {name}.\n2. Click Load Temporary Add-on.\n3. Select manifest.json in the folder opened in File Explorer.")
+        format!("1. Open {page} in {name}.\n2. Click Load Temporary Add-on.\n3. Select manifest.json from the extension folder.")
     } else {
-        format!("1. Open {page} in {name}.\n2. Enable Developer mode.\n3. Click Load unpacked and select the folder opened in File Explorer.")
+        format!("1. Open {page} in {name}.\n2. Enable Developer mode.\n3. Click Load unpacked and select the extension folder.")
     };
     Ok(BrowserSetupResult {
         browser_id,
         launched_browser,
-        revealed_extension_dir: true,
-        native_host_registered: browser_native_host_registered(base_key, browser_id),
+        revealed_extension_dir,
+        native_host_registered: executable
+            .as_deref()
+            .is_some_and(|exe| browser_native_host_registered(base_key, browser_id, exe)),
         extension_dir: extension_dir.to_string_lossy().into_owned(),
         extension_page_url: page.to_owned(),
         extension_id,

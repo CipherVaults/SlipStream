@@ -46,6 +46,57 @@ const row = (filename: string) => screen.getByRole("article", { name: filename }
 const inspector = () => within(screen.getByRole("complementary", { name: "Transfer inspector" }));
 const dialog = (name: string | RegExp) => within(screen.getByRole("dialog", { name }));
 
+describe("desktop browser guards", () => {
+  it.each([{ name: "Ctrl+F", ctrlKey: true }, { name: "Cmd+F", metaKey: true }])("focuses and selects download search with $name", async ({ name: _name, ...modifier }) => {
+    const user = await start();
+    const search = screen.getByRole<HTMLInputElement>("searchbox", { name: "Search downloads" });
+    await user.type(search, "ubuntu");
+    const chrome = screen.getByRole("button", { name: "Settings" });
+    chrome.focus();
+    const event = new KeyboardEvent("keydown", { key: "f", ...modifier, bubbles: true, cancelable: true });
+    fireEvent(chrome, event);
+    expect(event.defaultPrevented).toBe(true);
+    expect(search).toHaveFocus();
+    expect(search.selectionStart).toBe(0);
+    expect(search.selectionEnd).toBe(search.value.length);
+  });
+
+  it("prevents browser shortcuts while preserving editing and application commands", async () => {
+    await start();
+    const search = screen.getByRole("searchbox", { name: "Search downloads" });
+    const shortcuts: KeyboardEventInit[] = [
+      ...["F5", "F12", "F3"].map(key => ({ key })),
+      ...["r", "p", "s", "u", "+", "-", "=", "0"].map(key => ({ key, ctrlKey: true })),
+      ...["R", "I", "J", "C"].map(key => ({ key, ctrlKey: true, shiftKey: true })),
+      ...["ArrowLeft", "ArrowRight"].map(key => ({ key, altKey: true })),
+      { key: "r", metaKey: true },
+      { key: "F5", repeat: true },
+    ];
+    for (const shortcut of shortcuts) {
+      const event = new KeyboardEvent("keydown", { ...shortcut, bubbles: true, cancelable: true });
+      fireEvent(search, event);
+      expect(event.defaultPrevented, JSON.stringify(shortcut)).toBe(true);
+    }
+    for (const key of ["c", "v", "x", "a", "z"]) {
+      expect(fireEvent.keyDown(search, { key, ctrlKey: true })).toBe(true);
+    }
+    expect(inspector().getByRole("tab", { name: "Overview" })).toBeVisible();
+    fireEvent.keyDown(search, { key: ",", ctrlKey: true });
+    expect(screen.getByRole("dialog", { name: "Settings & Browser Integration" })).toBeVisible();
+  });
+
+  it("blocks context menus on app chrome and allows them on inputs and textareas", async () => {
+    const user = await start();
+    expect(fireEvent.contextMenu(screen.getByRole("button", { name: "Settings" }))).toBe(false);
+    expect(fireEvent.contextMenu(screen.getByRole("searchbox", { name: "Search downloads" }))).toBe(true);
+    await user.click(within(row(ubuntu)).getByRole("button", { name: /Inspect/ }));
+    await user.click(inspector().getByRole("button", { name: "Refresh URL" }));
+    const refresh = dialog("Refresh Expired Link");
+    await user.click(refresh.getByText("Request options"));
+    expect(fireEvent.contextMenu(refresh.getByLabelText("HTTP headers"))).toBe(true);
+  });
+});
+
 describe("workspace and inspector", () => {
   it("filters by sidebar, segmented status, search, queue and night schedule", async () => {
     const user = await start();
@@ -757,6 +808,51 @@ describe("appearance, settings and transfer dialogs", () => {
     await user.click(reopened.getByRole("button", { name: "Check for Updates" }));
     await user.click(reopened.getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("region", { name: "App update" })).not.toBeInTheDocument();
+  });
+
+  it("skips the background check on native window recreation and still allows manual checks", async () => {
+    let claimed = false;
+    const startup = vi.fn();
+    const check = vi.fn(() => availableUpdate);
+    mockWindows("main");
+    mockIPC((cmd, args) => {
+      if (cmd === "get_snapshot") return demo.snapshot();
+      if (cmd === "get_settings") return { ...demo.getSettings(), update_mode: "auto" };
+      if (cmd === "get_toolchain_status") return demo.toolchain();
+      if (cmd === "list_browsers") return demo.listBrowsers();
+      if (cmd === "check_for_updates") {
+        if (args && "startup" in args && args.startup === true) {
+          startup();
+          if (claimed) return null;
+          claimed = true;
+        }
+        return check();
+      }
+      return undefined;
+    }, { shouldMockEvents: true });
+
+    const first = render(<App />);
+    let restored: ReturnType<typeof render> | undefined;
+    const user = userEvent.setup();
+    try {
+      await screen.findByRole("region", { name: "App update" });
+      first.unmount();
+      restored = render(<App />);
+      await waitFor(() => expect(startup).toHaveBeenCalledTimes(2));
+      expect(check).toHaveBeenCalledOnce();
+      expect(screen.queryByRole("region", { name: "App update" })).not.toBeInTheDocument();
+
+      await user.click(screen.getByRole("button", { name: "Settings" }));
+      const about = within(dialog("Settings & Browser Integration").getByRole("region", { name: "About & Updates" }));
+      await user.click(about.getByRole("button", { name: "Check for Updates" }));
+      expect(check).toHaveBeenCalledTimes(2);
+      expect(about.getByRole("status")).toHaveTextContent("Update v1.1.1 available.");
+    } finally {
+      (restored ?? first).unmount();
+      clearMocks();
+      Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+      Reflect.deleteProperty(window, "__TAURI_EVENT_PLUGIN_INTERNALS__");
+    }
   });
 
   it("skips startup checks in manual mode and saves update checks in both directions", async () => {

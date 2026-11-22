@@ -59,6 +59,9 @@ export const desktop = {
       () => demo.installHosts([chrome_id, edge_id, firefox_id])),
   hibernateToTray: () => command<void>("hibernate_to_tray", undefined, () => undefined),
   checkForUpdates: () => command<UpdateStatus>("check_for_updates", undefined, demo.checkForUpdates),
+  checkForStartupUpdates: (): Promise<UpdateStatus | null> => isTauri()
+    ? invoke<UpdateStatus | null>("check_for_updates", { startup: true })
+    : desktop.checkForUpdates(),
   installUpdate: () => command<boolean>("install_update", undefined, demo.installUpdate),
 
   async onUpdateProgress(handler: (progress: UpdateProgress) => void) {

@@ -5,7 +5,7 @@
   "bundle": {
     "createUpdaterArtifacts": true,
     "resources": {
-      "../../../target/release/slipstream-native-host.exe": "bin/slipstream-native-host.exe"
+      "resources/": ""
     }
   }
 }

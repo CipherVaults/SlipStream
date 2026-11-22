@@ -22,7 +22,7 @@ use slipstream_protocol::{
     is_private_or_loopback_ip, validate_http_url, validate_magnet_uri, AddHttpDownloadRequest,
     AddMediaDownloadRequest, AddTorrentRequest, AppSettings, MediaProbeResult, NativeBridgeRequest,
     NativeBridgeResponse, RefreshDownloadUrlRequest, TelemetryBatch, TorrentFileEntry,
-    TransferSnapshot, TransferStatus,
+    TransferSnapshot, TransferStatus, UpdateMode,
 };
 use slipstream_torrent::{TorrentManager, TorrentManagerConfig};
 use std::{
@@ -112,6 +112,7 @@ pub struct AppState {
     scans: mpsc::Sender<ScanRequest>,
     stop: watch::Sender<bool>,
     tasks: AsyncMutex<Option<Vec<JoinHandle<()>>>>,
+    startup_update_checked: AtomicBool,
     quitting: AtomicBool,
 }
 
@@ -209,6 +210,7 @@ impl AppState {
             scans,
             stop,
             tasks: AsyncMutex::new(Some(Vec::new())),
+            startup_update_checked: AtomicBool::new(false),
             quitting: AtomicBool::new(false),
         });
         let runtime = Arc::downgrade(&state);
@@ -771,6 +773,11 @@ impl AppState {
 
     pub fn is_quitting(&self) -> bool {
         self.quitting.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn claim_startup_update_check(&self) -> bool {
+        self.settings.read().unwrap().update_mode == UpdateMode::Auto
+            && !self.startup_update_checked.swap(true, Ordering::Relaxed)
     }
 
     pub async fn quit(&self) {

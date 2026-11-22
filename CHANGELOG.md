@@ -2,6 +2,20 @@
 
 All notable changes to **SlipStream** are documented in this file following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [1.1.0]
+
+### Added
+
+- Automatic startup and manual-only update checks, plus live progress for signed app updates.
+- Bundled yt-dlp, FFmpeg 9.1 Essentials, and ffprobe in the Windows installer and portable ZIP. Settings displays each tool's version and source and offers a one-click, SHA-256-verified yt-dlp update.
+- A browser picker for Chrome, Edge, Brave, and Firefox that opens extension setup and locates the bundled extension. Chromium browsers share the fixed extension ID `nikdbkenglojniombimjdkneanmponcp`.
+
+### Changed
+
+- Locked down the main WebView2 window at the engine and application levels. Browser shortcuts, context menus, status UI, and zoom are suppressed. Release builds also disable DevTools. Ctrl+F selects download search, and editable fields and diagnostic text remain selectable.
+- Release builds stage verified media tools, the native messaging host, both browser extension trees, and third-party notices. The portable ZIP launches as `SlipStream.exe` and shares the installer's `bin/` and `extensions/` layout.
+- Release packaging validates the tag and app version, generates the updater manifest with the matching installer signature, and publishes asset checksums. The README documents v1.1.0 setup from the public repository.
+
 ## [1.0.0] - 2026-11-21
 
 ### Added

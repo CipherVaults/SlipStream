@@ -1,5 +1,5 @@
 use crate::{
-    manifest::{generate, Browser},
+    manifest::{generate, Browser, HostManifest},
     security::wide,
 };
 use slipstream_protocol::NATIVE_HOST_NAME;
@@ -84,23 +84,42 @@ pub fn install_hosts(
     let manifests = manifests.into_iter().collect::<io::Result<Vec<_>>>()?;
     let mut paths = Vec::new();
     for (browser, manifest) in Browser::ALL.into_iter().zip(manifests) {
-        let parent = directory.join(browser.directory());
-        let path = parent.join(format!("{NATIVE_HOST_NAME}.json"));
-        fs::create_dir_all(&parent)?;
-        let temporary = parent.join(format!(".manifest-{}.tmp", uuid::Uuid::new_v4()));
-        let bytes = serde_json::to_vec_pretty(&manifest)?;
-        if let Err(error) =
-            fs::write(&temporary, bytes).and_then(|()| fs::rename(&temporary, &path))
-        {
-            let _ = fs::remove_file(temporary);
-            return Err(error);
-        }
-        paths.push(path);
+        paths.push(write_manifest(&directory, browser, &manifest)?);
     }
     for (browser, path) in Browser::ALL.into_iter().zip(&paths) {
         register(base_key, browser, path)?;
     }
     Ok(paths)
+}
+
+pub fn install_host(
+    base_key: &str,
+    directory: &Path,
+    browser: Browser,
+    executable: &Path,
+    allowlist: &[String],
+) -> io::Result<PathBuf> {
+    let manifest = generate(browser, executable, allowlist, allowlist)?;
+    let path = write_manifest(&std::path::absolute(directory)?, browser, &manifest)?;
+    register(base_key, browser, &path)?;
+    Ok(path)
+}
+
+fn write_manifest(
+    directory: &Path,
+    browser: Browser,
+    manifest: &HostManifest<'_>,
+) -> io::Result<PathBuf> {
+    let parent = directory.join(browser.directory());
+    let path = parent.join(format!("{NATIVE_HOST_NAME}.json"));
+    fs::create_dir_all(&parent)?;
+    let temporary = parent.join(format!(".manifest-{}.tmp", uuid::Uuid::new_v4()));
+    let bytes = serde_json::to_vec_pretty(manifest)?;
+    if let Err(error) = fs::write(&temporary, bytes).and_then(|()| fs::rename(&temporary, &path)) {
+        let _ = fs::remove_file(temporary);
+        return Err(error);
+    }
+    Ok(path)
 }
 
 pub fn uninstall_hosts(base_key: &str) -> io::Result<()> {

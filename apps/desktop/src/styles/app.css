@@ -19,7 +19,8 @@ body {
   user-select: none;
 }
 
-input, select, textarea { user-select: text; }
+input, select, textarea, [contenteditable='true'], code, pre, .selectable, [data-selectable='true'],
+.inline-error, .browser-setup-code, .browser-setup-path { user-select: text; }
 button:enabled, summary { cursor: pointer; }
 button:disabled { opacity: 0.5; cursor: default; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

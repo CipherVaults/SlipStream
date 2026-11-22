@@ -7,32 +7,89 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build and publish (defaults to ref_name when triggered by tag push)"
+        description: "Existing version tag to build and publish (defaults to the selected tag)"
         required: false
         type: string
 
-permissions:
-  contents: write
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name || github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  YTDLP_VERSION: '2026.10.26'
+  YTDLP_EXE_SHA256: f5389d3698ecde4ef06f4e6b1ce0294fe9ac1396228c8990b8d3416d6d177a7d
+  YTDLP_SOURCE_SHA256: 21f942d258d25cc4e60b4982a25c423460f0bebb835f38e6dfd1fcb140087f95
+  FFMPEG_VERSION: '9.1'
+  FFMPEG_ZIP_SHA256: b9bbbb3acece000cbeec994f856649354e52c773807841e78908374b24d658fd
 
 jobs:
+  verify-media-tools:
+    permissions: {}
+    runs-on: windows-latest
+    steps:
+      - &download_media_tools
+        name: Download and verify pinned media tools and source
+        shell: pwsh
+        run: |
+          $downloadDir = Join-Path $env:RUNNER_TEMP "slipstream-media"
+          New-Item -ItemType Directory -Force $downloadDir | Out-Null
+          $ytDlpBase = "https://github.com/yt-dlp/yt-dlp/releases/download/$env:YTDLP_VERSION"
+          $ffmpegName = "ffmpeg-$env:FFMPEG_VERSION-essentials_build"
+          $ffmpegBase = "https://github.com/GyanD/codexffmpeg/releases/download/$env:FFMPEG_VERSION"
+          function Save-VerifiedAsset($url, $name, $expected) {
+            $path = Join-Path $downloadDir $name
+            Invoke-WebRequest -Uri $url -OutFile $path
+            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+            if ($actual -cne $expected) { throw "$name SHA-256 mismatch." }
+          }
+          Save-VerifiedAsset "$ytDlpBase/yt-dlp.exe" "yt-dlp.exe" $env:YTDLP_EXE_SHA256
+          Save-VerifiedAsset "$ytDlpBase/yt-dlp.tar.gz" "yt-dlp.tar.gz" $env:YTDLP_SOURCE_SHA256
+          Save-VerifiedAsset "$ffmpegBase/$ffmpegName.zip" "$ffmpegName.zip" $env:FFMPEG_ZIP_SHA256
+
+      - name: Smoke-test verified media tools
+        shell: pwsh
+        run: |
+          $downloadDir = Join-Path $env:RUNNER_TEMP "slipstream-media"
+          $ffmpegName = "ffmpeg-$env:FFMPEG_VERSION-essentials_build"
+          Expand-Archive -LiteralPath "$downloadDir/$ffmpegName.zip" -DestinationPath $downloadDir
+          & "$downloadDir/yt-dlp.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($name in @("ffmpeg.exe", "ffprobe.exe")) {
+            & "$downloadDir/$ffmpegName/bin/$name" -version
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
   release-windows:
+    needs: [verify-media-tools]
+    permissions:
+      contents: write
     runs-on: windows-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ format('refs/tags/{0}', inputs.tag || github.ref_name) }}
 
       - name: Resolve release metadata
         id: meta
         shell: pwsh
+        env:
+          REQUESTED_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch" -and "${{ inputs.tag }}" -ne "") {
-            "${{ inputs.tag }}"
-          } else {
-            "${{ github.ref_name }}"
-          }
-          $version = $tag.TrimStart("v")
+          $tag = $env:REQUESTED_TAG
+          if ($tag -cnotmatch '\Av(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)\z') { throw "Expected a release tag such as v1.1.0." }
+          $version = $tag.Substring(1)
+          $tagCommit = git rev-parse --verify "refs/tags/$tag^{commit}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $head = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($head -cne $tagCommit) { throw "The checkout does not match $tag." }
+          $appConfig = Get-Content -LiteralPath apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          if ($appConfig.version -cne $version) { throw "Tauri version $($appConfig.version) does not match $tag." }
           Write-Output "tag=$tag" >> $env:GITHUB_OUTPUT
           Write-Output "version=$version" >> $env:GITHUB_OUTPUT
 
@@ -43,6 +100,9 @@ jobs:
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+
+      - name: Fetch locked Rust dependencies before building
+        run: cargo fetch --locked --target x86_64-pc-windows-msvc
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -56,27 +116,74 @@ jobs:
           cache: "pnpm"
 
       - name: Install workspace dependencies
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm.cmd install --frozen-lockfile
 
       - name: Typecheck, test, and build frontend and browser extensions
         run: |
-          pnpm -r typecheck
-          pnpm -r test
-          pnpm -r build
+          pnpm.cmd -r typecheck
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm.cmd -r test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm.cmd build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify Rust formatting and lints
+        env:
+          CARGO_NET_OFFLINE: 'true'
         run: |
           cargo fmt --all -- --check
-          cargo clippy --workspace --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Build Native Messaging host (release)
-        run: cargo build --release -p slipstream-native-host
+      - name: Build native messaging host and stage extensions
+        env:
+          CARGO_NET_OFFLINE: 'true'
+        run: |
+          cargo build --release -p slipstream-native-host --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $resources = "apps/desktop/src-tauri/resources"
+          New-Item -ItemType Directory -Force "$resources/bin", "$resources/extensions" | Out-Null
+          Copy-Item -LiteralPath "target/release/slipstream-native-host.exe" -Destination "$resources/bin/"
+          foreach ($browser in @("chrome", "firefox")) {
+            $extension = "extensions/browser/dist/$browser"
+            if (-not (Test-Path -LiteralPath "$extension/manifest.json" -PathType Leaf)) {
+              throw "Missing $browser extension build."
+            }
+            Copy-Item -LiteralPath $extension -Destination "$resources/extensions/$browser" -Recurse
+          }
+          Copy-Item -LiteralPath "THIRD_PARTY_NOTICES.md" -Destination $resources
+
+      - *download_media_tools
+
+      - name: Stage verified media tools and required notices
+        run: |
+          $bin = "apps/desktop/src-tauri/resources/bin"
+          $downloadDir = Join-Path $env:RUNNER_TEMP "slipstream-media"
+          $ffmpegName = "ffmpeg-$env:FFMPEG_VERSION-essentials_build"
+          $ffmpegDir = Join-Path $downloadDir $ffmpegName
+          tar.exe -xf "$downloadDir/yt-dlp.tar.gz" -C $downloadDir yt-dlp/LICENSE
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Expand-Archive -LiteralPath "$downloadDir/$ffmpegName.zip" -DestinationPath $downloadDir
+          Copy-Item -LiteralPath "$downloadDir/yt-dlp.exe", "$ffmpegDir/bin/ffmpeg.exe", "$ffmpegDir/bin/ffprobe.exe" -Destination $bin
+
+          function Copy-RequiredNotice($path, $name) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
+                [string]::IsNullOrWhiteSpace([System.IO.File]::ReadAllText($path))) {
+              throw "Missing or empty release notice $path."
+            }
+            Copy-Item -LiteralPath $path -Destination (Join-Path $bin $name)
+          }
+          Copy-RequiredNotice "$downloadDir/yt-dlp/LICENSE" "yt-dlp-LICENSE.txt"
+          Copy-RequiredNotice "$ffmpegDir/LICENSE" "ffmpeg-LICENSE.txt"
+          Copy-RequiredNotice "$ffmpegDir/README.txt" "ffmpeg-README.txt"
 
       - name: Build signed NSIS installer and updater artifacts
         working-directory: apps/desktop
         env:
+          CARGO_NET_OFFLINE: 'true'
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        run: npx --yes @tauri-apps/cli@2 build --bundles nsis --config src-tauri/tauri.release.conf.json
+        run: npx.cmd --yes @tauri-apps/cli@2.12.4 build --bundles nsis --config src-tauri/tauri.release.conf.json -- --locked
 
       - name: Package release assets, latest.json, and SHA256SUMS.txt
         shell: pwsh
@@ -88,38 +195,71 @@ jobs:
           $ErrorActionPreference = "Stop"
           $out = "release-assets"
           New-Item -ItemType Directory -Force $out | Out-Null
+          $resources = "apps/desktop/src-tauri/resources"
 
-          $nsisDir = "target/release/bundle/nsis"
-          $setup = Get-ChildItem -LiteralPath $nsisDir -Filter "*-setup.exe" | Where-Object { $_.Name -notlike "*.sig" } | Select-Object -First 1
-          if (-not $setup) { throw "NSIS setup.exe missing under $nsisDir" }
-          $sig = Get-Item -LiteralPath "$($setup.FullName).sig" -ErrorAction SilentlyContinue
-          if (-not $sig) { throw "Updater .sig missing for $($setup.FullName)" }
+          $setupName = "SlipStream_${env:RELEASE_VERSION}_x64-setup.exe"
+          $setup = Get-Item -LiteralPath "target/release/bundle/nsis/$setupName"
+          $sig = Get-Item -LiteralPath "$($setup.FullName).sig"
+          $sigContent = Get-Content -Raw -LiteralPath $sig.FullName
+          if ([string]::IsNullOrWhiteSpace($sigContent)) { throw "Updater signature is empty." }
+          $sigContent = $sigContent.Trim()
+
+          $requiredResources = @(
+            "THIRD_PARTY_NOTICES.md",
+            "bin/slipstream-native-host.exe", "bin/yt-dlp.exe", "bin/ffmpeg.exe", "bin/ffprobe.exe",
+            "bin/yt-dlp-LICENSE.txt", "bin/ffmpeg-LICENSE.txt", "bin/ffmpeg-README.txt",
+            "extensions/chrome/manifest.json", "extensions/firefox/manifest.json"
+          )
+          $installerScript = Get-Content -Raw -LiteralPath "target/release/nsis/x64/installer.nsi"
+          foreach ($resource in $requiredResources) {
+            $destination = $resource.Replace('/', '\')
+            if (-not $installerScript.Contains('"/oname=' + $destination + '"')) {
+              throw "NSIS installer is missing $resource."
+            }
+          }
 
           Copy-Item -LiteralPath $setup.FullName -Destination (Join-Path $out $setup.Name) -Force
           Copy-Item -LiteralPath $sig.FullName -Destination (Join-Path $out $sig.Name) -Force
+          $source = Join-Path $env:RUNNER_TEMP "slipstream-media/yt-dlp.tar.gz"
+          Copy-Item -LiteralPath $source -Destination (Join-Path $out "yt-dlp-$env:YTDLP_VERSION-source.tar.gz")
 
           # Portable Windows x64 ZIP
-          $portableStage = Join-Path $out "portable-stage"
+          $portableStage = Join-Path $env:RUNNER_TEMP "slipstream-portable"
           New-Item -ItemType Directory -Force $portableStage | Out-Null
-          Copy-Item "target/release/slipstream-desktop.exe" $portableStage -Force
-          Copy-Item "target/release/slipstream-native-host.exe" $portableStage -Force
-          Copy-Item "README.md" $portableStage -Force
-          Copy-Item "CHANGELOG.md" $portableStage -Force
+          Copy-Item -LiteralPath "target/release/slipstream-desktop.exe" -Destination "$portableStage/SlipStream.exe"
+          Copy-Item -LiteralPath "$resources/bin", "$resources/extensions" -Destination $portableStage -Recurse
+          Copy-Item -LiteralPath "$resources/THIRD_PARTY_NOTICES.md", "README.md", "CHANGELOG.md" -Destination $portableStage
           $portableZip = Join-Path $out "SlipStream-$env:RELEASE_VERSION-windows-x64-portable.zip"
-          Compress-Archive -Path "$portableStage\*" -DestinationPath $portableZip -CompressionLevel Optimal -Force
-          Remove-Item -LiteralPath $portableStage -Recurse -Force
+          Compress-Archive -Path "$portableStage/*" -DestinationPath $portableZip -CompressionLevel Optimal -Force
+          $archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $portableZip).Path)
+          try {
+            $entries = @($archive.Entries | Where-Object Length -gt 0 | ForEach-Object { $_.FullName.Replace('\', '/') })
+            foreach ($name in $requiredResources + @("SlipStream.exe")) {
+              if ($entries -cnotcontains $name) { throw "Portable ZIP is missing $name." }
+            }
+            foreach ($browser in @("chrome", "firefox")) {
+              if (-not ($entries -clike "extensions/$browser/assets/*")) {
+                throw "Portable ZIP is missing the $browser extension assets."
+              }
+            }
+          } finally {
+            $archive.Dispose()
+          }
 
           # Cross-browser MV3 extension ZIPs
           $chromeZip = Join-Path $out "slipstream-extension-$env:RELEASE_VERSION-chrome-edge-brave.zip"
-          Compress-Archive -Path "extensions/browser/dist/chrome/*" -DestinationPath $chromeZip -CompressionLevel Optimal -Force
+          Compress-Archive -Path "$resources/extensions/chrome/*" -DestinationPath $chromeZip -CompressionLevel Optimal -Force
           $firefoxZip = Join-Path $out "slipstream-extension-$env:RELEASE_VERSION-firefox.zip"
-          Compress-Archive -Path "extensions/browser/dist/firefox/*" -DestinationPath $firefoxZip -CompressionLevel Optimal -Force
+          Compress-Archive -Path "$resources/extensions/firefox/*" -DestinationPath $firefoxZip -CompressionLevel Optimal -Force
 
           # Tauri v2 updater latest.json manifest
-          $sigContent = (Get-Content -Raw -LiteralPath $sig.FullName).Trim()
+          $changelog = Get-Content -Raw -LiteralPath "CHANGELOG.md"
+          $heading = [regex]::Escape("## [$env:RELEASE_VERSION]")
+          $entry = [regex]::Match($changelog, "(?ms)^$heading(?:[ \t]+[^\r\n]*)?\r?\n(.*?)(?=^## |\z)")
+          if (-not $entry.Success) { throw "Missing changelog entry for $env:RELEASE_TAG." }
           $manifest = @{
             version = $env:RELEASE_VERSION
-            notes = "SlipStream $env:RELEASE_TAG — segmented HTTP engine, yt-dlp/FFmpeg media pipeline, BitTorrent/Magnet, SID-ACL Native Pipe browser extension, and dual Graphite/Porcelain desktop UI."
+            notes = $entry.Groups[1].Value.Trim()
             pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
             platforms = @{
               "windows-x86_64" = @{
@@ -129,6 +269,13 @@ jobs:
             }
           } | ConvertTo-Json -Depth 6
           [System.IO.File]::WriteAllText((Join-Path (Resolve-Path $out) "latest.json"), $manifest + "`n", [System.Text.UTF8Encoding]::new($false))
+          $latest = Get-Content -Raw -LiteralPath "$out/latest.json" | ConvertFrom-Json
+          $platform = $latest.platforms.'windows-x86_64'
+          $expectedUrl = "https://github.com/$env:REPO/releases/download/$env:RELEASE_TAG/$setupName"
+          if ("v$($latest.version)" -cne $env:RELEASE_TAG -or
+              $platform.url -cne $expectedUrl -or $platform.signature -cne $sigContent) {
+            throw "latest.json does not match the tagged installer and its signature."
+          }
 
           # Checksums
           $files = Get-ChildItem -LiteralPath $out -File | Where-Object { $_.Name -ne "SHA256SUMS.txt" } | Sort-Object Name
@@ -149,25 +296,28 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           $ErrorActionPreference = "Stop"
-          $setup = Get-ChildItem -LiteralPath "release-assets" -Filter "*-setup.exe" | Where-Object { $_.Name -notlike "*.sig" } | Select-Object -First 1
-          $setupName = $setup.Name
+          $setupName = "SlipStream_${env:RELEASE_VERSION}_x64-setup.exe"
           $template = @'
           # SlipStream __TAG__
 
           High-speed Windows 10/11 download manager built with **Rust**, **Tauri v2**, **React 19**, and a **Manifest V3** browser extension.
 
           ## Downloads
-          - **Installer (Recommended, Signed Auto-Update):** `__SETUP__` (bundles `bin/slipstream-native-host.exe`)
+          - **Installer (Recommended, Signed Auto-Update):** `__SETUP__`
           - **Portable:** `SlipStream-__VER__-windows-x64-portable.zip`
           - **Browser Extension (Chrome / Edge / Brave):** `slipstream-extension-__VER__-chrome-edge-brave.zip`
           - **Browser Extension (Firefox):** `slipstream-extension-__VER__-firefox.zip`
+          - **Bundled yt-dlp source:** `yt-dlp-__YTDLP__-source.tar.gz`
           - **Updater & Verification:** `latest.json`, `__SETUP__.sig`, `SHA256SUMS.txt`
 
-          ## Full Changelog
+          The installer and portable ZIP include the native messaging host, yt-dlp, FFmpeg, ffprobe, and both browser extension builds.
+          [Third-party licenses and source](https://github.com/__REPO__/blob/__TAG__/THIRD_PARTY_NOTICES.md)
+
+          ## What's New
           '@
-          $notes = $template.Replace("__TAG__", $env:RELEASE_TAG).Replace("__VER__", $env:RELEASE_VERSION).Replace("__SETUP__", $setupName)
-          $changelog = Get-Content -Raw "CHANGELOG.md"
-          [System.IO.File]::WriteAllText((Join-Path (Get-Location) "RELEASE_NOTES.md"), $notes + "`n`n" + $changelog, [System.Text.UTF8Encoding]::new($false))
+          $notes = $template.Replace("__TAG__", $env:RELEASE_TAG).Replace("__VER__", $env:RELEASE_VERSION).Replace("__SETUP__", $setupName).Replace("__YTDLP__", $env:YTDLP_VERSION).Replace("__REPO__", $env:REPO)
+          $manifest = Get-Content -Raw -LiteralPath "release-assets/latest.json" | ConvertFrom-Json
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) "RELEASE_NOTES.md"), $notes + "`n`n" + $manifest.notes, [System.Text.UTF8Encoding]::new($false))
 
           $assets = @(Get-ChildItem -LiteralPath "release-assets" -File | ForEach-Object { $_.FullName })
           $ErrorActionPreference = "Continue"
@@ -181,6 +331,6 @@ jobs:
             gh release edit $env:RELEASE_TAG --title "SlipStream $env:RELEASE_TAG" --notes-file RELEASE_NOTES.md -R $env:REPO
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           } else {
-            gh release create $env:RELEASE_TAG @assets --title "SlipStream $env:RELEASE_TAG" --notes-file RELEASE_NOTES.md -R $env:REPO
+            gh release create $env:RELEASE_TAG @assets --verify-tag --title "SlipStream $env:RELEASE_TAG" --notes-file RELEASE_NOTES.md -R $env:REPO
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }

@@ -279,7 +279,14 @@ fn updater_error(action: &str, error: tauri_plugin_updater::Error) -> String {
 }
 
 #[tauri::command]
-pub(crate) async fn check_for_updates(app: AppHandle) -> Result<UpdateStatus> {
+pub(crate) async fn check_for_updates(
+    app: AppHandle,
+    state: Daemon<'_>,
+    startup: Option<bool>,
+) -> Result<Option<UpdateStatus>> {
+    if startup == Some(true) && !state.claim_startup_update_check() {
+        return Ok(None);
+    }
     const ACTION: &str = "check for updates";
     let current_version = app.package_info().version.to_string();
     let update = app
@@ -289,7 +296,7 @@ pub(crate) async fn check_for_updates(app: AppHandle) -> Result<UpdateStatus> {
         .await
         .map_err(|error| updater_error(ACTION, error))?;
 
-    Ok(match update {
+    Ok(Some(match update {
         Some(update) => UpdateStatus {
             available: true,
             current_version,
@@ -304,7 +311,7 @@ pub(crate) async fn check_for_updates(app: AppHandle) -> Result<UpdateStatus> {
             notes: None,
             pub_date: None,
         },
-    })
+    }))
 }
 
 #[tauri::command]
@@ -377,14 +384,15 @@ pub(crate) async fn install_update(app: AppHandle, state: Daemon<'_>) -> Result<
         downloaded_bytes,
         total_bytes,
     );
-    state.shutdown().await?;
-    // On Windows, the updater exits SlipStream and NSIS relaunches it after installing.
-    update.install(bytes).map_err(|error| {
-        format!(
-            "{} Restart SlipStream to resume downloads.",
-            updater_error("install the update", error)
-        )
+    const RECOVERY: &str = "Quit and reopen SlipStream to resume downloads.";
+    state.shutdown().await.map_err(|error| {
+        tracing::error!(%error, "could not stop the daemon for the update");
+        format!("Could not stop downloads to prepare the update. {RECOVERY}")
     })?;
+    // On Windows, the updater exits SlipStream and NSIS relaunches it after installing.
+    update
+        .install(bytes)
+        .map_err(|error| format!("{} {RECOVERY}", updater_error("install the update", error)))?;
     Ok(true)
 }
 

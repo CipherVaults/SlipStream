@@ -21,6 +21,9 @@ type Unsubscribe = () => void | Promise<void>;
 const systemThemeQuery = "(prefers-color-scheme: dark)";
 const emptySamples: number[] = [];
 const sampleCount = 40;
+const browserFunctionKeys = new Set(["f3", "f5", "f12"]);
+const browserCommandKeys = new Set(["r", "p", "s", "u", "+", "-", "=", "0"]);
+const devToolsKeys = new Set(["i", "j", "c"]);
 
 function stopSafely(unsubscribe: Unsubscribe) {
   try {
@@ -77,6 +80,7 @@ export default function App() {
   const [view, setView] = useState<View>("all");
   const [filter, setFilter] = useState<StatusFilter>("All");
   const [search, setSearch] = useState("");
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const [selectedId, setSelectedId] = useState<string>();
   const [removed, setRemoved] = useState<Set<string>>(() => new Set());
   const [torrentFilesMap, setTorrentFilesMap] = useState<Record<string, TorrentFilesEntry>>({});
@@ -126,10 +130,10 @@ export default function App() {
     setUpdateBannerDismissed(false);
   }, [updateInfo?.version]);
 
-  const checkForUpdates = useCallback(async () => {
+  const checkForUpdates = useCallback(async (startup = false) => {
     const sequence = ++updateCheckSequence.current;
-    const result = await desktop.checkForUpdates();
-    if (mountedRef.current && sequence === updateCheckSequence.current) setUpdateInfo(result);
+    const result = await (startup ? desktop.checkForStartupUpdates() : desktop.checkForUpdates());
+    if (result && mountedRef.current && sequence === updateCheckSequence.current) setUpdateInfo(result);
   }, []);
 
   async function installUpdate() {
@@ -197,7 +201,7 @@ export default function App() {
           }
           if (!startupUpdateChecked.current) {
             startupUpdateChecked.current = true;
-            if ((next.update_mode ?? "auto") === "auto") void checkForUpdates().catch(() => {});
+            if ((next.update_mode ?? "auto") === "auto") void checkForUpdates(true).catch(() => {});
           }
         }
         return next;
@@ -534,10 +538,10 @@ export default function App() {
     commitOverlay(undefined);
   }, [commitOverlay]);
   const openPalette = () => commitOverlay({ type: "palette" });
-  const openSettings = () => {
+  const openSettings = useCallback(() => {
     if (settingsLoadState === "error") void loadSettings().catch(() => {});
     commitOverlay({ type: "settings" });
-  };
+  }, [settingsLoadState, loadSettings, commitOverlay]);
   const openSource = (url: string) => openAdd({ url, autoProbe: true });
   const toggleInspector = () => setInspectorOpen(open => !open);
   const hibernate = async () => {
@@ -547,14 +551,31 @@ export default function App() {
 
   useEffect(() => {
     function handleKey(event: KeyboardEvent) {
-      if (event.defaultPrevented || event.repeat) return;
-      if (event.key === "Escape" && overlayRef.current) {
+      if (event.defaultPrevented) return;
+      const key = event.key.toLowerCase();
+      const command = (event.ctrlKey || event.metaKey) && !event.altKey;
+      if (browserFunctionKeys.has(key)
+        || (event.altKey && (key === "arrowleft" || key === "arrowright"))
+        || (command && (browserCommandKeys.has(key) || (event.shiftKey && devToolsKeys.has(key))))) {
+        event.preventDefault();
+        return;
+      }
+      if (command && !event.shiftKey && key === "f") {
+        event.preventDefault();
+        if (!event.repeat && !overlayRef.current) {
+          searchInputRef.current?.focus();
+          searchInputRef.current?.select();
+        }
+        return;
+      }
+      if (event.repeat) return;
+      if (key === "escape" && overlayRef.current) {
         event.preventDefault();
         if (!busyRef.current) closeDialog();
         return;
       }
-      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
-      switch (event.key.toLowerCase()) {
+      if (!command || event.shiftKey) return;
+      switch (key) {
         case "k":
           event.preventDefault();
           if (busyRef.current) break;
@@ -571,11 +592,24 @@ export default function App() {
           event.preventDefault();
           setInspectorOpen(open => !open);
           break;
+        case ",":
+          event.preventDefault();
+          if (!busyRef.current && (!overlayRef.current || overlayRef.current.type === "palette")) openSettings();
+          break;
       }
     }
+    function handleContextMenu(event: MouseEvent) {
+      if (event.target instanceof Element
+        && event.target.closest("input, textarea, [contenteditable='true'], [data-allow-contextmenu='true']")) return;
+      event.preventDefault();
+    }
     document.addEventListener("keydown", handleKey);
-    return () => document.removeEventListener("keydown", handleKey);
-  }, [openAdd, closeDialog, commitOverlay]);
+    document.addEventListener("contextmenu", handleContextMenu);
+    return () => {
+      document.removeEventListener("keydown", handleKey);
+      document.removeEventListener("contextmenu", handleContextMenu);
+    };
+  }, [openAdd, openSettings, closeDialog, commitOverlay]);
 
   const onTransferAction: OnTransferAction = (action, transfer) => {
     if (action === "refresh" || action === "verify") {
@@ -643,7 +677,7 @@ export default function App() {
     { label: "Toggle Inspector", shortcut: "Ctrl I", run: () => { closeDialog(); toggleInspector(); } },
     { label: "Pause All", run: () => { closeDialog(); void perform(() => groupAction("pause")); } },
     { label: "Resume All", run: () => { closeDialog(); void perform(() => groupAction("resume")); } },
-    { label: "Settings", run: openSettings },
+    { label: "Settings", shortcut: "Ctrl ,", run: openSettings },
     { label: "Hibernate to Tray", run: () => { closeDialog(); void perform(hibernate); } },
   ];
 
@@ -661,7 +695,7 @@ export default function App() {
           await pullSnapshot();
         }).catch(showError)} />
       <div className="main-col">
-        <Toolbar search={search} setSearch={setSearch} filter={filter} setFilter={setFilter}
+        <Toolbar search={search} searchInputRef={searchInputRef} setSearch={setSearch} filter={filter} setFilter={setFilter}
           theme={theme} accent={settings.accent} toggleTheme={toggleTheme} toggleAccent={toggleAccent}
           openAdd={() => openAdd()} openPalette={openPalette} windowAction={action => void perform(desktop[action])}
           submitSearch={() => { if (isDownloadSource(search.trim())) openSource(search.trim()); }} />
@@ -692,7 +726,7 @@ export default function App() {
       </div>
     </div>
     {notice && <div className={"toast " + notice.tone} role={notice.tone === "error" ? "alert" : "status"}>
-      <span>{notice.message}</span>
+      <span className="selectable">{notice.message}</span>
       <IconButton className="folder-ghost" label="Dismiss notification" onClick={() => setNotice(undefined)}><X size={13} /></IconButton>
     </div>}
     {overlay?.type === "add" && <AddDialog key={overlay.key} seed={overlay.seed} droppedSource={droppedSource} settings={settings} onClose={closeDialog}
