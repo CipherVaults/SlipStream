@@ -123,6 +123,7 @@ impl MediaJob {
     pub(crate) async fn start(
         self: &Arc<Self>,
         settings: AppSettings,
+        resource_dir: Option<PathBuf>,
         scans: mpsc::Sender<ScanRequest>,
     ) -> Result<(), String> {
         let mut run = self.run.lock().await;
@@ -147,7 +148,8 @@ impl MediaJob {
         }
         let (stop, stopped) = watch::channel(false);
         let job = self.clone();
-        let task = tokio::spawn(async move { job.download(settings, scans, stopped).await });
+        let task =
+            tokio::spawn(async move { job.download(settings, resource_dir, scans, stopped).await });
         *run = Some(MediaRun { stop, task });
         Ok(())
     }
@@ -191,12 +193,13 @@ impl MediaJob {
     async fn download(
         &self,
         settings: AppSettings,
+        resource_dir: Option<PathBuf>,
         scans: mpsc::Sender<ScanRequest>,
         mut stopped: watch::Receiver<bool>,
     ) {
         let (tx, mut rx) = mpsc::channel(16);
         let result = {
-            let operation = self.stage_download(settings, tx);
+            let operation = self.stage_download(settings, resource_dir, tx);
             tokio::pin!(operation);
             loop {
                 tokio::select! {
@@ -252,9 +255,10 @@ impl MediaJob {
     async fn stage_download(
         &self,
         settings: AppSettings,
+        resource_dir: Option<PathBuf>,
         progress: mpsc::Sender<MediaProgressEvent>,
     ) -> Result<(StagingDir, Vec<PathBuf>), String> {
-        let tools = discover_media_toolchain(settings).await?;
+        let tools = discover_media_toolchain(settings, resource_dir).await?;
         let path = self
             .directory
             .join(format!(".slipstream-media-{}", Uuid::new_v4()));
