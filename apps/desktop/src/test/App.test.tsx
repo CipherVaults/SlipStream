@@ -1,4 +1,5 @@
 import { StrictMode } from "react";
+import { emit } from "@tauri-apps/api/event";
 import { clearMocks, mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -6,7 +7,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import { demo } from "../lib/demo";
 import { desktop } from "../lib/tauri";
-import type { TelemetryBatch, UpdateStatus } from "../types/ipc";
+import { DEFAULT_CHROMIUM_EXTENSION_ID, DEFAULT_FIREFOX_EXTENSION_ID } from "../types/ipc";
+import type { AppSettings, TelemetryBatch, ToolchainStatus, UpdateStatus } from "../types/ipc";
 
 const alpine = "Alpine_Cinema_4K_60fps.mp4";
 const ubuntu = "Ubuntu-26.04-desktop-amd64.iso";
@@ -14,6 +16,10 @@ const blender = "Blender_5.2_Studio_Assets.torrent";
 const symphony = "Symphony_Live_Master.flac";
 const pdf = "Design_System_Specs_2026.pdf";
 const mediaUrl = "https://example.org/watch?v=tokyo";
+const availableUpdate: UpdateStatus = {
+  available: true, current_version: "1.1.0", version: "1.1.1",
+  notes: "Improved download recovery.", pub_date: "2026-11-21 0:00:00.0 +00:00:00",
+};
 
 let pushTelemetry: (batch: TelemetryBatch) => void;
 let openPicker: (url: string | null) => void;
@@ -625,20 +631,29 @@ describe("appearance, settings and transfer dialogs", () => {
 
   it("shows the toolchain and installs and saves browser integration settings", async () => {
     const getTools = vi.spyOn(desktop, "getToolchainStatus");
+    const listBrowsers = vi.spyOn(desktop, "listBrowsers");
     const install = vi.spyOn(desktop, "installBrowserHosts").mockResolvedValue(["Chrome", "Firefox"]);
     const save = vi.spyOn(desktop, "saveSettings").mockResolvedValue();
     const hibernate = vi.spyOn(desktop, "hibernateToTray").mockResolvedValue();
     const user = await start();
     await user.click(screen.getByRole("button", { name: "Settings" }));
     const settings = dialog("Settings & Browser Integration");
-    expect(await settings.findByText(/yt-dlp .* FFmpeg/)).toBeVisible();
+    expect(await settings.findByText("yt-dlp", { exact: true })).toBeVisible();
     expect(getTools).toHaveBeenCalled();
+    const advanced = settings.getByText("Advanced: Manual Host & Extension IDs");
+    expect(advanced.closest("details")).not.toHaveAttribute("open");
+    expect(settings.getByLabelText("Chrome extension ID")).not.toBeVisible();
+    expect(settings.getByLabelText("Edge extension ID")).not.toBeVisible();
+    expect(settings.getByLabelText("Firefox extension ID")).not.toBeVisible();
+    await user.click(advanced);
+    expect(settings.getByLabelText("Edge extension ID")).toBeVisible();
     await user.type(settings.getByLabelText("Chrome extension ID"), "chrome-demo");
     await user.type(settings.getByLabelText("Firefox extension ID"), "firefox@demo.test");
-    await user.click(settings.getByRole("button", { name: "Install Browser Native Hosts" }));
+    await user.click(settings.getByRole("button", { name: "Re-register Native Hosts" }));
     expect(install).toHaveBeenCalledWith("chrome-demo", null, "firefox@demo.test");
     expect(await settings.findByText("Browser hosts installed for Chrome, Firefox.")).toBeVisible();
     expect(getTools).toHaveBeenCalledTimes(2);
+    expect(listBrowsers).toHaveBeenCalledTimes(2);
     await user.click(settings.getByRole("button", { name: "Hibernate Now" }));
     expect(hibernate).toHaveBeenCalledOnce();
     await user.selectOptions(settings.getByLabelText("Max connections"), "24");
@@ -652,6 +667,7 @@ describe("appearance, settings and transfer dialogs", () => {
   });
 
   it("shows About & Updates and blocks other settings actions while checking", async () => {
+    vi.spyOn(desktop, "getSettings").mockResolvedValue({ ...demo.getSettings(), update_mode: "manual" });
     let resolveCheck!: (status: UpdateStatus) => void;
     const check = vi.spyOn(desktop, "checkForUpdates").mockImplementation(
       () => new Promise<UpdateStatus>(resolve => { resolveCheck = resolve; }),
@@ -661,7 +677,7 @@ describe("appearance, settings and transfer dialogs", () => {
     const settings = dialog("Settings & Browser Integration");
     const about = within(settings.getByRole("region", { name: "About & Updates" }));
 
-    expect(about.getByText("SlipStream v1.0.0")).toBeVisible();
+    expect(about.getByText("SlipStream v1.1.0")).toBeVisible();
     expect(about.getByText("CipherVaults · Windows 10/11 · MIT License")).toBeVisible();
     expect(about.getByText("Signed NSIS Auto-Update (GitHub Releases)")).toBeVisible();
     await user.click(about.getByRole("button", { name: "Check for Updates" }));
@@ -670,17 +686,15 @@ describe("appearance, settings and transfer dialogs", () => {
     expect(settings.getByRole("button", { name: "Save Settings" })).toBeDisabled();
     expect(settings.getByRole("button", { name: "Cancel" })).toBeDisabled();
 
-    await act(async () => resolveCheck({ available: false, current_version: "1.0.0" }));
-    expect(about.getByRole("status")).toHaveTextContent("Up to date (v1.0.0).");
-    expect(about.queryByRole("button", { name: "Install & Restart" })).not.toBeInTheDocument();
+    await act(async () => resolveCheck({ available: false, current_version: "1.1.0" }));
+    expect(about.getByRole("status")).toHaveTextContent("Up to date (v1.1.0).");
+    expect(about.queryByRole("button", { name: "Install Update & Restart" })).not.toBeInTheDocument();
     expect(settings.getByRole("button", { name: "Save Settings" })).toBeEnabled();
   });
 
-  it("offers an available update with release details and invokes Install & Restart", async () => {
-    vi.spyOn(desktop, "checkForUpdates").mockResolvedValue({
-      available: true, current_version: "1.0.0", version: "1.1.0",
-      notes: "Improved download recovery.", pub_date: "2026-11-21 0:00:00.0 +00:00:00",
-    });
+  it("offers an available update with release details and invokes Install Update & Restart", async () => {
+    vi.spyOn(desktop, "getSettings").mockResolvedValue({ ...demo.getSettings(), update_mode: "manual" });
+    vi.spyOn(desktop, "checkForUpdates").mockResolvedValue(availableUpdate);
     const install = vi.spyOn(desktop, "installUpdate")
       .mockRejectedValueOnce(new Error("Update signature verification failed"))
       .mockResolvedValueOnce(true);
@@ -691,15 +705,244 @@ describe("appearance, settings and transfer dialogs", () => {
     const about = within(settings.getByRole("region", { name: "About & Updates" }));
 
     await user.click(about.getByRole("button", { name: "Check for Updates" }));
-    expect(about.getByRole("status")).toHaveTextContent("Update v1.1.0 available.");
+    expect(about.getByRole("status")).toHaveTextContent("Update v1.1.1 available.");
     expect(about.getByText("Improved download recovery.")).toBeVisible();
     expect(about.getByText("Released 2026-11-21")).toBeVisible();
-    await user.click(about.getByRole("button", { name: "Install & Restart" }));
+    await user.click(about.getByRole("button", { name: "Install Update & Restart" }));
     expect(await settings.findByRole("alert")).toHaveTextContent("Update signature verification failed");
-    await user.click(about.getByRole("button", { name: "Install & Restart" }));
+    await user.click(about.getByRole("button", { name: "Install Update & Restart" }));
     expect(install).toHaveBeenCalledTimes(2);
     expect(save).not.toHaveBeenCalled();
     expect(settings.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("waits for saved automatic mode, checks once under StrictMode, and stays quiet when offline", async () => {
+    let resolveSettings!: (settings: AppSettings) => void;
+    const load = vi.spyOn(desktop, "getSettings").mockImplementation(
+      () => new Promise<AppSettings>(resolve => { resolveSettings = resolve; }),
+    );
+    const check = vi.spyOn(desktop, "checkForUpdates").mockRejectedValue(new Error("Update server offline"));
+    render(<StrictMode><App /></StrictMode>);
+    await screen.findByRole("progressbar", { name: alpine + " progress" });
+    expect(load).toHaveBeenCalledOnce();
+    expect(check).not.toHaveBeenCalled();
+
+    await act(async () => resolveSettings({ ...demo.getSettings(), update_mode: "auto" }));
+    expect(check).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText("Update server offline")).not.toBeInTheDocument();
+  });
+
+  it("checks legacy settings automatically and shares the dismissible banner's update with Settings", async () => {
+    vi.spyOn(desktop, "getSettings").mockResolvedValue({ ...demo.getSettings(), update_mode: undefined });
+    const check = vi.spyOn(desktop, "checkForUpdates").mockResolvedValue(availableUpdate);
+    const user = await start();
+    const banner = await screen.findByRole("region", { name: "App update" });
+    expect(check).toHaveBeenCalledOnce();
+    expect(banner).toHaveTextContent("Update v1.1.1 available");
+    expect(within(banner).getByRole("button", { name: "Install Update" })).toBeEnabled();
+    await user.click(within(banner).getByRole("button", { name: "Details" }));
+    const settings = dialog("Settings & Browser Integration");
+    const about = within(settings.getByRole("region", { name: "About & Updates" }));
+    expect(about.getByLabelText("Update Checks")).toHaveFocus();
+    expect(about.getByLabelText("Update Checks")).toHaveValue("auto");
+    expect(about.getByText("Improved download recovery.")).toBeVisible();
+    await user.click(settings.getByRole("button", { name: "Cancel" }));
+    await user.click(within(banner).getByRole("button", { name: "Dismiss update banner" }));
+    expect(banner).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    const reopened = dialog("Settings & Browser Integration");
+    expect(reopened.getByRole("button", { name: "Install Update & Restart" })).toBeEnabled();
+    await user.click(reopened.getByRole("button", { name: "Check for Updates" }));
+    await user.click(reopened.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("region", { name: "App update" })).not.toBeInTheDocument();
+  });
+
+  it("skips startup checks in manual mode and saves update checks in both directions", async () => {
+    vi.spyOn(desktop, "getSettings").mockResolvedValue({ ...demo.getSettings(), update_mode: "manual" });
+    const check = vi.spyOn(desktop, "checkForUpdates");
+    const save = vi.spyOn(desktop, "saveSettings").mockResolvedValue();
+    const user = await start();
+    const openSettings = () => user.click(screen.getByRole("button", { name: "Settings" }));
+    await openSettings();
+    let settings = dialog("Settings & Browser Integration");
+    expect(settings.getByLabelText("Update Checks")).toHaveValue("manual");
+    expect(check).not.toHaveBeenCalled();
+
+    await user.selectOptions(settings.getByLabelText("Update Checks"), "auto");
+    await user.click(settings.getByRole("button", { name: "Save Settings" }));
+    expect(save).toHaveBeenLastCalledWith(expect.objectContaining({ update_mode: "auto" }));
+    await openSettings();
+    settings = dialog("Settings & Browser Integration");
+    expect(settings.getByLabelText("Update Checks")).toHaveValue("auto");
+    await user.selectOptions(settings.getByLabelText("Update Checks"), "manual");
+    await user.click(settings.getByRole("button", { name: "Save Settings" }));
+    expect(save).toHaveBeenLastCalledWith(expect.objectContaining({ update_mode: "manual" }));
+    expect(save).toHaveBeenCalledTimes(2);
+    expect(check).not.toHaveBeenCalled();
+  });
+
+  it("shows native update progress in the banner and Settings and clears it when installation settles", async () => {
+    let resolveInstall!: (installed: boolean) => void;
+    const install = vi.fn(() => new Promise<boolean>(resolve => { resolveInstall = resolve; }));
+    mockWindows("main");
+    mockIPC(cmd => {
+      if (cmd === "get_snapshot") return demo.snapshot();
+      if (cmd === "get_settings") return { ...demo.getSettings(), update_mode: "auto" };
+      if (cmd === "check_for_updates") return availableUpdate;
+      if (cmd === "get_toolchain_status") return demo.toolchain();
+      if (cmd === "list_browsers") return demo.listBrowsers();
+      if (cmd === "install_update") return install();
+      return undefined;
+    }, { shouldMockEvents: true });
+
+    const user = userEvent.setup();
+    const { unmount } = render(<App />);
+    try {
+      const banner = within(await screen.findByRole("region", { name: "App update" }));
+      await user.click(banner.getByRole("button", { name: "Install Update" }));
+      expect(install).toHaveBeenCalledOnce();
+      expect(banner.getByRole("button", { name: "Install Update" })).toBeDisabled();
+      await act(async () => emit("slipstream://update-progress", {
+        stage: "downloading", downloaded_bytes: 12_400_000, total_bytes: 29_500_000,
+      }));
+      expect(banner.getByText("Downloading… 42% (12.4 MB / 29.5 MB)")).toBeVisible();
+      await user.click(banner.getByRole("button", { name: "Details" }));
+      const settings = dialog("Settings & Browser Integration");
+      const about = within(settings.getByRole("region", { name: "About & Updates" }));
+      const progress = about.getByRole("progressbar", { name: "Update progress" });
+      expect(progress).toHaveProperty("value", 12_400_000 / 29_500_000);
+      expect(about.getByText("Downloading… 42% (12.4 MB / 29.5 MB)")).toBeVisible();
+      expect(about.getByRole("button", { name: "Update in progress…" })).toBeDisabled();
+      await act(async () => emit("slipstream://update-progress", { stage: "downloading", downloaded_bytes: 12_400_000 }));
+      expect(about.getByText("Downloading… 12.4 MB")).toBeVisible();
+      expect(progress).not.toHaveAttribute("value");
+      await act(async () => emit("slipstream://update-progress", { stage: "verifying", downloaded_bytes: 29_500_000 }));
+      expect(about.getByText("Verifying…")).toBeVisible();
+      await act(async () => emit("slipstream://update-progress", { stage: "installing", downloaded_bytes: 29_500_000 }));
+      expect(about.getByText("Installing…")).toBeVisible();
+      await act(async () => resolveInstall(false));
+      expect(about.queryByRole("progressbar")).not.toBeInTheDocument();
+      expect(about.getByRole("status")).toHaveTextContent("Up to date (v1.1.0).");
+      expect(screen.queryByRole("region", { name: "App update" })).not.toBeInTheDocument();
+    } finally {
+      unmount();
+      clearMocks();
+      Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+      Reflect.deleteProperty(window, "__TAURI_EVENT_PLUGIN_INTERNALS__");
+    }
+  });
+
+  it("detects tool versions and sources, updates yt-dlp, and reveals custom paths on demand", async () => {
+    const initial: ToolchainStatus = {
+      ...demo.toolchain(),
+      ytdlp_version: "2026.11.17", ytdlp_source: "bundled",
+      ffmpeg_version: "ffmpeg version 9.0 Copyright (c) the FFmpeg developers\nbuilt with clang",
+      ffmpeg_source: "system_path", ffprobe_version: "ffprobe version 9.0\nCopyright (c) the FFmpeg developers",
+      ffprobe_source: "custom",
+    };
+    vi.spyOn(desktop, "getToolchainStatus").mockResolvedValue(initial);
+    let resolveUpdate!: (status: ToolchainStatus) => void;
+    const update = vi.spyOn(desktop, "updateYtdlp")
+      .mockRejectedValueOnce(new Error("yt-dlp download failed"))
+      .mockImplementationOnce(() => new Promise<ToolchainStatus>(resolve => { resolveUpdate = resolve; }));
+    const user = await start();
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    const settings = dialog("Settings & Browser Integration");
+    const toolchain = within(settings.getByRole("region", { name: "Toolchain" }));
+    expect(await toolchain.findByText("yt-dlp")).toBeVisible();
+    for (const [name, version, source] of [
+      ["yt-dlp", "2026.11.17", "Bundled"], ["FFmpeg", "ffmpeg version 9.0", "System PATH"],
+      ["ffprobe", "ffprobe version 9.0", "Custom"],
+    ]) {
+      const tool = within(toolchain.getByText(name).closest("li")!);
+      expect(tool.getByText(version)).toBeVisible();
+      expect(tool.getByText(source)).toBeVisible();
+    }
+    expect(toolchain.queryByText(/Copyright|built with/)).not.toBeInTheDocument();
+    const advanced = toolchain.getByText("Advanced: Custom Paths");
+    expect(advanced.closest("details")).not.toHaveAttribute("open");
+    expect(toolchain.getByLabelText("yt-dlp path")).not.toBeVisible();
+    expect(toolchain.getByLabelText("FFmpeg path")).not.toBeVisible();
+    await user.click(advanced);
+    expect(toolchain.getByLabelText("yt-dlp path")).toBeVisible();
+    expect(toolchain.getByLabelText("FFmpeg path")).toBeVisible();
+
+    await user.click(toolchain.getByRole("button", { name: "Update yt-dlp" }));
+    expect(await settings.findByRole("alert")).toHaveTextContent("yt-dlp download failed");
+    await user.click(toolchain.getByRole("button", { name: "Update yt-dlp" }));
+    expect(toolchain.getByRole("button", { name: "Updating…" })).toBeDisabled();
+    await act(async () => resolveUpdate({
+      ...initial, ytdlp_version: "2026.11.22", ytdlp_source: "managed",
+      ffprobe_path: null, ffprobe_version: null, ffprobe_source: "missing",
+    }));
+    expect(update).toHaveBeenCalledTimes(2);
+    expect(toolchain.getByText("2026.11.22")).toBeVisible();
+    expect(toolchain.getByText("Managed")).toBeVisible();
+    expect(toolchain.getByText("Missing")).toBeVisible();
+    expect(toolchain.getByText("yt-dlp update completed.")).toBeVisible();
+    expect(settings.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("sets up individual browsers, shows the exact folder and ID, and copies setup values safely", async () => {
+    const browsers = demo.listBrowsers();
+    const list = vi.spyOn(desktop, "listBrowsers").mockImplementation(async () => browsers.map(browser => ({ ...browser })));
+    const tools = vi.spyOn(desktop, "getToolchainStatus");
+    const setup = vi.spyOn(desktop, "openBrowserExtensionSetup").mockImplementation(async (id, customId) => {
+      const browser = browsers.find(entry => entry.id === id)!;
+      browser.native_host_registered = true;
+      return {
+        browser_id: id, extension_id: customId || browser.extension_id, extension_dir: browser.bundled_extension_dir!,
+        extension_page_url: browser.extension_url, native_host_registered: true,
+        launched_browser: true, revealed_extension_dir: true, instructions: "",
+      };
+    });
+    const user = await start();
+    const write = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    const settings = dialog("Settings & Browser Integration");
+    const integration = within(settings.getByRole("region", { name: "Browser Integration" }));
+    const chrome = within(await integration.findByRole("article", { name: "Google Chrome" }));
+    for (const name of ["Google Chrome", "Microsoft Edge", "Brave", "Mozilla Firefox"]) {
+      const browser = within(integration.getByRole("article", { name }));
+      expect(browser.getByText(name === "Brave" ? "Not detected" : "Detected", { exact: true })).toBeVisible();
+      expect(browser.getByText("Host pending")).toBeVisible();
+    }
+    await user.click(chrome.getByRole("button", { name: "Add Extension for Google Chrome" }));
+    expect(setup).toHaveBeenCalledWith("chrome", null);
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(tools).toHaveBeenCalledTimes(2);
+    expect(chrome.getByText("Host ready")).toBeVisible();
+    expect(chrome.getByRole("button", { name: "Open Setup for Google Chrome" })).toBeEnabled();
+    let panel = within(integration.getByRole("region", { name: "Extension setup" }));
+    const chromiumFolder = "C:\\SlipStream\\extensions\\chromium";
+    expect(panel.getByText(chromiumFolder)).toBeVisible();
+    expect(panel.getByText(DEFAULT_CHROMIUM_EXTENSION_ID)).toBeVisible();
+    expect(panel.getByText("Developer mode")).toBeVisible();
+    expect(panel.getByText("Load unpacked")).toBeVisible();
+    await user.click(panel.getByRole("button", { name: "Copy Path" }));
+    expect(write).toHaveBeenLastCalledWith(chromiumFolder);
+    expect(panel.getByRole("status")).toHaveTextContent("Copied path");
+    await user.click(panel.getByRole("button", { name: "Copy ID" }));
+    expect(write).toHaveBeenLastCalledWith(DEFAULT_CHROMIUM_EXTENSION_ID);
+    expect(panel.getByRole("status")).toHaveTextContent("Copied ID");
+    write.mockRejectedValueOnce(new Error("Clipboard denied"));
+    await user.click(panel.getByRole("button", { name: "Copy Path" }));
+    expect(panel.getByRole("status")).toHaveTextContent("Select the path to copy it manually.");
+
+    await user.click(integration.getByRole("button", { name: "Add Extension for Mozilla Firefox" }));
+    expect(setup).toHaveBeenLastCalledWith("firefox", null);
+    panel = within(integration.getByRole("region", { name: "Extension setup" }));
+    expect(panel.getByText(DEFAULT_FIREFOX_EXTENSION_ID)).toBeVisible();
+    expect(panel.getByText("Load Temporary Add-on")).toBeVisible();
+    expect(panel.getByText("manifest.json")).toBeVisible();
+    await user.click(integration.getByText("Advanced: Manual Host & Extension IDs"));
+    await user.type(integration.getByLabelText("Firefox extension ID"), " custom@demo.test ");
+    await user.click(integration.getByRole("button", { name: "Open Setup for Mozilla Firefox" }));
+    expect(setup).toHaveBeenLastCalledWith("firefox", "custom@demo.test");
+    panel = within(integration.getByRole("region", { name: "Extension setup" }));
+    expect(panel.getByText("custom@demo.test")).toBeVisible();
   });
 
   it("refreshes an HTTP link with optional request fields, excludes Refresh URL on media, and reports checksum results", async () => {
@@ -865,6 +1108,8 @@ describe("appearance, settings and transfer dialogs", () => {
       if (cmd === "get_snapshot") return demo.snapshot();
       if (cmd === "get_settings") return backendSettings;
       if (cmd === "get_toolchain_status") return demo.toolchain();
+      if (cmd === "list_browsers") return demo.listBrowsers();
+      if (cmd === "check_for_updates") return demo.checkForUpdates();
       if (cmd === "save_settings") {
         const submitted = (args as { settings: typeof backendSettings }).settings;
         backendSettings = { ...submitted, default_download_dir: "D:\\Canonical\\Downloads" };
@@ -947,6 +1192,8 @@ describe("appearance, settings and transfer dialogs", () => {
     mockIPC(cmd => {
       if (cmd === "get_snapshot") return demo.snapshot();
       if (cmd === "get_toolchain_status") return demo.toolchain();
+      if (cmd === "list_browsers") return demo.listBrowsers();
+      if (cmd === "check_for_updates") return demo.checkForUpdates();
       if (cmd === "save_settings") return undefined;
       if (cmd === "get_settings") {
         getSettingsCalls++;

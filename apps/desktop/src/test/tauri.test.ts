@@ -3,6 +3,7 @@ import { clearMocks, mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SETTINGS, demo } from "../lib/demo";
 import { desktop, isTauri } from "../lib/tauri";
+import { DEFAULT_CHROMIUM_EXTENSION_ID, DEFAULT_FIREFOX_EXTENSION_ID } from "../types/ipc";
 
 const invoke = vi.fn();
 
@@ -54,7 +55,7 @@ describe("Tauri v2 adapter", () => {
     await desktop.installBrowserHosts("chrome", null, "firefox@example.org");
     await desktop.hibernateToTray();
 
-    const update = { available: true, current_version: "1.0.0", version: "1.1.0" };
+    const update = { available: true, current_version: "1.1.0", version: "1.1.1" };
     invoke.mockResolvedValueOnce(update).mockResolvedValueOnce(true);
     await expect(desktop.checkForUpdates()).resolves.toEqual(update);
     await expect(desktop.installUpdate()).resolves.toBe(true);
@@ -71,6 +72,57 @@ describe("Tauri v2 adapter", () => {
       ["get_toolchain_status", {}], ["install_browser_hosts", { chrome_id: "chrome", edge_id: null, firefox_id: "firefox@example.org" }],
       ["hibernate_to_tray", {}], ["check_for_updates", {}], ["install_update", {}],
     ]);
+  });
+
+  it("uses the native toolchain and browser commands with Tauri's camelCase setup keys", async () => {
+    useTauri();
+    const tools = demo.toolchain();
+    const browsers = demo.listBrowsers();
+    const setup = {
+      browser_id: "edge", extension_dir: "C:\\SlipStream\\extensions\\chromium",
+      extension_page_url: "edge://extensions/", extension_id: DEFAULT_CHROMIUM_EXTENSION_ID,
+      launched_browser: true, revealed_extension_dir: true, native_host_registered: true,
+      instructions: "Enable Developer mode and choose Load unpacked.",
+    };
+    invoke.mockResolvedValueOnce(tools).mockResolvedValueOnce(browsers).mockResolvedValueOnce(setup);
+    await expect(desktop.updateYtdlp()).resolves.toEqual(tools);
+    await expect(desktop.listBrowsers()).resolves.toEqual(browsers);
+    await expect(desktop.openBrowserExtensionSetup("edge")).resolves.toEqual(setup);
+    await desktop.openBrowserExtensionSetup("firefox", "custom@example.org");
+    expect(invoke.mock.calls).toEqual([
+      ["update_ytdlp", {}], ["list_browsers", {}],
+      ["open_browser_extension_setup", { browserId: "edge", customExtensionId: null }],
+      ["open_browser_extension_setup", { browserId: "firefox", customExtensionId: "custom@example.org" }],
+    ]);
+  });
+
+  it("subscribes to native update progress and removes the handler on cleanup", async () => {
+    useTauri();
+    const handler = vi.fn();
+    const unsubscribe = await desktop.onUpdateProgress(handler);
+    const progress = { stage: "downloading", downloaded_bytes: 42, total_bytes: 100 };
+    await emit("slipstream://update-progress", progress);
+    expect(handler).toHaveBeenCalledExactlyOnceWith(progress);
+    await unsubscribe();
+    await emit("slipstream://update-progress", { stage: "verifying", downloaded_bytes: 100 });
+    expect(handler).toHaveBeenCalledOnce();
+  });
+
+  it("keeps update progress optional outside Tauri and when native listening fails", async () => {
+    const handler = vi.fn();
+    expect(isTauri()).toBe(false);
+    const stopDemo = await desktop.onUpdateProgress(handler);
+    expect(() => stopDemo()).not.toThrow();
+    expect(invoke).not.toHaveBeenCalled();
+    mockIPC(invoke);
+    expect(isTauri()).toBe(true);
+    invoke.mockRejectedValueOnce(new Error("Event plugin unavailable"));
+    const stopNative = await desktop.onUpdateProgress(handler);
+    expect(() => stopNative()).not.toThrow();
+    expect(invoke).toHaveBeenCalledWith("plugin:event|listen", expect.objectContaining({
+      event: "slipstream://update-progress",
+    }));
+    expect(handler).not.toHaveBeenCalled();
   });
 
   it("unwraps telemetry and { url: string | null } picker payloads and returns event cleanup", async () => {
@@ -128,9 +180,43 @@ describe("Tauri v2 adapter", () => {
 describe("browser demo", () => {
   it("reports the current version and has no updates to install", async () => {
     await expect(desktop.checkForUpdates()).resolves.toEqual({
-      available: false, current_version: "1.0.0", version: null, notes: null, pub_date: null,
+      available: false, current_version: "1.1.0", version: null, notes: null, pub_date: null,
     });
     await expect(desktop.installUpdate()).resolves.toBe(false);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("tracks demo tool updates and per-browser native host registration", async () => {
+    const previous = demo.getSettings();
+    expect(await desktop.getToolchainStatus()).toMatchObject({
+      ytdlp_version: "2026.11.17", ytdlp_source: "bundled", ffmpeg_source: "bundled",
+      ffprobe_path: "C:\\SlipStream\\tools\\ffprobe.exe", ffprobe_source: "bundled", native_hosts_installed: false,
+    });
+    expect(await desktop.updateYtdlp()).toMatchObject({ ytdlp_version: "2026.11.22", ytdlp_source: "managed" });
+    try {
+      await desktop.saveSettings({ ...previous, ytdlp_path: "C:\\Custom\\yt-dlp.exe", ffmpeg_path: "C:\\Custom\\ffmpeg.exe" });
+      expect(await desktop.getToolchainStatus()).toMatchObject({
+        ytdlp_path: "C:\\Custom\\yt-dlp.exe", ytdlp_source: "custom", ffmpeg_source: "custom",
+      });
+    } finally {
+      await desktop.saveSettings(previous);
+    }
+    expect(await desktop.listBrowsers()).toMatchObject([
+      { id: "chrome", extension_id: DEFAULT_CHROMIUM_EXTENSION_ID, native_host_registered: false },
+      { id: "edge", extension_id: DEFAULT_CHROMIUM_EXTENSION_ID, native_host_registered: false },
+      { id: "brave", extension_id: DEFAULT_CHROMIUM_EXTENSION_ID, installed: false, native_host_registered: false },
+      { id: "firefox", extension_id: DEFAULT_FIREFOX_EXTENSION_ID, native_host_registered: false },
+    ]);
+    expect(await desktop.openBrowserExtensionSetup("brave", "  custom-id  ")).toMatchObject({
+      browser_id: "brave", extension_id: "custom-id", extension_page_url: "brave://extensions/",
+      native_host_registered: true, launched_browser: true, revealed_extension_dir: true,
+    });
+    const browsers = await desktop.listBrowsers();
+    expect(browsers.find(browser => browser.id === "brave")).toMatchObject({
+      installed: true, native_host_registered: true, extension_id: "custom-id",
+    });
+    expect(browsers.filter(browser => browser.native_host_registered)).toHaveLength(1);
+    expect(await desktop.getToolchainStatus()).toMatchObject({ native_hosts_installed: true });
     expect(invoke).not.toHaveBeenCalled();
   });
 
