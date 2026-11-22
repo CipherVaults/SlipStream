@@ -223,6 +223,72 @@ pub enum PostQueueAction {
     Shutdown,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateMode {
+    #[default]
+    Auto,
+    Manual,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateProgressStage {
+    Downloading,
+    Verifying,
+    Installing,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateProgress {
+    pub stage: UpdateProgressStage,
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSource {
+    Custom,
+    Managed,
+    Bundled,
+    SystemPath,
+    #[default]
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserKind {
+    Chrome,
+    Edge,
+    Brave,
+    Firefox,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserStatus {
+    pub id: BrowserKind,
+    pub name: String,
+    pub installed: bool,
+    pub native_host_registered: bool,
+    pub extension_url: String,
+    pub bundled_extension_dir: Option<String>,
+    pub extension_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserSetupResult {
+    pub browser_id: BrowserKind,
+    pub launched_browser: bool,
+    pub revealed_extension_dir: bool,
+    pub native_host_registered: bool,
+    pub extension_dir: String,
+    pub extension_page_url: String,
+    pub extension_id: String,
+    pub instructions: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdateStatus {
     pub available: bool,
@@ -245,6 +311,8 @@ pub struct AppSettings {
     pub monitor_clipboard: bool,
     pub ytdlp_path: Option<String>,
     pub ffmpeg_path: Option<String>,
+    #[serde(default)]
+    pub update_mode: UpdateMode,
 }
 
 impl Default for AppSettings {
@@ -261,6 +329,7 @@ impl Default for AppSettings {
             monitor_clipboard: false,
             ytdlp_path: None,
             ffmpeg_path: None,
+            update_mode: UpdateMode::Auto,
         }
     }
 }

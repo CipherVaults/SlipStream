@@ -1,4 +1,6 @@
 export const NATIVE_HOST_NAME = "com.ciphervaults.slipstream";
+export const DEFAULT_CHROMIUM_EXTENSION_ID = "nikdbkenglojniombimjdkneanmponcp";
+export const DEFAULT_FIREFOX_EXTENSION_ID = "slipstream@ciphervaults.com";
 
 export type TransferKind = "http" | "media" | "torrent";
 
@@ -139,6 +141,37 @@ export interface AddTorrentRequest {
 
 export type ThemeMode = "system" | "dark" | "light";
 export type AccentMode = "blue" | "mono";
+export type UpdateMode = "auto" | "manual";
+export type UpdateProgressStage = "downloading" | "verifying" | "installing";
+export type ToolSource = "custom" | "managed" | "bundled" | "system_path" | "missing";
+export type BrowserKind = "chrome" | "edge" | "brave" | "firefox";
+
+export interface UpdateProgress {
+  stage: UpdateProgressStage;
+  downloaded_bytes: number;
+  total_bytes?: number | null;
+}
+
+export interface BrowserStatus {
+  id: BrowserKind;
+  name: string;
+  installed: boolean;
+  native_host_registered: boolean;
+  extension_url: string;
+  bundled_extension_dir: string | null;
+  extension_id: string;
+}
+
+export interface BrowserSetupResult {
+  browser_id: BrowserKind;
+  launched_browser: boolean;
+  revealed_extension_dir: boolean;
+  native_host_registered: boolean;
+  extension_dir: string;
+  extension_page_url: string;
+  extension_id: string;
+  instructions: string;
+}
 
 export interface UpdateStatus {
   available: boolean;
@@ -160,6 +193,7 @@ export interface AppSettings {
   monitor_clipboard: boolean;
   ytdlp_path: string | null;
   ffmpeg_path: string | null;
+  update_mode?: UpdateMode;
 }
 
 export type NativeBridgeRequest =

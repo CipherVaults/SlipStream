@@ -3,6 +3,8 @@ use slipstream_protocol::NATIVE_HOST_NAME;
 use std::{io, path::Path};
 
 pub const DEFAULT_FIREFOX_ID: &str = "slipstream@ciphervaults.com";
+pub const DEFAULT_CHROMIUM_EXTENSION_ID: &str = "nikdbkenglojniombimjdkneanmponcp";
+pub const DEFAULT_CHROMIUM_ORIGIN: &str = "chrome-extension://nikdbkenglojniombimjdkneanmponcp/";
 
 #[derive(Debug, Clone, Copy)]
 pub enum Browser {
