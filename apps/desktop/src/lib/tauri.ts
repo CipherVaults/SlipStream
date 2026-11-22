@@ -3,8 +3,9 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview, type DragDropEvent } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type {
-  AddHttpDownloadRequest, AddMediaDownloadRequest, AddTorrentRequest, AppSettings, MediaProbeResult,
-  RefreshDownloadUrlRequest, TelemetryBatch, ToolchainStatus, TorrentFileEntry, UpdateStatus,
+  AddHttpDownloadRequest, AddMediaDownloadRequest, AddTorrentRequest, AppSettings, BrowserKind,
+  BrowserSetupResult, BrowserStatus, MediaProbeResult, RefreshDownloadUrlRequest, TelemetryBatch,
+  ToolchainStatus, TorrentFileEntry, UpdateProgress, UpdateStatus,
 } from "../types/ipc";
 import { demo } from "./demo";
 
@@ -48,6 +49,11 @@ export const desktop = {
   getSettings: () => command<AppSettings>("get_settings", undefined, demo.getSettings),
   saveSettings: (settings: AppSettings) => command<void>("save_settings", { settings }, () => demo.saveSettings(settings)),
   getToolchainStatus: () => command<ToolchainStatus>("get_toolchain_status", undefined, demo.toolchain),
+  updateYtdlp: () => command<ToolchainStatus>("update_ytdlp", undefined, demo.updateYtdlp),
+  listBrowsers: () => command<BrowserStatus[]>("list_browsers", undefined, demo.listBrowsers),
+  openBrowserExtensionSetup: (browserId: BrowserKind, customExtensionId?: string | null) =>
+    command<BrowserSetupResult>("open_browser_extension_setup", { browserId, customExtensionId: customExtensionId ?? null },
+      () => demo.openBrowserExtensionSetup(browserId, customExtensionId)),
   installBrowserHosts: (chrome_id: string | null, edge_id: string | null, firefox_id: string | null) =>
     command<string[]>("install_browser_hosts", { chrome_id, edge_id, firefox_id },
       () => demo.installHosts([chrome_id, edge_id, firefox_id])),
@@ -55,6 +61,16 @@ export const desktop = {
   checkForUpdates: () => command<UpdateStatus>("check_for_updates", undefined, demo.checkForUpdates),
   installUpdate: () => command<boolean>("install_update", undefined, demo.installUpdate),
 
+  async onUpdateProgress(handler: (progress: UpdateProgress) => void) {
+    if (isTauri()) {
+      try {
+        return await listen<UpdateProgress>("slipstream://update-progress", event => handler(event.payload));
+      } catch {
+        // Updates remain usable when the event plugin is unavailable.
+      }
+    }
+    return () => {};
+  },
   async onTelemetry(handler: (batch: TelemetryBatch) => void) {
     return isTauri() ? listen<TelemetryBatch>("slipstream://telemetry", event => handler(event.payload))
       : demo.listenTelemetry(handler);

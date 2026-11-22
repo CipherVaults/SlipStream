@@ -383,16 +383,59 @@ html[data-theme="light"] .sheet-card {
 .check-row input, .file-option input { accent-color: var(--dialog-accent, var(--accent)); }
 .settings-sheet { width: 648px; }
 .dialog-symbol { color: var(--dialog-accent); flex-shrink: 0; }
-.settings-group { border: 1px solid var(--dialog-border); padding: 9px 11px; border-radius: 8px; display: grid; gap: 8px; }
-.settings-heading { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 650; }
+.settings-group { border: 1px solid var(--dialog-border); padding: 12px; border-radius: 9px; display: grid; gap: 10px; }
+.settings-heading { display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 650; }
+.settings-section-header { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .settings-switches { display: flex; gap: 8px 14px; flex-wrap: wrap; align-items: center; }
 .settings-switches .toggle-item { min-height: 29px; }
+.tool-list { list-style: none; margin: 0; padding: 0; }
+.tool-row {
+  display: grid;
+  grid-template-columns: 5em minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-top: 1px solid var(--dialog-border);
+}
+.tool-version { color: var(--dialog-muted); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.settings-advanced { border-top: 1px solid var(--dialog-border); padding-top: 8px; }
+.settings-advanced > summary { width: fit-content; color: var(--dialog-muted); cursor: pointer; }
+.settings-advanced > summary:hover { color: var(--dialog-text); }
+.settings-advanced > :not(summary) { margin-top: 8px; }
+.browser-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.browser-card {
+  display: grid;
+  justify-items: start;
+  gap: 7px;
+  padding: 10px;
+  border: 1px solid var(--dialog-border);
+  border-radius: 8px;
+  background: var(--dialog-raised);
+}
+.browser-status { display: flex; flex-wrap: wrap; gap: 5px; }
+.browser-status .badge { border-radius: 999px; }
 .browser-fields { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.integration-status { display: flex; justify-content: space-between; align-items: center; gap: 7px; }
-.integration-status span { display: flex; align-items: center; gap: 4px; }
-.integration-status .integrity-ok { color: var(--green); }
+.browser-setup {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 11px;
+  border: 1px solid var(--dialog-border-strong);
+  border-radius: 8px;
+  background: var(--dialog-input);
+}
+.browser-setup-values { display: grid; gap: 4px; margin: 0; }
+.browser-setup-values dt { color: var(--dialog-muted); font-size: 11.5px; }
+.browser-setup-values dd { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 0; }
+.browser-setup code { overflow-wrap: anywhere; user-select: text; }
+.browser-steps { list-style: decimal; margin: 0; padding-left: 19px; }
+.browser-steps li + li { margin-top: 4px; }
+.clipboard-fallback { position: fixed; top: 0; left: 0; opacity: 0; pointer-events: none; }
 .settings-about { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
 .settings-update-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+.settings-update-mode, .settings-update-progress { display: grid; gap: 5px; }
+.settings-update-mode .field { width: min(100%, 240px); }
+.settings-update-progress progress { width: 100%; height: 7px; accent-color: var(--dialog-accent); }
 .settings-update-notes { white-space: pre-wrap; overflow-wrap: anywhere; }
 .compact-sheet { width: 460px; }
 .dialog-filename { color: var(--dialog-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -418,4 +461,7 @@ html[data-theme="light"] .sheet-card {
   .sheet-card { padding: 14px; }
   .format-right { gap: 3px; }
   .browser-fields { grid-template-columns: 1fr; }
+}
+@media (max-width: 360px) {
+  .browser-cards { grid-template-columns: 1fr; }
 }

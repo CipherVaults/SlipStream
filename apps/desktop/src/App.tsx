@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState, type DragEvent } from "react"
 import { AddDialog, type AddSeed } from "./components/AddDialog";
 import { Inspector, type TorrentFilesEntry } from "./components/Inspector";
 import { Palette, type QuickCommand } from "./components/Palette";
-import { SettingsDialog, type SettingsLoadState } from "./components/SettingsDialog";
+import { formatUpdateProgress, SettingsDialog, type SettingsLoadState } from "./components/SettingsDialog";
 import { Sidebar, Toolbar, matchesStatus, matchesView, type StatusFilter, type View } from "./components/Shell";
 import { TransferDialog } from "./components/TransferDialog";
 import { TransferList, type OnTransferAction } from "./components/TransferList";
@@ -11,9 +11,9 @@ import { IconButton } from "./components/ui";
 import { DEFAULT_SETTINGS } from "./lib/demo";
 import { desktop, isTauri } from "./lib/tauri";
 import { errorMessage, isDownloadSource, isRemoteTorrentUrl, isRunning, isTorrentSource, MB, SPEED_CAP } from "./lib/transfers";
-import type { AppSettings, TelemetryBatch, TorrentFileEntry, TransferSnapshot } from "./types/ipc";
+import type { AppSettings, TelemetryBatch, TorrentFileEntry, TransferSnapshot, UpdateProgress, UpdateStatus } from "./types/ipc";
 
-type Overlay = { type: "add"; seed: AddSeed; key: number } | { type: "settings" } | { type: "palette" }
+type Overlay = { type: "add"; seed: AddSeed; key: number } | { type: "settings"; focusUpdates?: boolean } | { type: "palette" }
   | { type: "refresh" | "verify"; transfer: TransferSnapshot };
 type Notice = { tone: "ok" | "error"; message: string };
 type Unsubscribe = () => void | Promise<void>;
@@ -61,6 +61,13 @@ export default function App() {
   const settingsQueue = useRef(Promise.resolve());
   const settingsErrorMessagesRef = useRef<Set<string>>(new Set());
   const mountedRef = useRef(true);
+  const startupUpdateChecked = useRef(false);
+  const updateCheckSequence = useRef(0);
+  const [updateInfo, setUpdateInfo] = useState<UpdateStatus>();
+  const [updateBannerDismissed, setUpdateBannerDismissed] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(null);
+  const [updateInstalling, setUpdateInstalling] = useState(false);
+  const updateInstallLock = useRef(false);
   const [batch, setBatch] = useState<TelemetryBatch | null>(null);
   const latest = useRef<TelemetryBatch | null>(null);
   const eventVersion = useRef(0);
@@ -115,6 +122,35 @@ export default function App() {
   const showError = useCallback((error: unknown) => setNotice({ tone: "error", message: errorMessage(error) }), []);
   const notify = (message: string) => setNotice({ tone: "ok", message });
 
+  useEffect(() => {
+    setUpdateBannerDismissed(false);
+  }, [updateInfo?.version]);
+
+  const checkForUpdates = useCallback(async () => {
+    const sequence = ++updateCheckSequence.current;
+    const result = await desktop.checkForUpdates();
+    if (mountedRef.current && sequence === updateCheckSequence.current) setUpdateInfo(result);
+  }, []);
+
+  async function installUpdate() {
+    if (updateInstallLock.current) return;
+    updateInstallLock.current = true;
+    updateCheckSequence.current++;
+    setUpdateInstalling(true);
+    setUpdateProgress(null);
+    try {
+      if (!await desktop.installUpdate() && mountedRef.current) {
+        setUpdateInfo(previous => previous && { available: false, current_version: previous.current_version });
+      }
+    } finally {
+      updateInstallLock.current = false;
+      if (mountedRef.current) {
+        setUpdateProgress(null);
+        setUpdateInstalling(false);
+      }
+    }
+  }
+
   const bumpTorrentGen = useCallback((transferId: string) => {
     const nextGen = (torrentGenRef.current.get(transferId) ?? 0) + 1;
     torrentGenRef.current.set(transferId, nextGen);
@@ -159,6 +195,10 @@ export default function App() {
           if (trackedErrors.size > 0) {
             setNotice(current => current?.tone === "error" && trackedErrors.has(current.message) ? undefined : current);
           }
+          if (!startupUpdateChecked.current) {
+            startupUpdateChecked.current = true;
+            if ((next.update_mode ?? "auto") === "auto") void checkForUpdates().catch(() => {});
+          }
         }
         return next;
       }).catch(error => {
@@ -173,7 +213,7 @@ export default function App() {
       });
     }
     return settingsLoadRef.current;
-  }, []);
+  }, [checkForUpdates]);
 
   const acceptBatch = useCallback((next: TelemetryBatch) => {
     if (latest.current && Date.parse(next.timestamp) < Date.parse(latest.current.timestamp)) return;
@@ -384,13 +424,13 @@ export default function App() {
     let cancelled = false;
     const cleanup: Unsubscribe[] = [];
     const report = (error: unknown) => { if (!cancelled) showError(error); };
-    async function connect(listener: Promise<Unsubscribe>) {
+    async function connect(listener: Promise<Unsubscribe>, onError = report) {
       try {
         const stop = await listener;
         if (!cancelled) cleanup.push(stop);
         else stopSafely(stop);
       } catch (error) {
-        report(error);
+        onError(error);
       }
     }
     void connect(desktop.onTelemetry(next => {
@@ -403,6 +443,9 @@ export default function App() {
     void connect(desktop.onOpenPicker(url => {
       if (!cancelled) openAdd({ url: url ?? undefined, autoProbe: Boolean(url) }, true);
     }));
+    void connect(desktop.onUpdateProgress(progress => {
+      if (!cancelled && updateInstallLock.current) setUpdateProgress(progress);
+    }), () => {});
     void connect(desktop.onFileDrop(event => {
       if (cancelled) return;
       if (event.type === "enter") setDragging(event.paths.some(isTorrentSource));
@@ -622,6 +665,22 @@ export default function App() {
           theme={theme} accent={settings.accent} toggleTheme={toggleTheme} toggleAccent={toggleAccent}
           openAdd={() => openAdd()} openPalette={openPalette} windowAction={action => void perform(desktop[action])}
           submitSearch={() => { if (isDownloadSource(search.trim())) openSource(search.trim()); }} />
+        {updateInfo?.available && updateInfo.version && !updateBannerDismissed &&
+          <section className="update-banner" aria-label="App update">
+            <Download size={16} aria-hidden="true" />
+            <div className="update-banner-copy" role="status">
+              <strong>Update v{updateInfo.version} available</strong>
+              {updateInstalling && <span>{updateProgress ? formatUpdateProgress(updateProgress) : "Preparing update…"}</span>}
+            </div>
+            <div className="update-banner-actions">
+              <button type="button" className="btn-ghost form-button"
+                onClick={() => commitOverlay({ type: "settings", focusUpdates: true })}>Details</button>
+              <button type="button" className="btn-primary form-button" disabled={updateInstalling}
+                onClick={() => void perform(installUpdate)}>Install Update</button>
+              <IconButton className="folder-ghost" label="Dismiss update banner"
+                onClick={() => setUpdateBannerDismissed(true)}><X size={14} /></IconButton>
+            </div>
+          </section>}
         <div className="workspace-body">
           <TransferList items={items} selected={selected?.id} setSelected={id => { setSelectedId(id); setInspectorOpen(true); }}
             onAction={onTransferAction} view={view} preview={preview} loading={!batch && !notice} />
@@ -654,6 +713,8 @@ export default function App() {
       }} />}
     {overlay?.type === "settings" && <SettingsDialog settings={{ ...settings, global_speed_limit_bps: speedLimit }}
       loadState={settingsLoadState} loadError={settingsError} onRetryLoad={() => void loadSettings().catch(() => {})}
+      focusUpdates={overlay.focusUpdates} updateInfo={updateInfo} updateProgress={updateProgress} updateInstalling={updateInstalling}
+      onCheckForUpdates={checkForUpdates} onInstallUpdate={installUpdate}
       onClose={closeDialog} onBusyChange={updateBusy} onHibernate={hibernate} onSave={async patch => {
         await enqueueSettings(async () => {
           const next = { ...settingsRef.current, ...patch };

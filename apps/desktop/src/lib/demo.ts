@@ -1,6 +1,8 @@
 import { version } from "../../package.json";
+import { DEFAULT_CHROMIUM_EXTENSION_ID, DEFAULT_FIREFOX_EXTENSION_ID } from "../types/ipc";
 import type {
-  AddHttpDownloadRequest, AddMediaDownloadRequest, AddTorrentRequest, AppSettings, MediaFormatOption,
+  AddHttpDownloadRequest, AddMediaDownloadRequest, AddTorrentRequest, AppSettings, BrowserKind,
+  BrowserSetupResult, BrowserStatus, MediaFormatOption,
   RefreshDownloadUrlRequest, SegmentSnapshot, TelemetryBatch, ToolchainStatus, TorrentFileEntry, TransferSnapshot, UpdateStatus,
 } from "../types/ipc";
 import { MB, SEGMENT_COUNT, isHttpUrl, isRunning, ratio, sourceName } from "./transfers";
@@ -9,6 +11,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   theme: "dark", accent: "blue", default_download_dir: "", default_connections: 16,
   global_speed_limit_bps: null, max_concurrent_downloads: 4, auto_defender_scan: true,
   close_to_tray_hibernate: true, monitor_clipboard: false, ytdlp_path: null, ffmpeg_path: null,
+  update_mode: "auto",
 };
 
 const demoFolder = "D:\\Downloads";
@@ -98,6 +101,40 @@ const rates = new Map(transfers.map(transfer => [transfer.id, [
 ]] as const));
 let settings: AppSettings = { ...DEFAULT_SETTINGS, default_download_dir: demoFolder };
 let installed = false;
+let managedYtdlp = false;
+const registeredHosts = new Map<BrowserKind, string>();
+const browsers = {
+  chrome: { name: "Google Chrome", installed: true, extension_url: "chrome://extensions/" },
+  edge: { name: "Microsoft Edge", installed: true, extension_url: "edge://extensions/" },
+  brave: { name: "Brave", installed: false, extension_url: "brave://extensions/" },
+  firefox: { name: "Mozilla Firefox", installed: true, extension_url: "about:debugging#/runtime/this-firefox" },
+};
+const browserIds = ["chrome", "edge", "brave", "firefox"] as const;
+const manualBrowserIds = ["chrome", "edge", "firefox"] as const;
+
+function defaultExtensionId(browser: BrowserKind) {
+  return browser === "firefox" ? DEFAULT_FIREFOX_EXTENSION_ID : DEFAULT_CHROMIUM_EXTENSION_ID;
+}
+
+function extensionDirectory(browser: BrowserKind) {
+  return "C:\\SlipStream\\extensions\\" + (browser === "firefox" ? "firefox" : "chromium");
+}
+
+function toolchain(): ToolchainStatus {
+  return {
+    ytdlp_path: settings.ytdlp_path || (managedYtdlp
+      ? "C:\\SlipStream\\managed\\yt-dlp.exe" : "C:\\SlipStream\\tools\\yt-dlp.exe"),
+    ytdlp_version: managedYtdlp ? "2026.11.22" : "2026.11.17",
+    ytdlp_source: settings.ytdlp_path ? "custom" : managedYtdlp ? "managed" : "bundled",
+    ffmpeg_path: settings.ffmpeg_path || "C:\\SlipStream\\tools\\ffmpeg.exe",
+    ffmpeg_version: "9.0",
+    ffmpeg_source: settings.ffmpeg_path ? "custom" : "bundled",
+    ffprobe_path: "C:\\SlipStream\\tools\\ffprobe.exe",
+    ffprobe_version: "9.0",
+    ffprobe_source: "bundled",
+    native_hosts_installed: installed,
+  };
+}
 
 const seededFormats: MediaFormatOption[] = [
   makeFormat("401", "2160p 4K · 60fps", "mp4", 2160, "AV1", "Opus", 1480),
@@ -329,15 +366,44 @@ export const demo = {
     return { available: false, current_version: version, version: null, notes: null, pub_date: null };
   },
   installUpdate() { return false; },
-  toolchain(): ToolchainStatus {
+  toolchain,
+  updateYtdlp(): ToolchainStatus {
+    managedYtdlp = true;
+    return toolchain();
+  },
+  listBrowsers(): BrowserStatus[] {
+    return browserIds.map(id => ({
+      id,
+      ...browsers[id],
+      native_host_registered: registeredHosts.has(id),
+      bundled_extension_dir: extensionDirectory(id),
+      extension_id: registeredHosts.get(id) ?? defaultExtensionId(id),
+    }));
+  },
+  openBrowserExtensionSetup(browserId: BrowserKind, customExtensionId?: string | null): BrowserSetupResult {
+    const extensionId = customExtensionId?.trim() || defaultExtensionId(browserId);
+    installed = true;
+    browsers[browserId].installed = true;
+    registeredHosts.set(browserId, extensionId);
     return {
-      ytdlp_path: settings.ytdlp_path ?? "C:\\SlipStream\\tools\\yt-dlp.exe", ytdlp_version: "2026.11.17",
-      ffmpeg_path: settings.ffmpeg_path ?? "C:\\SlipStream\\tools\\ffmpeg.exe", ffmpeg_version: "9.0",
-      native_hosts_installed: installed,
+      browser_id: browserId,
+      launched_browser: true,
+      revealed_extension_dir: true,
+      native_host_registered: true,
+      extension_dir: extensionDirectory(browserId),
+      extension_page_url: browsers[browserId].extension_url,
+      extension_id: extensionId,
+      instructions: browserId === "firefox"
+        ? "Choose Load Temporary Add-on and select manifest.json in the extension folder."
+        : "Enable Developer mode, choose Load unpacked, and select the extension folder.",
     };
   },
   installHosts(ids: Array<string | null>) {
     installed = true;
+    manualBrowserIds.forEach((browser, index) => {
+      const id = ids[index]?.trim();
+      if (id || browser === "firefox") registeredHosts.set(browser, id || defaultExtensionId(browser));
+    });
     return ["Chrome", "Edge", "Firefox"].filter((_, index) => Boolean(ids[index]));
   },
 };
