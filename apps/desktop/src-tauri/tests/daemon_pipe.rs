@@ -233,6 +233,7 @@ fn options(pipe: &str, registry_key: &str) -> DaemonOptions {
         pipe_name: Some(pipe.into()),
         allow_loopback: true,
         registry_base_key: Some(registry_key.into()),
+        resource_dir: None,
         torrent: TorrentManagerConfig {
             enable_dht: false,
             enable_trackers: false,

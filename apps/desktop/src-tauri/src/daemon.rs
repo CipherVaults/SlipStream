@@ -74,6 +74,7 @@ pub struct DaemonOptions {
     pub pipe_name: Option<String>,
     pub allow_loopback: bool,
     pub registry_base_key: Option<String>,
+    pub resource_dir: Option<PathBuf>,
     pub torrent: TorrentManagerConfig,
 }
 
@@ -92,6 +93,7 @@ struct Picker {
 pub struct AppState {
     data_dir: PathBuf,
     registry_base_key: String,
+    resource_dir: Option<PathBuf>,
     allow_loopback: bool,
     ui: Arc<dyn UiBridge>,
     engine: DownloadEngine,
@@ -185,6 +187,7 @@ impl AppState {
         let state = Arc::new(Self {
             data_dir,
             registry_base_key,
+            resource_dir: options.resource_dir,
             allow_loopback: options.allow_loopback,
             ui,
             engine,
@@ -251,6 +254,10 @@ impl AppState {
 
     pub fn registry_base_key(&self) -> &str {
         &self.registry_base_key
+    }
+
+    pub(crate) fn resource_dir(&self) -> Option<&Path> {
+        self.resource_dir.as_deref()
     }
 
     pub fn settings(&self) -> AppSettings {
@@ -413,7 +420,7 @@ impl AppState {
 
     pub async fn probe_media(&self, url: &str) -> Result<MediaProbeResult> {
         let (url, playlist) = validate_media_url(url, self.allow_loopback)?;
-        let tools = discover_media_toolchain(self.settings()).await?;
+        let tools = discover_media_toolchain(self.settings(), self.resource_dir.clone()).await?;
         probe_url(&tools, &url, ProbeOptions { playlist })
             .await
             .map_err(message)
@@ -437,7 +444,8 @@ impl AppState {
             .map_err(message)?;
         let job = Arc::new(MediaJob::new(request, directory)?);
         let id = job.snapshot().id;
-        job.start(settings, self.scans.clone()).await?;
+        job.start(settings, self.resource_dir.clone(), self.scans.clone())
+            .await?;
         self.media.write().unwrap().insert(id.clone(), job);
         Ok(id)
     }
@@ -525,7 +533,12 @@ impl AppState {
         if self.http_snapshot(id).is_some() {
             self.engine.resume_transfer(id).await.map_err(message)?;
         } else if let Some(job) = self.media_job(id) {
-            job.start(self.settings(), self.scans.clone()).await?;
+            job.start(
+                self.settings(),
+                self.resource_dir.clone(),
+                self.scans.clone(),
+            )
+            .await?;
         } else {
             self.torrent
                 .read()
@@ -672,7 +685,12 @@ impl AppState {
     }
 
     pub async fn get_toolchain_status(&self) -> ToolchainStatus {
-        toolchain_status(&self.settings(), &self.registry_base_key).await
+        toolchain_status(
+            &self.settings(),
+            &self.registry_base_key,
+            self.resource_dir(),
+        )
+        .await
     }
 
     pub async fn show_main_window(&self) -> Result<()> {
@@ -1434,6 +1452,7 @@ mod tests {
                 pipe_name: Some(pipe),
                 allow_loopback: true,
                 registry_base_key: Some(reg.0.clone()),
+                resource_dir: None,
                 torrent: TorrentManagerConfig {
                     enable_dht: false,
                     enable_trackers: false,

@@ -314,7 +314,10 @@ pub(crate) fn run() {
             commands::get_settings,
             commands::save_settings,
             commands::get_toolchain_status,
+            commands::update_ytdlp,
             commands::install_browser_hosts,
+            commands::list_browsers,
+            commands::open_browser_extension_setup,
             commands::hibernate_to_tray,
             commands::check_for_updates,
             commands::install_update,
@@ -340,12 +343,31 @@ pub(crate) fn run() {
         .setup(|app| {
             let ui = Arc::new(DesktopUi::new(app.handle().clone()));
             let data_dir = slipstream_native_host::token::local_app_directory()?;
+            let resource_dir = app.path().resource_dir().ok();
             let state = tauri::async_runtime::block_on(AppState::start(
                 data_dir,
                 ui.clone(),
-                DaemonOptions::default(),
+                DaemonOptions {
+                    resource_dir,
+                    ..DaemonOptions::default()
+                },
             ))
             .map_err(io::Error::other)?;
+            #[cfg(not(test))]
+            if let Some(dir) = state.resource_dir() {
+                if let Ok(executable) = crate::tools::native_host_executable(Some(dir)) {
+                    if let Err(error) = crate::tools::install_browser_hosts_into(
+                        state.registry_base_key(),
+                        &state.data_dir().join("native-messaging"),
+                        &executable,
+                        None,
+                        None,
+                        None,
+                    ) {
+                        tracing::warn!(%error, "could not register browser native messaging hosts");
+                    }
+                }
+            }
             app.manage(ui.clone());
             app.manage(state.clone());
             let setup = tray(app.handle())
