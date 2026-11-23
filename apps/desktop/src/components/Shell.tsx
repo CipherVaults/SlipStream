@@ -3,6 +3,7 @@ import {
   Minus, Moon, Music, Plus, Search, Settings, Square, Sun, Video, X,
 } from "lucide-react";
 import type { RefObject } from "react";
+import { version } from "../../package.json";
 import type { TelemetryBatch, TransferSnapshot } from "../types/ipc";
 import { bytes, fileCategory, isDone, isRunning, speed } from "../lib/transfers";
 import { IconButton } from "./ui";
@@ -60,7 +61,7 @@ export function Sidebar({ view, select, transfers, batch, folder, samples, limit
       <div className="brand-bar" data-tauri-drag-region>
         <span className="brand-left"><span className="brand-mark"><Download size={14} strokeWidth={2.2} /></span>
           <span className="brand-name">SlipStream</span></span>
-        <span className="brand-ver">v0.1</span>
+        <span className="brand-ver">v{version}</span>
       </div>
       <nav className="nav-scroll" aria-label="Download views">
         {navigation.slice(0, 6).map(item)}

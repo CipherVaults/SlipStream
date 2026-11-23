@@ -1,9 +1,9 @@
-use std::{collections::HashSet, time::Duration};
+use std::{cmp::Ordering, collections::HashSet, time::Duration};
 
 use serde_json::Value;
 use slipstream_protocol::{
-    validate_http_url, AudioPreset, MediaContainer, MediaFormatOption, MediaProbeResult,
-    SubtitleTrack,
+    sanitize_title_to_filename, validate_http_url, AudioPreset, AudioTrackKind, MediaContainer,
+    MediaFormatOption, MediaProbeResult, SubtitleTrack,
 };
 
 use crate::{
@@ -16,6 +16,11 @@ use crate::{
 pub struct ProbeOptions {
     pub playlist: bool,
 }
+
+// Keep the preview comfortably below the native IPC frame limit. The count
+// is calculated from the full probe before taking the preview.
+const MAX_PLAYLIST_PREVIEW_ENTRIES: usize = 512;
+const MAX_PLAYLIST_TITLE_CHARS: usize = 160;
 
 pub async fn probe_url(
     tools: &MediaToolchain,
@@ -75,12 +80,7 @@ pub fn parse_ytdlp_probe_json(
     if formats.is_empty() && !is_playlist {
         formats.extend(parse_format(&value));
     }
-    formats.sort_by(|a, b| {
-        b.height
-            .cmp(&a.height)
-            .then_with(|| b.fps.unwrap_or(0.0).total_cmp(&a.fps.unwrap_or(0.0)))
-            .then_with(|| b.has_audio.cmp(&a.has_audio))
-    });
+    let formats = rank_formats(formats);
 
     let mut subtitles = Vec::new();
     for (key, is_auto) in [("subtitles", false), ("automatic_captions", true)] {
@@ -126,6 +126,26 @@ pub fn parse_ytdlp_probe_json(
             .map(|url| url.to_string()),
         is_playlist,
         playlist_count,
+        playlist_entries: entries
+            .into_iter()
+            .flatten()
+            .take(MAX_PLAYLIST_PREVIEW_ENTRIES)
+            .map(|entry| {
+                entry["title"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|title| !title.is_empty())
+                    .and_then(|title| {
+                        let end = title
+                            .char_indices()
+                            .nth(MAX_PLAYLIST_TITLE_CHARS)
+                            .map_or(title.len(), |(end, _)| end);
+                        sanitize_title_to_filename(&title[..end], "txt").ok()
+                    })
+                    .and_then(|name| name.strip_suffix(".txt").map(str::to_owned))
+                    .unwrap_or_default()
+            })
+            .collect(),
         formats,
         subtitles,
     })
@@ -144,12 +164,129 @@ fn duration_seconds(value: &Value) -> Option<u64> {
     })
 }
 
-fn parse_format(value: &Value) -> Option<MediaFormatOption> {
+struct ProbedFormat {
+    option: MediaFormatOption,
+    language: Option<String>,
+    is_dubbed: bool,
+    is_direct: bool,
+    is_hls: bool,
+    is_drc: bool,
+    exact_size: bool,
+}
+
+impl ProbedFormat {
+    fn video_key(&self) -> (Option<u32>, Option<u32>, Option<String>, bool) {
+        (
+            self.option.height,
+            fps_bucket(self.option.fps),
+            self.option.video_codec.clone(),
+            self.option.has_audio,
+        )
+    }
+
+    fn preference(&self, other: &Self) -> Ordering {
+        self.option
+            .audio_track_kind
+            .unwrap_or_default()
+            .cmp(&other.option.audio_track_kind.unwrap_or_default())
+            .then_with(|| self.is_direct.cmp(&other.is_direct))
+            .then_with(|| other.is_hls.cmp(&self.is_hls))
+            .then_with(|| other.is_drc.cmp(&self.is_drc))
+            .then_with(|| self.exact_size.cmp(&other.exact_size))
+            .then_with(|| {
+                self.option
+                    .filesize_bytes
+                    .is_some()
+                    .cmp(&other.option.filesize_bytes.is_some())
+            })
+            .then_with(|| {
+                self.option
+                    .bitrate_kbps
+                    .unwrap_or_default()
+                    .total_cmp(&other.option.bitrate_kbps.unwrap_or_default())
+            })
+            .then_with(|| self.option.filesize_bytes.cmp(&other.option.filesize_bytes))
+    }
+}
+
+fn rank_formats(mut formats: Vec<ProbedFormat>) -> Vec<MediaFormatOption> {
+    let direct_video: HashSet<_> = formats
+        .iter()
+        .filter(|f| f.is_direct && f.option.has_video)
+        .map(ProbedFormat::video_key)
+        .collect();
+    let direct_audio = formats
+        .iter()
+        .any(|f| f.is_direct && f.option.is_audio_only && f.option.audio_codec.is_some());
+    let audio_ids: HashSet<_> = formats
+        .iter()
+        .filter(|f| f.option.is_audio_only && !f.is_drc)
+        .map(|f| (f.option.format_id.clone(), f.language.clone()))
+        .collect();
+
+    formats.sort_by(|a, b| b.preference(a));
+    let mut seen_video = HashSet::new();
+    let mut seen_audio = HashSet::new();
+    formats.retain(|f| {
+        let opt = &f.option;
+        if opt.has_video {
+            let key = f.video_key();
+            !(f.is_hls && direct_video.contains(&key))
+                && seen_video.insert((key, opt.container.clone()))
+        } else {
+            !(f.is_hls && direct_audio && opt.audio_codec.is_none() && f.language.is_none())
+                && !(f.is_drc
+                    && opt
+                        .format_id
+                        .split_once("-drc")
+                        .is_some_and(|(base, suffix)| {
+                            audio_ids.contains(&(format!("{base}{suffix}"), f.language.clone()))
+                        }))
+                && seen_audio.insert((
+                    opt.audio_codec.clone(),
+                    opt.container.clone(),
+                    f.language.clone(),
+                    f.is_dubbed,
+                    opt.audio_track_kind == Some(AudioTrackKind::Descriptive),
+                ))
+        }
+    });
+    formats.sort_by(|a, b| {
+        let (video_a, video_b) = (&a.option, &b.option);
+        if video_a.is_audio_only && video_b.is_audio_only {
+            return b.preference(a);
+        }
+        video_a
+            .is_audio_only
+            .cmp(&video_b.is_audio_only)
+            .then_with(|| video_b.height.cmp(&video_a.height))
+            .then_with(|| {
+                video_b
+                    .fps
+                    .unwrap_or_default()
+                    .total_cmp(&video_a.fps.unwrap_or_default())
+            })
+            .then_with(|| b.is_direct.cmp(&a.is_direct))
+            .then_with(|| {
+                video_b
+                    .filesize_bytes
+                    .is_some()
+                    .cmp(&video_a.filesize_bytes.is_some())
+            })
+            .then_with(|| video_b.has_audio.cmp(&video_a.has_audio))
+            .then_with(|| video_b.filesize_bytes.cmp(&video_a.filesize_bytes))
+    });
+    formats.into_iter().map(|f| f.option).collect()
+}
+
+fn parse_format(value: &Value) -> Option<ProbedFormat> {
     let format_id = value["format_id"].as_str()?;
     validate_format_id(format_id).ok()?;
     let raw_ext = value["ext"].as_str().unwrap_or_default();
+    let protocol = value["protocol"].as_str().unwrap_or_default();
+    let is_hls = protocol.starts_with("m3u8");
     if raw_ext.eq_ignore_ascii_case("mhtml")
-        || value["protocol"].as_str() == Some("mhtml")
+        || protocol == "mhtml"
         || value["resolution"].as_str() == Some("storyboard")
     {
         return None;
@@ -182,7 +319,7 @@ fn parse_format(value: &Value) -> Option<MediaFormatOption> {
             raw_ext.to_ascii_lowercase().as_str(),
             "mp3" | "m4a" | "aac" | "opus" | "ogg" | "oga" | "flac" | "wav" | "mka"
         );
-        if is_audio_ext && !acodec_none {
+        if (is_audio_ext || (is_hls && vcodec_none)) && !acodec_none {
             has_audio = true;
         } else if !is_audio_ext && !vcodec_none {
             has_video = true;
@@ -209,19 +346,73 @@ fn parse_format(value: &Value) -> Option<MediaFormatOption> {
         label.push_str(" · ");
         label.push_str(&container);
     }
-    Some(MediaFormatOption {
-        format_id: format_id.into(),
-        label,
-        container,
-        video_codec,
-        audio_codec,
-        height,
-        fps,
-        filesize_bytes: byte_count(&value["filesize"])
-            .or_else(|| byte_count(&value["filesize_approx"])),
-        is_audio_only: has_audio && !has_video,
-        has_video,
-        has_audio,
+    let language = value["language"]
+        .as_str()
+        .map(str::trim)
+        .filter(|lang| !has_video && validate_subtitle_language(lang).is_ok())
+        .map(|lang| lang.to_ascii_lowercase().replace('_', "-"));
+    if let Some(lang) = &language {
+        label.push_str(" · ");
+        label.push_str(lang);
+    }
+    let note = value["format_note"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let is_drc = !has_video && format_id.split('-').any(|part| part == "drc");
+    let preference = value["language_preference"].as_f64().unwrap_or_default();
+    let is_dubbed =
+        !has_video && (note.contains("dubbed") || (language.is_some() && preference < 0.0));
+    let audio_track_kind = if has_video {
+        None
+    } else if note.contains("descript")
+        || language
+            .as_deref()
+            .is_some_and(|lang| lang.ends_with("-desc"))
+    {
+        label.push_str(" · Descriptive");
+        Some(AudioTrackKind::Descriptive)
+    } else if note.contains("original") {
+        Some(AudioTrackKind::Original)
+    } else if note.contains("default") || preference > 0.0 {
+        Some(AudioTrackKind::Default)
+    } else if is_dubbed {
+        Some(AudioTrackKind::Dubbed)
+    } else {
+        None
+    };
+    if is_dubbed && audio_track_kind != Some(AudioTrackKind::Descriptive) {
+        label.push_str(" · Dubbed");
+    }
+    let exact = byte_count(&value["filesize"]);
+    let bitrate = |key: &str| value[key].as_f64().filter(|rate| *rate > 0.0);
+    let bitrate_kbps = if has_video {
+        bitrate("tbr").or_else(|| bitrate("vbr"))
+    } else {
+        bitrate("abr").or_else(|| bitrate("tbr"))
+    };
+    Some(ProbedFormat {
+        language,
+        is_dubbed,
+        is_direct: matches!(protocol, "http" | "https"),
+        is_hls,
+        is_drc,
+        exact_size: exact.is_some(),
+        option: MediaFormatOption {
+            format_id: format_id.into(),
+            label,
+            container,
+            video_codec,
+            audio_codec,
+            height,
+            fps,
+            filesize_bytes: exact.or_else(|| byte_count(&value["filesize_approx"])),
+            bitrate_kbps,
+            audio_track_kind,
+            is_audio_only: has_audio && !has_video,
+            has_video,
+            has_audio,
+        },
     })
 }
 
@@ -236,17 +427,21 @@ fn byte_count(value: &Value) -> Option<u64> {
 
 fn quality_label(height: Option<u32>, fps: Option<f32>) -> Option<String> {
     let height = height?;
-    Some(match fps.filter(|fps| *fps >= 49.0) {
-        Some(fps) => format!("{height}p{:.0}", fps.round()),
+    Some(match fps_bucket(fps) {
+        Some(fps) => format!("{height}p{fps}"),
         None => format!("{height}p"),
     })
+}
+
+fn fps_bucket(fps: Option<f32>) -> Option<u32> {
+    fps.filter(|fps| *fps >= 49.0).map(|fps| fps.round() as u32)
 }
 
 fn codec(raw: Option<&str>) -> Option<String> {
     let raw = raw?;
     let first = raw.split(['.', ' ']).next()?.to_ascii_lowercase();
     let normalized = match first.as_str() {
-        "" | "none" => return None,
+        "" | "none" | "unknown" => return None,
         "av01" | "av1" => "AV1",
         "vp09" | "vp9" => "VP9",
         "vp08" | "vp8" => "VP8",
@@ -374,6 +569,114 @@ mod tests {
     const URL: &str = "https://example.com/watch?v=[123]&t=%32";
 
     #[test]
+    fn ranks_direct_youtube_formats_and_drops_equivalent_hls_video() {
+        let probe = parse_ytdlp_probe_json(r#"{"formats":[
+            {"format_id":"312","protocol":"m3u8_native","height":720,"fps":59.94,"vcodec":"avc1","ext":"mp4"},
+            {"format_id":"299","protocol":"https","height":720,"fps":60,"vcodec":"avc1","ext":"mp4","filesize":91000000,"tbr":1500},
+            {"format_id":"299-low","protocol":"https","height":720,"fps":60,"vcodec":"avc1","ext":"mp4","filesize":90000000,"vbr":1200},
+            {"format_id":"299-approx","protocol":"https","height":720,"fps":60,"vcodec":"avc1","ext":"mp4","filesize_approx":99000000,"tbr":2000},
+            {"format_id":"299-segments","protocol":"http_dash_segments","height":720,"fps":60,"vcodec":"avc1","ext":"mp4","filesize":99000000,"tbr":2500},
+            {"format_id":"18","protocol":"https","height":720,"fps":60,"vcodec":"avc1","acodec":"aac","ext":"mp4","filesize":92000000},
+            {"format_id":"605","protocol":"m3u8","height":360,"fps":30,"vcodec":"vp09","ext":"mp4"},
+            {"format_id":"243","protocol":"http","height":360,"fps":25,"vcodec":"vp9","ext":"webm"},
+            {"format_id":"600","protocol":"m3u8","height":720,"fps":60,"vcodec":"vp9","ext":"webm","filesize":99000000},
+            {"format_id":"301","protocol":"m3u8","height":720,"fps":30,"vcodec":"avc1","ext":"mp4"}
+        ]}"#, URL).unwrap();
+        let ids: Vec<_> = probe.formats.iter().map(|f| f.format_id.as_str()).collect();
+        assert_eq!(ids, ["18", "299", "600", "301", "243"]);
+        assert_eq!(probe.formats[1].label, "720p60 · H.264 · MP4");
+        assert_eq!(probe.formats[1].filesize_bytes, Some(91_000_000));
+    }
+
+    #[test]
+    fn keeps_muxed_hls_alongside_direct_video_only() {
+        let probe = parse_ytdlp_probe_json(r#"{"formats":[
+            {"format_id":"direct","ext":"mp4","protocol":"https","height":720,"fps":30,"vcodec":"avc1","acodec":"none"},
+            {"format_id":"hls-video","ext":"mp4","protocol":"m3u8_native","height":720,"fps":30,"vcodec":"avc1","acodec":"none"},
+            {"format_id":"hls-muxed","ext":"mp4","protocol":"m3u8_native","height":720,"fps":30,"vcodec":"avc1","acodec":"mp4a.40.2"}
+        ]}"#, URL).unwrap();
+        assert_eq!(probe.formats.len(), 2);
+        assert!(probe
+            .formats
+            .iter()
+            .any(|f| f.format_id == "direct" && !f.has_audio));
+        assert!(probe
+            .formats
+            .iter()
+            .any(|f| f.format_id == "hls-muxed" && f.has_audio));
+    }
+
+    #[test]
+    fn large_playlist_probe_fits_native_frame_and_preserves_count() {
+        use slipstream_protocol::{NativeBridgeResponse, MAX_NATIVE_MESSAGE_BYTES};
+
+        let entries = vec![serde_json::json!({ "title": "🎬".repeat(512) }); 6000];
+        let json = serde_json::json!({ "_type": "playlist", "entries": entries }).to_string();
+        let probe = parse_ytdlp_probe_json(&json, URL).unwrap();
+        assert_eq!(probe.playlist_count, Some(6000));
+        assert_eq!(probe.playlist_entries.len(), MAX_PLAYLIST_PREVIEW_ENTRIES);
+        assert!(probe.playlist_entries.iter().all(|title| {
+            !title.is_empty() && title.chars().count() <= MAX_PLAYLIST_TITLE_CHARS
+        }));
+        let response = serde_json::to_vec(&NativeBridgeResponse::MediaProbed { probe }).unwrap();
+        assert!(response.len() < MAX_NATIVE_MESSAGE_BYTES / 2);
+    }
+
+    #[test]
+    fn deduplicates_audio_variants_without_discarding_hls_only_choices() {
+        let probe = parse_ytdlp_probe_json(r#"{"formats":[
+            {"format_id":"233","protocol":"m3u8","vcodec":"none","acodec":"unknown","ext":"mp4"},
+            {"format_id":"234","protocol":"m3u8_native","vcodec":"none","acodec":null,"ext":"mp4"},
+            {"format_id":"140","protocol":"https","vcodec":"none","acodec":"aac","ext":"m4a","filesize":100,"abr":128},
+            {"format_id":"140-drc","protocol":"https","vcodec":"none","acodec":"aac","ext":"m4a","filesize":200,"abr":160},
+            {"format_id":"140-hls","protocol":"m3u8","vcodec":"none","acodec":"aac","ext":"m4a","filesize":300,"abr":300},
+            {"format_id":"249","protocol":"https","vcodec":"none","acodec":"opus","ext":"webm","filesize":400,"abr":50},
+            {"format_id":"251","protocol":"https","vcodec":"none","acodec":"opus","ext":"webm","filesize":300,"abr":160},
+            {"format_id":"251-drc","protocol":"https","vcodec":"none","acodec":"opus","ext":"webm","filesize":500,"abr":170},
+            {"format_id":"flac-drc","protocol":"https","vcodec":"none","acodec":"flac","ext":"flac"}
+        ]}"#, URL).unwrap();
+        let ids: Vec<_> = probe.formats.iter().map(|f| f.format_id.as_str()).collect();
+        assert_eq!(ids, ["251", "140", "flac-drc"]);
+        assert_eq!(probe.formats[0].bitrate_kbps, Some(160.0));
+
+        let hls = parse_ytdlp_probe_json(r#"{"formats":[
+            {"format_id":"high","protocol":"m3u8_native","height":720,"vcodec":"avc1","ext":"mp4","tbr":2000},
+            {"format_id":"low","protocol":"m3u8","height":720,"vcodec":"avc1","ext":"mp4","tbr":1000},
+            {"format_id":"medium","protocol":"m3u8","height":480,"vcodec":"avc1","ext":"mp4"},
+            {"format_id":"audio","protocol":"m3u8","vcodec":"none","acodec":"unknown","ext":"mp4"}
+        ]}"#, URL).unwrap();
+        let ids: Vec<_> = hls.formats.iter().map(|f| f.format_id.as_str()).collect();
+        assert_eq!(ids, ["high", "medium", "audio"]);
+        assert!(hls.formats[2].is_audio_only);
+    }
+
+    #[test]
+    fn preserves_distinct_audio_languages_and_ranks_original_first() {
+        let probe = parse_ytdlp_probe_json(
+            r#"{"formats":[
+                {"format_id":"140-2","protocol":"https","vcodec":"none","acodec":"aac","ext":"m4a","language":"es","format_note":"Spanish (dubbed) (default)","language_preference":5,"abr":256},
+                {"format_id":"140-1","protocol":"https","vcodec":"none","acodec":"aac","ext":"m4a","language":" EN_us ","format_note":"English (original)","language_preference":10,"abr":128},
+                {"format_id":"139-1","protocol":"https","vcodec":"none","acodec":"aac","ext":"m4a","language":"en-US","abr":48},
+                {"format_id":"140-drc-1","protocol":"https","vcodec":"none","acodec":"aac","ext":"m4a","language":"en-US","language_preference":10,"abr":320},
+                {"format_id":"140-3","protocol":"https","vcodec":"none","acodec":"aac","ext":"m4a","language":"fr","language_preference":-1,"abr":288},
+                {"format_id":"140-5","protocol":"https","vcodec":"none","acodec":"aac","ext":"m4a","language":"en-US","format_note":"English (dubbed)","abr":320},
+                {"format_id":"140-4","protocol":"https","vcodec":"none","acodec":"aac","ext":"m4a","language":"de","format_note":"German (descriptive)","abr":296}
+            ]}"#,
+            URL,
+        )
+        .unwrap();
+        let ids: Vec<_> = probe.formats.iter().map(|f| f.format_id.as_str()).collect();
+        assert_eq!(ids, ["140-1", "140-2", "140-5", "140-3", "140-4"]);
+        assert_eq!(probe.formats[0].label, "Audio · AAC · M4A · en-us");
+        assert_eq!(
+            probe.formats[0].audio_track_kind,
+            Some(AudioTrackKind::Original)
+        );
+        assert_eq!(probe.formats[1].label, "Audio · AAC · M4A · es · Dubbed");
+        assert_eq!(probe.formats[2].label, "Audio · AAC · M4A · en-us · Dubbed");
+    }
+
+    #[test]
     fn normalizes_video_audio_and_subtitles() {
         let probe = parse_ytdlp_probe_json(r#"{
             "title": "東京建築_4K_HDR",
@@ -461,12 +764,13 @@ mod tests {
     #[test]
     fn parses_flat_playlists_and_direct_media() {
         let flat = parse_ytdlp_probe_json(
-            r#"{"_type":"playlist","title":"Clips","entries":[{},null,{}],"thumbnail":"file:///clip.mp4"}"#, URL,
+            r#"{"_type":"playlist","title":"Clips","entries":[{"title":"  First: Clip  "},null,{"title":"../CON"}],"thumbnail":"file:///clip.mp4"}"#, URL,
         ).unwrap();
         assert!(flat.is_playlist);
         assert_eq!(flat.playlist_count, Some(3));
         assert!(flat.thumbnail_url.is_none());
         assert!(flat.formats.is_empty());
+        assert_eq!(flat.playlist_entries, ["First_ Clip", "", "_CON"]);
         let direct = parse_ytdlp_probe_json(
             r#"{"duration":12,"format_id":"http-480","height":480,"vcodec":"avc1","ext":"mp4"}"#,
             URL,
@@ -474,6 +778,7 @@ mod tests {
         .unwrap();
         assert_eq!(direct.duration_seconds, Some(12));
         assert_eq!(direct.formats.len(), 1);
+        assert!(direct.playlist_entries.is_empty());
         let generic_direct = parse_ytdlp_probe_json(
             r#"{"title":"","extractor":"generic","formats":[{"format_id":"mp4","ext":"mp4","vcodec":null,"video_ext":"mp4","audio_ext":"none"},{"format_id":"sb0","ext":"mhtml","vcodec":"none","acodec":"none","protocol":"mhtml"}]}"#,
             URL,

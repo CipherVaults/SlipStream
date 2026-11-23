@@ -1,4 +1,7 @@
-use std::{ffi::OsString, path::Path};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 use slipstream_protocol::{validate_http_url, validate_safe_filename_component, MediaContainer};
 
@@ -14,9 +17,13 @@ const YTDLP_FLAGS: &[&str] = &[
     "--no-playlist",
     "--yes-playlist",
     "--flat-playlist",
+    "--ignore-errors",
     "--playlist-items",
     "-f",
+    "--format-sort",
+    "--format-sort-force",
     "--ffmpeg-location",
+    "--merge-output-format",
     "-o",
     "--newline",
     "--progress",
@@ -36,6 +43,8 @@ const FFMPEG_FLAGS: &[&str] = &[
     "-y",
     "-progress",
     "-nostats",
+    "-xerror",
+    "-abort_on",
     "-i",
     "-map",
     "-c",
@@ -56,6 +65,26 @@ const FFMPEG_FLAGS: &[&str] = &[
 pub(crate) const DOWNLOAD_PROGRESS_PREFIX: &str = "SLIPSTREAM|";
 pub(crate) const LOUDNORM_FILTER: &str = "loudnorm=I=-16:TP=-1.5:LRA=11";
 const DOWNLOAD_TEMPLATE: &str = "media-%(autonumber)06d.%(ext)s";
+// The playlist index can repeat in nested playlists. With one input URL,
+// yt-dlp's autonumber advances across all downloads in the invocation.
+const PLAYLIST_TEMPLATE: &str = "media-%(playlist_index,autonumber)06d-%(autonumber)06d.%(ext)s";
+const DOWNLOAD_PROGRESS_TEMPLATE: &str = concat!(
+    "download:SLIPSTREAM|",
+    "%(progress.downloaded_bytes)s|%(progress.total_bytes)s|",
+    "%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s",
+);
+
+macro_rules! capped_video_selector {
+    ($height:literal) => {
+        concat!(
+            "bestvideo*[height<=",
+            $height,
+            "]+bestaudio/bestvideo*[height<=",
+            $height,
+            "]",
+        )
+    };
+}
 
 pub fn validate_ytdlp_flag(flag: &str) -> Result<(), MediaError> {
     if YTDLP_FLAGS.contains(&flag) {
@@ -66,11 +95,13 @@ pub fn validate_ytdlp_flag(flag: &str) -> Result<(), MediaError> {
 }
 
 pub fn validate_ffmpeg_flag(flag: &str) -> Result<(), MediaError> {
-    let indexed = ["-disposition:v:", "-metadata:s:s:"].iter().any(|prefix| {
-        flag.strip_prefix(prefix).is_some_and(|index| {
-            index.parse::<u32>().is_ok() && index.bytes().all(|b| b.is_ascii_digit())
-        })
-    });
+    let indexed = ["-disposition:v:", "-metadata:s:s:", "-c:s:"]
+        .iter()
+        .any(|prefix| {
+            flag.strip_prefix(prefix).is_some_and(|index| {
+                index.parse::<u32>().is_ok() && index.bytes().all(|b| b.is_ascii_digit())
+            })
+        });
     if FFMPEG_FLAGS.contains(&flag) || indexed {
         Ok(())
     } else {
@@ -204,6 +235,19 @@ pub fn validate_local_path(path: &Path) -> Result<(), MediaError> {
     Ok(())
 }
 
+/// Use ordinary drive paths at the sidecar boundary, keeping canonical paths for
+/// filesystem operations and equality checks.
+pub(crate) fn sidecar_path(path: &Path) -> Result<PathBuf, MediaError> {
+    validate_local_path(path)?;
+    if cfg!(windows) {
+        if let Some(drive_path) = path.to_str().and_then(|path| path.strip_prefix(r"\\?\")) {
+            // Validation only accepts this prefix on absolute drive paths.
+            return Ok(PathBuf::from(drive_path));
+        }
+    }
+    Ok(path.to_owned())
+}
+
 #[derive(Debug, Clone)]
 pub struct BuildYtDlpArgs {
     args: Vec<OsString>,
@@ -213,11 +257,12 @@ impl BuildYtDlpArgs {
     pub fn probe(playlist: bool) -> Self {
         let mut builder = Self::base();
         builder.flag("--dump-single-json");
-        builder.flag(if playlist {
-            "--flat-playlist"
+        if playlist {
+            builder.flag("--yes-playlist");
+            builder.flag("--flat-playlist");
         } else {
-            "--no-playlist"
-        });
+            builder.flag("--no-playlist");
+        }
         builder
     }
 
@@ -230,15 +275,20 @@ impl BuildYtDlpArgs {
         });
         builder.flag("--newline");
         builder.flag("--progress");
-        builder.option(
-            "--progress-template",
-            concat!(
-                "download:SLIPSTREAM|",
-                "%(progress.downloaded_bytes)s|%(progress.total_bytes)s|",
-                "%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s",
-            ),
-        );
-        builder.option("-o", DOWNLOAD_TEMPLATE);
+        let progress_template = if playlist {
+            format!(
+                "{DOWNLOAD_PROGRESS_TEMPLATE}|%(autonumber)s|%(info.n_entries)s|%(info.format_id)s"
+            )
+        } else {
+            DOWNLOAD_PROGRESS_TEMPLATE.to_owned()
+        };
+        builder.option("--progress-template", progress_template);
+        if playlist {
+            builder.flag("--ignore-errors");
+            builder.option("-o", PLAYLIST_TEMPLATE);
+        } else {
+            builder.option("-o", DOWNLOAD_TEMPLATE);
+        }
         builder
     }
 
@@ -246,6 +296,41 @@ impl BuildYtDlpArgs {
         validate_format_id(format)?;
         self.option("-f", format);
         Ok(self)
+    }
+
+    pub fn playlist_video(mut self, max_height: Option<u32>) -> Result<Self, MediaError> {
+        let selector = match max_height {
+            None => "bestvideo*+bestaudio/bestvideo*",
+            Some(2160) => capped_video_selector!(2160),
+            Some(1440) => capped_video_selector!(1440),
+            Some(1080) => capped_video_selector!(1080),
+            Some(720) => capped_video_selector!(720),
+            Some(480) => capped_video_selector!(480),
+            Some(360) => capped_video_selector!(360),
+            Some(height) => {
+                return Err(MediaError::argument(
+                    "maximum video height",
+                    height.to_string(),
+                ))
+            }
+        };
+        // Keep extractor and codec preferences from overriding video height.
+        self.flag("--format-sort-force");
+        self.option("--format-sort", "height");
+        self.option("-f", selector);
+        Ok(self)
+    }
+
+    pub fn merge_output_format(mut self, target: Option<MediaContainer>) -> Self {
+        let container = match target {
+            Some(MediaContainer::Mp4) => "mp4",
+            Some(MediaContainer::Mkv) => "mkv",
+            Some(MediaContainer::Webm) => "webm",
+            // yt-dlp checks the actual selected codecs, including fallback branches.
+            _ => "mp4/webm/mkv",
+        };
+        self.option("--merge-output-format", container);
+        self
     }
 
     pub fn playlist_items(mut self, items: &str) -> Result<Self, MediaError> {
@@ -265,7 +350,7 @@ impl BuildYtDlpArgs {
     }
 
     pub fn ffmpeg_location(mut self, binary: &Path) -> Result<Self, MediaError> {
-        validate_local_path(binary)?;
+        let binary = sidecar_path(binary)?;
         if !binary.is_absolute() {
             return Err(MediaError::argument(
                 "FFmpeg executable path",
@@ -389,18 +474,33 @@ impl BuildFfmpegArgs {
     }
 
     fn output(mut self, path: &Path, muxer: &'static str) -> Result<Vec<OsString>, MediaError> {
-        validate_local_path(path)?;
         self.option("-f", muxer);
         self.flag("--");
-        self.args.push(path.into());
+        self.args.push(sidecar_path(path)?.into());
         Ok(self.args)
     }
 
     pub(crate) fn input(&mut self, path: &Path) -> Result<(), MediaError> {
         // Force a standalone demuxer. Disguised playlists cannot select a
         // demuxer that opens additional URLs.
-        self.option("-f", local_demuxer(path)?);
-        self.option("-i", path);
+        self.input_with_demuxer(path, false)
+    }
+
+    pub(crate) fn input_with_demuxer(
+        &mut self,
+        path: &Path,
+        is_mpegts: bool,
+    ) -> Result<(), MediaError> {
+        let by_extension = local_demuxer(path)?;
+        self.option(
+            "-f",
+            if is_mpegts && matches!(by_extension, "mov" | "matroska") {
+                "mpegts"
+            } else {
+                by_extension
+            },
+        );
+        self.option("-i", sidecar_path(path)?);
         Ok(())
     }
 
@@ -480,6 +580,100 @@ fn container_muxer(container: MediaContainer) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_selectors_cap_every_branch_and_keep_user_selectors_strict() {
+        let url = "https://example.com/playlist";
+        let best = BuildYtDlpArgs::download(true)
+            .playlist_video(None)
+            .unwrap()
+            .build(url)
+            .unwrap();
+        assert!(best
+            .windows(2)
+            .any(|pair| pair[0] == "-f" && pair[1] == "bestvideo*+bestaudio/bestvideo*"));
+        assert!(best.iter().any(|arg| arg == "--format-sort-force"));
+        assert!(best
+            .windows(2)
+            .any(|pair| pair == ["--format-sort", "height"]));
+        for height in [2160, 1440, 1080, 720, 480, 360] {
+            let args = BuildYtDlpArgs::download(true)
+                .playlist_video(Some(height))
+                .unwrap()
+                .merge_output_format(None)
+                .build(url)
+                .unwrap();
+            let selector = args.windows(2).find(|pair| pair[0] == "-f").unwrap()[1]
+                .to_str()
+                .unwrap();
+            let bound = format!("[height<={height}]");
+            assert!(selector.split('/').all(|branch| branch.contains(&bound)));
+            assert_eq!(
+                selector,
+                format!("bestvideo*{bound}+bestaudio/bestvideo*{bound}")
+            );
+            assert!(validate_format_id(selector).is_err());
+            assert!(args.iter().any(|arg| arg == "--ignore-errors"));
+            assert!(args
+                .windows(2)
+                .any(|pair| pair[0] == "--merge-output-format" && pair[1] == "mp4/webm/mkv"));
+            assert!(args
+                .windows(2)
+                .any(|pair| pair[0] == "-o" && pair[1] == PLAYLIST_TEMPLATE));
+        }
+        assert!(BuildYtDlpArgs::download(true)
+            .playlist_video(Some(1081))
+            .is_err());
+        for (target, expected) in [
+            (MediaContainer::Mkv, "mkv"),
+            (MediaContainer::Mp4, "mp4"),
+            (MediaContainer::Webm, "webm"),
+        ] {
+            let args = BuildYtDlpArgs::download(false)
+                .merge_output_format(Some(target))
+                .build(url)
+                .unwrap();
+            assert!(args
+                .windows(2)
+                .any(|pair| pair[0] == "--merge-output-format" && pair[1] == expected));
+            assert!(!args.iter().any(|arg| arg == "--ignore-errors"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strips_only_validated_verbatim_drive_paths_in_sidecar_arguments() {
+        let binary = Path::new(r"\\?\C:\Program Files\ffmpeg.exe");
+        let args = BuildYtDlpArgs::download(false)
+            .ffmpeg_location(binary)
+            .unwrap()
+            .build("https://example.com/video")
+            .unwrap();
+        assert!(args.windows(2).any(
+            |pair| pair[0] == "--ffmpeg-location" && pair[1] == r"C:\Program Files\ffmpeg.exe"
+        ));
+        let input = Path::new(r"\\?\C:\media\input.mp4");
+        let output = Path::new(r"\\?\C:\media\output.mp4");
+        let args = BuildFfmpegArgs::new()
+            .local_input(input)
+            .unwrap()
+            .build(output, MediaContainer::Mp4)
+            .unwrap();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "-i" && pair[1] == r"C:\media\input.mp4"));
+        assert_eq!(args.last().unwrap(), r"C:\media\output.mp4");
+        for invalid in [
+            r"\\?\UNC\server\share\input.mp4",
+            r"\\?\Volume{123}\input.mp4",
+            r"\\?\C:relative.mp4",
+            r"\\?\C:\media\..\input.mp4",
+            r"\\?\C:\media\input.mp4:stream",
+            r"\\?\C:\media \input.mp4",
+        ] {
+            assert!(sidecar_path(Path::new(invalid)).is_err(), "{invalid}");
+        }
+    }
 
     #[test]
     fn rejects_unsafe_ytdlp_arguments() {

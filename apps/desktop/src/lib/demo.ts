@@ -5,7 +5,7 @@ import type {
   BrowserSetupResult, BrowserStatus, MediaFormatOption,
   RefreshDownloadUrlRequest, SegmentSnapshot, TelemetryBatch, ToolchainStatus, TorrentFileEntry, TransferSnapshot, UpdateStatus,
 } from "../types/ipc";
-import { MB, SEGMENT_COUNT, isHttpUrl, isRunning, ratio, sourceName } from "./transfers";
+import { MB, SEGMENT_COUNT, isHttpUrl, isPurePlaylistUrl, isRunning, ratio, sourceName } from "./transfers";
 
 export const DEFAULT_SETTINGS: AppSettings = {
   theme: "dark", accent: "blue", default_download_dir: "", default_connections: 16,
@@ -286,12 +286,20 @@ export const demo = {
   openPicker(url: string | null) {
     for (const listener of pickerListeners) listener(url);
   },
-  probe(url: string) {
+  probe(url: string, playlist = isPurePlaylistUrl(url)) {
     if (!isHttpUrl(url)) throw new Error("Enter an HTTP or HTTPS media URL.");
+    if (playlist) {
+      const entries = ["Alpine Cinema in 4K", "Tokyo Architecture in 4K HDR", "Dolomites at Dawn"];
+      return {
+        title: "Cinema Playlist", source_url: url, extractor: sourceName(url), duration_seconds: null,
+        thumbnail_url: null, is_playlist: true, playlist_count: entries.length, playlist_entries: entries,
+        formats: [], subtitles: [],
+      };
+    }
     return {
       title: url === mediaUrl ? "Alpine Cinema in 4K" : "Tokyo Architecture in 4K HDR",
       source_url: url, extractor: sourceName(url), duration_seconds: 1122, thumbnail_url: null,
-      is_playlist: false, playlist_count: null, formats: seededFormats,
+      is_playlist: false, playlist_count: null, playlist_entries: [], formats: seededFormats,
       subtitles: [{ lang: "en", name: "English", is_auto: false }, { lang: "ar", name: "Arabic", is_auto: false },
         { lang: "es", name: "Spanish", is_auto: true }],
     };
@@ -307,7 +315,8 @@ export const demo = {
   addMedia(request: AddMediaDownloadRequest) {
     const format = seededFormats.find(item => item.format_id === request.format_id) ?? seededFormats[0];
     const extension = request.audio_only_preset?.split("_")[0] ?? request.target_container ?? format.container;
-    return add(baseTransfer("demo-" + ++sequence, request.filename || "Tokyo_Architecture." + extension, request.url), {
+    const name = request.download_playlist ? "Cinema Playlist" : "Tokyo_Architecture." + extension;
+    return add(baseTransfer("demo-" + ++sequence, request.filename || name, request.url), {
       kind: "media", save_dir: request.save_dir || settings.default_download_dir,
       total_bytes: request.audio_only_preset ? 48 * MB : format.filesize_bytes, download_speed_bps: 27 * MB,
       active_connections: settings.default_connections, format_tags: [extension.toUpperCase(), format.label],

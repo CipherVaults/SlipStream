@@ -47,6 +47,7 @@ use tokio::{
     task::JoinHandle,
     time::{timeout, Instant},
 };
+use url::Url;
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 type Result<T> = std::result::Result<T, String>;
@@ -420,17 +421,25 @@ impl AppState {
             .map_err(message)
     }
 
-    pub async fn probe_media(&self, url: &str) -> Result<MediaProbeResult> {
-        let (url, playlist) = validate_media_url(url, self.allow_loopback)?;
+    pub async fn probe_media(&self, url: &str, playlist: Option<bool>) -> Result<MediaProbeResult> {
+        let url = validate_media_url(url, self.allow_loopback)?;
+        let playlist = playlist.unwrap_or_else(|| is_pure_playlist_url(&url));
         let tools = discover_media_toolchain(self.settings(), self.resource_dir.clone()).await?;
-        probe_url(&tools, &url, ProbeOptions { playlist })
+        probe_url(&tools, url.as_str(), ProbeOptions { playlist })
             .await
             .map_err(message)
     }
 
     pub async fn add_media_download(&self, mut request: AddMediaDownloadRequest) -> Result<String> {
-        let (url, _) = validate_media_url(&request.url, self.allow_loopback)?;
-        request.url = url;
+        let url = validate_media_url(&request.url, self.allow_loopback)?;
+        if !request.download_playlist
+            && request.playlist_items.is_none()
+            && request.format_id.is_none()
+            && is_pure_playlist_url(&url)
+        {
+            request.download_playlist = true;
+        }
+        request.url = url.into();
         let _operation = self.operation().await?;
         let settings = self.settings();
         let raw_dir = PathBuf::from(
@@ -874,7 +883,7 @@ impl AppState {
             }
             ProbeMedia { url } => {
                 return self
-                    .probe_media(&url)
+                    .probe_media(&url, None)
                     .await
                     .map(|probe| NativeBridgeResponse::MediaProbed { probe })
             }
@@ -964,7 +973,7 @@ fn check_media_ip(ip: std::net::IpAddr, allow_loopback: bool) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate_media_url(raw: &str, allow_loopback: bool) -> Result<(String, bool)> {
+pub(crate) fn validate_media_url(raw: &str, allow_loopback: bool) -> Result<Url> {
     let url = validate_http_url(raw).map_err(message)?;
     if let Some(host) = url.host_str() {
         let host = host.trim_end_matches('.');
@@ -981,8 +990,23 @@ pub(crate) fn validate_media_url(raw: &str, allow_loopback: bool) -> Result<(Str
             return Err("disallowed loopback host".into());
         }
     }
-    let playlist = url.query_pairs().any(|(key, _)| key == "list");
-    Ok((url.as_str().to_owned(), playlist))
+    Ok(url)
+}
+
+fn is_pure_playlist_url(url: &Url) -> bool {
+    let host = url.host_str().unwrap_or_default();
+    let mut path = url.path_segments().into_iter().flatten();
+    let first = path.next();
+    let targets_video = url.query_pairs().any(|(key, _)| key == "v")
+        || (matches!(host, "youtu.be" | "www.youtu.be") && first.is_some_and(|id| !id.is_empty()))
+        || ((host == "youtube.com" || host.ends_with(".youtube.com"))
+            && matches!(first, Some("shorts" | "live" | "embed"))
+            && path.next().is_some_and(|id| !id.is_empty()));
+    !targets_video
+        && (url.path().trim_end_matches('/').ends_with("/playlist")
+            || url
+                .query_pairs()
+                .any(|(key, value)| key == "list" && !value.is_empty()))
 }
 
 fn created(transfer_id: String) -> NativeBridgeResponse {
@@ -1388,10 +1412,39 @@ mod tests {
                 "{blocked_always}"
             );
         }
-        assert_eq!(
-            validate_media_url("https://example.com/watch?v=1&list=PL1", false).unwrap(),
-            ("https://example.com/watch?v=1&list=PL1".into(), true)
-        );
+    }
+
+    #[test]
+    fn classifies_playlist_urls_without_treating_watch_urls_as_playlists() {
+        for (path, expected) in [
+            ("/watch?v=1&list=PL1", false),
+            ("/watch?list=PL1", true),
+            ("/playlist", true),
+            ("/channel/playlist/?list=PL1", true),
+            ("/playlist-export", false),
+            ("/watch?list=", false),
+            ("/video#list=PL1", false),
+        ] {
+            let url = validate_media_url(&format!("https://example.com{path}"), false).unwrap();
+            assert_eq!(is_pure_playlist_url(&url), expected, "{path}");
+        }
+    }
+
+    #[test]
+    fn youtube_video_paths_with_list_can_be_probed_as_single_video() {
+        for (url, pure) in [
+            ("https://youtu.be/jNQXAC9IVRw?list=PL123", false),
+            ("https://youtube.com/shorts/jNQXAC9IVRw?list=PL123", false),
+            ("https://www.youtube.com/live/jNQXAC9IVRw?list=PL123", false),
+            ("https://m.youtube.com/embed/jNQXAC9IVRw?list=PL123", false),
+            ("https://youtu.be/?list=PL123", true),
+            ("https://youtube.com/shorts/?list=PL123", true),
+            ("https://youtube.com/playlist?v=video&list=PL123", false),
+            ("https://notyoutube.com/shorts/video?list=PL123", true),
+        ] {
+            let url = validate_media_url(url, false).unwrap();
+            assert_eq!(is_pure_playlist_url(&url), pure, "{url}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

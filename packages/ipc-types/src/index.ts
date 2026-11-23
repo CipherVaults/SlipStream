@@ -50,6 +50,7 @@ export interface TransferSnapshot {
   resumable: boolean;
   queue_id: string;
   error_message: string | null;
+  completion_notice?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -88,6 +89,8 @@ export interface MediaFormatOption {
   height: number | null;
   fps: number | null;
   filesize_bytes: number | null;
+  bitrate_kbps?: number | null;
+  audio_track_kind?: "descriptive" | "dubbed" | "unspecified" | "default" | "original";
   is_audio_only: boolean;
   has_video: boolean;
   has_audio: boolean;
@@ -107,6 +110,7 @@ export interface MediaProbeResult {
   thumbnail_url: string | null;
   is_playlist: boolean;
   playlist_count: number | null;
+  playlist_entries?: string[];
   formats: MediaFormatOption[];
   subtitles: SubtitleTrack[];
 }
@@ -122,6 +126,8 @@ export interface AddMediaDownloadRequest {
   save_dir?: string | null;
   filename?: string | null;
   playlist_items?: string | null;
+  download_playlist?: boolean;
+  max_height?: number | null;
 }
 
 export interface TorrentFileEntry {

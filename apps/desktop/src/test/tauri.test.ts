@@ -38,6 +38,8 @@ describe("Tauri v2 adapter", () => {
     await desktop.addHttpDownload(http);
     await desktop.expandWildcardUrls("https://example.org/[1-3].zip");
     await desktop.probeMedia(url);
+    await desktop.probeMedia(url, true);
+    await desktop.probeMedia(url, false);
     await desktop.addMediaDownload(media);
     await desktop.addTorrent(torrent);
     await desktop.listTorrentFiles(id);
@@ -55,7 +57,7 @@ describe("Tauri v2 adapter", () => {
     await desktop.installBrowserHosts("chrome", null, "firefox@example.org");
     await desktop.hibernateToTray();
 
-    const update = { available: true, current_version: "1.1.0", version: "1.1.1" };
+    const update = { available: true, current_version: "1.1.1", version: "1.1.2" };
     invoke.mockResolvedValueOnce(update).mockResolvedValueOnce(true);
     await expect(desktop.checkForUpdates()).resolves.toEqual(update);
     await expect(desktop.installUpdate()).resolves.toBe(true);
@@ -63,7 +65,8 @@ describe("Tauri v2 adapter", () => {
     expect(invoke.mock.calls).toEqual([
       ["get_snapshot", {}], ["add_http_download", { request: http }],
       ["expand_wildcard_urls", { pattern: "https://example.org/[1-3].zip" }],
-      ["probe_media", { url }], ["add_media_download", { request: media }], ["add_torrent", { request: torrent }],
+      ["probe_media", { url }], ["probe_media", { url, playlist: true }], ["probe_media", { url, playlist: false }],
+      ["add_media_download", { request: media }], ["add_torrent", { request: torrent }],
       ["list_torrent_files", { transfer_id: id }], ["set_torrent_files", { transfer_id: id, selected_indices: [1, 3] }],
       ["pause_transfer", { transfer_id: id }], ["resume_transfer", { transfer_id: id }],
       ["cancel_transfer", { transfer_id: id, delete_files: true }], ["refresh_download_url", { request: refresh }],
@@ -180,7 +183,7 @@ describe("Tauri v2 adapter", () => {
 describe("browser demo", () => {
   it("reports the current version and has no updates to install", async () => {
     await expect(desktop.checkForUpdates()).resolves.toEqual({
-      available: false, current_version: "1.1.0", version: null, notes: null, pub_date: null,
+      available: false, current_version: "1.1.1", version: null, notes: null, pub_date: null,
     });
     await expect(desktop.installUpdate()).resolves.toBe(false);
     expect(invoke).not.toHaveBeenCalled();

@@ -458,6 +458,8 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
                 save_dir: None,
                 filename: Some("video.mp4".into()),
                 playlist_items: None,
+                download_playlist: false,
+                max_height: None,
             },
         })
         .await;
@@ -536,6 +538,8 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
                     save_dir: Some(dir.to_string_lossy().into_owned()),
                     filename: Some("override.mp4".into()),
                     playlist_items: None,
+                    download_playlist: false,
+                    max_height: None,
                 },
             })
             .await,
@@ -895,6 +899,115 @@ fn directory_junction(link: &Path, destination: &Path) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn media_playlist_publishes_successful_items_with_original_indices_and_motw() {
+    let temp = TempDir::new();
+    let downloads = temp.0.join("Downloads");
+    let executable = media_tool_fixture(&temp.0)
+        .await
+        .to_string_lossy()
+        .into_owned();
+    let settings = installed_settings(&temp.0, &downloads);
+    let pipe = format!(r"\\.\pipe\SlipStream.Playlists.{}", Uuid::new_v4());
+    let registry_key = RegistryKey::isolated();
+    let state = AppState::start(
+        temp.0.clone(),
+        Arc::new(FakeUi::default()),
+        options(&pipe, &registry_key.0),
+    )
+    .await
+    .unwrap();
+    state
+        .save_settings(AppSettings {
+            ytdlp_path: Some(executable.clone()),
+            ffmpeg_path: Some(executable),
+            ..settings
+        })
+        .await
+        .unwrap();
+    let token = SessionToken::read(&temp.0.join("session.token")).unwrap();
+    let mut bridge = Bridge(Some(
+        PipeClient::connect(&pipe, &token, "playlist-integration")
+            .await
+            .unwrap(),
+    ));
+    let mixed = "https://example.com/watch?v=1&list=PL1";
+    assert!(!state.probe_media(mixed, None).await.unwrap().is_playlist);
+    let playlist = state.probe_media(mixed, Some(true)).await.unwrap();
+    assert_eq!(playlist.playlist_count, Some(4));
+    assert_eq!(
+        playlist.playlist_entries,
+        ["First_ video", "", "Broken video", "Fourth video"]
+    );
+    assert!(
+        !state
+            .probe_media(mixed, Some(false))
+            .await
+            .unwrap()
+            .is_playlist
+    );
+    let pure = "https://example.com/playlist?list=PL1";
+    assert!(matches!(
+        bridge.request(Request::ProbeMedia { url: pure.into() }).await,
+        Response::MediaProbed { probe } if probe.is_playlist
+    ));
+    let large = Request::ProbeMedia {
+        url: "https://example.com/playlist?list=PL6000".into(),
+    };
+    let large = bridge.request(large).await;
+    assert!(matches!(&large, Response::MediaProbed { probe }
+        if probe.playlist_count == Some(6000) && !probe.playlist_entries.is_empty()));
+    assert!(
+        serde_json::to_vec(&large).unwrap().len()
+            < slipstream_protocol::MAX_NATIVE_MESSAGE_BYTES / 2
+    );
+    let id = bridge
+        .created(Request::AddMediaDownload {
+            request: AddMediaDownloadRequest {
+                url: pure.into(),
+                format_id: None,
+                audio_only_preset: None,
+                target_container: None,
+                embed_subtitles_langs: vec!["en".into()],
+                lossless_remux: true,
+                normalize_audio: false,
+                save_dir: None,
+                filename: None,
+                playlist_items: None,
+                download_playlist: false,
+                max_height: Some(720),
+            },
+        })
+        .await;
+    let active = wait_for(&state, &id, TransferStatus::Active).await;
+    assert_eq!(active.filename, "Fixture playlist");
+    let done = wait_for(&state, &id, TransferStatus::Completed).await;
+    assert_eq!(done.filename, "Fixture playlist (2 files)");
+    assert_eq!(
+        done.completion_notice.as_deref(),
+        Some("2 of 4 videos downloaded (2 skipped). Requested subtitles were unavailable for 1 downloaded video.")
+    );
+    assert!(done.error_message.is_none());
+    assert_eq!(done.downloaded_bytes, 11);
+    assert_eq!(done.total_bytes, Some(11));
+    for (name, payload) in [
+        ("Fixture playlist-000001.mp4", &b"first"[..]),
+        ("Fixture playlist-000004.mp4", &b"fourth"[..]),
+    ] {
+        assert_eq!(fs::read(downloads.join(name)).unwrap(), payload);
+        assert_eq!(
+            fs::read_to_string(downloads.join(format!("{name}:Zone.Identifier"))).unwrap(),
+            format!("[ZoneTransfer]\r\nZoneId=3\r\nHostUrl={pure}\r\n")
+        );
+    }
+    assert!(!downloads.join("Fixture playlist-000002.mp4").exists());
+    assert!(!downloads.join("Fixture playlist-000003.mp4").exists());
+    assert_eq!(fs::read_dir(&downloads).unwrap().count(), 2);
+    state.cancel_transfer(&id, true).await.unwrap();
+    assert_eq!(fs::read_dir(&downloads).unwrap().count(), 0);
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn completed_media_shutdown_ssrf_guard_and_reparse_tool_rejection() {
     let temp = TempDir::new();
     let downloads = temp.0.join("Downloads");
@@ -934,7 +1047,7 @@ async fn completed_media_shutdown_ssrf_guard_and_reparse_tool_rejection() {
         "http://100.64.0.1/video",
         "http://[::ffff:127.0.0.1]/video",
     ] {
-        assert!(state.probe_media(blocked).await.is_err(), "{blocked}");
+        assert!(state.probe_media(blocked, None).await.is_err(), "{blocked}");
         assert!(
             state
                 .add_media_download(AddMediaDownloadRequest {
@@ -948,6 +1061,8 @@ async fn completed_media_shutdown_ssrf_guard_and_reparse_tool_rejection() {
                     save_dir: None,
                     filename: None,
                     playlist_items: None,
+                    download_playlist: false,
+                    max_height: None,
                 })
                 .await
                 .is_err(),
@@ -963,7 +1078,7 @@ async fn completed_media_shutdown_ssrf_guard_and_reparse_tool_rejection() {
     assert_eq!(status.ytdlp_path, None);
     assert_eq!(status.ffmpeg_path, None);
     assert!(state
-        .probe_media("https://example.com/video")
+        .probe_media("https://example.com/video", None)
         .await
         .is_err());
     let rejected_media = state
@@ -978,6 +1093,8 @@ async fn completed_media_shutdown_ssrf_guard_and_reparse_tool_rejection() {
             save_dir: None,
             filename: None,
             playlist_items: None,
+            download_playlist: false,
+            max_height: None,
         })
         .await
         .unwrap();
@@ -1023,6 +1140,8 @@ async fn completed_media_shutdown_ssrf_guard_and_reparse_tool_rejection() {
             save_dir: None,
             filename: Some("done.mp4".into()),
             playlist_items: None,
+            download_playlist: false,
+            max_height: None,
         })
         .await
         .unwrap();

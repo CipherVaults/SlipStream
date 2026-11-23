@@ -1,8 +1,10 @@
 use std::{
+    collections::BTreeMap,
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::Duration,
 };
 
@@ -103,6 +105,75 @@ async fn packet_hashes(binary: &ResolvedBinary, path: &Path, selector: &str) -> 
         .collect()
 }
 
+async fn check_playlist_recovery(root: &Path, ffmpeg: &ResolvedBinary, ffprobe: &ResolvedBinary) {
+    let executable = root.join("playlist-tool.exe");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/playlist_tool.rs");
+    let status = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+        .arg("--edition=2021")
+        .arg(source)
+        .arg("-o")
+        .arg(&executable)
+        .status()
+        .await
+        .unwrap();
+    assert!(status.success());
+    let tools = MediaToolchain::discover(ToolchainConfig {
+        ytdlp_path: Some(executable),
+        ffmpeg_path: Some(ffmpeg.path.clone()),
+        ffprobe_path: Some(ffprobe.path.clone()),
+        ..ToolchainConfig::default()
+    })
+    .await
+    .unwrap();
+
+    for status in [1, 101] {
+        let save_dir = root.join(format!("playlist-{status}"));
+        let pipeline = MediaPipeline::new(tools.clone(), &save_dir);
+        let request = AddMediaDownloadRequest {
+            url: format!("https://example.com/playlist/{status}"),
+            format_id: None,
+            audio_only_preset: None,
+            target_container: None,
+            embed_subtitles_langs: Vec::new(),
+            lossless_remux: false,
+            normalize_audio: false,
+            save_dir: None,
+            filename: None,
+            playlist_items: None,
+            download_playlist: true,
+            max_height: None,
+        };
+        let outcome = pipeline
+            .download_with_summary(&request, &DownloadOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.paths.len(), 2);
+        assert_eq!(fs::read_dir(&save_dir).unwrap().count(), 2);
+        assert_eq!(
+            outcome.completion_notice.as_deref(),
+            Some("2 of 4 videos downloaded (2 skipped).")
+        );
+        assert_eq!(
+            fs::read(&outcome.paths[0]).unwrap(),
+            fs::read(root.join("synthetic.mp4")).unwrap()
+        );
+        assert_eq!(outcome.paths[1].file_name().unwrap(), "Recovery-000002.mp4");
+        let details = probe(
+            ffprobe,
+            &["-show_format", "-show_streams"],
+            &outcome.paths[1],
+        )
+        .await;
+        assert!(details["format"]["format_name"]
+            .as_str()
+            .unwrap()
+            .split(',')
+            .any(|name| name == "mp4"));
+        assert_eq!(stream(&details, "video")["codec_name"], "h264");
+        assert_eq!(stream(&details, "audio")["codec_name"], "aac");
+    }
+}
+
 #[tokio::test]
 async fn real_ffmpeg_pipeline() {
     let tools = match MediaToolchain::discover_ffmpeg_only(ToolchainConfig::default()).await {
@@ -182,7 +253,66 @@ async fn real_ffmpeg_pipeline() {
     .await;
     fs::write(&srt, "1\n00:00:00,100 --> 00:00:00,750\nHello SlipStream\n").unwrap();
 
+    let ts_in_mp4 = temp.0.join("hls-segments.mp4");
+    fixture(
+        &ffmpeg_bin,
+        &[
+            "-hide_banner",
+            "-nostdin",
+            "-y",
+            "-i",
+            input.to_str().unwrap(),
+            "-c",
+            "copy",
+            "-f",
+            "mpegts",
+        ],
+        &ts_in_mp4,
+    )
+    .await;
     let pipeline = MediaPipeline::new(tools, &save_dir);
+    let converted = pipeline
+        .remux(
+            &ts_in_mp4,
+            "hls-faststart.mp4",
+            MediaContainer::Mp4,
+            &LocalMediaOptions::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    let detected = probe(&ffprobe, &["-show_format", "-show_streams"], &converted).await;
+    assert!(detected["format"]["format_name"]
+        .as_str()
+        .unwrap()
+        .split(',')
+        .any(|name| name == "mp4"));
+    assert_eq!(stream(&detected, "video")["codec_name"], "h264");
+    assert_eq!(stream(&detected, "audio")["codec_name"], "aac");
+    let bytes = fs::read(converted).unwrap();
+    assert!(
+        bytes.windows(4).position(|part| part == b"moov").unwrap()
+            < bytes.windows(4).position(|part| part == b"mdat").unwrap()
+    );
+    let disguised_playlist = temp.0.join("disguised.mp4");
+    fs::write(
+        &disguised_playlist,
+        "#EXTM3U\n#EXTINF:1,\nhls-segments.mp4\n#EXT-X-ENDLIST\n",
+    )
+    .unwrap();
+    assert!(pipeline
+        .remux(
+            &disguised_playlist,
+            "bad.mp4",
+            MediaContainer::Mp4,
+            &LocalMediaOptions::default(),
+            None
+        )
+        .await
+        .is_err());
+    assert!(!save_dir.join("bad.mp4").exists());
+    check_playlist_recovery(&temp.0, &ffmpeg_bin, &ffprobe).await;
+
     let options = LocalMediaOptions {
         subtitles: vec![SubtitleInput {
             path: srt,
@@ -240,6 +370,34 @@ async fn real_ffmpeg_pipeline() {
         details["format"]["tags"]["title"],
         "Café & Crème [4K 60fps]"
     );
+    let from_mkv = pipeline
+        .remux(
+            &mkv,
+            "from-mkv.mp4",
+            MediaContainer::Mp4,
+            &LocalMediaOptions {
+                subtitles: vec![SubtitleInput {
+                    path: options.subtitles[0].path.clone(),
+                    language: "es".into(),
+                }],
+                ..LocalMediaOptions::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let details = probe(&ffprobe, &["-show_streams"], &from_mkv).await;
+    let languages: Vec<_> = details["streams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|stream| stream["codec_type"] == "subtitle")
+        .map(|stream| {
+            assert_eq!(stream["codec_name"], "mov_text");
+            stream["tags"]["language"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(languages, ["spa", "eng"]);
     for stream in ["v:0", "a:0"] {
         assert_eq!(
             packet_hashes(&ffprobe, &input, stream).await,
@@ -284,6 +442,49 @@ async fn real_ffmpeg_pipeline() {
     assert_eq!(video_streams[0]["disposition"]["attached_pic"], 0);
     assert_eq!(video_streams[1]["disposition"]["attached_pic"], 1);
 
+    for (ext, muxer) in [("mov", "mov"), ("m4v", "mp4")] {
+        let input = temp.0.join(format!("with-text.{ext}"));
+        fixture(
+            &ffmpeg_bin,
+            &[
+                "-hide_banner",
+                "-nostdin",
+                "-y",
+                "-i",
+                mp4.to_str().unwrap(),
+                "-map",
+                "0:V",
+                "-map",
+                "0:a",
+                "-map",
+                "0:s",
+                "-c",
+                "copy",
+                "-f",
+                muxer,
+            ],
+            &input,
+        )
+        .await;
+        let remuxed = pipeline
+            .remux(
+                &input,
+                &format!("from-{ext}.mp4"),
+                MediaContainer::Mp4,
+                &LocalMediaOptions::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let details = probe(&ffprobe, &["-show_streams"], &remuxed).await;
+        assert_eq!(stream(&details, "subtitle")["codec_name"], "mov_text");
+        assert_eq!(stream(&details, "subtitle")["tags"]["language"], "eng");
+        assert_eq!(
+            packet_hashes(&ffprobe, &input, "s:0").await,
+            packet_hashes(&ffprobe, &remuxed, "s:0").await,
+        );
+    }
+
     // Re-remux an MP4 that already contains an attached_pic stream; -select_streams V
     // must ignore the prior cover art so the replacement cover stays at v:1.
     let reembedded = pipeline
@@ -302,6 +503,7 @@ async fn real_ffmpeg_pipeline() {
         .await
         .unwrap();
     let details = probe(&ffprobe, &["-show_streams"], &reembedded).await;
+    assert_eq!(stream(&details, "subtitle")["codec_name"], "mov_text");
     let re_video_streams: Vec<_> = details["streams"]
         .as_array()
         .unwrap()
@@ -427,15 +629,18 @@ async fn real_ffmpeg_pipeline() {
         .starts_with(".slipstream-")));
 }
 
-async fn spawn_mp4_server(payload: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+async fn spawn_media_server(
+    files: BTreeMap<&'static str, (&'static str, Vec<u8>)>,
+) -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let files = Arc::new(files);
     let handle = tokio::spawn(async move {
         loop {
             let Ok((mut socket, _)) = listener.accept().await else {
                 break;
             };
-            let data = payload.clone();
+            let files = files.clone();
             tokio::spawn(async move {
                 let mut req_buf = Vec::new();
                 let mut chunk = [0_u8; 2048];
@@ -452,6 +657,11 @@ async fn spawn_mp4_server(payload: Vec<u8>) -> (String, tokio::task::JoinHandle<
                 }
                 let req = String::from_utf8_lossy(&req_buf);
                 let is_head = req.starts_with("HEAD ");
+                let path = req.split_ascii_whitespace().nth(1).unwrap_or_default();
+                let Some((mime, data)) = files.get(path) else {
+                    let _ = socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    return;
+                };
                 let total = data.len();
                 let (status, start, end) = req
                     .lines()
@@ -474,12 +684,12 @@ async fn spawn_mp4_server(payload: Vec<u8>) -> (String, tokio::task::JoinHandle<
                 let slice = &data[start..=end];
                 let header = if status == 206 {
                     format!(
-                        "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 206 Partial Content\r\nContent-Type: {mime}\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         slice.len()
                     )
                 } else {
                     format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
+                        "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nAccept-Ranges: bytes\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
                     )
                 };
                 if socket.write_all(header.as_bytes()).await.is_err() {
@@ -491,7 +701,7 @@ async fn spawn_mp4_server(payload: Vec<u8>) -> (String, tokio::task::JoinHandle<
             });
         }
     });
-    (format!("http://{addr}/synthetic_clip.mp4"), handle)
+    (format!("http://{addr}"), handle)
 }
 
 #[tokio::test]
@@ -539,8 +749,51 @@ async fn real_ytdlp_probe_and_download_loopback() {
         &input,
     )
     .await;
-    let payload = fs::read(&input).unwrap();
-    let (url, server) = spawn_mp4_server(payload).await;
+    let video = temp.0.join("video.ts");
+    let audio = temp.0.join("audio.aac");
+    for (path, only, muxer) in [(&video, "-an", "mpegts"), (&audio, "-vn", "adts")] {
+        fixture(
+            tools.ffmpeg(),
+            &[
+                "-hide_banner",
+                "-nostdin",
+                "-y",
+                "-i",
+                input.to_str().unwrap(),
+                only,
+                "-c",
+                "copy",
+                "-f",
+                muxer,
+            ],
+            path,
+        )
+        .await;
+    }
+    let mime = "application/vnd.apple.mpegurl";
+    let media_playlist = |file| {
+        format!("#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:0.8,\n{file}\n#EXT-X-ENDLIST\n")
+            .into_bytes()
+    };
+    let master = concat!(
+        "#EXTM3U\n",
+        "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",DEFAULT=YES,URI=\"audio.m3u8\"\n",
+        "#EXT-X-STREAM-INF:BANDWIDTH=450000,RESOLUTION=64x48,FRAME-RATE=10.0,CODECS=\"avc1.64000a,mp4a.40.2\",AUDIO=\"aud\"\n",
+        "video.m3u8\n",
+    );
+    let (base, server) = spawn_media_server(BTreeMap::from([
+        (
+            "/synthetic_clip.mp4",
+            ("video/mp4", fs::read(&input).unwrap()),
+        ),
+        ("/master.m3u8", (mime, master.as_bytes().to_vec())),
+        ("/audio.m3u8", (mime, media_playlist("audio.aac"))),
+        ("/video.m3u8", (mime, media_playlist("video.ts"))),
+        ("/audio.aac", ("audio/aac", fs::read(audio).unwrap())),
+        ("/video.ts", ("video/mp2t", fs::read(video).unwrap())),
+    ]))
+    .await;
+    let url = format!("{base}/synthetic_clip.mp4");
 
     let probe_res = probe_url(&tools, &url, ProbeOptions { playlist: false })
         .await
@@ -549,7 +802,7 @@ async fn real_ytdlp_probe_and_download_loopback() {
     assert!(!probe_res.formats.is_empty());
 
     let save_dir = temp.0.join("downloads");
-    let pipeline = MediaPipeline::new(tools, &save_dir);
+    let pipeline = MediaPipeline::new(tools.clone(), &save_dir);
     let (tx, mut rx) = mpsc::channel(32);
     let request = AddMediaDownloadRequest {
         url: url.clone(),
@@ -562,6 +815,8 @@ async fn real_ytdlp_probe_and_download_loopback() {
         save_dir: None,
         filename: Some("My Clip.v2.mp4".to_owned()),
         playlist_items: None,
+        download_playlist: false,
+        max_height: None,
     };
     let (download, events) = tokio::join!(
         async {
@@ -579,8 +834,6 @@ async fn real_ytdlp_probe_and_download_loopback() {
             events
         }
     );
-    server.abort();
-
     let paths = download.unwrap();
     assert_eq!(paths.len(), 1);
     assert_eq!(
@@ -617,4 +870,44 @@ async fn real_ytdlp_probe_and_download_loopback() {
             format!("[ZoneTransfer]\r\nZoneId=3\r\nHostUrl={url}\r\n")
         );
     }
+
+    let hls_url = format!("{base}/master.m3u8");
+    let hls = probe_url(&tools, &hls_url, ProbeOptions::default())
+        .await
+        .unwrap();
+    let video = hls
+        .formats
+        .iter()
+        .find(|f| f.has_video && !f.has_audio)
+        .unwrap();
+    let audio = hls.formats.iter().find(|f| f.is_audio_only).unwrap();
+    let merged = pipeline
+        .download(
+            &AddMediaDownloadRequest {
+                url: hls_url,
+                format_id: Some(format!("{}+{}", video.format_id, audio.format_id)),
+                audio_only_preset: None,
+                filename: Some("Merged HLS".into()),
+                lossless_remux: true,
+                ..request
+            },
+            &DownloadOptions::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    server.abort();
+    let expected_format = match merged[0].extension().and_then(OsStr::to_str) {
+        Some("mp4") => "mp4",
+        Some("mkv") => "matroska",
+        extension => panic!("unexpected output extension {extension:?}"),
+    };
+    let details = probe(&ffprobe, &["-show_format", "-show_streams"], &merged[0]).await;
+    assert!(details["format"]["format_name"]
+        .as_str()
+        .unwrap()
+        .split(',')
+        .any(|name| name == expected_format));
+    assert_eq!(stream(&details, "video")["codec_name"], "h264");
+    assert_eq!(stream(&details, "audio")["codec_name"], "aac");
 }

@@ -136,6 +136,11 @@ html[data-theme="light"] .sheet-card {
   box-shadow: 0 1px 3px var(--dialog-border);
 }
 
+.playlist-mode {
+  grid-template-columns: repeat(2, 1fr);
+  align-self: flex-start;
+}
+
 .format-list {
   border: 1px solid var(--dialog-border);
   border-radius: 11px;
@@ -381,6 +386,10 @@ html[data-theme="light"] .sheet-card {
 .check-row { display: flex; align-items: center; gap: 7px; padding: 8px 12px; border-bottom: 1px solid var(--dialog-border); }
 .check-row:last-child { border-bottom: 0; }
 .check-row input, .file-option input { accent-color: var(--dialog-accent, var(--accent)); }
+.playlist-subtitles { padding: 8px 12px; }
+.subtitle-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.subtitle-chip { padding-inline: 10px; }
+.subtitle-chip[aria-pressed="true"] { border-color: var(--dialog-accent, var(--accent)); }
 .settings-sheet { width: 648px; }
 .dialog-symbol { color: var(--dialog-accent); flex-shrink: 0; }
 .settings-group { border: 1px solid var(--dialog-border); padding: 12px; border-radius: 9px; display: grid; gap: 10px; }

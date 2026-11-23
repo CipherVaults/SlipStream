@@ -2,6 +2,18 @@
 
 All notable changes to **SlipStream** are documented in this file following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [1.1.1] - 2026-11-23
+
+### Added
+
+- Whole-playlist download support: auto-detects pure playlist links, adds a **Single Video / Whole Playlist** switcher for watch, `youtu.be`, Shorts, Live, and embed URLs containing a `list` parameter, provides playlist quality presets (`Best Available` through `360p`), optional playlist item ranges, flat-playlist subtitle language selection, live probed titles before completion, smooth video/audio playlist progress, and partial-completion notices in Inspector when unavailable items or subtitles are skipped.
+
+### Fixed
+
+- Format picker deduplication & ranking: collapses duplicate HLS (`m3u8`) video formats whenever equivalent direct HTTP/HTTPS streams exist (while preserving muxed HLS streams alongside video-only options and keeping HLS-only sources intact), removes redundant `-drc` and unknown-codec HLS audio duplicates, preserves distinct audio languages with original/default tracks ranked first, and sorts direct known-size streams ahead of HLS.
+- Lossless Remux & `yt-dlp` postprocessing reliability: pairs video-only selections with container-compatible original audio (`${id}+${audio}/${id}+bestaudio/${id}`), converts validated canonical `\\?\` Windows drive paths before calling `yt-dlp` / `ffmpeg` / `ffprobe`, passes `--merge-output-format`, detects actual MPEG-TS demuxers disguised under `.mp4`/`.mkv`, preserves convertible embedded text subtitles across `.mkv`/`.mov`/`.m4v`/`.mp4`, skips redundant second FFmpeg passes on clean Matroska outputs, and retries failed implicit `MP4`/`WebM` remuxes as `MKV`.
+- Sidebar version badge now reads the application package version (`v1.1.1`) instead of a hardcoded `v0.1` label.
+
 ## [1.1.0]
 
 ### Added

@@ -17,7 +17,7 @@ const symphony = "Symphony_Live_Master.flac";
 const pdf = "Design_System_Specs_2026.pdf";
 const mediaUrl = "https://example.org/watch?v=tokyo";
 const availableUpdate: UpdateStatus = {
-  available: true, current_version: "1.1.0", version: "1.1.1",
+  available: true, current_version: "1.1.1", version: "1.1.2",
   notes: "Improved download recovery.", pub_date: "2026-11-21 0:00:00.0 +00:00:00",
 };
 
@@ -487,6 +487,7 @@ describe("workspace and inspector", () => {
 describe("add and command palette", () => {
   it("handles Ctrl+K, command filtering, Ctrl+N, Escape and picker events", async () => {
     const user = await start();
+    expect(screen.getByText("v1.1.1")).toBeVisible();
     await user.keyboard("{Control>}k{/Control}");
     const palette = dialog("Command Palette");
     expect(palette.getByRole("button", { name: /Toggle Inspector/ })).toBeVisible();
@@ -535,7 +536,7 @@ describe("add and command palette", () => {
     expect(await screen.findByText("Download added.")).toBeVisible();
   });
 
-  it("pairs adaptive video-only streams with +bestaudio and strips subtitles on audio-only downloads", async () => {
+  it("prefers original audio over a container-compatible dub and strips subtitles on audio downloads", async () => {
     vi.spyOn(desktop, "probeMedia").mockResolvedValue({
       title: "Adaptive Test",
       source_url: mediaUrl,
@@ -559,17 +560,25 @@ describe("add and command palette", () => {
           has_audio: false,
         },
         {
-          format_id: "140",
-          label: "Audio · AAC",
-          container: "m4a",
+          format_id: "251",
+          label: "Audio · Opus · en",
+          container: "WebM",
           video_codec: null,
-          audio_codec: "AAC",
+          audio_codec: "Opus",
+          audio_track_kind: "original",
           height: null,
           fps: null,
           filesize_bytes: 12_000_000,
+          bitrate_kbps: 160,
           is_audio_only: true,
           has_video: false,
           has_audio: true,
+        },
+        {
+          format_id: "140-2", label: "Audio · AAC · es · Dubbed", container: "m4a", video_codec: null, audio_codec: "AAC",
+          audio_track_kind: "dubbed",
+          height: null, fps: null, filesize_bytes: 15_000_000, bitrate_kbps: 256,
+          is_audio_only: true, has_video: false, has_audio: true,
         },
       ],
       subtitles: [{ lang: "en", name: "English", is_auto: false }],
@@ -584,7 +593,7 @@ describe("add and command palette", () => {
     expect(await sheet.findByRole("button", { name: /1080p HD/ })).toBeVisible();
     await user.click(sheet.getByRole("button", { name: "Download" }));
     expect(add).toHaveBeenLastCalledWith(expect.objectContaining({
-      format_id: "137+bestaudio",
+      format_id: "137+251/137+bestaudio/137",
       embed_subtitles_langs: ["en"],
     }));
 
@@ -594,12 +603,153 @@ describe("add and command palette", () => {
     await user.click(sheet.getByRole("button", { name: "Probe" }));
     expect(await sheet.findByRole("button", { name: /1080p HD/ })).toBeVisible();
     await user.click(sheet.getByRole("tab", { name: "Audio Only" }));
+    expect(sheet.getByRole("button", { name: /Audio · Opus · en/ })).toBeVisible();
+    expect(sheet.getByRole("button", { name: /Audio · AAC · es · Dubbed/ })).toBeVisible();
     expect(sheet.queryByRole("switch", { name: "Embed Subtitles" })).not.toBeInTheDocument();
     await user.click(sheet.getByRole("button", { name: "Download" }));
     expect(add).toHaveBeenLastCalledWith(expect.objectContaining({
       audio_only_preset: "mp3_320",
       embed_subtitles_langs: [],
     }));
+  });
+
+  it.each([
+    { container: "WebM", hasAudio: true, selector: "243+251/243+bestaudio/243" },
+    { container: "MKV", hasAudio: true, selector: "243+bestaudio/243" },
+    { container: "MP4", hasAudio: false, selector: "243+bestaudio/243" },
+  ])("keeps the selected $container rendition in the fallback (audio available: $hasAudio)", async ({ container, hasAudio, selector }) => {
+    const probe = demo.probe(mediaUrl);
+    const audio = { format_id: "251", label: "Audio Opus", container: "WebM", video_codec: null, audio_codec: "Opus",
+      height: null, fps: null, filesize_bytes: 12_000, is_audio_only: true, has_video: false, has_audio: true };
+    vi.spyOn(desktop, "probeMedia").mockResolvedValue({
+      ...probe,
+      formats: [
+        { format_id: "243", label: "360p Adaptive", container, video_codec: "VP9", audio_codec: null,
+          height: 360, fps: 30, filesize_bytes: null, is_audio_only: false, has_video: true, has_audio: false },
+        ...(hasAudio ? [audio] : []),
+      ],
+    });
+    const add = vi.spyOn(desktop, "addMediaDownload").mockResolvedValue("media-id");
+    const user = await start();
+    act(() => openPicker(mediaUrl));
+    const sheet = dialog("Add Download");
+    expect(await sheet.findByRole("button", { name: /360p Adaptive/ })).toBeVisible();
+    await user.click(sheet.getByRole("button", { name: "Download" }));
+    expect(add).toHaveBeenCalledWith(expect.objectContaining({ format_id: selector }));
+  });
+
+  it("switches a watch URL between single video and whole playlist and submits a validated range", async () => {
+    const url = mediaUrl + "&list=PL1";
+    const probe = vi.spyOn(desktop, "probeMedia");
+    const add = vi.spyOn(desktop, "addMediaDownload").mockResolvedValue("playlist-id");
+    const http = vi.spyOn(desktop, "addHttpDownload");
+    const user = await start();
+    act(() => openPicker(url));
+    const sheet = dialog("Add Download");
+    expect(await sheet.findByRole("button", { name: /2160p 4K/ })).toBeVisible();
+    expect(sheet.getByRole("button", { name: "Single Video" })).toHaveAttribute("aria-pressed", "true");
+    await user.click(sheet.getByRole("button", { name: "Whole Playlist" }));
+    expect(probe).toHaveBeenLastCalledWith(url, true);
+    expect(await sheet.findByText("Playlist · 3 videos")).toBeVisible();
+    expect(sheet.queryByText("Direct HTTP download")).toBeNull();
+    await user.click(sheet.getByRole("button", { name: "Single Video" }));
+    expect(probe).toHaveBeenLastCalledWith(url, false);
+    expect(await sheet.findByRole("button", { name: /2160p 4K/ })).toBeVisible();
+    await user.click(sheet.getByRole("button", { name: "Whole Playlist" }));
+    await user.click(await sheet.findByRole("button", { name: /1080p · Full HD/ }));
+    const items = sheet.getByRole("textbox", { name: "Playlist Items" });
+    await user.type(items, "1-5, ,8");
+    await user.click(sheet.getByRole("button", { name: "Download Playlist" }));
+    expect(sheet.getByRole("alert")).toHaveTextContent("Enter playlist item numbers or ranges");
+    expect(add).not.toHaveBeenCalled();
+    await user.clear(items);
+    await user.type(items, "1 - 5, 8");
+    await user.click(sheet.getByRole("button", { name: "Download Playlist" }));
+    expect(add).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      url, format_id: null, download_playlist: true, playlist_items: "1-5,8", max_height: 1080,
+    }));
+    expect(http).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "https://youtu.be/jNQXAC9IVRw?list=PL123",
+    "https://youtube.com/shorts/jNQXAC9IVRw?list=PL123",
+    "https://www.youtube.com/live/jNQXAC9IVRw?list=PL123",
+    "https://m.youtube.com/embed/jNQXAC9IVRw?list=PL123",
+  ])("defaults to Single Video and offers Whole Playlist for %s", async url => {
+    const probe = vi.spyOn(desktop, "probeMedia");
+    const user = await start();
+    act(() => openPicker(url));
+    const sheet = dialog("Add Download");
+    await sheet.findByRole("button", { name: /2160p 4K/ });
+    expect(sheet.getByRole("button", { name: "Single Video" })).toHaveAttribute("aria-pressed", "true");
+    await user.click(sheet.getByRole("button", { name: "Whole Playlist" }));
+    expect(probe).toHaveBeenLastCalledWith(url, true);
+    expect(await sheet.findByRole("button", { name: "Download Playlist" })).toBeVisible();
+  });
+
+  it("requests subtitle languages for a flat playlist with no tracks in the probe", async () => {
+    const url = "https://example.org/playlist?list=PL1";
+    vi.spyOn(desktop, "probeMedia").mockResolvedValue({ ...demo.probe(url, true), subtitles: [] });
+    const add = vi.spyOn(desktop, "addMediaDownload").mockResolvedValue("playlist-id");
+    const user = await start();
+    act(() => openPicker(url));
+    const sheet = dialog("Add Download");
+    await sheet.findByText("Playlist · 3 videos");
+    await user.click(sheet.getByRole("tab", { name: "Subtitles" }));
+    const chips = within(sheet.getByRole("group", { name: "Subtitle languages" }));
+    for (const name of ["en", "ar", "es", "fr", "de", "ja"]) {
+      expect(chips.getByRole("button", { name })).toBeVisible();
+    }
+    await user.click(chips.getByRole("button", { name: "ar" }));
+    await user.click(sheet.getByRole("button", { name: "Probe" }));
+    expect(chips.getByRole("button", { name: "ar" })).toHaveAttribute("aria-pressed", "true");
+    const custom = sheet.getByRole("textbox", { name: "Custom subtitle language code" });
+    await user.type(custom, "en.*");
+    await user.click(sheet.getByRole("button", { name: "Add Language" }));
+    expect(sheet.getByRole("alert")).toHaveTextContent("Enter a subtitle language code");
+    await user.clear(custom);
+    await user.type(custom, "pt-BR{Enter}");
+    expect(chips.getByRole("button", { name: "pt-BR" })).toHaveAttribute("aria-pressed", "true");
+    await user.click(sheet.getByRole("button", { name: "Download Playlist" }));
+    expect(add).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      url, download_playlist: true, embed_subtitles_langs: ["ar", "pt-BR"],
+    }));
+  });
+
+  it("shows the partial completion notice in the inspector for a completed playlist", async () => {
+    const base = demo.snapshot();
+    const filename = "Weekend playlist (2 files)";
+    const notice = "2 of 3 videos downloaded (1 skipped).";
+    const complete = {
+      ...base.transfers.find(item => item.id === "alpine")!,
+      id: "playlist-complete", filename, status: "completed" as const, completion_notice: notice,
+    };
+    vi.spyOn(desktop, "getSnapshot").mockResolvedValue({ ...base, transfers: [...base.transfers, complete] });
+    const user = await start();
+    await user.click(within(row(filename)).getByRole("button", { name: /Inspect/ }));
+    expect(inspector().getByText(notice)).toBeVisible();
+    expect(inspector().queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("routes an unprobed pure playlist to media download with the audio preset", async () => {
+    const url = "https://example.org/playlist?list=PL1";
+    const add = vi.spyOn(desktop, "addMediaDownload").mockResolvedValue("playlist-id");
+    const http = vi.spyOn(desktop, "addHttpDownload");
+    const user = await start();
+    await user.click(screen.getByRole("button", { name: "Add" }));
+    const sheet = dialog("Add Download");
+    await user.type(sheet.getByRole("textbox", { name: "Download source" }), url);
+    expect(sheet.getByRole("button", { name: "Best Available" })).toHaveAttribute("aria-pressed", "true");
+    expect(sheet.queryByRole("button", { name: "Single Video" })).toBeNull();
+    await user.click(sheet.getByRole("tab", { name: "Audio Only" }));
+    await user.click(sheet.getByRole("button", { name: /FLAC · Lossless/ }));
+    await user.click(sheet.getByRole("button", { name: "Download Playlist" }));
+    expect(add).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      url, format_id: null, download_playlist: true, audio_only_preset: "flac",
+      max_height: null, playlist_items: null,
+    }));
+    expect(http).not.toHaveBeenCalled();
   });
 
   it("submits direct HTTP, torrent file and wildcard batch requests", async () => {
@@ -728,7 +878,7 @@ describe("appearance, settings and transfer dialogs", () => {
     const settings = dialog("Settings & Browser Integration");
     const about = within(settings.getByRole("region", { name: "About & Updates" }));
 
-    expect(about.getByText("SlipStream v1.1.0")).toBeVisible();
+    expect(about.getByText("SlipStream v1.1.1")).toBeVisible();
     expect(about.getByText("CipherVaults · Windows 10/11 · MIT License")).toBeVisible();
     expect(about.getByText("Signed NSIS Auto-Update (GitHub Releases)")).toBeVisible();
     await user.click(about.getByRole("button", { name: "Check for Updates" }));
@@ -737,8 +887,8 @@ describe("appearance, settings and transfer dialogs", () => {
     expect(settings.getByRole("button", { name: "Save Settings" })).toBeDisabled();
     expect(settings.getByRole("button", { name: "Cancel" })).toBeDisabled();
 
-    await act(async () => resolveCheck({ available: false, current_version: "1.1.0" }));
-    expect(about.getByRole("status")).toHaveTextContent("Up to date (v1.1.0).");
+    await act(async () => resolveCheck({ available: false, current_version: "1.1.1" }));
+    expect(about.getByRole("status")).toHaveTextContent("Up to date (v1.1.1).");
     expect(about.queryByRole("button", { name: "Install Update & Restart" })).not.toBeInTheDocument();
     expect(settings.getByRole("button", { name: "Save Settings" })).toBeEnabled();
   });
@@ -756,7 +906,7 @@ describe("appearance, settings and transfer dialogs", () => {
     const about = within(settings.getByRole("region", { name: "About & Updates" }));
 
     await user.click(about.getByRole("button", { name: "Check for Updates" }));
-    expect(about.getByRole("status")).toHaveTextContent("Update v1.1.1 available.");
+    expect(about.getByRole("status")).toHaveTextContent("Update v1.1.2 available.");
     expect(about.getByText("Improved download recovery.")).toBeVisible();
     expect(about.getByText("Released 2026-11-21")).toBeVisible();
     await user.click(about.getByRole("button", { name: "Install Update & Restart" }));
@@ -790,7 +940,7 @@ describe("appearance, settings and transfer dialogs", () => {
     const user = await start();
     const banner = await screen.findByRole("region", { name: "App update" });
     expect(check).toHaveBeenCalledOnce();
-    expect(banner).toHaveTextContent("Update v1.1.1 available");
+    expect(banner).toHaveTextContent("Update v1.1.2 available");
     expect(within(banner).getByRole("button", { name: "Install Update" })).toBeEnabled();
     await user.click(within(banner).getByRole("button", { name: "Details" }));
     const settings = dialog("Settings & Browser Integration");
@@ -846,7 +996,7 @@ describe("appearance, settings and transfer dialogs", () => {
       const about = within(dialog("Settings & Browser Integration").getByRole("region", { name: "About & Updates" }));
       await user.click(about.getByRole("button", { name: "Check for Updates" }));
       expect(check).toHaveBeenCalledTimes(2);
-      expect(about.getByRole("status")).toHaveTextContent("Update v1.1.1 available.");
+      expect(about.getByRole("status")).toHaveTextContent("Update v1.1.2 available.");
     } finally {
       (restored ?? first).unmount();
       clearMocks();
@@ -920,7 +1070,7 @@ describe("appearance, settings and transfer dialogs", () => {
       expect(about.getByText("Installing…")).toBeVisible();
       await act(async () => resolveInstall(false));
       expect(about.queryByRole("progressbar")).not.toBeInTheDocument();
-      expect(about.getByRole("status")).toHaveTextContent("Up to date (v1.1.0).");
+      expect(about.getByRole("status")).toHaveTextContent("Up to date (v1.1.1).");
       expect(screen.queryByRole("region", { name: "App update" })).not.toBeInTheDocument();
     } finally {
       unmount();

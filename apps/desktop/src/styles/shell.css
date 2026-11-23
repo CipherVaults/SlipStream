@@ -1193,6 +1193,7 @@ button.verified-pill:hover { box-shadow: 0 0 0 1px currentColor; }
 .empty-state { color: var(--text-2); font-size: 12px; padding: 12px 8px; }
 .inline-error { color: var(--danger); border: 1px solid var(--border-strong); border-radius: 8px; padding: 8px 10px; font-size: 12px; overflow-wrap: anywhere; }
 .inline-error .btn-ghost { margin-top: 6px; }
+.completion-notice { color: var(--text-2); border: 1px solid var(--border-strong); border-radius: 8px; padding: 8px 10px; font-size: 12px; }
 .drop-overlay {
   position: absolute;
   inset: 7px;

@@ -2,7 +2,7 @@ import { Download, Folder, Link2, Upload } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import mediaArtwork from "../assets/media-sheet.svg";
 import { desktop, isTauri } from "../lib/tauri";
-import { bytes, clock, errorMessage, isHttpUrl, isRemoteTorrentUrl, isTorrentSource, isWildcard, sourceName } from "../lib/transfers";
+import { bytes, clock, errorMessage, hasListParam, isHttpUrl, isPurePlaylistUrl, isRemoteTorrentUrl, isTorrentSource, isWildcard, sourceName } from "../lib/transfers";
 import type { AppSettings, AudioPreset, MediaFormatOption, MediaProbeResult } from "../types/ipc";
 import { Dialog, FormatRow, Switch, Tabs } from "./ui";
 
@@ -12,6 +12,42 @@ const audioPresets: Array<[AudioPreset, string, string]> = [
   ["mp3_320", "MP3 · High Quality", "320 kbps"], ["m4a_aac", "M4A · AAC", "AAC"],
   ["opus", "Opus", "Opus"], ["flac", "FLAC · Lossless", "FLAC"], ["wav", "WAV · Uncompressed", "PCM"],
 ];
+const playlistQualities = [
+  [null, "Best Available"], [2160, "2160p · 4K UHD"], [1080, "1080p · Full HD"],
+  [720, "720p · HD"], [480, "480p · SD"], [360, "360p"],
+] as const;
+
+const formatPart = /^[a-z0-9_][a-z0-9_.-]*$/i;
+const subtitleLanguage = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
+const quickSubtitleLanguages = ["en", "ar", "es", "fr", "de", "ja"];
+const audioTrackPriority = { descriptive: 0, dubbed: 1, unspecified: 2, default: 3, original: 4 };
+
+function pairVideoWithAudio(video: MediaFormatOption, formats: MediaFormatOption[]) {
+  const id = video.format_id;
+  const fallback = id + "+bestaudio/" + id;
+  if (!formatPart.test(id) || fallback.length > 256) return id;
+  const container = video.container.toLowerCase();
+  const priority = (audio: MediaFormatOption) => audioTrackPriority[audio.audio_track_kind ?? "unspecified"];
+  const tracks = formats.filter(audio => audio.is_audio_only && formatPart.test(audio.format_id))
+    .sort((a, b) => priority(b) - priority(a));
+  const preferred = tracks[0];
+  if (!preferred) return fallback;
+  const compatible = tracks.filter(audio => {
+    if (priority(audio) !== priority(preferred)) return false;
+    const codec = audio.audio_codec?.toLowerCase() ?? "";
+    const ext = audio.container.toLowerCase();
+    return (container === "mp4" && (codec ? ["aac", "alac", "mp3"].includes(codec) : ["m4a", "mp4"].includes(ext)))
+      || (container === "webm" && (codec ? ["opus", "vorbis"].includes(codec) : ["webm", "opus", "ogg"].includes(ext)));
+  });
+  if (priority(preferred) > audioTrackPriority.unspecified && !compatible.includes(preferred)) {
+    compatible.push(preferred);
+  }
+  for (const audio of compatible) {
+    const selector = id + "+" + audio.format_id + "/" + fallback;
+    if (selector.length <= 256) return selector;
+  }
+  return fallback;
+}
 
 export interface AddSeed {
   url?: string;
@@ -31,11 +67,18 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
   const [tab, setTab] = useState<AddTab>(() => seed.format?.is_audio_only ? "audio"
     : isTorrentSource(seed.url ?? "") || isWildcard(seed.url ?? "") ? "torrent" : "video");
   const [probe, setProbe] = useState<MediaProbeResult | undefined>(seed.probe);
+  const [playlistMode, setPlaylistMode] = useState(() => {
+    const initial = seed.url?.trim() ?? "";
+    return isPurePlaylistUrl(initial) || (!hasListParam(initial) && Boolean(seed.probe?.is_playlist));
+  });
+  const [maxHeight, setMaxHeight] = useState<number | null>(null);
+  const [playlistItems, setPlaylistItems] = useState("");
   const [videoFormat, setVideoFormat] = useState<string | null>(seed.format?.is_audio_only ? null : seed.format?.format_id ?? null);
   const [audio, setAudio] = useState<{ preset: AudioPreset } | { format: string }>(
     seed.format?.is_audio_only ? { format: seed.format.format_id } : { preset: "mp3_320" }
   );
   const [languages, setLanguages] = useState<string[]>([]);
+  const [customLanguage, setCustomLanguage] = useState("");
   const [embed, setEmbed] = useState(true);
   const [remux, setRemux] = useState(true);
   const [normalize, setNormalize] = useState(false);
@@ -49,16 +92,19 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
   const [submitting, setSubmitting] = useState(false);
   const [message, setMessage] = useState("");
   const probeRequest = useRef(0);
-  const activeProbe = useRef<{ id: number; source: string } | null>(null);
+  const activeProbe = useRef<{ id: number; source: string; playlist?: boolean } | null>(null);
   const submitLock = useRef(false);
   const batchProgress = useRef({ pattern: "", count: 0 });
   const appliedDropSeq = useRef(0);
 
   const source = url.trim();
-  const wildcard = isWildcard(source);
+  const isPlaylistActive = playlistMode;
+  const canTogglePlaylist = hasListParam(source) && !isPurePlaylistUrl(source);
+  const wildcard = !isPlaylistActive && isWildcard(source);
   const torrent = !wildcard && (tab === "torrent" || isTorrentSource(source));
-  const direct = !torrent && (wildcard || (tab === "video" && !videoFormat));
+  const direct = !isPlaylistActive && !torrent && (wildcard || (tab === "video" && !videoFormat));
   const mediaOptions = [...new Map(probe?.subtitles.map(track => [track.lang, track]) ?? []).values()];
+  const choosePlaylistLanguages = isPlaylistActive && mediaOptions.length === 0;
 
   function changeSource(value: string) {
     setUrl(value);
@@ -67,36 +113,42 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
     setVideoFormat(null);
     setAudio({ preset: "mp3_320" });
     setLanguages([]);
+    setCustomLanguage("");
     setWildcardUrls([]);
     setProbeBusy(false);
     activeProbe.current = null;
     probeRequest.current++;
     batchProgress.current = { pattern: "", count: 0 };
     const next = value.trim();
-    if (isTorrentSource(next) || isWildcard(next)) setTab("torrent");
+    const playlist = isPurePlaylistUrl(next);
+    setPlaylistMode(playlist);
+    setMaxHeight(null);
+    setPlaylistItems("");
+    if (!playlist && (isTorrentSource(next) || isWildcard(next))) setTab("torrent");
     else if (isRemoteTorrentUrl(next)) setTab("video");
     else if (isHttpUrl(next) && tab === "torrent") setTab("video");
   }
 
-  async function probeSource(value: string, coalesceSeed = false) {
-    if (activeProbe.current?.source === value) return;
+  async function probeSource(value: string, playlist: boolean | undefined = playlistMode || undefined, coalesceSeed = false) {
+    if (activeProbe.current?.source === value && activeProbe.current.playlist === playlist) return;
     const request = ++probeRequest.current;
-    activeProbe.current = { id: request, source: value };
+    activeProbe.current = { id: request, source: value, playlist };
     setMessage("");
     setProbeBusy(true);
     try {
-      if (isWildcard(value)) {
+      if (!playlist && isWildcard(value)) {
         const urls = await desktop.expandWildcardUrls(value);
         if (request !== probeRequest.current) return;
         setWildcardUrls(urls);
         setTab("torrent");
       } else {
         if (!isHttpUrl(value)) throw new Error("Enter an HTTP or HTTPS media URL to probe.");
+        const runProbe = () => playlist === undefined ? desktop.probeMedia(value) : desktop.probeMedia(value, playlist);
         let probePromise: Promise<MediaProbeResult>;
         if (coalesceSeed) {
           let cached = pendingAutoProbes.get(seed);
           if (!cached) {
-            cached = desktop.probeMedia(value);
+            cached = runProbe();
             pendingAutoProbes.set(seed, cached);
             void cached.finally(() => {
               if (pendingAutoProbes.get(seed) === cached) pendingAutoProbes.delete(seed);
@@ -104,13 +156,19 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
           }
           probePromise = cached;
         } else {
-          probePromise = desktop.probeMedia(value);
+          probePromise = runProbe();
         }
         const result = await probePromise;
         if (request !== probeRequest.current) return;
         setProbe(result);
+        if (result.is_playlist) {
+          setPlaylistMode(true);
+          setAudio({ preset: "mp3_320" });
+        }
         setVideoFormat(result.formats.find(format => format.has_video)?.format_id ?? null);
-        setLanguages(result.subtitles.some(track => track.lang === "en") ? ["en"] : []);
+        if (!result.is_playlist || result.subtitles.length > 0) {
+          setLanguages(result.subtitles.some(track => track.lang === "en") ? ["en"] : []);
+        }
       }
     } catch (error) {
       if (request === probeRequest.current) setMessage(errorMessage(error));
@@ -122,10 +180,21 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
     }
   }
 
+  function changePlaylistMode(playlist: boolean) {
+    if (playlist === playlistMode) return;
+    setPlaylistMode(playlist);
+    setProbe(undefined);
+    setVideoFormat(null);
+    setLanguages([]);
+    setCustomLanguage("");
+    setAudio({ preset: "mp3_320" });
+    void probeSource(source, playlist);
+  }
+
   useEffect(() => {
     const initial = seed.url?.trim();
     if (seed.autoProbe && initial && !isTorrentSource(initial) && !isRemoteTorrentUrl(initial)) {
-      void probeSource(initial, true);
+      void probeSource(initial, undefined, true);
     }
     return () => {
       probeRequest.current++;
@@ -153,6 +222,23 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
     changeSource(path ?? file.name);
   }
 
+  function toggleLanguage(language: string) {
+    setLanguages(current => current.includes(language)
+      ? current.filter(item => item !== language) : [...current, language]);
+    setMessage("");
+  }
+
+  function addCustomLanguage() {
+    const language = customLanguage.trim();
+    if (!subtitleLanguage.test(language)) {
+      setMessage("Enter a subtitle language code such as en-US.");
+      return;
+    }
+    setLanguages(current => current.includes(language) ? current : [...current, language]);
+    setCustomLanguage("");
+    setMessage("");
+  }
+
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (submitLock.current) return;
@@ -166,7 +252,14 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
       return;
     }
     if (tab === "subs" && !wildcard && !torrent && languages.length === 0) {
-      setMessage("Probe the URL and select at least one subtitle language.");
+      setMessage(choosePlaylistLanguages ? "Select at least one subtitle language."
+        : "Probe the URL and select at least one subtitle language.");
+      return;
+    }
+    const items = isPlaylistActive ? playlistItems.trim().replace(/\s*([,-])\s*/g, "$1") : "";
+    if (items && (items.length > 512 || !/^\d+(-\d+)?(,\d+(-\d+)?)*$/.test(items)
+      || items.split(/[,-]/).some(value => Number(value) < 1 || Number(value) > 0xFFFFFFFF))) {
+      setMessage("Enter playlist item numbers or ranges, such as 1-5, 8.");
       return;
     }
     submitLock.current = true;
@@ -193,12 +286,11 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
         id = await desktop.addHttpDownload({ url: source, save_dir: saveDir, max_connections: threads,
           filename: outputName, expected_sha256: checksum.trim() || null, headers: {} });
       } else {
-        let format = tab === "audio" ? ("format" in audio ? audio.format : null) : videoFormat;
+        let format = isPlaylistActive ? null : tab === "audio" ? ("format" in audio ? audio.format : null) : videoFormat;
         if (tab !== "audio" && format && probe) {
           const picked = probe.formats.find(item => item.format_id === format);
-          if (picked && !picked.has_audio && probe.formats.some(item => item.has_audio)) {
-            const combined = format + "+bestaudio";
-            if (combined.length <= 256) format = combined;
+          if (picked?.has_video && !picked.has_audio) {
+            format = pairVideoWithAudio(picked, probe.formats);
           }
         }
         id = await desktop.addMediaDownload({
@@ -206,6 +298,7 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
           audio_only_preset: tab === "audio" && "preset" in audio ? audio.preset : null,
           embed_subtitles_langs: tab === "audio" ? [] : tab === "subs" || embed ? languages : [],
           lossless_remux: remux, normalize_audio: normalize, save_dir: saveDir, filename: outputName,
+          ...(isPlaylistActive && { download_playlist: true, max_height: tab === "audio" ? null : maxHeight, playlist_items: items || null }),
         });
       }
       onAdded("Download added.", id);
@@ -234,6 +327,7 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
   }>
     {probe && <div className="probe-summary tabular"><strong>{probe.title}</strong>
       <span>{sourceName(probe.source_url)}{probe.duration_seconds !== null ? " · " + clock(probe.duration_seconds) : ""}</span>
+      {isPlaylistActive && <span className="light-pill">Playlist{probe.playlist_count !== null ? " · " + probe.playlist_count + " videos" : ""}</span>}
       <span className="sheet-url-pill">{probe.extractor}</span></div>}
     <form onSubmit={submit} className="dialog-form">
       <fieldset disabled={submitting} className="dialog-fields">
@@ -248,9 +342,21 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
             <button type="button" className="btn-ghost form-button" disabled={!source || probeBusy || isTorrentSource(source)}
               onClick={() => void probeSource(source)}>{probeBusy ? "Probing…" : "Probe"}</button></span>
         </div>
+        {canTogglePlaylist && <div className="sheet-tabs playlist-mode" role="group" aria-label="Download scope">
+          {([[false, "Single Video"], [true, "Whole Playlist"]] as const).map(([playlist, label]) =>
+            <button key={label} type="button" className={"sheet-tab" + (playlistMode === playlist ? " active" : "")}
+              aria-pressed={playlistMode === playlist} onClick={() => changePlaylistMode(playlist)}>{label}</button>)}
+        </div>}
 
         <Tabs<AddTab> label="Download format" value={tab} onChange={setTab} options={tabs} className="sheet-tabs" buttonClass="sheet-tab">
-          {tab === "video" && <div className="format-list">
+          {tab === "video" && isPlaylistActive && <div className="field">
+            <span>Max Quality</span>
+            <div className="format-list">
+              {playlistQualities.map(([height, name]) => <FormatRow key={name} name={name}
+                selected={maxHeight === height} onSelect={() => setMaxHeight(height)} />)}
+            </div>
+          </div>}
+          {tab === "video" && !isPlaylistActive && <div className="format-list">
             {probe?.formats.filter(format => format.has_video).map(format => formatRow(format, videoFormat === format.format_id,
               () => setVideoFormat(format.format_id)))}
             <FormatRow name="Direct HTTP download" tags={["HTTP"]} selected={!videoFormat} onSelect={() => setVideoFormat(null)} />
@@ -258,17 +364,33 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
           {tab === "audio" && <div className="format-list">
             {audioPresets.map(([preset, name, tag]) => <FormatRow key={preset} name={name} tags={[tag]}
               selected={"preset" in audio && audio.preset === preset} onSelect={() => setAudio({ preset })} />)}
-            {probe?.formats.filter(format => format.is_audio_only).map(format =>
+            {!isPlaylistActive && probe?.formats.filter(format => format.is_audio_only).map(format =>
               formatRow(format, "format" in audio && audio.format === format.format_id, () => setAudio({ format: format.format_id })))}
           </div>}
           {tab === "subs" && <div className="format-list">
             {mediaOptions.map(track => <label className="check-row" key={track.lang}>
-              <input type="checkbox" checked={languages.includes(track.lang)} onChange={event => setLanguages(event.target.checked
-                ? [...languages, track.lang] : languages.filter(language => language !== track.lang))} />
+              <input type="checkbox" checked={languages.includes(track.lang)} onChange={() => toggleLanguage(track.lang)} />
               {track.name} <span className="light-pill">{track.lang.toUpperCase()}</span>
               {track.is_auto && <span className="field-note">Automatic</span>}
             </label>)}
-            {mediaOptions.length === 0 && <p className="empty-state">{probe ? "No subtitle tracks detected." : "Probe a media URL to see available subtitles."}</p>}
+            {choosePlaylistLanguages ? <div className="field playlist-subtitles">
+              <div className="subtitle-chips" role="group" aria-label="Subtitle languages">
+                {[...new Set([...quickSubtitleLanguages, ...languages])].map(language =>
+                  <button key={language} type="button" className="btn-ghost subtitle-chip"
+                    aria-pressed={languages.includes(language)} onClick={() => toggleLanguage(language)}>{language}</button>)}
+              </div>
+              <div className="field-inline">
+                <input aria-label="Custom subtitle language code" placeholder="e.g. en-US" value={customLanguage}
+                  onChange={event => setCustomLanguage(event.target.value)}
+                  onKeyDown={event => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      addCustomLanguage();
+                    }
+                  }} />
+                <button type="button" className="btn-ghost form-button" onClick={addCustomLanguage}>Add Language</button>
+              </div>
+            </div> : mediaOptions.length === 0 && <p className="empty-state">{probe ? "No subtitle tracks detected." : "Probe a media URL to see available subtitles."}</p>}
           </div>}
           {tab === "torrent" && (wildcard ? <div className="format-list wildcard-panel">
             <div className="section-head"><strong>Wildcard Batch Preview</strong>
@@ -304,6 +426,10 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
             <Switch label="Sequential" checked={sequential} onChange={setSequential} />
           </div>)}
         </Tabs>
+        {isPlaylistActive && !torrent && <label className="field">Playlist Items
+          <input value={playlistItems} onChange={event => setPlaylistItems(event.target.value)}
+            placeholder="All videos (e.g. 1-5, 8)" />
+        </label>}
 
         {tab !== "torrent" && <div className="sheet-toggles">
           {tab !== "audio" && <Switch label="Embed Subtitles" checked={embed} onChange={setEmbed} />}
@@ -329,11 +455,11 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
       </fieldset>
       {message && <p className="inline-error" role="alert">{message}</p>}
       <div className="sheet-footer">
-        <span className="sheet-foot-note tabular">{torrent ? "BitTorrent" : direct ? threads + " HTTP threads" : "Media download"}</span>
+        <span className="sheet-foot-note tabular">{torrent ? "BitTorrent" : isPlaylistActive ? "Playlist download" : direct ? threads + " HTTP threads" : "Media download"}</span>
         <div className="sheet-foot-btns">
           <button type="button" className="btn-ghost form-button" disabled={submitting} onClick={onClose}>Cancel</button>
           <button type="submit" className="btn-primary" disabled={submitting || probeBusy || !source}>
-            <Download size={14} />{submitting ? "Adding…" : "Download"}
+            <Download size={14} />{submitting ? "Adding…" : isPlaylistActive && !torrent ? "Download Playlist" : "Download"}
           </button>
         </div>
       </div>

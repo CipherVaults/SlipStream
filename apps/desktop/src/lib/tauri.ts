@@ -24,7 +24,8 @@ export const desktop = {
     command<string>("add_http_download", { request }, () => demo.addHttp(request)),
   expandWildcardUrls: (pattern: string) =>
     command<string[]>("expand_wildcard_urls", { pattern }, () => demo.expandWildcard(pattern)),
-  probeMedia: (url: string) => command<MediaProbeResult>("probe_media", { url }, () => demo.probe(url)),
+  probeMedia: (url: string, playlist?: boolean) =>
+    command<MediaProbeResult>("probe_media", playlist === undefined ? { url } : { url, playlist }, () => demo.probe(url, playlist)),
   addMediaDownload: (request: AddMediaDownloadRequest) =>
     command<string>("add_media_download", { request }, () => demo.addMedia(request)),
   addTorrent: (request: AddTorrentRequest) =>

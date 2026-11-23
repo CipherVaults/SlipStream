@@ -12,7 +12,7 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 
 - **Target OS:** Windows 10 / Windows 11 (`x86_64`)
 - **Public repository** [CipherVaults/SlipStream](https://github.com/CipherVaults/SlipStream)
-- **Release** [v1.1.0](https://github.com/CipherVaults/SlipStream/releases/tag/v1.1.0)
+- **Release** [v1.1.1](https://github.com/CipherVaults/SlipStream/releases/tag/v1.1.1)
 
 ---
 
@@ -58,8 +58,8 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 
 ## Download, Installation & Browser Setup
 
-1. **Installer** Download `SlipStream_1.1.0_x64-setup.exe` and run the per-user installer. It includes the native messaging host, media tools, and both browser extension builds. [v1.1.0 release assets](https://github.com/CipherVaults/SlipStream/releases/tag/v1.1.0)
-2. **Portable ZIP** Extract `SlipStream-1.1.0-windows-x64-portable.zip` and run `SlipStream.exe`. Keep the extracted `bin/` and `extensions/` directories beside it.
+1. **Installer** Download `SlipStream_1.1.1_x64-setup.exe` and run the per-user installer. It includes the native messaging host, media tools, and both browser extension builds. [v1.1.1 release assets](https://github.com/CipherVaults/SlipStream/releases/tag/v1.1.1)
+2. **Portable ZIP** Extract `SlipStream-1.1.1-windows-x64-portable.zip` and run `SlipStream.exe`. Keep the extracted `bin/` and `extensions/` directories beside it.
 3. **Browser extension** In **Settings → Browser Integration**, select your browser. For Chrome, Edge, or Brave, enable **Developer mode**, select **Load unpacked**, and choose the revealed folder. In Firefox, choose **Load Temporary Add-on** and select the revealed `manifest.json`. Separate browser extension ZIPs are also available on the release page.
 
 **Upgrading from v1.0.0** SlipStream keeps the valid native messaging IDs already registered for each browser and adds the bundled extension ID. If an older unpacked copy’s ID is missing from the registration, copy the ID from the browser’s extensions page and enter it in **Settings → Browser Integration** for that browser.

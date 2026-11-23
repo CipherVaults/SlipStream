@@ -34,8 +34,12 @@ pub(crate) fn expand_wildcard_urls(pattern: String) -> Result<Vec<String>> {
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub(crate) async fn probe_media(state: Daemon<'_>, url: String) -> Result<MediaProbeResult> {
-    state.probe_media(&url).await
+pub(crate) async fn probe_media(
+    state: Daemon<'_>,
+    url: String,
+    playlist: Option<bool>,
+) -> Result<MediaProbeResult> {
+    state.probe_media(&url, playlist).await
 }
 
 #[tauri::command(rename_all = "snake_case")]

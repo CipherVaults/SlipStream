@@ -167,6 +167,7 @@ impl Entry {
             resumable: true,
             queue_id: "default".into(),
             error_message,
+            completion_notice: None,
             created_at: self.created_at,
             updated_at: state.updated_at,
         };

@@ -958,6 +958,7 @@ impl Job {
                 && record.validators.if_range().is_some(),
             queue_id: record.queue_id.clone(),
             error_message: record.error.clone(),
+            completion_notice: None,
             created_at: record.created_at,
             updated_at: record.updated_at,
         }

@@ -279,15 +279,19 @@ pub(super) fn run(suite: &mut Suite) {
                         "--newline",
                         "--progress",
                         "--progress-template",
-                        "download:SLIPSTREAM|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s",
-                        "-o",
-                        &name,
-                        "-f",
-                        format,
+                        if playlist {
+                            "download:SLIPSTREAM|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(autonumber)s|%(info.n_entries)s|%(info.format_id)s"
+                        } else {
+                            "download:SLIPSTREAM|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s"
+                        },
                     ]
                     .into_iter()
                     .map(OsString::from)
                     .collect();
+                    if playlist {
+                        expected_yt.push("--ignore-errors".into());
+                    }
+                    expected_yt.extend(["-o", &name, "-f", format].into_iter().map(OsString::from));
                     if playlist {
                         expected_yt.extend(
                             ["--playlist-items", playlist_spec]

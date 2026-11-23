@@ -68,6 +68,19 @@ pub enum MediaError {
 }
 
 impl MediaError {
+    pub(crate) fn tool_failed(tool: &'static str, status: ExitStatus, mut stderr: String) -> Self {
+        if tool == "yt-dlp" && stderr.contains("Postprocessing:") {
+            stderr.push_str(
+                "\nFFmpeg could not finish processing the downloaded streams. Try another quality or format, and check FFmpeg and FFprobe in Settings.",
+            );
+        }
+        Self::ToolFailed {
+            tool,
+            status,
+            stderr,
+        }
+    }
+
     pub(crate) fn argument(kind: &'static str, value: impl Into<String>) -> Self {
         Self::InvalidArgument {
             kind,

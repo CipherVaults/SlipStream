@@ -75,6 +75,8 @@ pub struct TransferSnapshot {
     pub resumable: bool,
     pub queue_id: String,
     pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_notice: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -133,6 +135,19 @@ pub enum MediaContainer {
     Wav,
 }
 
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioTrackKind {
+    Descriptive,
+    Dubbed,
+    #[default]
+    Unspecified,
+    Default,
+    Original,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaFormatOption {
     pub format_id: String,
@@ -143,6 +158,10 @@ pub struct MediaFormatOption {
     pub height: Option<u32>,
     pub fps: Option<f32>,
     pub filesize_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitrate_kbps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_track_kind: Option<AudioTrackKind>,
     pub is_audio_only: bool,
     pub has_video: bool,
     pub has_audio: bool,
@@ -164,6 +183,8 @@ pub struct MediaProbeResult {
     pub thumbnail_url: Option<String>,
     pub is_playlist: bool,
     pub playlist_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub playlist_entries: Vec<String>,
     pub formats: Vec<MediaFormatOption>,
     pub subtitles: Vec<SubtitleTrack>,
 }
@@ -180,6 +201,10 @@ pub struct AddMediaDownloadRequest {
     pub save_dir: Option<String>,
     pub filename: Option<String>,
     pub playlist_items: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub download_playlist: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_height: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,4 +421,47 @@ pub enum NativeBridgeResponse {
         code: String,
         message: String,
     },
+}
+
+#[cfg(test)]
+mod media_wire_tests {
+    use super::*;
+
+    #[test]
+    fn older_media_messages_default_new_playlist_fields() {
+        let request: NativeBridgeRequest = serde_json::from_str(
+            r#"{
+            "type":"add_media_download",
+            "request":{"url":"https://example.com/video","embed_subtitles_langs":[],
+                       "lossless_remux":true,"normalize_audio":false}
+        }"#,
+        )
+        .unwrap();
+        let NativeBridgeRequest::AddMediaDownload { mut request } = request else {
+            panic!("wrong request")
+        };
+        assert!(!request.download_playlist);
+        assert_eq!(request.max_height, None);
+        assert_eq!(request.playlist_items, None);
+        let wire = serde_json::to_value(&request).unwrap();
+        assert!(wire.get("download_playlist").is_none());
+        assert!(wire.get("max_height").is_none());
+        request.download_playlist = true;
+        request.max_height = Some(1080);
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["download_playlist"], true);
+        assert_eq!(wire["max_height"], 1080);
+        let probe: MediaProbeResult = serde_json::from_str(
+            r#"{
+            "title":"Older probe","source_url":"https://example.com/video","extractor":"generic",
+            "is_playlist":false,"formats":[],"subtitles":[]
+        }"#,
+        )
+        .unwrap();
+        assert!(probe.playlist_entries.is_empty());
+        assert!(serde_json::to_value(probe)
+            .unwrap()
+            .get("playlist_entries")
+            .is_none());
+    }
 }

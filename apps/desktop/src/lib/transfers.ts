@@ -44,6 +44,10 @@ export function ratio(value: number) {
 
 export function percentage(transfer: TransferSnapshot) {
   if (isDone(transfer)) return 100;
+  if (transfer.kind === "media" && transfer.ui_segments.length) {
+    const filled = transfer.ui_segments.reduce((sum, segment) => sum + ratio(segment), 0);
+    return Math.round(100 * filled / transfer.ui_segments.length);
+  }
   return transfer.total_bytes ? Math.round(ratio(transfer.downloaded_bytes / transfer.total_bytes) * 100) : 0;
 }
 
@@ -55,12 +59,35 @@ export function bytePair(transfer: TransferSnapshot) {
   return bytes(downloaded) + " / " + bytes(total);
 }
 
-export function isHttpUrl(input: string) {
+function parseHttpUrl(input: string) {
+  if (!/^https?:\/\//i.test(input)) return;
   try {
-    return /^https?:\/\//i.test(input) && /^https?:$/.test(new URL(input).protocol);
+    const url = new URL(input);
+    if (url.protocol === "http:" || url.protocol === "https:") return url;
   } catch {
-    return false;
+    // The user may still be typing the URL.
   }
+}
+
+export function hasListParam(input: string) {
+  const url = parseHttpUrl(input);
+  return !!url && url.searchParams.getAll("list").some(Boolean);
+}
+
+export function isPurePlaylistUrl(input: string) {
+  const url = parseHttpUrl(input);
+  if (!url) return false;
+  const { hostname, pathname, searchParams } = url;
+  const [, first, second] = pathname.split("/", 3);
+  const targetsVideo = searchParams.has("v")
+    || (["youtu.be", "www.youtu.be"].includes(hostname) && Boolean(first))
+    || ((hostname === "youtube.com" || hostname.endsWith(".youtube.com"))
+      && ["shorts", "live", "embed"].includes(first) && Boolean(second));
+  return !targetsVideo && (/\/playlist\/*$/.test(pathname) || searchParams.getAll("list").some(Boolean));
+}
+
+export function isHttpUrl(input: string) {
+  return Boolean(parseHttpUrl(input));
 }
 
 export function isTorrentSource(input: string) {

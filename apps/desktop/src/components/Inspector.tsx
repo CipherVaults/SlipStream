@@ -91,6 +91,8 @@ function Overview({ transfer, samples, preview, onAction }: {
       {(example ? ["4K 2160p60", ...transfer.format_tags.filter(tag => tag !== "MP4").slice(1)] : transfer.format_tags)
         .map((tag, index) => <span className={"badge" + (index === 0 ? " accent" : "")} key={tag + index}>{tag}</span>)}
     </div>}
+    {transfer.status === "completed" && transfer.completion_notice &&
+      <p className="completion-notice" role="status">{transfer.completion_notice}</p>}
     {transfer.status === "failed" && <div className="inline-error" role="alert">
       <p>{transfer.error_message || "The transfer failed."}</p>
       {transfer.kind === "http" && <button type="button" className="btn-ghost form-button" onClick={() => onAction("refresh", transfer)}>Refresh Link</button>}
