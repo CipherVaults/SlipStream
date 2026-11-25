@@ -162,12 +162,16 @@ pub(crate) fn ensure_playlist_subfolder(base_dir: &Path, raw_name: &str) -> io::
             Ok(metadata) if reparse(&metadata) => {
                 return Err(invalid("playlist folder is a reparse point"))
             }
-            Ok(metadata) if metadata.is_file() => continue,
-            Ok(_) => {}
+            Ok(_) => continue,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let directory = ensure_safe_directory(&target)?;
+        match fs::create_dir(&target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+        let directory = canonical_directory(&target)?;
         if directory.parent() != Some(base.as_path()) {
             return Err(invalid("playlist folder is outside the save directory"));
         }

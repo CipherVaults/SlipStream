@@ -48,6 +48,7 @@ use tokio::{
     process::Command,
     sync::{
         broadcast, mpsc, watch, Mutex as AsyncMutex, MutexGuard, Notify, RwLock as AsyncRwLock,
+        Semaphore,
     },
     task::JoinHandle,
     time::{timeout, Instant},
@@ -64,6 +65,8 @@ const DEFENDER_SCAN_TIMEOUT: Duration = Duration::from_secs(60);
 const PROBE_CACHE_TTL: Duration = Duration::from_secs(300);
 const PROBE_CACHE_CAPACITY: usize = 128;
 const MAX_SELECTED_ENTRIES: usize = 512;
+const MAX_BATCH_URLS: usize = 512;
+const MAX_CONCURRENT_PROBES: usize = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpenPickerEvent {
@@ -160,6 +163,8 @@ struct PlaylistSelection {
     probe: Option<Arc<MediaProbeResult>>,
 }
 
+type PendingMediaJob = (Arc<MediaJob>, Option<Arc<MediaProbeResult>>);
+
 pub struct AppState {
     data_dir: PathBuf,
     registry_base_key: String,
@@ -172,8 +177,10 @@ pub struct AppState {
     media: RwLock<HashMap<String, Arc<MediaJob>>>,
     toolchain_cache: Arc<ToolchainCache>,
     probe_cache: Arc<Mutex<ProbeCache>>,
+    probe_permits: Arc<Semaphore>,
+    media_queue: Mutex<VecDeque<PendingMediaJob>>,
     playlists: Mutex<HashMap<String, PlaylistCoordinator>>,
-    playlist_finished: mpsc::UnboundedSender<String>,
+    media_finished: mpsc::UnboundedSender<Option<String>>,
     settings: RwLock<AppSettings>,
     dismissed_http: RwLock<HashSet<String>>,
     verified: RwLock<HashMap<String, bool>>,
@@ -254,7 +261,7 @@ impl AppState {
             .map(|snapshot| snapshot.id)
             .collect();
         let (scans, scan_requests) = mpsc::channel(DEFENDER_SCAN_QUEUE_CAPACITY);
-        let (playlist_finished, playlist_events) = mpsc::unbounded_channel();
+        let (media_finished, media_events) = mpsc::unbounded_channel();
         let (stop, _) = watch::channel(false);
         let ready = ui.has_main_window();
         let registry_base_key = options
@@ -272,8 +279,10 @@ impl AppState {
             media: RwLock::default(),
             toolchain_cache: Arc::default(),
             probe_cache: Arc::default(),
+            probe_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_PROBES)),
+            media_queue: Mutex::default(),
             playlists: Mutex::default(),
-            playlist_finished,
+            media_finished,
             settings: RwLock::new(settings),
             dismissed_http: RwLock::new(dismissed_http),
             verified: RwLock::default(),
@@ -315,10 +324,10 @@ impl AppState {
                 state.stop.subscribe(),
                 scan_requests,
             )),
-            tokio::spawn(watch_playlists(
+            tokio::spawn(watch_media_jobs(
                 Arc::downgrade(&state),
                 state.stop.subscribe(),
-                playlist_events,
+                media_events,
             )),
         ];
         *state.tasks.lock().await = Some(tasks);
@@ -406,6 +415,7 @@ impl AppState {
                 .map_err(message)?;
         }
         *self.settings.write().unwrap() = settings;
+        let _ = self.media_finished.send(None);
         Ok(())
     }
 
@@ -479,20 +489,10 @@ impl AppState {
         mut request: AddHttpDownloadRequest,
         settings: &AppSettings,
     ) -> Result<String> {
-        let dir_raw = request
-            .save_dir
-            .take()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| settings.default_download_dir.clone());
-        let validated_dir = tokio::task::spawn_blocking(move || {
-            let canonical = ensure_safe_directory(Path::new(&dir_raw))?;
-            local_drive_path(&canonical)
-        })
-        .await
-        .map_err(message)?
-        .map_err(message)?;
+        let directory = http_save_directory(request.save_dir.take(), settings).await?;
         request.save_dir = Some(
-            validated_dir
+            local_drive_path(&directory)
+                .map_err(message)?
                 .into_os_string()
                 .into_string()
                 .map_err(|_| "non-Unicode save directory".to_owned())?,
@@ -533,8 +533,7 @@ impl AppState {
         if *stopped.borrow() {
             return Err("SlipStream is shutting down".into());
         }
-        // The validated URL is normalized by Url. Keep the path, query, and
-        // credentials in the key so different authenticated URLs stay isolated.
+        // Keep the URL path and query, and the request headers, in the cache key.
         let mut result = {
             let mut cache = self.probe_cache.lock().unwrap();
             if let Some(probe) = cache.get(&key) {
@@ -547,6 +546,7 @@ impl AppState {
                 cache.in_flight.insert(key.clone(), sender.clone());
                 let toolchain_cache = self.toolchain_cache.clone();
                 let probe_cache = self.probe_cache.clone();
+                let probe_permits = self.probe_permits.clone();
                 let settings = self.settings();
                 let resource_dir = self.resource_dir.clone();
                 let cache_dir = self.ytdlp_cache_path();
@@ -555,11 +555,14 @@ impl AppState {
                     let result = tokio::select! {
                         biased;
                         _ = stopped_signal(stopped) => Err("SlipStream is shutting down".into()),
-                        result = run_media_probe(&toolchain_cache, settings, resource_dir, &key.url, ProbeOptions {
-                            playlist: key.playlist,
-                            cache_dir: Some(cache_dir),
-                            headers: key.headers.iter().cloned().collect(),
-                        }) => result.map(Arc::new),
+                        result = async {
+                            let _permit = probe_permits.acquire().await.map_err(message)?;
+                            run_media_probe(&toolchain_cache, settings, resource_dir, &key.url, ProbeOptions {
+                                playlist: key.playlist,
+                                cache_dir: Some(cache_dir),
+                                headers: key.headers.iter().cloned().collect(),
+                            }).await
+                        } => result.map(Arc::new),
                     };
                     let mut cache = probe_cache.lock().unwrap();
                     if cache
@@ -627,8 +630,11 @@ impl AppState {
         }
         let job = Arc::new(MediaJob::new(request, directory, None)?);
         let id = job.snapshot().id;
-        self.start_media_job(&job, None).await?;
-        self.media.write().unwrap().insert(id.clone(), job);
+        self.media.write().unwrap().insert(id.clone(), job.clone());
+        if let Err(error) = self.start_media_job(&job, None).await {
+            self.media.write().unwrap().remove(&id);
+            return Err(error);
+        }
         Ok(id)
     }
 
@@ -642,9 +648,13 @@ impl AppState {
             if !(1..=MAX_SELECTED_ENTRIES).contains(&selected.len()) {
                 return Err("select between 1 and 512 playlist entries".into());
             }
-            for entry in selected.iter_mut() {
+            let mut indices = HashSet::new();
+            for entry in &mut selected {
                 if entry.index == 0 {
                     return Err("playlist entry indices must be positive".into());
+                }
+                if !indices.insert(entry.index) {
+                    return Err("playlist entry indices must be unique".into());
                 }
                 if let Some(url) = &mut entry.url {
                     *url = validate_media_url(url, self.allow_loopback)?.into();
@@ -823,13 +833,72 @@ impl AppState {
             }
         }
         let first_id = playlist.job_ids[0].clone();
-        self.playlists.lock().unwrap().insert(playlist_id, playlist);
+        self.playlists
+            .lock()
+            .unwrap()
+            .insert(playlist_id.clone(), playlist);
         let pre_probe = playlist_probe.filter(|_| jobs[0].request().download_playlist);
-        self.start_media_job(&jobs[0], pre_probe).await?;
+        if let Err(error) = self.start_media_job(&jobs[0], pre_probe).await {
+            let playlist = self.playlists.lock().unwrap().remove(&playlist_id).unwrap();
+            let mut media = self.media.write().unwrap();
+            for id in playlist.job_ids {
+                media.remove(&id);
+            }
+            return Err(error);
+        }
         Ok(first_id)
     }
 
+    fn media_slot_available(&self) -> bool {
+        let limit = usize::from(self.settings.read().unwrap().max_concurrent_downloads);
+        self.media
+            .read()
+            .unwrap()
+            .values()
+            .filter(|job| active(job.status()))
+            .count()
+            < limit
+    }
+
+    fn remove_queued_media_job(&self, job: &Arc<MediaJob>) {
+        self.media_queue
+            .lock()
+            .unwrap()
+            .retain(|(queued, _)| !Arc::ptr_eq(queued, job));
+    }
+
     async fn start_media_job(
+        &self,
+        job: &Arc<MediaJob>,
+        pre_probe: Option<Arc<MediaProbeResult>>,
+    ) -> Result<()> {
+        {
+            let mut queue = self.media_queue.lock().unwrap();
+            if queue.iter().any(|(queued, _)| Arc::ptr_eq(queued, job)) {
+                return Ok(());
+            }
+            if !queue.is_empty() || !self.media_slot_available() {
+                job.queue_for_start()?;
+                queue.push_back((job.clone(), pre_probe));
+                let _ = self.media_finished.send(None);
+                return Ok(());
+            }
+        }
+        self.launch_media_job(job, pre_probe).await
+    }
+
+    async fn drain_media_queue(&self) {
+        while self.media_slot_available() {
+            let next = self.media_queue.lock().unwrap().pop_front();
+            let Some((job, pre_probe)) = next else { return };
+            if let Err(error) = self.launch_media_job(&job, pre_probe).await {
+                job.fail_queued_start(error);
+                let _ = self.media_finished.send(job.snapshot().playlist_id);
+            }
+        }
+    }
+
+    async fn launch_media_job(
         &self,
         job: &Arc<MediaJob>,
         pre_probe: Option<Arc<MediaProbeResult>>,
@@ -849,7 +918,7 @@ impl AppState {
                 ..DownloadOptions::default()
             },
             scans: self.scans.clone(),
-            playlist_finished: self.playlist_finished.clone(),
+            media_finished: self.media_finished.clone(),
         })
         .await
     }
@@ -920,7 +989,10 @@ impl AppState {
         if self.http_snapshot(id).is_some() {
             self.engine.pause_transfer(id).await.map_err(message)
         } else if let Some(job) = self.media_job(id) {
-            job.stop(TransferStatus::Paused).await
+            self.remove_queued_media_job(&job);
+            job.stop(TransferStatus::Paused).await?;
+            let _ = self.media_finished.send(None);
+            Ok(())
         } else {
             self.torrent
                 .read()
@@ -940,7 +1012,11 @@ impl AppState {
             let snapshot = job.snapshot();
             if let Some(playlist_id) = &snapshot.playlist_id {
                 let (paused, jobs) = self.playlist_jobs(playlist_id)?;
-                if paused || jobs.iter().any(|job| active(job.snapshot().status)) {
+                let sibling_queued = self.media_queue.lock().unwrap().iter().any(|(queued, _)| {
+                    !Arc::ptr_eq(&job, queued)
+                        && jobs.iter().any(|member| Arc::ptr_eq(member, queued))
+                });
+                if paused || sibling_queued || jobs.iter().any(|job| active(job.status())) {
                     return Err("the playlist is paused or already has a running transfer".into());
                 }
                 if snapshot.status == TransferStatus::Queued {
@@ -1003,7 +1079,13 @@ impl AppState {
 
     async fn advance_playlist(&self, id: &str, resume_paused: bool) -> Result<()> {
         let (paused, jobs) = self.playlist_jobs(id)?;
-        if paused || jobs.iter().any(|job| active(job.snapshot().status)) {
+        let has_pending_job = self
+            .media_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(queued, _)| jobs.iter().any(|job| Arc::ptr_eq(job, queued)));
+        if paused || has_pending_job || jobs.iter().any(|job| active(job.status())) {
             return Ok(());
         }
         let paused_job = jobs
@@ -1031,13 +1113,17 @@ impl AppState {
             .get_mut(playlist_id)
             .unwrap()
             .paused = true;
-        if let Some(job) = jobs.iter().find(|job| active(job.snapshot().status)) {
+        for job in &jobs {
+            self.remove_queued_media_job(job);
+        }
+        if let Some(job) = jobs.iter().find(|job| active(job.status())) {
             if let Err(error) = job.stop(TransferStatus::Paused).await {
                 if job.snapshot().status != TransferStatus::Completed {
                     return Err(error);
                 }
             }
         }
+        let _ = self.media_finished.send(None);
         Ok(())
     }
 
@@ -1080,6 +1166,9 @@ impl AppState {
                     stopped.map_err(message)?;
                 }
             }
+            self.engine
+                .scrub_transfer_credentials(id)
+                .map_err(message)?;
             if remove_files {
                 let mut paths = vec![format!(".{id}.slipstream-part")];
                 // A failed download can have collided with someone else's file.
@@ -1094,11 +1183,10 @@ impl AppState {
                 .map_err(message)?;
             *self.dismissed_http.write().unwrap() = dismissed;
         } else if let Some(job) = self.media_job(id) {
+            self.remove_queued_media_job(&job);
             job.stop(TransferStatus::Canceled).await?;
             let snapshot = job.snapshot();
-            if let Some(playlist_id) = &snapshot.playlist_id {
-                let _ = self.playlist_finished.send(playlist_id.clone());
-            }
+            let _ = self.media_finished.send(snapshot.playlist_id.clone());
             if remove_files {
                 remove_outputs(snapshot.save_dir.into(), job.outputs()).await?;
             }
@@ -1314,28 +1402,15 @@ impl AppState {
     }
 
     async fn grab_batch(&self, urls: Vec<String>, referrer: Option<String>) -> Result<()> {
-        for url in &urls {
-            validate_http_url(url).map_err(message)?;
+        if !(1..=MAX_BATCH_URLS).contains(&urls.len()) {
+            return Err("provide between 1 and 512 batch URLs".into());
         }
         let _operation = self.operation().await?;
         let settings = self.settings();
-        for url in urls {
-            self.enqueue_http(
-                AddHttpDownloadRequest {
-                    url,
-                    filename: None,
-                    save_dir: None,
-                    max_connections: None,
-                    queue_id: None,
-                    headers: HashMap::new(),
-                    referrer: referrer.clone(),
-                    expected_sha256: None,
-                },
-                &settings,
-            )
-            .await?;
-        }
-        Ok(())
+        let save_dir = http_save_directory(None, &settings).await?;
+        self.engine
+            .add_http_batch(urls, referrer, save_dir, settings.default_connections)
+            .map_err(message)
     }
 
     async fn native_request(&self, request: NativeBridgeRequest) -> Result<NativeBridgeResponse> {
@@ -1452,6 +1527,16 @@ fn browser_source_url(raw: &str) -> String {
     }
 }
 
+async fn http_save_directory(raw: Option<String>, settings: &AppSettings) -> Result<PathBuf> {
+    let raw = raw
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or_else(|| settings.default_download_dir.clone());
+    tokio::task::spawn_blocking(move || ensure_safe_directory(Path::new(&raw)))
+        .await
+        .map_err(message)?
+        .map_err(message)
+}
+
 fn bounded_native_status(mut response: NativeBridgeResponse) -> Result<NativeBridgeResponse> {
     const BUDGET: usize = MAX_NATIVE_MESSAGE_BYTES - 16 * 1024;
     if serde_json::to_vec(&response).map_err(message)?.len() < BUDGET {
@@ -1465,14 +1550,15 @@ fn bounded_native_status(mut response: NativeBridgeResponse) -> Result<NativeBri
     let mut sizes = Vec::with_capacity(transfers.len());
     for transfer in &mut transfers {
         transfer.segments.clear();
-        transfer.error_message = transfer
-            .error_message
-            .take()
-            .filter(|text| text.len() <= 256);
-        transfer.completion_notice = transfer
-            .completion_notice
-            .take()
-            .filter(|text| text.len() <= 256);
+        for text in [&mut transfer.error_message, &mut transfer.completion_notice]
+            .into_iter()
+            .flatten()
+        {
+            if text.len() > 256 {
+                text.truncate(text.floor_char_boundary(253));
+                text.push_str("...");
+            }
+        }
         let bytes = serde_json::to_vec(transfer).map_err(message)?.len() + 1;
         size += bytes;
         sizes.push(bytes);
@@ -1515,6 +1601,9 @@ fn check_media_ip(ip: std::net::IpAddr, allow_loopback: bool) -> Result<()> {
 
 pub(crate) fn validate_media_url(raw: &str, allow_loopback: bool) -> Result<Url> {
     let url = validate_http_url(raw).map_err(message)?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("URL credentials are unsupported".into());
+    }
     if let Some(host) = url.host_str() {
         let host = host.trim_end_matches('.');
         let stripped = host
@@ -1611,10 +1700,10 @@ async fn stopped_signal(mut stop: watch::Receiver<bool>) {
     let _ = stop.wait_for(|stopped| *stopped).await;
 }
 
-async fn watch_playlists(
+async fn watch_media_jobs(
     state: Weak<AppState>,
     stop: watch::Receiver<bool>,
-    mut finished: mpsc::UnboundedReceiver<String>,
+    mut finished: mpsc::UnboundedReceiver<Option<String>>,
 ) {
     let stopped = stopped_signal(stop);
     tokio::pin!(stopped);
@@ -1625,7 +1714,8 @@ async fn watch_playlists(
             Some(id) = finished.recv() => {
                 let Some(state) = state.upgrade() else { return };
                 let Ok(_operation) = state.operation().await else { return };
-                if state.playlists.lock().unwrap().contains_key(&id) {
+                state.drain_media_queue().await;
+                if let Some(id) = id.filter(|id| state.playlists.lock().unwrap().contains_key(id)) {
                     if let Err(error) = state.advance_playlist(&id, false).await {
                         tracing::warn!(playlist_id = %id, %error, "could not advance playlist");
                     }
@@ -1775,6 +1865,9 @@ fn retry_http_completions(
 }
 
 async fn scan_torrent_completions(state: &AppState, scans: &mpsc::Sender<ScanRequest>) {
+    let Ok(_operation) = state.operation().await else {
+        return;
+    };
     let mut completed = Vec::new();
     {
         let torrent = state.torrent.read().await;
@@ -1800,14 +1893,14 @@ async fn scan_torrent_completions(state: &AppState, scans: &mpsc::Sender<ScanReq
                 .filter(|file| file.selected)
                 .map(|file| file.relative_path)
             {
-                if recorded.marked.insert(path.clone()) {
+                if !recorded.marked.contains(&path) {
                     to_mark.push(path.clone());
                 }
                 if auto_scan && !recorded.scanned.contains(&path) {
                     to_scan.push(path);
                 }
             }
-            let mut retry = false;
+            let mut retry_scan = false;
             let scan = if to_scan.is_empty() {
                 None
             } else {
@@ -1818,36 +1911,60 @@ async fn scan_torrent_completions(state: &AppState, scans: &mpsc::Sender<ScanReq
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         tracing::debug!(transfer_id = %id, "could not enqueue torrent Defender scan");
-                        retry = true;
+                        retry_scan = true;
                         None
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => None,
                 }
             };
-            if !to_mark.is_empty() || scan.is_some() {
-                completed.push((id.clone(), PathBuf::from(report.snapshot.save_dir), to_mark, scan));
+            let marking_pending = !to_mark.is_empty();
+            if marking_pending || scan.is_some() {
+                completed.push((id.clone(), PathBuf::from(report.snapshot.save_dir), to_mark, scan, retry_scan));
             }
-            retry
+            marking_pending || retry_scan
         });
     }
     if completed.is_empty() {
         return;
     }
-    if let Err(error) = tokio::task::spawn_blocking(move || {
-        for (id, root, to_mark, scan) in completed {
+    let results = tokio::task::spawn_blocking(move || {
+        let mut results = Vec::with_capacity(completed.len());
+        for (id, root, to_mark, scan, retry_scan) in completed {
+            let mut retry = retry_scan;
+            let mut marked = Vec::new();
             for path in to_mark {
-                if let Err(error) = write_zone_identifier(&root, &path) {
-                    tracing::debug!(transfer_id = %id, %error, "could not write torrent Zone.Identifier");
+                match write_zone_identifier(&root, &path) {
+                    Ok(()) => marked.push(path),
+                    Err(error) => {
+                        retry = true;
+                        tracing::debug!(transfer_id = %id, %error, "could not write torrent Zone.Identifier");
+                    }
                 }
             }
             if let Some((permit, to_scan)) = scan {
                 permit.send((root, to_scan));
             }
+            results.push((id, marked, retry));
         }
+        results
     })
-    .await
-    {
-        tracing::debug!(%error, "torrent completion worker failed");
+    .await;
+    match results {
+        Ok(results) => {
+            let mut pending = state.torrent_completions.lock().unwrap();
+            let mut completed = state.torrent_completed_files.lock().unwrap();
+            for (id, marked, retry) in results {
+                completed
+                    .entry(id.clone())
+                    .or_default()
+                    .marked
+                    .extend(marked);
+                if !retry {
+                    pending.remove(&id);
+                }
+            }
+        }
+        Err(error) => tracing::debug!(%error, "torrent completion worker failed"),
     }
 }
 
@@ -1912,6 +2029,7 @@ async fn scan_completed(
 mod tests {
     use super::*;
     use slipstream_torrent::TorrentAddOptions;
+    use std::os::windows::fs::OpenOptionsExt;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -1973,6 +2091,234 @@ mod tests {
         fn request_quit(&self) {}
     }
 
+    async fn start_test_daemon(directory: &Path) -> Arc<AppState> {
+        let settings = AppSettings {
+            default_download_dir: directory.join("Downloads").to_string_lossy().into_owned(),
+            auto_defender_scan: false,
+            ..AppSettings::default()
+        };
+        write_json_atomically(&directory.join(SETTINGS_FILE), &settings).unwrap();
+        AppState::start(
+            directory.to_path_buf(),
+            Arc::new(NullUi),
+            DaemonOptions {
+                pipe_name: Some(format!(
+                    r"\\.\pipe\SlipStream.DaemonUnitTest.{}",
+                    Uuid::new_v4()
+                )),
+                allow_loopback: true,
+                torrent: TorrentManagerConfig {
+                    enable_dht: false,
+                    enable_trackers: false,
+                    listen_port_range: None,
+                    ..TorrentManagerConfig::default()
+                },
+                ..DaemonOptions::default()
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    fn media_request() -> AddMediaDownloadRequest {
+        serde_json::from_value(serde_json::json!({
+            "url": "https://example.com/video",
+            "embed_subtitles_langs": [],
+            "lossless_remux": false,
+            "normalize_audio": false
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn grab_batch_rejects_bad_sizes_urls_and_referrers_without_enqueuing() {
+        let temp = TestDir::new();
+        let state = start_test_daemon(&temp.0).await;
+        let url = "https://example.com/item.bin".to_owned();
+        for (urls, referrer) in [
+            (vec![], None),
+            (vec![url.clone(); MAX_BATCH_URLS + 1], None),
+            (vec![url.clone(), "http://169.254.169.254/".into()], None),
+            (vec![url], Some("file:///invalid-referrer".into())),
+        ] {
+            assert!(state.grab_batch(urls, referrer).await.is_err());
+            assert!(state.engine.snapshots().is_empty());
+        }
+        state.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn selected_playlist_entries_reject_duplicate_indices() {
+        let temp = TestDir::new();
+        let state = start_test_daemon(&temp.0).await;
+        let mut request = media_request();
+        let entry = SelectedPlaylistEntry {
+            index: 1,
+            title: "Video".into(),
+            url: None,
+        };
+        request.selected_entries = Some(vec![entry.clone(), entry]);
+        assert_eq!(
+            state.add_media_download(request).await.unwrap_err(),
+            "playlist entry indices must be unique"
+        );
+        assert!(state.media.read().unwrap().is_empty());
+        assert!(state.playlists.lock().unwrap().is_empty());
+        state.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn playlist_start_error_rolls_back_children_and_coordinator() {
+        let temp = TestDir::new();
+        let state = start_test_daemon(&temp.0).await;
+        let mut request = media_request();
+        request.headers.insert("Cookie".into(), "private".into());
+        let directory = ensure_safe_directory(&temp.0.join("Downloads")).unwrap();
+        let result = state
+            .enqueue_playlist(
+                request,
+                directory,
+                PlaylistSelection {
+                    entries: Vec::new(),
+                    probe: None,
+                },
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(state.media.read().unwrap().is_empty());
+        assert!(state.playlists.lock().unwrap().is_empty());
+        state.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_media_can_be_canceled_and_capacity_restarts_the_queue() {
+        let temp = TestDir::new();
+        let state = start_test_daemon(&temp.0).await;
+        state.settings.write().unwrap().max_concurrent_downloads = 0;
+        let canceled = state.add_media_download(media_request()).await.unwrap();
+        let next = state.add_media_download(media_request()).await.unwrap();
+        assert_eq!(
+            state.media_job(&next).unwrap().status(),
+            TransferStatus::Queued
+        );
+        state.cancel_transfer(&canceled, false).await.unwrap();
+        assert!(state.media_job(&canceled).is_none());
+        assert_eq!(state.media_queue.lock().unwrap().len(), 1);
+
+        let mut settings = state.settings();
+        settings.max_concurrent_downloads = 1;
+        state.save_settings(settings).await.unwrap();
+        timeout(Duration::from_secs(5), async {
+            while state.media_job(&next).unwrap().status() == TransferStatus::Queued {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("media queue should advance when a slot is available");
+        assert!(state.media_queue.lock().unwrap().is_empty());
+        state.shutdown().await.unwrap();
+    }
+
+    fn sqlite_fixture(path: &Path, sql: &str) -> String {
+        use std::ffi::{c_char, c_int, c_void, CStr, CString};
+        use std::ptr;
+
+        // These test calls use the same bundled SQLite library linked by the engine.
+        extern "C" {
+            fn sqlite3_open(path: *const c_char, database: *mut *mut c_void) -> c_int;
+            fn sqlite3_exec(
+                database: *mut c_void,
+                sql: *const c_char,
+                callback: unsafe extern "C" fn(
+                    *mut c_void,
+                    c_int,
+                    *mut *mut c_char,
+                    *mut *mut c_char,
+                ) -> c_int,
+                output: *mut c_void,
+                error: *mut *mut c_char,
+            ) -> c_int;
+            fn sqlite3_close(database: *mut c_void) -> c_int;
+        }
+        unsafe extern "C" fn collect(
+            output: *mut c_void,
+            columns: c_int,
+            values: *mut *mut c_char,
+            _: *mut *mut c_char,
+        ) -> c_int {
+            if columns != 1 || (*values).is_null() {
+                return 1;
+            }
+            let value = CStr::from_ptr(*values).to_string_lossy();
+            (*output.cast::<String>()).push_str(&value);
+            0
+        }
+        let path = CString::new(path.to_str().unwrap()).unwrap();
+        let sql = CString::new(sql).unwrap();
+        let mut database = ptr::null_mut();
+        let mut output = String::new();
+        let opened = unsafe { sqlite3_open(path.as_ptr(), &mut database) };
+        assert_eq!(opened, 0);
+        let result = unsafe {
+            sqlite3_exec(
+                database,
+                sql.as_ptr(),
+                collect,
+                ptr::from_mut(&mut output).cast(),
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(unsafe { sqlite3_close(database) }, 0);
+        assert_eq!(result, 0, "SQLite test fixture statement failed");
+        output
+    }
+
+    #[tokio::test]
+    async fn dismissing_completed_http_scrubs_legacy_sqlite_credentials() {
+        let temp = TestDir::new();
+        let state = start_test_daemon(&temp.0).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let id = state
+            .add_http_download(AddHttpDownloadRequest {
+                url: format!("http://{}/file.bin", listener.local_addr().unwrap()),
+                filename: None,
+                save_dir: None,
+                max_connections: None,
+                queue_id: None,
+                headers: HashMap::new(),
+                referrer: None,
+                expected_sha256: None,
+            })
+            .await
+            .unwrap();
+        state.shutdown().await.unwrap();
+        let db = temp.0.join("slipstream.sqlite");
+        sqlite_fixture(
+            &db,
+            "UPDATE transfers SET record = json_set(record,
+            '$.status', 'completed',
+            '$.headers', json_object('Authorization', 'private'),
+            '$.referrer', 'https://app.example.com/referrer',
+            '$.source_url', 'https://user:pass@example.com/file.bin?token=private#fragment')",
+        );
+
+        let state = start_test_daemon(&temp.0).await;
+        assert_eq!(
+            state.http_snapshot(&id).unwrap().status,
+            TransferStatus::Completed
+        );
+        state.cancel_transfer(&id, false).await.unwrap();
+        assert!(state.http_snapshot(&id).is_none());
+        state.shutdown().await.unwrap();
+
+        let record: serde_json::Value =
+            serde_json::from_str(&sqlite_fixture(&db, "SELECT record FROM transfers")).unwrap();
+        assert_eq!(record["status"], "completed");
+        assert_eq!(record["headers"], serde_json::json!({}));
+        assert!(record["referrer"].is_null());
+        assert_eq!(record["source_url"], "https://example.com/file.bin");
+    }
+
     #[test]
     fn probe_cache_expires_entries_before_evicting_the_oldest() {
         let url = "https://example.com/video";
@@ -2020,17 +2366,12 @@ mod tests {
 
     #[test]
     fn native_status_budget_compacts_large_batches_and_keeps_live_transfers() {
-        let request = serde_json::from_value(serde_json::json!({
-            "url": "https://example.com/video", "embed_subtitles_langs": [],
-            "lossless_remux": false, "normalize_audio": false
-        }))
-        .unwrap();
-        let job = MediaJob::new(request, PathBuf::new(), None).unwrap();
+        let job = MediaJob::new(media_request(), PathBuf::new(), None).unwrap();
         let mut snapshot = job.snapshot();
         snapshot.id = "oldest-live".into();
         snapshot.status = TransferStatus::Active;
-        snapshot.error_message = Some("e".repeat(4096));
-        snapshot.completion_notice = Some("n".repeat(4096));
+        snapshot.error_message = Some("é".repeat(2048));
+        snapshot.completion_notice = Some("界".repeat(2048));
         snapshot
             .segments
             .push(slipstream_protocol::SegmentSnapshot {
@@ -2071,9 +2412,11 @@ mod tests {
         assert_eq!(batch.transfers.first().unwrap().id, "oldest-live");
         assert_eq!(batch.transfers.last().unwrap().id, "terminal-1999");
         assert!(batch.transfers.len() < 2001);
+        let error = format!("{}...", "é".repeat(126));
+        let notice = format!("{}...", "界".repeat(84));
         assert!(batch.transfers.iter().all(|item| item.segments.is_empty()
-            && item.error_message.is_none()
-            && item.completion_notice.is_none()));
+            && item.error_message.as_deref() == Some(error.as_str())
+            && item.completion_notice.as_deref() == Some(notice.as_str())));
     }
 
     #[test]
@@ -2121,6 +2464,17 @@ mod tests {
                 validate_media_url(blocked_always, true).is_err(),
                 "{blocked_always}"
             );
+        }
+    }
+
+    #[test]
+    fn validate_media_url_rejects_usernames_and_passwords() {
+        for url in [
+            "https://alice@example.com/video",
+            "https://alice:secret@example.com/video",
+            "https://:secret@example.com/video",
+        ] {
+            assert!(validate_media_url(url, false).is_err(), "{url}");
         }
     }
 
@@ -2288,6 +2642,13 @@ mod tests {
                 .unwrap();
             id
         };
+        let zone_stream = downloads.join("torrent.bin:Zone.Identifier");
+        let locked_stream = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .share_mode(0)
+            .open(&zone_stream)
+            .unwrap();
         state
             .torrent_completions
             .lock()
@@ -2315,9 +2676,23 @@ mod tests {
             .lock()
             .unwrap()
             .get(&torrent_id)
+            .is_some_and(|files| files.marked.is_empty()));
+        drop(locked_stream);
+
+        scan_torrent_completions(&state, &tx).await;
+        assert!(state
+            .torrent_completions
+            .lock()
+            .unwrap()
+            .contains(&torrent_id));
+        assert!(state
+            .torrent_completed_files
+            .lock()
+            .unwrap()
+            .get(&torrent_id)
             .is_some_and(|files| files.scanned.is_empty()));
         assert_eq!(
-            std::fs::read(downloads.join("torrent.bin:Zone.Identifier")).unwrap(),
+            std::fs::read(zone_stream).unwrap(),
             b"[ZoneTransfer]\r\nZoneId=3\r\n"
         );
 

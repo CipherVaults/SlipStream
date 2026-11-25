@@ -613,6 +613,8 @@ pub(crate) async fn update_ytdlp_managed() -> Result<(PathBuf, String), String> 
     let directory = default_managed_bin_dir()
         .ok_or("SlipStream could not find its local app data directory.")?;
     let client = reqwest::Client::builder()
+        .use_rustls_tls()
+        .no_proxy()
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(300))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {

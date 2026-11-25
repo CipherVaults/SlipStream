@@ -2,6 +2,7 @@ use crate::storage::Record;
 use crate::{EngineError, Result};
 use md5::Md5;
 use sha2::{Digest, Sha256};
+use slipstream_protocol::security::MAX_FILENAME_BYTES;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 #[cfg(windows)]
@@ -162,6 +163,30 @@ pub(crate) async fn commit(record: &Record) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn numbered_filename(filename: &str, number: usize) -> String {
+    if number == 0 {
+        return filename.to_owned();
+    }
+    let path = Path::new(filename);
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(filename);
+    let suffix = format!(" ({number})");
+    if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
+        let available = MAX_FILENAME_BYTES - suffix.len() - 1;
+        let first_char = stem.chars().next().map_or(0, char::len_utf8);
+        let extension = &extension[..extension.floor_char_boundary(available - first_char)];
+        let extension = extension.trim_end_matches(['.', ' ']);
+        if !extension.is_empty() {
+            let stem = &stem[..stem.floor_char_boundary(available - extension.len())];
+            return format!("{stem}{suffix}.{extension}");
+        }
+    }
+    let stem = &stem[..stem.floor_char_boundary(MAX_FILENAME_BYTES - suffix.len())];
+    format!("{stem}{suffix}")
+}
+
 #[cfg(windows)]
 fn move_file(part: &Path, final_path: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
@@ -180,17 +205,23 @@ fn move_file(part: &Path, final_path: &Path) -> std::io::Result<()> {
             .collect::<Vec<_>>()
     };
     let part = wide(part);
-    let final_path = wide(final_path);
+    let destination = wide(final_path);
     // Both owned, NUL-terminated strings live across the call. The source and
     // destination share a directory, and the flags forbid copy and replacement.
     for attempt in 0..5 {
-        if unsafe { MoveFileExW(part.as_ptr(), final_path.as_ptr(), MOVEFILE_WRITE_THROUGH) } != 0 {
+        if unsafe { MoveFileExW(part.as_ptr(), destination.as_ptr(), MOVEFILE_WRITE_THROUGH) } != 0
+        {
             return Ok(());
         }
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) && attempt < 4 {
             std::thread::sleep(std::time::Duration::from_millis(20));
             continue;
+        }
+        if error.kind() == std::io::ErrorKind::PermissionDenied
+            && fs::symlink_metadata(final_path).is_ok()
+        {
+            return Err(std::io::ErrorKind::AlreadyExists.into());
         }
         return Err(error);
     }

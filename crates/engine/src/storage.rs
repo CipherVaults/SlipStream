@@ -127,7 +127,7 @@ impl Database {
     }
 
     pub(crate) fn transfers(&self) -> Result<Vec<(Record, Segments)>> {
-        let mut transfers = self.0.prepare("SELECT record FROM transfers")?;
+        let mut transfers = self.0.prepare("SELECT id, record FROM transfers")?;
         let mut segments = self.0.prepare(
             "SELECT segment_index, start_byte, end_byte, cursor_byte, state
              FROM segments WHERE transfer_id = ?1",
@@ -135,7 +135,18 @@ impl Database {
         let mut records = transfers.query([])?;
         let mut output = Vec::new();
         while let Some(row) = records.next()? {
-            let record: Record = serde_json::from_str(&row.get::<_, String>(0)?)?;
+            let record = row
+                .get::<_, String>(1)
+                .map_err(EngineError::from)
+                .and_then(|json| serde_json::from_str::<Record>(&json).map_err(EngineError::from));
+            let record = match record {
+                Ok(record) => record,
+                Err(_) => {
+                    let id: String = row.get(0)?;
+                    tracing::warn!(transfer_id = %id, "skipping unreadable transfer record");
+                    continue;
+                }
+            };
             let mut rows = segments.query([&record.id])?;
             let mut ranges = Segments::new();
             while let Some(row) = rows.next()? {
@@ -166,6 +177,15 @@ impl Database {
 
     pub(crate) fn save_record(&self, record: &Record) -> Result<()> {
         save_record(&self.0, record)
+    }
+
+    pub(crate) fn save_records(&mut self, records: &[Record]) -> Result<()> {
+        let transaction = self.0.transaction()?;
+        for record in records {
+            save_record(&transaction, record)?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub(crate) fn replace_segments(&mut self, record: &Record, segments: &Segments) -> Result<()> {

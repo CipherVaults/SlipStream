@@ -1,9 +1,9 @@
 use crate::{EngineError, Result};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{
-    HeaderMap, HeaderName, HeaderValue, ACCEPT, ACCEPT_ENCODING, AUTHORIZATION,
-    CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, COOKIE, ETAG, IF_RANGE,
-    LAST_MODIFIED, LOCATION, ORIGIN, PROXY_AUTHORIZATION, RANGE, REFERER, USER_AGENT,
+    HeaderMap, HeaderName, HeaderValue, ACCEPT, ACCEPT_ENCODING, CONTENT_DISPOSITION,
+    CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE, LAST_MODIFIED, LOCATION,
+    RANGE, REFERER, USER_AGENT,
 };
 use reqwest::{Client, Method, Response, StatusCode, Version};
 use serde::{Deserialize, Serialize};
@@ -282,7 +282,6 @@ impl Http {
         if_range: Option<&str>,
     ) -> Result<Response> {
         let mut url = source.url.clone();
-        let initial_origin = url.origin();
         let mut headers = source.headers.clone();
         if let Some((start, last)) = range {
             headers.insert(
@@ -327,7 +326,7 @@ impl Http {
                     "missing or invalid redirect location",
                 ))?;
             let next = validate_redirect_target(&url, location, self.allow_loopback)?;
-            apply_redirect_header_policy(&mut headers, &initial_origin, &url, &next);
+            apply_redirect_header_policy(&mut headers, &url, &next);
             url = next;
         }
         unreachable!("request loop returns after its final hop")
@@ -487,26 +486,33 @@ pub(crate) fn sanitize_http_url_credentials(raw: &str) -> Option<String> {
     Some(parsed.into())
 }
 
-fn apply_redirect_header_policy(
-    headers: &mut HeaderMap,
-    initial_origin: &url::Origin,
-    previous: &Url,
-    next: &Url,
-) {
-    if previous.scheme() == "https" && next.scheme() == "http" {
-        headers.remove(REFERER);
-        headers.remove(ORIGIN);
+fn apply_redirect_header_policy(headers: &mut HeaderMap, previous: &Url, next: &Url) {
+    if previous.origin() == next.origin() {
+        return;
     }
-    if next.origin() != *initial_origin {
-        for name in [
-            COOKIE,
-            HeaderName::from_static("cookie2"),
-            AUTHORIZATION,
-            PROXY_AUTHORIZATION,
-        ] {
-            headers.remove(name);
+    let mut safe = HeaderMap::new();
+    for (name, value) in headers.iter() {
+        if matches!(
+            name.as_str(),
+            "user-agent" | "accept" | "accept-encoding" | "accept-language" | "range" | "if-range"
+        ) {
+            safe.append(name.clone(), value.clone());
         }
     }
+    if previous.scheme() == "https" && next.scheme() == "http" {
+        headers.remove(REFERER);
+    }
+    let origin = headers
+        .get(REFERER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| validate_http_url(value).ok())
+        .and_then(|url| {
+            HeaderValue::from_str(&format!("{}/", url.origin().ascii_serialization())).ok()
+        });
+    if let Some(origin) = origin {
+        safe.insert(REFERER, origin);
+    }
+    *headers = safe;
 }
 
 pub(crate) fn request_error(error: reqwest::Error) -> EngineError {
@@ -737,20 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn redirect_strips_page_headers_on_https_downgrade_and_credentials_from_referrer() {
-        let https_origin = validate_http_url("https://cdn.example.com/start").unwrap();
-        let https_other = validate_http_url("https://mirror.example.com/file").unwrap();
-        let http_other = validate_http_url("http://mirror.example.com/file").unwrap();
-
-        let mut headers = HeaderMap::new();
-        headers.insert(COOKIE, HeaderValue::from_static("sid=secret"));
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
-        headers.insert(ORIGIN, HeaderValue::from_static("https://app.example.com"));
-        let clean_ref =
-            sanitize_http_url_credentials("https://user:pass@app.example.com/page#secret").unwrap();
-        assert_eq!(clean_ref, "https://app.example.com/page");
-        headers.insert(REFERER, HeaderValue::from_str(&clean_ref).unwrap());
-
+    fn source_sanitizes_credentials_from_referrer() {
         let header_src = Source::new(
             "https://cdn.example.com/file",
             &[(
@@ -769,29 +762,56 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("https://ref.example.com/doc")
         );
+    }
 
-        apply_redirect_header_policy(
-            &mut headers,
-            &https_origin.origin(),
-            &https_origin,
-            &https_other,
+    #[test]
+    fn redirect_filters_headers_by_origin_and_downgrade() {
+        let origin = Url::parse("https://cdn.example.com/start").unwrap();
+        let same_origin = origin.join("/other").unwrap();
+        let cross_origin = Url::parse("https://mirror.example.com/file").unwrap();
+        let downgrade = Url::parse("http://cdn.example.com/file").unwrap();
+        let allowed = [
+            "user-agent",
+            "accept",
+            "accept-encoding",
+            "accept-language",
+            "range",
+            "if-range",
+        ];
+        let stripped = [
+            "cookie",
+            "cookie2",
+            "authorization",
+            "proxy-authorization",
+            "x-api-key",
+            "x-auth-token",
+            "origin",
+            "x-custom",
+        ];
+        let mut headers = HeaderMap::new();
+        for name in allowed.into_iter().chain(stripped) {
+            headers.insert(name, HeaderValue::from_static("value"));
+        }
+        headers.insert(
+            REFERER,
+            HeaderValue::from_static("https://user:pw@app.example.com:8443/page?secret=1#fragment"),
         );
-        assert!(headers.get(COOKIE).is_none());
-        assert!(headers.get(AUTHORIZATION).is_none());
-        assert_eq!(
-            headers.get(REFERER).and_then(|v| v.to_str().ok()),
-            Some("https://app.example.com/page")
-        );
-        assert_eq!(headers.get(ORIGIN).unwrap(), "https://app.example.com");
+        let original = headers.clone();
+        apply_redirect_header_policy(&mut headers, &origin, &same_origin);
+        assert_eq!(headers, original);
 
-        apply_redirect_header_policy(
-            &mut headers,
-            &https_origin.origin(),
-            &https_other,
-            &http_other,
-        );
-        assert!(headers.get(REFERER).is_none());
-        assert!(headers.get(ORIGIN).is_none());
+        apply_redirect_header_policy(&mut headers, &origin, &cross_origin);
+        assert_eq!(headers.len(), allowed.len() + 1);
+        for name in allowed {
+            assert_eq!(headers[name], original[name]);
+        }
+        assert_eq!(headers[REFERER], "https://app.example.com:8443/");
+
+        let mut headers = original;
+        apply_redirect_header_policy(&mut headers, &origin, &downgrade);
+        assert_eq!(headers.len(), allowed.len());
+        assert!(!headers.contains_key(REFERER));
+        assert!(!headers.contains_key("origin"));
     }
 
     #[test]

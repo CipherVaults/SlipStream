@@ -38,7 +38,7 @@ pub(crate) struct MediaJobRunOptions {
     pub toolchain_cache: Arc<ToolchainCache>,
     pub download: DownloadOptions,
     pub scans: mpsc::Sender<ScanRequest>,
-    pub playlist_finished: mpsc::UnboundedSender<String>,
+    pub media_finished: mpsc::UnboundedSender<Option<String>>,
 }
 
 pub(crate) struct MediaJob {
@@ -209,6 +209,38 @@ impl MediaJob {
         &self.request
     }
 
+    pub(crate) fn status(&self) -> TransferStatus {
+        self.data.lock().unwrap().snapshot.status
+    }
+
+    fn ensure_can_start(status: TransferStatus) -> Result<(), String> {
+        if matches!(
+            status,
+            TransferStatus::Queued | TransferStatus::Paused | TransferStatus::Failed
+        ) {
+            Ok(())
+        } else {
+            Err("media transfer must be queued, paused, or failed to start".into())
+        }
+    }
+
+    pub(crate) fn queue_for_start(&self) -> Result<(), String> {
+        let mut data = self.data.lock().unwrap();
+        let snapshot = &mut data.snapshot;
+        Self::ensure_can_start(snapshot.status)?;
+        snapshot.status = TransferStatus::Queued;
+        snapshot.error_message = None;
+        snapshot.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub(crate) fn fail_queued_start(&self, error: String) {
+        let mut data = self.data.lock().unwrap();
+        data.snapshot.status = TransferStatus::Failed;
+        data.snapshot.error_message = Some(error);
+        data.snapshot.updated_at = Utc::now();
+    }
+
     pub(crate) async fn start(self: &Arc<Self>, options: MediaJobRunOptions) -> Result<(), String> {
         let mut run = self.run.lock().await;
         {
@@ -216,12 +248,7 @@ impl MediaJob {
             let MediaData {
                 snapshot, playlist, ..
             } = &mut *data;
-            if !matches!(
-                snapshot.status,
-                TransferStatus::Queued | TransferStatus::Paused | TransferStatus::Failed
-            ) {
-                return Err("media transfer must be paused or failed to resume".into());
-            }
+            Self::ensure_can_start(snapshot.status)?;
             snapshot.status = TransferStatus::Probing;
             snapshot.downloaded_bytes = 0;
             snapshot.total_bytes = None;
@@ -287,7 +314,7 @@ impl MediaJob {
             toolchain_cache,
             download,
             scans,
-            playlist_finished,
+            media_finished,
         } = options;
         let (tx, mut rx) = mpsc::channel(16);
         let result = {
@@ -355,9 +382,7 @@ impl MediaJob {
                 snapshot.error_message = Some(error.to_string());
             }
         }
-        if let Some(id) = &snapshot.playlist_id {
-            let _ = playlist_finished.send(id.clone());
-        }
+        let _ = media_finished.send(snapshot.playlist_id.clone());
     }
 
     async fn stage_download(
@@ -474,19 +499,34 @@ struct StagingDir(PathBuf);
 
 impl Drop for StagingDir {
     fn drop(&mut self) {
-        for attempt in 0..5 {
-            match fs::remove_dir_all(&self.0) {
-                Ok(()) => return,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return,
-                Err(error) if attempt < 4 && error.kind() == io::ErrorKind::PermissionDenied => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+        let Err(error) = fs::remove_dir_all(&self.0) else {
+            return;
+        };
+        if error.kind() == io::ErrorKind::NotFound {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(%error, "could not clean the media staging directory");
+            return;
+        };
+        let path = self.0.clone();
+        runtime.spawn_blocking(move || {
+            let mut error = error;
+            for _ in 0..4 {
+                if error.kind() != io::ErrorKind::PermissionDenied
+                    && error.raw_os_error() != Some(32)
+                {
+                    break;
                 }
-                Err(error) => {
-                    tracing::warn!(%error, "could not clean the media staging directory");
-                    return;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                match fs::remove_dir_all(&path) {
+                    Ok(()) => return,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+                    Err(err) => error = err,
                 }
             }
-        }
+            tracing::warn!(%error, "could not clean the media staging directory");
+        });
     }
 }
 

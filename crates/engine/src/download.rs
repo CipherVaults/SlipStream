@@ -639,7 +639,7 @@ impl Run<'_> {
             output::prepare_commit(&for_check, || cancel.check())
         })
         .await??;
-        let record = {
+        {
             let mut state = self.engine.lock();
             let (db, job) = state.job_mut(self.id)?;
             let mut record = job.record.clone();
@@ -655,15 +655,36 @@ impl Run<'_> {
             db.save_record(&record)?;
             job.record = record.clone();
             stop.check()?;
-            // The verified file and its ADS are durable before the rename.
-            // A crash after rename can be reconciled on the next open.
-            record.commit_digest = Some(verification.digest);
-            db.save_record(&record)?;
-            db.checkpoint(false)?;
-            job.record = record.clone();
-            record
-        };
-        output::commit(&record).await
+        }
+        let filename = record.filename;
+        for number in 0.. {
+            stop.check()?;
+            let candidate = output::numbered_filename(&filename, number);
+            let target = slipstream_protocol::safe_join_under(&record.save_dir, &candidate)?;
+            match tokio::fs::symlink_metadata(&target).await {
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            let record = {
+                let mut state = self.engine.lock();
+                let (db, job) = state.job_mut(self.id)?;
+                let mut record = job.record.clone();
+                record.filename = candidate;
+                // Persist this candidate before moving it so recovery can find the output.
+                record.commit_digest = Some(verification.digest.clone());
+                db.save_record(&record)?;
+                db.checkpoint(false)?;
+                job.record = record.clone();
+                record
+            };
+            match output::commit(&record).await {
+                Err(EngineError::Io(error))
+                    if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                result => return result,
+            }
+        }
+        unreachable!("filename suffixes are unbounded")
     }
 }
 

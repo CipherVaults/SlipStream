@@ -687,12 +687,7 @@ impl ManagerInner {
         if let Some(indices) = &options.selected_file_indices {
             validate_selection(&metadata, indices)?;
         }
-        // Disabling trackers for a raw torrent must preserve the exact info bytes.
-        let engine_bytes = if self.config.enable_trackers {
-            bytes.clone()
-        } else {
-            info_only(&bytes)?
-        };
+        let engine_bytes = engine_manifest(&bytes, &metadata, self.config.enable_trackers)?;
         let factory = ConfinedStorageFactory::new(
             &self.config.default_save_dir,
             &entry.save_dir,
@@ -946,17 +941,40 @@ impl Entry {
     }
 }
 
-fn info_only(bytes: &[u8]) -> Result<Bytes, TorrentError> {
-    // Retain v2 piece layers for storage validation of a hybrid torrent.
-    let (root, info) = crate::bencode::decode_with_info(bytes)?;
-    let mut output = b"d4:info".to_vec();
+fn engine_manifest(
+    bytes: &[u8],
+    metadata: &TorrentMetadata,
+    enable_trackers: bool,
+) -> Result<Bytes, TorrentError> {
+    use crate::bencode::{decode_with_info, encode, BencodeValue as Value};
+
+    let (root, info) = decode_with_info(bytes)?;
+    let mut output = b"d".to_vec();
+    if enable_trackers {
+        let tracker = |url: &String| Value::Bytes(url.as_bytes().to_vec());
+        if let Some(url) = &metadata.announce {
+            output.extend_from_slice(b"8:announce");
+            output.extend(encode(&tracker(url)));
+        }
+        if !metadata.announce_list.is_empty() {
+            let tiers = metadata
+                .announce_list
+                .iter()
+                .map(|tier| Value::List(tier.iter().map(tracker).collect()))
+                .collect();
+            output.extend_from_slice(b"13:announce-list");
+            output.extend(encode(&Value::List(tiers)));
+        }
+    }
+    // Keep the exact info bytes for the hash and retain hybrid piece layers.
+    output.extend_from_slice(b"4:info");
     output.extend_from_slice(
         info.ok_or_else(|| TorrentError::Metadata("missing info dictionary".into()))?,
     );
-    if let crate::bencode::BencodeValue::Dict(root) = root {
+    if let Value::Dict(root) = root {
         if let Some(layers) = root.get(b"piece layers".as_slice()) {
             output.extend_from_slice(b"12:piece layers");
-            output.extend(crate::bencode::encode(layers));
+            output.extend(encode(layers));
         }
     }
     output.push(b'e');
