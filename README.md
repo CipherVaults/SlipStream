@@ -4,6 +4,15 @@
 
 SlipStream combines a multi-segment HTTP download engine, a managed `yt-dlp` + `FFmpeg` media format/audio pipeline, native BitTorrent/Magnet support, and an isolated browser extension inside a dual-theme (**Soft Graphite Dark** ↔ **Porcelain Light**) native desktop workspace.
 
+![SlipStream Desktop — Graphite Dark](docs/screenshots/slipstream-desktop.png)
+
+<details>
+<summary>Porcelain Light theme preview</summary>
+
+![SlipStream Desktop — Porcelain Light](docs/screenshots/slipstream-light.png)
+
+</details>
+
 ---
 
 ## About SlipStream
@@ -12,7 +21,7 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 
 - **Target OS:** Windows 10 / Windows 11 (`x86_64`)
 - **Public repository** [CipherVaults/SlipStream](https://github.com/CipherVaults/SlipStream)
-- **Release** [v1.2.0](https://github.com/CipherVaults/SlipStream/releases/tag/v1.2.0)
+- **Latest release** [v1.2.1](https://github.com/CipherVaults/SlipStream/releases/tag/v1.2.1)
 
 ---
 
@@ -52,17 +61,15 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 
 ## Security & Verification
 
-The figures below are the historical audit and evaluation results recorded for v1.0.0. [v1.0.0 changelog entry](CHANGELOG.md#100---2026-11-21)
-
-- **6-Phase `/security-audit`:** Completed 3 hunting waves across 19 coverage units, 3 independent coverage critics, cross-model candidate validation, and fresh record verification (`0` confirmed vulnerabilities; proactive hardening landed for browser `GetStatus` redaction, cancel credential scrubbing, torrent `:Zone.Identifier` tagging, and trailing-dot `localhost.` SSRF normalization).
-- **Part II Safety & Resilience Evaluation (`tests/safety-eval`):** Preregistered (`slipstream-safety-v1`) deterministic oracle suite passing **1,200 / 1,200** adversarial + benign single-input boundary cases and **108 / 108** orthogonal 5-factor stateful HTTP chaos chains (`0` broken items, `0` escapes, `0` benign false rejections, strict `bias-audit` Cramér's `V = 0.0`).
+- **v1.2.1 Security Audit & DevSecOps Review (`run-2`, `/security-audit` + `/security-auditor`):** Audited `23` coverage units (`15` `candidate`, `7` `covered`, `1` `out_of_scope`) across Rust engines, MV3 extension, React UI, and GitHub Actions with cross-model Codex CLI + Neon verification (`0` confirmed vulnerabilities under read-only/offline policy; `3` prior `v1.0.0` leads verified mitigated in `v1.2.0`). `v1.2.1` landed defense-in-depth hardening across `48+` files—including Completed/legacy SQLite credential scrubbing, strict cross-origin redirect header allowlists + origin-only `Referer` trimming, media userinfo rejection + proxy env cleanup, BitTorrent public-tracker filtering, Win32 Job Objects for `ffmpeg` grandchildren, `GrabBatchUrls` & probe concurrency bounds, WebView CSP/referrer hardening, floating pill live-format & incognito fixes, collision-safe playlist folders/filenames, SHA-pinned CI/Release actions, and lockfile-pinned `@tauri-apps/cli`.
+- **v1.0.0 Baseline (`run-1` & `tests/safety-eval`):** [v1.0.0 changelog entry](CHANGELOG.md#100---2026-11-21) — `3` hunting waves across `19` coverage units (`0` confirmed vulnerabilities) plus the preregistered `slipstream-safety-v1` deterministic oracle suite passing **1,200 / 1,200** single-input boundary cases and **108 / 108** orthogonal 5-factor stateful HTTP chaos chains (`0` broken items, `0` escapes, `0` benign false rejections, `bias-audit` Cramér's `V = 0.0`).
 
 ---
 
 ## Download, Installation & Browser Setup
 
-1. **Installer** Download `SlipStream_1.2.0_x64-setup.exe` and run the per-user installer. It includes the native messaging host, media tools, and both browser extension builds. [v1.2.0 release assets](https://github.com/CipherVaults/SlipStream/releases/tag/v1.2.0)
-2. **Portable ZIP** Extract `SlipStream-1.2.0-windows-x64-portable.zip` and run `SlipStream.exe`. Keep the extracted `bin/` and `extensions/` directories beside it.
+1. **Installer** Download `SlipStream_1.2.1_x64-setup.exe` and run the per-user installer. It includes the native messaging host, media tools, and both browser extension builds. [v1.2.1 release assets](https://github.com/CipherVaults/SlipStream/releases/tag/v1.2.1)
+2. **Portable ZIP** Extract `SlipStream-1.2.1-windows-x64-portable.zip` and run `SlipStream.exe`. Keep the extracted `bin/` and `extensions/` directories beside it.
 3. **Browser extension** In **Settings → Browser Integration**, select your browser. For Chrome, Edge, or Brave, enable **Developer mode**, select **Load unpacked**, and choose the revealed folder. In Firefox, choose **Load Temporary Add-on** and select the revealed `manifest.json`. Separate browser extension ZIPs are also available on the release page.
 
 **Upgrading from v1.0.0** SlipStream keeps the valid native messaging IDs already registered for each browser and adds the bundled extension ID. If an older unpacked copy’s ID is missing from the registration, copy the ID from the browser’s extensions page and enter it in **Settings → Browser Integration** for that browser.
@@ -72,7 +79,7 @@ The figures below are the historical audit and evaluation results recorded for v
 Prerequisites: **Rust (stable)**, **Node.js 22**, **pnpm 9+**, **VS Build Tools (C++ x64)**, **WebView2 Runtime**.
 
 ```powershell
-pnpm.cmd install
+pnpm.cmd install --frozen-lockfile
 if ($LASTEXITCODE -ne 0) { throw 'Workspace dependency installation failed.' }
 pnpm.cmd -r typecheck
 if ($LASTEXITCODE -ne 0) { throw 'Type checking failed.' }

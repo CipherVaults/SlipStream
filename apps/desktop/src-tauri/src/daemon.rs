@@ -1936,8 +1936,18 @@ async fn scan_torrent_completions(state: &AppState, scans: &mpsc::Sender<ScanReq
                 match write_zone_identifier(&root, &path) {
                     Ok(()) => marked.push(path),
                     Err(error) => {
-                        retry = true;
-                        tracing::debug!(transfer_id = %id, %error, "could not write torrent Zone.Identifier");
+                        let permanent = matches!(
+                            error.kind(),
+                            std::io::ErrorKind::Unsupported
+                                | std::io::ErrorKind::InvalidInput
+                                | std::io::ErrorKind::NotFound
+                        ) || matches!(error.raw_os_error(), Some(1 | 50 | 87 | 123));
+                        if permanent {
+                            marked.push(path);
+                        } else {
+                            retry = true;
+                        }
+                        tracing::debug!(transfer_id = %id, permanent, %error, "could not write torrent Zone.Identifier");
                     }
                 }
             }

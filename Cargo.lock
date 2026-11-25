@@ -4517,7 +4517,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slipstream-desktop"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "chrono",
  "futures-util",
@@ -4547,7 +4547,7 @@ dependencies = [
 
 [[package]]
 name = "slipstream-engine"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "chrono",
  "futures-util",
@@ -4568,7 +4568,7 @@ dependencies = [
 
 [[package]]
 name = "slipstream-media"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "chrono",
  "hex 0.4.3",
@@ -4585,7 +4585,7 @@ dependencies = [
 
 [[package]]
 name = "slipstream-native-host"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "chrono",
  "hex 0.4.3",
@@ -4602,7 +4602,7 @@ dependencies = [
 
 [[package]]
 name = "slipstream-protocol"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "chrono",
  "serde",
@@ -4614,7 +4614,7 @@ dependencies = [
 
 [[package]]
 name = "slipstream-safety-eval"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "chrono",
  "serde",
@@ -4632,7 +4632,7 @@ dependencies = [
 
 [[package]]
 name = "slipstream-torrent"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "bytes",

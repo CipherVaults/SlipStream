@@ -395,7 +395,10 @@ function startOrReuseProbe(frame: Frame, url: string, playlist: boolean, timeout
   const active: Probe = { frame, expires: Date.now() + 120_000, controller, response, settled: false };
   probes.set(key, active);
   void response.then((res) => {
-    if (probes.get(key) === active && (!res || res.type !== "media_probed")) {
+    if (
+      probes.get(key) === active
+      && (!res || res.type !== "media_probed" || !res.probe || typeof res.probe !== "object" || !Array.isArray(res.probe.formats))
+    ) {
       probes.delete(key);
     }
   }).catch(() => {
@@ -626,7 +629,13 @@ api.contextMenus.onClicked.addListener((info, tab) => {
       const key = refreshKey(id);
       await api.storage.session.set({ [key]: intent });
       api.alarms.create(key, { when: intent.expires });
-      await api.tabs.create({ url: popupUrl + "?refresh=" + id, ...(tab?.windowId !== undefined && { windowId: tab.windowId }) });
+      const targetUrl = popupUrl + "?refresh=" + id;
+      try {
+        await api.tabs.create({ url: targetUrl, ...(tab?.windowId !== undefined && { windowId: tab.windowId }) });
+      } catch {
+        // Chrome spanning mode disallows extension tabs inside incognito windows.
+        await api.tabs.create({ url: targetUrl });
+      }
     }
   })().catch(report);
 });

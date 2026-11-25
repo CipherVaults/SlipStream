@@ -265,6 +265,17 @@ impl DownloadEngine {
                     }
                     record.commit_digest = None;
                     db.replace_segments(&record, &segments)?;
+                } else if matches!(
+                    record.status,
+                    TransferStatus::Completed | TransferStatus::Canceled
+                ) {
+                    let prev_headers = !record.headers.is_empty();
+                    let prev_referrer = record.referrer.is_some();
+                    let prev_url = record.source_url.clone();
+                    scrub_record_credentials(&mut record);
+                    if prev_headers || prev_referrer || record.source_url != prev_url {
+                        db.save_record(&record)?;
+                    }
                 }
                 jobs.insert(
                     record.id.clone(),

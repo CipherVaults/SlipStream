@@ -2,6 +2,22 @@
 
 All notable changes to **SlipStream** are documented in this file following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] - 2026-11-26
+
+### Security & Hardening
+
+- **Credential scrubbing & redirect isolation (`crates/engine`):** Scrubbed `headers`, `referrer`, and URL credentials/query/fragment on `TransferStatus::Completed` (as well as `Canceled`), added startup migration scrubbing for legacy terminal SQLite rows and dismissal cleanup, and restricted cross-origin redirects to an explicit safe header allowlist with origin-only `Referer` preservation.
+- **Media pipeline & process-tree confinement (`crates/media`, `apps/desktop/src-tauri`):** Rejected credential-bearing URLs in `validate_media_url`, cleared proxy environment variables (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`) on spawned sidecars, added `-protocol_whitelist file` to `ffprobe` stream counting, bounded concurrent media probes (`Semaphore(4)`) and single-video jobs, enforced Win32 Job Objects (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) to terminate `ffmpeg` grandchildren on cancellation, and moved staging cleanup retries off async workers.
+- **BitTorrent & MotW hardening (`crates/torrent`, `daemon.rs`):** Filtered `magnet:` `tr` and `.torrent` `announce`/`announce-list` entries to public `http`/`https`/`udp` endpoints, and updated `scan_torrent_completions` so Mark-of-the-Web only marks paths after `Zone.Identifier` succeeds while stopping infinite retries on non-NTFS volumes.
+- **IPC, WebView & CI/Release supply-chain hardening:** Added a 512-URL cap and upfront validation in `GrabBatchUrls`, hardened `tools.rs` runtime `yt-dlp` client (`.use_rustls_tls().no_proxy()`), tightened Tauri CSP (`object-src 'none'; base-uri 'none'; frame-ancestors 'none'`), added `referrerPolicy="no-referrer"` + private-host checks to remote thumbnails, pinned all GitHub Actions `uses:` entries in CI/Release workflows to commit SHAs, switched `release.yml` from `npx --yes` to lockfile-pinned `@tauri-apps/cli@2.12.4`, and enabled `--frozen-lockfile` + least-privilege `permissions` in `ci.yml`.
+- **Browser extension hardening (`extensions/browser`):** Unified `pillOpen` and `mediaAction` guards (`<= 8192` URL cap, incognito no-probe isolation, max-3 concurrent probe limit), allowed public cross-origin embedded players and `isKnownVideoPage` targets in `pillOpen`, rejected 6to4 (`2002::/16`) and Teredo (`2001:0:`/`2001::`) + non-public HLS variants, validated `NativeClient.probe()` responses before caching, capped `grabLinks` at 512 URLs, and fixed Chrome spanning-mode incognito refresh tab fallback.
+
+### Fixed
+
+- **Floating pill live format rendering & units (`extensions/browser`):** Fixed `updateFormats()` deferral in `pill.ts` so probed video formats and **Download Playlist…** render immediately while the pill menu is open, added `formatBytes()` so format sizes display `KB`/`MB` instead of `MB/s`, guarded fullscreen `showPopover()` calls, and removed the dead `video-seen` message wakeup.
+- **Playlist & file collision reliability (`crates/engine`, `apps/desktop/src-tauri`):** Updated `ensure_playlist_subfolder` to deduplicate existing directory names (`Playlist (2)`, …), auto-numbered colliding HTTP target filenames (`file (1).ext`) on publish instead of failing at 100%, rejected duplicate `selected_entries` indices, rolled back `enqueue_playlist` state on start errors, truncated >256-byte `GetStatus` error/notice fields instead of dropping them, skipped corrupt SQLite transfer rows on startup, added an explicit `mark_ui_ready` Tauri command, and made `reveal_playlist_folder` async.
+- **Desktop UI playlist state & dialogs (`apps/desktop/src`):** Fixed failed/canceled playlist classification so they no longer appear under **Completed** or skew sidebar badge counts, corrected whole-playlist completion summaries, fixed `AddDialog` re-probe selection, filtered Select All/Clear/Invert, `Playlist Items` sync, sanitized `playlist_folder_name` submission, `SettingsDialog` browser-button busy state, and `TransferDialog` header control-character validation.
+
 ## [1.2.0] - 2026-11-25
 
 ### Added

@@ -364,6 +364,7 @@ export function SettingsDialog({
               <p className="settings-heading tabular">SlipStream v{currentVersion}</p>
               <p className="field-note">CipherVaults · Windows 10/11 · MIT License</p>
               <p className="field-note">Signed NSIS Auto-Update (GitHub Releases)</p>
+              <p className="field-note">Segmented HTTP/2 · yt-dlp/FFmpeg · BitTorrent · github.com/CipherVaults/SlipStream</p>
               <p className="field-note" role="status">
                 {updateInfo && (updateInfo.available
                   ? <>Update v{updateInfo.version} available.</>

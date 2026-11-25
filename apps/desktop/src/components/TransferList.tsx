@@ -197,7 +197,9 @@ function PlaylistGroup({ playlistId, transfers, members, onAction, renderRow }: 
     ? statusLabel[current.status] + (current.playlist_index != null ? ` #${current.playlist_index} of ${total}` : "")
     : "";
   const summary = done === members.length && members.length > 0
-    ? `${done}/${members.length === total ? total : members.length} completed`
+    ? (members.length === 1 && members[0].playlist_index == null && total > 1
+      ? `${total} videos completed`
+      : `${done}/${members.length} completed`)
     : [progress, `${done}/${total} done`, queued ? queued + " queued" : "", failed ? failed + " failed" : "",
       canceled ? canceled + " canceled" : ""].filter(Boolean).join(" · ");
 
