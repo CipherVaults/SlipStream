@@ -107,6 +107,7 @@ export function createMediaPill(
   let pendingFormats: { formats: readonly PillFormat[]; playlist: boolean } | undefined;
 
   const locked = () => hovered || !menu.hidden || !!drag || pressed.size > 0;
+  const pointerActive = () => !!drag || pressed.size > 0;
 
   function writePosition(x: number, y: number, above: boolean, force = false): void {
     x = Math.round(x);
@@ -165,11 +166,11 @@ export function createMediaPill(
   }
 
   function interactionEnded(): void {
-    if (locked()) return;
-    if (pendingFormats) {
+    if (!pointerActive() && pendingFormats) {
       const { formats, playlist } = pendingFormats;
       updateFormats(formats, playlist);
     }
+    if (locked()) return;
     if (pendingHide) requestHide();
     options.onInteractionEnd?.();
   }
@@ -328,7 +329,7 @@ export function createMediaPill(
   let isPlaylist = !!options.isPlaylist;
   function updateFormats(formats: readonly PillFormat[], playlist = isPlaylist): void {
     isPlaylist = playlist;
-    if (locked()) {
+    if (pointerActive()) {
       pendingFormats = { formats, playlist };
       return;
     }
@@ -341,6 +342,8 @@ export function createMediaPill(
     const signature = JSON.stringify(choices);
     if (signature === menuSignature) return;
     menuSignature = signature;
+    const activeEl = root.activeElement as HTMLElement | null;
+    const focusedAction = activeEl && menu.contains(activeEl) ? activeEl.dataset.action : undefined;
     const groups = choices.map((items) => {
       const group = document.createElement("div");
       group.className = "group";
@@ -348,6 +351,11 @@ export function createMediaPill(
       return group;
     });
     menu.replaceChildren(...groups);
+    if (focusedAction && !menu.hidden) {
+      const buttons = Array.from(menu.querySelectorAll<HTMLButtonElement>("button"));
+      const match = buttons.find((button) => button.dataset.action === focusedAction) ?? buttons[0];
+      match?.focus({ preventScroll: true });
+    }
   }
 
   bar.append(toggle, dismiss);

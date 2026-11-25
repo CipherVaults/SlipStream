@@ -85,7 +85,10 @@ export class NativeClient {
     // cannot hold the status and user-action connection.
     return new Promise((resolve) => {
       let port: chrome.runtime.Port | undefined;
+      let done = false;
       const finish = (response: NativeBridgeResponse, disconnect = true) => {
+        if (done) return;
+        done = true;
         signal.removeEventListener("abort", abort);
         resolve(response);
         if (disconnect) port?.disconnect();
@@ -94,7 +97,13 @@ export class NativeClient {
       try {
         port = extension.runtime.connectNative(NATIVE_HOST_NAME);
         signal.addEventListener("abort", abort, { once: true });
-        port.onMessage.addListener((response: NativeBridgeResponse) => finish(response));
+        port.onMessage.addListener((response: unknown) => {
+          if (response && typeof response === "object" && typeof (response as { type?: unknown }).type === "string") {
+            finish(response as NativeBridgeResponse);
+          } else {
+            finish({ type: "error", code: "invalid_response", message: "Unexpected response from SlipStream." });
+          }
+        });
         port.onDisconnect.addListener(() => {
           void extension.runtime.lastError;
           finish(disconnected, false);

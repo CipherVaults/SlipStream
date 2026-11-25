@@ -21,6 +21,73 @@ export function isPlaylistPending(transfer: TransferSnapshot) {
   return ["queued", "probing", "active", "remuxing", "paused"].includes(transfer.status);
 }
 
+export type PlaylistBucket = "completed" | "active" | "canceled";
+
+export function classifyPlaylist(members: readonly TransferSnapshot[]): PlaylistBucket {
+  if (members.some(isPlaylistPending) || members.some(transfer => transfer.status === "failed")) {
+    return "active";
+  }
+  const nonCanceled = members.filter(transfer => transfer.status !== "canceled");
+  return nonCanceled.length > 0 && nonCanceled.every(isDone) ? "completed" : "canceled";
+}
+
+export function isPlaylistCompleted(members: readonly TransferSnapshot[]): boolean {
+  return classifyPlaylist(members) === "completed";
+}
+
+export function playlistBuckets(transfers: readonly TransferSnapshot[]): Map<string, PlaylistBucket> {
+  const grouped = new Map<string, TransferSnapshot[]>();
+  for (const transfer of transfers) {
+    if (!transfer.playlist_id) continue;
+    const list = grouped.get(transfer.playlist_id);
+    if (list) list.push(transfer);
+    else grouped.set(transfer.playlist_id, [transfer]);
+  }
+  const buckets = new Map<string, PlaylistBucket>();
+  for (const [id, members] of grouped) {
+    buckets.set(id, classifyPlaylist(members));
+  }
+  return buckets;
+}
+
+export function isSafeThumbnailUrl(raw: string | null | undefined): string | null {
+  if (!raw || !/^https:\/\//i.test(raw)) return null;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:" || url.username || url.password) return null;
+  const host = url.hostname.toLowerCase().replace(/\.$/, "");
+  if (!host) return null;
+  if (host.startsWith("[")) {
+    const ip = host.slice(1, -1);
+    const isGlobalUnicast = /^[23][0-9a-f]{3}:/.test(ip)
+      && !ip.startsWith("2001:db8:")
+      && !ip.startsWith("2002:")
+      && !/^2001:(?:0{0,4}:|$)/.test(ip);
+    return isGlobalUnicast ? url.href : null;
+  }
+  if (/^\d+(?:\.\d+){3}$/.test(host)) {
+    const [a, b, c] = host.split(".").map(Number);
+    const isPrivate = a === 0 || a === 10 || a === 127 || a >= 224
+      || (a === 100 && b >= 64 && b <= 127)
+      || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168)
+      || (a === 192 && b === 0 && (c === 0 || c === 2))
+      || (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100)))
+      || (a === 203 && b === 0 && c === 113);
+    return isPrivate ? null : url.href;
+  }
+  const labels = host.split(".");
+  if (labels.length < 2 || ["localhost", "local", "internal"].includes(labels.at(-1)!) || host.endsWith(".home.arpa")) {
+    return null;
+  }
+  return url.href;
+}
+
 export function bytes(value: number | null, mbDecimals = 1) {
   if (value === null) return "—";
   if (value >= 1e12) return (value / 1e12).toFixed(1) + " TB";

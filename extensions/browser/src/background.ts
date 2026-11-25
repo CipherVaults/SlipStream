@@ -11,7 +11,7 @@ import {
   readPillSpot, readState, rememberPillSpot, SETTINGS_KEY, STATE_KEY,
   type ActionResult, type BrowserMessage, type MediaAction, type PillFormatsMessage,
 } from "./shared/state";
-import { isHls, isMediaStream, isPlaylistPage, mediaLength, mediaMime, parseHlsMaster, probeFormats, selectPillFormatId, validFormatId } from "./shared/streams";
+import { isHls, isKnownVideoPage, isMediaStream, isPlaylistPage, mediaLength, mediaMime, parseHlsMaster, probeFormats, selectPillFormatId, validFormatId } from "./shared/streams";
 
 const popupUrl = api.runtime.getURL("popup.html");
 const refreshKey = (id: string) => "refresh:" + id;
@@ -358,39 +358,69 @@ function cachedProbe(frame: Frame, url: string, playlist: boolean): Probe | unde
   probes.delete(key);
 }
 
+const MAX_URL_LENGTH = 8192;
+const MAX_CONCURRENT_PROBES = 3;
+
+function activeProbeCount(): number {
+  let count = 0;
+  for (const entry of probes.values()) {
+    if (!entry.settled) count++;
+  }
+  return count;
+}
+
+function parseMediaTarget(frame: Frame, rawUrl: unknown, stream: Stream | undefined, embedded: boolean): URL | undefined {
+  if (typeof rawUrl !== "string" || rawUrl.length > MAX_URL_LENGTH) return;
+  const url = httpUrl(rawUrl);
+  if (!url || url.href.length > MAX_URL_LENGTH) return;
+  if (url.origin === frame.page.origin || stream?.url === url.href) return url;
+  if (isPublicHttpUrl(url.href) && (isKnownVideoPage(url.href) || (frame.frameId === 0 && embedded))) return url;
+}
+
+function startOrReuseProbe(frame: Frame, url: string, playlist: boolean, timeoutMs: number): Probe | undefined {
+  if (frame.private) return;
+  const key = probeKey(frame, url, playlist);
+  const existing = cachedProbe(frame, url, playlist);
+  if (existing) return existing;
+  if (!native.state.connected || activeProbeCount() >= MAX_CONCURRENT_PROBES) return;
+  if (probes.size >= 64) {
+    const oldest = [...probes].find(([, entry]) => entry.settled);
+    if (oldest) probes.delete(oldest[0]);
+  }
+  const controller = new AbortController();
+  const response = native.probe(
+    { type: "probe_media", url, ...(playlist ? { playlist: true } : {}) },
+    AbortSignal.any([controller.signal, AbortSignal.timeout(timeoutMs)]),
+  );
+  const active: Probe = { frame, expires: Date.now() + 120_000, controller, response, settled: false };
+  probes.set(key, active);
+  void response.then((res) => {
+    if (probes.get(key) === active && (!res || res.type !== "media_probed")) {
+      probes.delete(key);
+    }
+  }).catch(() => {
+    if (probes.get(key) === active) probes.delete(key);
+  }).finally(() => {
+    active.settled = true;
+  });
+  return active;
+}
+
 function pillOpen(frame: Frame, message: Extract<BrowserMessage, { kind: "pill-open" }>): ActionResult {
-  const url = typeof message.url === "string" && message.url.length <= 8192 ? httpUrl(message.url) : undefined;
   const stream = observedStream(frame);
+  const url = parseMediaTarget(frame, message.url, stream, message.embedded === true);
   if (frame.private || !url || (message.requestId !== undefined && !Number.isSafeInteger(message.requestId)) || blockedSite(frame.page, settings)
-    || blockedSite(httpUrl(frame.tabUrl), settings) || blockedSite(url, settings)
-    || (url.origin !== frame.page.origin && stream?.url !== url.href)) return { ok: false };
+    || blockedSite(httpUrl(frame.tabUrl), settings) || blockedSite(url, settings)) return { ok: false };
   if (stream?.frameId === frame.frameId && stream.url === url.href && isHls(url, stream.mime)) {
     if (!stream.variants) readHls(stream);
     return { ok: true };
   }
   const playlist = message.isPlaylist === true && isPlaylistPage(url.href);
   const key = probeKey(frame, url.href, playlist);
-  let probe = cachedProbe(frame, url.href, playlist);
-  if (!probe) {
-    if (!native.state.connected || [...probes.values()].filter((entry) => !entry.settled).length >= 3) return { ok: false };
-    if (probes.size >= 64) {
-      const oldest = [...probes].find(([, entry]) => entry.settled);
-      if (oldest) probes.delete(oldest[0]);
-    }
-    const controller = new AbortController();
-    const response = native.probe({ type: "probe_media", url: url.href, ...(playlist ? { playlist: true } : {}) },
-      AbortSignal.any([controller.signal, AbortSignal.timeout(12_000)]));
-    probe = { frame, expires: Date.now() + 120_000, controller, response, settled: false };
-    probes.set(key, probe);
-  }
-  const active = probe;
+  const active = startOrReuseProbe(frame, url.href, playlist, 12_000);
+  if (!active) return { ok: false };
   void active.response.then((response) => {
-    if (probes.get(key) !== active) return;
-    active.settled = true;
-    if (response.type !== "media_probed") {
-      probes.delete(key);
-      return;
-    }
+    if (probes.get(key) !== active || !response || response.type !== "media_probed") return;
     const update: PillFormatsMessage = {
       kind: "pill-formats", url: url.href, requestId: message.requestId,
       formats: probeFormats(response.probe), isPlaylist: playlist || response.probe.is_playlist,
@@ -400,7 +430,7 @@ function pillOpen(frame: Frame, message: Extract<BrowserMessage, { kind: "pill-o
   return { ok: true };
 }
 
-async function mediaAction(action: MediaAction, source: string, links: unknown[], frame: Frame): Promise<ActionResult> {
+async function mediaAction(action: MediaAction, source: string, links: unknown[], frame: Frame, embedded = false): Promise<ActionResult> {
   const { page, tabId, tabUrl, frameId } = frame;
   if (action === "mute") {
     if (frame.private) return { ok: false };
@@ -412,8 +442,12 @@ async function mediaAction(action: MediaAction, source: string, links: unknown[]
     return { ok: false, message: "SlipStream is disabled for this site." };
   }
   if (action === "links") return grabLinks(links);
+  if (source.length > MAX_URL_LENGTH) return { ok: false, message: "Media URL is too long." };
   const observed = observedStream(frame);
-  let url = httpUrl(source)?.href ?? observed?.url ?? page.href;
+  const parsedSource = source ? parseMediaTarget(frame, source, observed, embedded) : undefined;
+  if (source && !parsedSource) return { ok: false, message: "SlipStream cannot use this media URL." };
+  let url = parsedSource?.href ?? observed?.url ?? page.href;
+  if (url.length > MAX_URL_LENGTH) return { ok: false, message: "Media URL is too long." };
   if (blockedSite(httpUrl(url), settings)) return { ok: false, message: "SlipStream is disabled for this site." };
   if (action === "picker" || action === "playlist") {
     return result(await native.send({ type: "open_desktop_window", open_picker_url: url }), ["ack"]);
@@ -434,10 +468,19 @@ async function mediaAction(action: MediaAction, source: string, links: unknown[]
   }
 
   if (height !== undefined) {
-    const response = await (cachedProbe(frame, url, false)?.response
-      ?? native.probe({ type: "probe_media", url, playlist: false }, AbortSignal.timeout(30_000)));
-    if (response.type !== "media_probed") {
-      return response.type === "error" ? result(response, ["media_probed"]) : { ok: false, message: "SlipStream returned no formats." };
+    if (frame.private) {
+      return { ok: false, message: "Automatic format probing is disabled in private windows." };
+    }
+    const active = startOrReuseProbe(frame, url, false, 30_000);
+    if (!active) {
+      return {
+        ok: false,
+        message: native.state.connected ? "Too many probes in progress. Try again shortly." : "SlipStream desktop is disconnected.",
+      };
+    }
+    const response = await active.response;
+    if (!response || response.type !== "media_probed") {
+      return response?.type === "error" ? result(response, ["media_probed"]) : { ok: false, message: "SlipStream returned no formats." };
     }
     formatId = height > 0 ? selectPillFormatId(response.probe, height) : "best";
     if (!formatId) return { ok: false, message: "That quality is unavailable. Open the format picker for more options." };
@@ -469,10 +512,6 @@ api.runtime.onMessage.addListener((message: BrowserMessage, sender, reply) => {
     reply({ ok: true });
     return;
   }
-  if (message.kind === "video-seen" && frame) {
-    reply({ ok: true });
-    return;
-  }
   if (message.kind === "alt" && frame?.frameId === 0 && typeof message.held === "boolean") {
     if (message.held) heldAlt.add(frame.tabId);
     else heldAlt.delete(frame.tabId);
@@ -498,7 +537,7 @@ api.runtime.onMessage.addListener((message: BrowserMessage, sender, reply) => {
   let response: Promise<ActionResult> | undefined;
   if (message.kind === "media" && frame && isMediaAction(message.action) && typeof message.url === "string") {
     response = settingsReady.then(() => mediaAction(
-      message.action, message.url, Array.isArray(message.links) ? message.links : [], frame,
+      message.action, message.url, Array.isArray(message.links) ? message.links : [], frame, message.embedded === true,
     ));
   } else if (message.kind === "pill-open" && frame && !frame.private) {
     response = settingsReady.then(() => pillOpen(frame, message));
@@ -514,15 +553,16 @@ api.runtime.onMessage.addListener((message: BrowserMessage, sender, reply) => {
     }
   } else if (fromPopup && message.kind === "save-settings") {
     response = (async () => {
-      const [activeTab] = await api.tabs.query({ active: true, lastFocusedWindow: true });
-      if (!canUseSiteStorage(api.extension?.inIncognitoContext, sender.tab?.incognito) || activeTab?.incognito) {
+      const [activeTab] = sender.tab ? [sender.tab] : await api.tabs.query({ active: true, currentWindow: true });
+      if (!canUseSiteStorage(api.extension?.inIncognitoContext, sender.tab?.incognito ?? activeTab?.incognito)) {
         return { ok: false, message: "Settings cannot be changed from an incognito window." };
       }
       await updateSettings(() => readSettings(message.settings));
       return { ok: true, message: "Settings saved." };
     })();
   } else if (fromPopup && message.kind === "refresh" && typeof message.id === "string" && typeof message.transferId === "string") {
-    response = refreshDownload(message.id, message.transferId);
+    const senderIncognito = Boolean(api.extension?.inIncognitoContext || sender.tab?.incognito);
+    response = refreshDownload(message.id, message.transferId, senderIncognito);
   }
   if (!response) return;
   void response.then(reply, () => reply({ ok: false, message: "SlipStream could not complete the request." }));
@@ -530,12 +570,15 @@ api.runtime.onMessage.addListener((message: BrowserMessage, sender, reply) => {
 });
 
 const REFRESH_TTL = 5 * 60_000;
-type RefreshIntent = { url: string; tabId?: number; origin?: string; expires: number };
+type RefreshIntent = { url: string; tabId?: number; origin?: string; incognito?: boolean; expires: number };
 
-async function refreshDownload(id: string, transferId: string): Promise<ActionResult> {
+async function refreshDownload(id: string, transferId: string, senderIncognito: boolean): Promise<ActionResult> {
   const key = refreshKey(id);
   const entry = (await api.storage.session.get(key))[key] as RefreshIntent | undefined;
   if (!entry || Date.now() > entry.expires) return { ok: false, message: "This refresh link expired. Open it again from the context menu." };
+  if (Boolean(entry.incognito) !== senderIncognito) {
+    return { ok: false, message: "This refresh link belongs to a different browsing context." };
+  }
   const target = httpUrl(entry.url);
   if (!target) return { ok: false, message: "This refresh link is invalid." };
   const transfer = native.state.batch?.transfers.find((item) => item.id === transferId && isRefreshableHttpTransfer(item));
@@ -576,11 +619,14 @@ api.contextMenus.onClicked.addListener((info, tab) => {
       }
     } else if (info.menuItemId === "refresh" && url) {
       const id = crypto.randomUUID();
-      const intent: RefreshIntent = { url: url.href, tabId: tabInScope?.id, origin: page?.origin, expires: Date.now() + REFRESH_TTL };
+      const incognito = Boolean(api.extension?.inIncognitoContext || tab?.incognito);
+      const intent: RefreshIntent = {
+        url: url.href, tabId: tabInScope?.id, origin: page?.origin, incognito, expires: Date.now() + REFRESH_TTL,
+      };
       const key = refreshKey(id);
       await api.storage.session.set({ [key]: intent });
       api.alarms.create(key, { when: intent.expires });
-      await api.tabs.create({ url: popupUrl + "?refresh=" + id });
+      await api.tabs.create({ url: popupUrl + "?refresh=" + id, ...(tab?.windowId !== undefined && { windowId: tab.windowId }) });
     }
   })().catch(report);
 });

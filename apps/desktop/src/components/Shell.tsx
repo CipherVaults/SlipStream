@@ -5,7 +5,7 @@ import {
 import type { RefObject } from "react";
 import { version } from "../../package.json";
 import type { TelemetryBatch, TransferSnapshot } from "../types/ipc";
-import { bytes, fileCategory, isDone, isRunning, speed } from "../lib/transfers";
+import { bytes, fileCategory, isDone, isRunning, playlistBuckets, speed, type PlaylistBucket } from "../lib/transfers";
 import { IconButton } from "./ui";
 import { Sparkline } from "./Sparkline";
 
@@ -19,7 +19,14 @@ export type View = typeof navigation[number][0];
 export const filters = ["All", "Active", "Paused", "Done"] as const;
 export type StatusFilter = typeof filters[number];
 
-export function matchesView(transfer: TransferSnapshot, view: View) {
+export function matchesView(transfer: TransferSnapshot, view: View, playlists?: ReadonlyMap<string, PlaylistBucket>) {
+  if (transfer.playlist_id && playlists) {
+    const bucket = playlists.get(transfer.playlist_id);
+    if (bucket) {
+      if (view === "completed") return bucket === "completed";
+      if (view === "active" || view === "queues") return bucket === "active" && transfer.status !== "canceled";
+    }
+  }
   switch (view) {
     case "all": return true;
     case "active": return !isDone(transfer) && transfer.status !== "canceled";
@@ -43,11 +50,12 @@ export function Sidebar({ view, select, transfers, batch, folder, samples, limit
   view: View; select: (view: View) => void; transfers: TransferSnapshot[]; batch: TelemetryBatch | null;
   folder: string; samples: number[]; limit: number | null; preview: boolean; toggleLimit: () => void; openSettings: () => void;
 }) {
+  const playlists = playlistBuckets(transfers);
   const torrentActive = transfers.some(transfer => transfer.kind === "torrent" && isRunning(transfer));
-  const queueCount = new Set(transfers.filter(transfer => matchesView(transfer, "queues")).map(transfer => transfer.queue_id)).size;
+  const queueCount = new Set(transfers.filter(transfer => matchesView(transfer, "queues", playlists)).map(transfer => transfer.queue_id)).size;
 
   function item([key, label, Icon]: typeof navigation[number]) {
-    const count = key === "queues" ? queueCount : transfers.filter(transfer => matchesView(transfer, key)).length;
+    const count = key === "queues" ? queueCount : transfers.filter(transfer => matchesView(transfer, key, playlists)).length;
     return <button type="button" key={key} className={"nav-item" + (view === key ? " active" : "")}
       aria-current={view === key ? "page" : undefined} onClick={() => select(key)}>
       <span className="nav-item-left"><Icon size={15} strokeWidth={1.75} />{label}</span>

@@ -4,7 +4,7 @@ import mediaArtwork from "../assets/media-sheet.svg";
 import { desktop, isTauri } from "../lib/tauri";
 import {
   bytes, clock, errorMessage, folderSeparator, hasListParam, isHttpUrl, isPurePlaylistUrl,
-  isRemoteTorrentUrl, isTorrentSource, isWildcard, parsePlaylistRanges, sanitizeMediaStem, sourceName,
+  isRemoteTorrentUrl, isSafeThumbnailUrl, isTorrentSource, isWildcard, parsePlaylistRanges, sanitizeMediaStem, sourceName,
 } from "../lib/transfers";
 import type { AppSettings, AudioPreset, MediaFormatOption, MediaProbeResult, SelectedPlaylistEntry } from "../types/ipc";
 import { Dialog, FormatRow, Switch, Tabs } from "./ui";
@@ -95,6 +95,7 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
   const [checksum, setChecksum] = useState("");
   const [wildcardUrls, setWildcardUrls] = useState<string[]>([]);
   const [probeBusy, setProbeBusy] = useState(false);
+  const [thumbFailed, setThumbFailed] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [message, setMessage] = useState("");
   const probeRequest = useRef(0);
@@ -113,6 +114,9 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
   const choosePlaylistLanguages = isPlaylistActive && mediaOptions.length === 0;
   const entries = isPlaylistActive && !torrent ? probe?.playlist_items ?? [] : [];
   const previewIncomplete = probe?.playlist_count != null && probe.playlist_count > entries.length;
+  const normalizedRange = playlistItems.trim().replace(/\s*([,-])\s*/g, "$1");
+  const parsedRanges = normalizedRange ? parsePlaylistRanges(normalizedRange) : null;
+  const rangeHasOutOfPreview = Boolean(parsedRanges && entries.length && parsedRanges.some(([, last]) => last > entries.at(-1)!.index));
   const noPlaylistSelection = entries.length > 0 && selectedIndices.size === 0 && !playlistItems.trim();
   const filter = playlistFilter.trim().toLowerCase();
   const indexFilter = /^#?\s*(\d+)$/.exec(filter)?.[1];
@@ -140,9 +144,14 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
   function changePlaylistRange(value: string) {
     setPlaylistItems(value);
     setMessage("");
+    if (!entries.length) return;
     const normalized = value.trim().replace(/\s*([,-])\s*/g, "$1");
+    if (!normalized) {
+      setSelectedIndices(new Set(entries.map(entry => entry.index)));
+      return;
+    }
     const ranges = parsePlaylistRanges(normalized);
-    if (entries.length && normalized && ranges) {
+    if (ranges) {
       setSelectedIndices(new Set(entries.filter(entry => ranges.some(([first, last]) =>
         entry.index >= first && entry.index <= last)).map(entry => entry.index)));
     }
@@ -204,7 +213,9 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
         const result = await probePromise;
         if (request !== probeRequest.current) return;
         setProbe(result);
-        if (probe && value === source && (playlist === undefined || playlist === playlistMode)) {
+        setThumbFailed(false);
+        if (probe?.is_playlist && probe.playlist_items?.length && result.is_playlist
+          && value === source && (playlist === undefined || playlist === playlistMode)) {
           const indices = result.playlist_items?.map(item => item.index) ?? [];
           setSelectedIndices(current => new Set(indices.filter(index => current.has(index))));
         } else {
@@ -245,7 +256,7 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
   useEffect(() => {
     const initial = seed.url?.trim();
     if (seed.autoProbe && initial && !isTorrentSource(initial) && !isRemoteTorrentUrl(initial)) {
-      void probeSource(initial, undefined, true);
+      void probeSource(initial, isPurePlaylistUrl(initial) || undefined, true);
     }
     return () => {
       probeRequest.current++;
@@ -352,10 +363,12 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
           url: source, format_id: format,
           audio_only_preset: tab === "audio" && "preset" in audio ? audio.preset : null,
           embed_subtitles_langs: tab === "audio" ? [] : tab === "subs" || embed ? languages : [],
-          lossless_remux: remux, normalize_audio: normalize, save_dir: saveDir, filename: outputName,
+          lossless_remux: remux, normalize_audio: normalize, save_dir: saveDir,
+          filename: isPlaylistActive ? null : outputName,
           ...(isPlaylistActive && {
             download_playlist: true, max_height: tab === "audio" ? null : maxHeight,
-            playlist_items: items || null, playlist_folder_name: playlistFolderValue.trim() || null,
+            playlist_items: items || null,
+            playlist_folder_name: playlistFolderValue.trim() ? sanitizeMediaStem(playlistFolderValue) : null,
             selected_entries: selectedEntries,
           }),
         });
@@ -381,8 +394,11 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
       tags={tags} selected={selected} onSelect={select} />;
   }
 
+  const safeThumb = !thumbFailed ? isSafeThumbnailUrl(probe?.thumbnail_url) : null;
+
   return <Dialog title="Add Download" onClose={onClose} className="add-sheet" busy={submitting} header={
-    probe && <div className="sheet-thumb"><img src={probe.thumbnail_url?.startsWith("https://") ? probe.thumbnail_url : mediaArtwork} alt="" /></div>
+    probe && <div className="sheet-thumb"><img src={safeThumb ?? mediaArtwork} referrerPolicy="no-referrer" alt=""
+      onError={() => { if (safeThumb) setThumbFailed(true); }} /></div>
   }>
     {probe && <div className="probe-summary tabular"><strong>{probe.title}</strong>
       <span>{sourceName(probe.source_url)}{probe.duration_seconds !== null ? " · " + clock(probe.duration_seconds) : ""}</span>
@@ -490,16 +506,34 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
             <div className="playlist-checklist-toolbar">
               <div className="playlist-checklist-heading">
                 <h3 id="playlist-videos-label">Playlist Videos</h3>
-                <span className="field-note tabular" role="status">{selectedIndices.size} of {entries.length} selected</span>
+                <span className="field-note tabular" role="status">
+                  {rangeHasOutOfPreview && selectedIndices.size === 0
+                    ? `Custom range: ${normalizedRange}`
+                    : `${selectedIndices.size} of ${entries.length} selected`}
+                </span>
               </div>
               <div className="playlist-checklist-actions">
                 <button type="button" className="btn-ghost form-button"
-                  onClick={() => selectPlaylistIndices(new Set(entries.map(entry => entry.index)))}>Select All</button>
+                  onClick={() => {
+                    const next = new Set(selectedIndices);
+                    for (const entry of visibleEntries) next.add(entry.index);
+                    selectPlaylistIndices(next);
+                  }}>Select All</button>
                 <button type="button" className="btn-ghost form-button"
-                  onClick={() => selectPlaylistIndices(new Set())}>Clear</button>
+                  onClick={() => {
+                    const next = new Set(selectedIndices);
+                    for (const entry of visibleEntries) next.delete(entry.index);
+                    selectPlaylistIndices(next);
+                  }}>Clear</button>
                 <button type="button" className="btn-ghost form-button"
-                  onClick={() => selectPlaylistIndices(new Set(entries.filter(entry => !selectedIndices.has(entry.index))
-                    .map(entry => entry.index)))}>Invert</button>
+                  onClick={() => {
+                    const next = new Set(selectedIndices);
+                    for (const entry of visibleEntries) {
+                      if (next.has(entry.index)) next.delete(entry.index);
+                      else next.add(entry.index);
+                    }
+                    selectPlaylistIndices(next);
+                  }}>Invert</button>
               </div>
               <label className="field-inline playlist-filter"><Search size={14} aria-hidden="true" />
                 <input type="search" aria-label="Filter videos" placeholder="Filter videos…" value={playlistFilter}
@@ -557,7 +591,7 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
         <details className="optional-fields">
           <summary>{direct && !wildcard ? "Filename / Expected SHA-256" : "Filename"}</summary>
           <div className="fields-grid">
-            <label className="field">Filename<input value={filename} disabled={wildcard || torrent} onChange={event => setFilename(event.target.value)} /></label>
+            <label className="field">Filename<input value={filename} disabled={wildcard || torrent || isPlaylistActive} onChange={event => setFilename(event.target.value)} /></label>
             {direct && !wildcard && <label className="field">Expected SHA-256<input value={checksum} spellCheck={false}
               onChange={event => setChecksum(event.target.value)} /></label>}
           </div>

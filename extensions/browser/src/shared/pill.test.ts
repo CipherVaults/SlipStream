@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createMediaPill, pillAnchor } from "./pill";
 import { installPillGuard, isPillHost, isReplayedUserEvent, routePillEvent } from "./pillGuard";
-import { emptyState, formatSpeed, type MediaAction } from "./state";
+import { emptyState, formatBytes, formatSpeed, type MediaAction } from "./state";
 import pillCss from "./pill.css?raw";
 import themeCss from "./theme.css?raw";
 
@@ -163,37 +163,50 @@ describe("floating media pill", () => {
     pill.destroy();
   });
 
-  it("defers format updates through hover, opening and pointer presses", () => {
+  it("renders probed formats live while hovered or open, preserves focus, and defers only during pointer press", () => {
     vi.useFakeTimers();
     const onOpen = vi.fn();
     const pill = mount({ onOpen });
     pill.toggle.click();
     expect(onOpen).not.toHaveBeenCalled();
+
+    // Hovering or opening the menu renders probed formats and playlist entry immediately.
     pill.surface.dispatchEvent(new MouseEvent("mouseenter"));
-    const old = pill.menu.querySelector("button")!;
-    pill.updateFormats([{ id: "format:137", label: "1080p MP4" }]);
-    expect(pill.menu.querySelector("button")).toBe(old);
     press(pill, pill.toggle);
+    vi.runAllTimers();
     expect(onOpen).toHaveBeenCalledOnce();
     expect(pill.menu.hidden).toBe(false);
-    pill.surface.dispatchEvent(new MouseEvent("mouseleave"));
+    const pickerBefore = pill.menu.querySelector<HTMLButtonElement>('button[data-action="picker"]')!;
+    pickerBefore.focus();
+    pill.updateFormats([{ id: "format:137", label: "1080p MP4", sub: "12.0 MB" }], true);
+    expect(pill.menu.querySelector("button")?.dataset.action).toBe("format:137");
+    expect(pill.menu.querySelector('button[data-action="playlist"]')?.textContent).toBe("Download Playlist…");
+    expect((pill.root.activeElement as HTMLElement | null)?.dataset.action).toBe("picker");
+
+    // Active pointer press defers format updates until pointer release, then flushes even while menu is open.
+    const currentFirst = pill.menu.querySelector("button")!;
     const pointer = { pointerId: 3, button: 0 };
-    hit(pill, old, "pointerdown", pointer);
+    hit(pill, currentFirst, "pointerdown", pointer);
+    pill.updateFormats([{ id: "format:313", label: "4K VP9", sub: "50.0 MB" }], true);
+    expect(pill.menu.querySelector("button")).toBe(currentFirst);
     const other = pill.menu.querySelectorAll("button")[1];
     hit(pill, other, "pointerup", pointer);
-    hit(pill, other);
-    expect(pill.send).not.toHaveBeenCalled();
-    pill.toggle.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-    expect(pill.menu.querySelector("button")).toBe(old);
+    expect(pill.menu.querySelector("button")).toBe(currentFirst);
     vi.runAllTimers();
-    expect(pill.menu.querySelector("button")?.dataset.action).toBe("format:137");
+    expect(pill.menu.querySelector("button")?.dataset.action).toBe("format:313");
+    expect(pill.menu.hidden).toBe(false);
+
+    pill.surface.dispatchEvent(new MouseEvent("mouseleave"));
+    pill.toggle.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(pill.menu.hidden).toBe(true);
     pill.toggle.focus();
     hit(pill, pill.toggle, "click", { detail: 0 });
     expect(onOpen).toHaveBeenCalledTimes(2);
     pill.destroy();
   });
 
-  it("formats speeds with stable units", () => {
+  it("formats byte sizes and speeds with stable units", () => {
+    expect([0, 512, 1536, 1024 * 1024, 1024 ** 3].map(formatBytes)).toEqual(["0 B", "512 B", "1.5 KB", "1.0 MB", "1.0 GB"]);
     expect([0, 512, 1536, 1024 * 1024].map(formatSpeed)).toEqual(["0 B/s", "512 B/s", "1.5 KB/s", "1.0 MB/s"]);
   });
 });

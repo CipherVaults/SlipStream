@@ -1,6 +1,6 @@
 import type { MediaProbeResult } from "@slipstream/ipc-types";
-import { httpUrl, matchesSite } from "./downloads";
-import { formatSpeed, type PillFormat } from "./state";
+import { httpUrl, isPublicHttpUrl, matchesSite } from "./downloads";
+import { formatBytes, type PillFormat } from "./state";
 
 export interface Header { name: string; value?: string }
 export interface HlsVariant { url: string; height?: number; bandwidth?: number; label: string }
@@ -61,7 +61,7 @@ export function parseHlsMaster(manifestText: string, baseUrl: string): HlsVarian
     if (/[\u0000-\u0020\u007f\\]/.test(line)) continue;
     try {
       const url = httpUrl(new URL(line, baseUrl).href);
-      if (!url || url.href.length > 8192) continue;
+      if (!url || url.href.length > 8192 || !isPublicHttpUrl(url.href)) continue;
       const height = Number(/^\d+x(\d+)$/i.exec(values.get("RESOLUTION") ?? "")?.[1]);
       const bandwidth = Number(/^\d+$/.exec(values.get("BANDWIDTH") ?? "")?.[0]);
       if (!Number.isSafeInteger(bandwidth) || bandwidth <= 0) continue;
@@ -188,7 +188,7 @@ export function probeFormats(probe: MediaProbeResult): PillFormat[] {
     .map(({ format_id, label, has_audio, filesize_bytes }) => ({
       id: "format:" + (hasAudio && !has_audio && validFormatId(format_id + "+bestaudio") ? format_id + "+bestaudio" : format_id) as PillFormat["id"],
       label,
-      sub: filesize_bytes && filesize_bytes > 0 ? formatSpeed(filesize_bytes) : undefined,
+      sub: filesize_bytes && filesize_bytes > 0 ? formatBytes(filesize_bytes) : undefined,
     }));
 }
 

@@ -170,10 +170,16 @@ describe("workspace and inspector", () => {
     videos.forEach(video => { video.status = "completed"; });
     videos[1].status = "failed";
     act(() => pushTelemetry(snapshot()));
+    expect(active().getByRole("region", { name: "Playlist: Weekend films" })).toBeVisible();
+    expect(screen.queryByRole("region", { name: "Completed Today" })?.querySelector('[aria-label="Playlist: Weekend films"]')).toBeNull();
+    expect(playlist().getByText("2/3 done · 1 failed")).toBeVisible();
+
+    videos[1].status = "completed";
+    act(() => pushTelemetry(snapshot()));
     expect(active().queryByRole("region", { name: "Playlist: Weekend films" })).not.toBeInTheDocument();
     const completed = within(screen.getByRole("region", { name: "Completed Today" }));
     expect(completed.getByRole("region", { name: "Playlist: Weekend films" })).toBeVisible();
-    expect(playlist().getByText("2/3 done · 1 failed")).toBeVisible();
+    expect(playlist().getByText("3/3 completed")).toBeVisible();
     expect(playlist().getByRole("button", { name: "Expand Weekend films" })).toHaveAttribute("aria-expanded", "false");
     expect(playlist().queryByRole("article")).not.toBeInTheDocument();
   });
