@@ -514,6 +514,12 @@ async fn startup_pauses_abandoned_runs_and_reconciles_an_unrecorded_rename() {
             record.set_status(TransferStatus::Active);
             if record.id == renamed {
                 record.commit_digest = Some(hex::encode(Sha256::digest(&*data)));
+                record
+                    .headers
+                    .insert("Authorization".into(), "private".into());
+                record.referrer = Some("https://example.com/referrer".into());
+                record.source_url =
+                    "https://user:pass@example.com/file?token=private#fragment".into();
             } else {
                 for segment in segments.values_mut() {
                     segment.state = SegmentState::Active;
@@ -540,6 +546,19 @@ async fn startup_pauses_abandoned_runs_and_reconciles_an_unrecorded_rename() {
         engine.snapshot(&renamed).unwrap().status,
         TransferStatus::Completed
     );
+    let (record, _) = engine
+        .inner
+        .lock()
+        .db()
+        .unwrap()
+        .transfers()
+        .unwrap()
+        .into_iter()
+        .find(|(record, _)| record.id == renamed)
+        .unwrap();
+    assert!(record.headers.is_empty());
+    assert_eq!(record.referrer, None);
+    assert_eq!(record.source_url, "https://example.com/file");
     engine.resume_transfer(&partial).await.unwrap();
     completed(&engine, &partial).await;
     dir.assert_output("crashed.bin", &data).await;
@@ -629,6 +648,79 @@ async fn cancel_transfer_scrubs_persisted_request_credentials() {
     assert_eq!(record.referrer, None);
     assert_eq!(record.source_url, canceled.source_url);
     engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn completed_downloads_scrub_credentials_and_publish_under_unique_names() {
+    let data = payload(8 * KIB, 6);
+    let contents = data.clone();
+    let server = Server::new(move |req| Reply::resource(req, &contents, "\"duplicates\"")).await;
+    let dir = TestDir::new().await;
+    let config = dir.config();
+    let engine = DownloadEngine::new(config.clone()).await.unwrap();
+    let mut download = request(server.url("/repeated.bin?token=private#fragment"), None, 1);
+    download.headers = [("X-Api-Key".into(), "private".into())].into();
+    download.referrer = Some("https://example.com/path?token=private".into());
+    let first = engine.add_http_download(download.clone()).await.unwrap();
+    let second = engine.add_http_download(download).await.unwrap();
+    let mut filenames = vec![
+        completed(&engine, &first).await.filename,
+        completed(&engine, &second).await.filename,
+    ];
+    filenames.sort_unstable();
+    assert_eq!(filenames, ["repeated (1).bin", "repeated.bin"]);
+    for name in filenames {
+        dir.assert_output(&name, &data).await;
+    }
+    engine.shutdown().await.unwrap();
+
+    let records = Database::open(&config.db_path)
+        .unwrap()
+        .transfers()
+        .unwrap();
+    assert_eq!(records.len(), 2);
+    for (record, _) in records {
+        assert_eq!(record.status, TransferStatus::Completed);
+        assert!(record.headers.is_empty());
+        assert_eq!(record.referrer, None);
+        assert_eq!(record.source_url, server.url("/repeated.bin"));
+        assert!(config.default_download_dir.join(record.filename).is_file());
+    }
+}
+
+#[tokio::test]
+async fn database_load_skips_a_corrupt_transfer_record() {
+    let dir = TestDir::new().await;
+    let config = dir.config();
+    let engine = DownloadEngine::new(config.clone()).await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/valid", listener.local_addr().unwrap());
+    let valid = engine
+        .add_http_download(request(url, None, 1))
+        .await
+        .unwrap();
+    engine.shutdown().await.unwrap();
+    let raw = rusqlite::Connection::open(&config.db_path).unwrap();
+    raw.execute(
+        "INSERT INTO transfers (id, queue_id, record) VALUES ('broken', 'default', '{')",
+        [],
+    )
+    .unwrap();
+    let records = Database::open(&config.db_path)
+        .unwrap()
+        .transfers()
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].0.id, valid);
+}
+
+#[test]
+fn numbered_output_names_handle_extensionless_and_long_unicode_names() {
+    assert_eq!(output::numbered_filename("download", 1), "download (1)");
+    let filename = format!("{}.bin", "界".repeat(65));
+    let deduplicated = output::numbered_filename(&filename, 1);
+    assert!(deduplicated.ends_with(" (1).bin"));
+    assert!(slipstream_protocol::validate_safe_filename_component(&deduplicated).is_ok());
 }
 
 #[tokio::test]

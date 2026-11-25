@@ -22,7 +22,7 @@ use windows_sys::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
 
-const MAIN: &str = "main";
+pub(crate) const MAIN: &str = "main";
 const OPEN_PICKER_EVENT: &str = "slipstream://open-picker";
 const TELEMETRY_EVENT: &str = "slipstream://telemetry";
 type Result<T> = std::result::Result<T, String>;
@@ -339,6 +339,7 @@ pub(crate) fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
+            commands::mark_ui_ready,
             commands::get_snapshot,
             commands::add_http_download,
             commands::expand_wildcard_urls,

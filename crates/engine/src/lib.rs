@@ -20,9 +20,7 @@ use chrono::Utc;
 use http::{filename_from_url, sanitize_http_url_credentials, Http, Source};
 use limiter::Limiter;
 use serde::{Deserialize, Serialize};
-use slipstream_protocol::{
-    safe_join_under, sanitize_filename, validate_http_url, TransferKind, UI_SEGMENT_COUNT,
-};
+use slipstream_protocol::{sanitize_filename, validate_http_url, TransferKind, UI_SEGMENT_COUNT};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -258,6 +256,7 @@ impl DownloadEngine {
                 ) {
                     if output::recovered_commit(&record)? {
                         record.set_status(TransferStatus::Completed);
+                        scrub_record_credentials(&mut record);
                     } else {
                         record.set_status(TransferStatus::Paused);
                         for segment in segments.values_mut() {
@@ -322,6 +321,80 @@ impl DownloadEngine {
         request: AddHttpDownloadRequest,
         options: ExtendedHttpOptions,
     ) -> Result<String> {
+        let mut record = self.new_http_record(request, options)?;
+        {
+            let state = self.inner.lock();
+            state.open()?;
+            if !state.queues.contains_key(&record.queue_id) {
+                return Err(EngineError::NotFound(record.queue_id));
+            }
+        }
+        tokio::fs::create_dir_all(&record.save_dir).await?;
+        record.save_dir = tokio::fs::canonicalize(&record.save_dir).await?;
+        record.paths()?;
+        let mut state = self.inner.lock();
+        state.open()?;
+        state.db()?.save_record(&record)?;
+        let id = self.register_http_job(&mut state, record);
+        self.inner.wake.notify_one();
+        Ok(id)
+    }
+
+    /// Enqueue a batch in one transaction using a canonical download directory
+    /// that the caller has already created and validated.
+    pub fn add_http_batch(
+        &self,
+        urls: Vec<String>,
+        referrer: Option<String>,
+        save_dir: PathBuf,
+        max_connections: u8,
+    ) -> Result<()> {
+        let mut records = urls
+            .into_iter()
+            .map(|url| {
+                self.new_http_record(
+                    AddHttpDownloadRequest {
+                        url,
+                        filename: None,
+                        save_dir: None,
+                        max_connections: Some(max_connections),
+                        queue_id: None,
+                        headers: HashMap::new(),
+                        referrer: referrer.clone(),
+                        expected_sha256: None,
+                    },
+                    ExtendedHttpOptions::default(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !save_dir.is_absolute() {
+            return Err(EngineError::InvalidRequest(
+                "expected an absolute batch save directory".into(),
+            ));
+        }
+        for record in &mut records {
+            record.save_dir.clone_from(&save_dir);
+            record.paths()?;
+        }
+        let mut state = self.inner.lock();
+        state.open()?;
+        state
+            .database
+            .as_mut()
+            .ok_or(EngineError::Closed)?
+            .save_records(&records)?;
+        for record in records {
+            self.register_http_job(&mut state, record);
+        }
+        self.inner.wake.notify_one();
+        Ok(())
+    }
+
+    fn new_http_record(
+        &self,
+        request: AddHttpDownloadRequest,
+        options: ExtendedHttpOptions,
+    ) -> Result<Record> {
         let source = Source::new(
             &request.url,
             &request.headers,
@@ -335,22 +408,12 @@ impl DownloadEngine {
         let expected_sha256 = checksum(request.expected_sha256, 64, "SHA-256")?;
         let expected_md5 = checksum(options.expected_md5, 32, "MD5")?;
         let queue_id = request.queue_id.unwrap_or_else(|| DEFAULT_QUEUE.into());
-        {
-            let state = self.inner.lock();
-            state.open()?;
-            if !state.queues.contains_key(&queue_id) {
-                return Err(EngineError::NotFound(queue_id));
-            }
-        }
         let save_dir = request
             .save_dir
             .map(PathBuf::from)
             .unwrap_or_else(|| self.inner.config.default_download_dir.clone());
-        tokio::fs::create_dir_all(&save_dir).await?;
-        let save_dir = tokio::fs::canonicalize(save_dir).await?;
-        safe_join_under(&save_dir, &filename)?;
         let now = Utc::now();
-        let record = Record {
+        Ok(Record {
             id: Uuid::new_v4().to_string(),
             filename,
             use_server_filename: request.filename.is_none(),
@@ -373,19 +436,19 @@ impl DownloadEngine {
                 .unwrap_or(self.inner.config.default_connections)
                 .clamp(1, 32),
             protocol: String::new(),
-            queue_id: queue_id.clone(),
+            queue_id,
             error: None,
             sha256_verified: None,
             commit_digest: None,
             speed_limit_bps: options.speed_limit_bps.filter(|rate| *rate > 0),
             created_at: now,
             updated_at: now,
-        };
+        })
+    }
+
+    fn register_http_job(&self, state: &mut State, record: Record) -> String {
         let id = record.id.clone();
-        let mut state = self.inner.lock();
-        state.open()?;
-        state.db()?.save_record(&record)?;
-        state.armed_queues.insert(queue_id);
+        state.armed_queues.insert(record.queue_id.clone());
         state.jobs.insert(
             id.clone(),
             Job {
@@ -395,8 +458,7 @@ impl DownloadEngine {
             },
         );
         self.inner.status(&id, TransferStatus::Queued);
-        self.inner.wake.notify_one();
-        Ok(id)
+        id
     }
 
     pub fn snapshot(&self, id: &str) -> Result<TransferSnapshot> {
@@ -546,6 +608,24 @@ impl DownloadEngine {
         self.stop_transfer(id, TransferStatus::Canceled).await
     }
 
+    /// Remove credentials from a terminal row, including records from older versions.
+    pub fn scrub_transfer_credentials(&self, id: &str) -> Result<()> {
+        let mut state = self.inner.lock();
+        state.open()?;
+        let (db, job) = state.job_mut(id)?;
+        if !matches!(
+            job.record.status,
+            TransferStatus::Completed | TransferStatus::Canceled
+        ) {
+            return Err(EngineError::InvalidState("transfer has not finished"));
+        }
+        let mut record = job.record.clone();
+        scrub_record_credentials(&mut record);
+        db.save_record(&record)?;
+        job.record = record;
+        Ok(())
+    }
+
     async fn stop_transfer(&self, id: &str, target: TransferStatus) -> Result<()> {
         let mut done = {
             let mut state = self.inner.lock();
@@ -660,19 +740,9 @@ fn save_status(
     // Keep the intent in SQLite if publishing Completed fails after a move.
     if status == TransferStatus::Completed {
         record.commit_digest = None;
-    } else if status == TransferStatus::Canceled {
-        record.headers.clear();
-        record.referrer = None;
-        record.source_url = validate_http_url(&record.source_url).map_or_else(
-            |_| String::new(),
-            |mut url| {
-                let _ = url.set_username("");
-                let _ = url.set_password(None);
-                url.set_query(None);
-                url.set_fragment(None);
-                url.into()
-            },
-        );
+    }
+    if matches!(status, TransferStatus::Completed | TransferStatus::Canceled) {
+        scrub_record_credentials(&mut record);
     }
     let segment_state = if status == TransferStatus::Failed {
         SegmentState::Error
@@ -686,6 +756,21 @@ fn save_status(
     job.record = record;
     job.segments = segments;
     Ok(())
+}
+
+fn scrub_record_credentials(record: &mut Record) {
+    record.headers.clear();
+    record.referrer = None;
+    record.source_url = validate_http_url(&record.source_url).map_or_else(
+        |_| String::new(),
+        |mut url| {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.into()
+        },
+    );
 }
 
 impl Inner {

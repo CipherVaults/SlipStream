@@ -9,11 +9,19 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_updater::UpdaterExt;
 
 type Daemon<'a> = State<'a, Arc<AppState>>;
 type Result<T> = std::result::Result<T, String>;
+
+#[tauri::command]
+pub(crate) fn mark_ui_ready(state: Daemon<'_>, window: WebviewWindow) -> Result<()> {
+    if window.label() != crate::shell::MAIN {
+        return Err("only the main window can mark the UI ready".into());
+    }
+    state.window_ready(state.window_generation())
+}
 
 #[tauri::command(rename_all = "snake_case")]
 pub(crate) async fn get_snapshot(state: Daemon<'_>) -> Result<TelemetryBatch> {
@@ -95,8 +103,11 @@ pub(crate) async fn resume_playlist(state: Daemon<'_>, playlist_id: String) -> R
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub(crate) fn reveal_playlist_folder(state: Daemon<'_>, playlist_id: String) -> Result<()> {
-    state.reveal_playlist_folder(&playlist_id)
+pub(crate) async fn reveal_playlist_folder(state: Daemon<'_>, playlist_id: String) -> Result<()> {
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || state.reveal_playlist_folder(&playlist_id))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command(rename_all = "snake_case")]

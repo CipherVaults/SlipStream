@@ -3,7 +3,7 @@ use std::{
     ffi::OsStr,
     io,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     time::Duration,
 };
 
@@ -12,10 +12,13 @@ use slipstream_protocol::AppSettings;
 use tokio::{
     fs,
     io::{AsyncRead, AsyncReadExt},
-    process::Command,
+    process::{Child, Command},
 };
 
 use crate::{args::validate_local_path, MediaError};
+
+#[cfg(windows)]
+mod windows_job;
 
 #[derive(Debug, Clone, Default)]
 pub struct ToolchainConfig {
@@ -340,13 +343,50 @@ pub(crate) fn command(path: &Path, tool: &str) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .env_remove("FFREPORT");
+        .env_remove("FFREPORT")
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("ALL_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .env_remove("all_proxy")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy");
     if tool == YTDLP.name {
         cmd.env("YTDLP_NO_PLUGINS", "1");
     }
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     cmd
+}
+
+pub(crate) struct SidecarChild {
+    #[cfg(windows)]
+    job: Option<std::os::windows::io::OwnedHandle>,
+    pub(crate) child: Child,
+}
+
+impl SidecarChild {
+    pub(crate) async fn wait(&mut self) -> io::Result<ExitStatus> {
+        let status = self.child.wait().await;
+        // Descendants can inherit the pipes and keep the output readers alive.
+        #[cfg(windows)]
+        drop(self.job.take());
+        status
+    }
+}
+
+pub(crate) fn spawn_sidecar(cmd: &mut Command) -> io::Result<SidecarChild> {
+    #[cfg(windows)]
+    let job = windows_job::create()?;
+    let child = cmd.spawn()?;
+    #[cfg(windows)]
+    let job = windows_job::assign(job, &child)?;
+    Ok(SidecarChild {
+        #[cfg(windows)]
+        job,
+        child,
+    })
 }
 
 pub(crate) async fn capture(
@@ -357,9 +397,9 @@ pub(crate) async fn capture(
     stdout_limit: usize,
 ) -> Result<Vec<u8>, MediaError> {
     tokio::time::timeout(timeout, async {
-        let mut child = cmd.spawn()?;
-        let stdout = child.stdout.take().expect("stdout is piped");
-        let stderr = child.stderr.take().expect("stderr is piped");
+        let mut child = spawn_sidecar(&mut cmd)?;
+        let stdout = child.child.stdout.take().expect("stdout is piped");
+        let stderr = child.child.stderr.take().expect("stderr is piped");
         let (output, stderr, status) = tokio::try_join!(
             async move {
                 let mut output = Vec::new();

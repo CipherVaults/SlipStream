@@ -1,7 +1,9 @@
 use crate::TorrentError;
-use slipstream_protocol::{sanitize_filename, validate_magnet_uri, UrlSecurityError};
+use slipstream_protocol::{
+    is_private_or_loopback_ip, sanitize_filename, validate_magnet_uri, UrlSecurityError,
+};
 use std::collections::BTreeSet;
-use url::Url;
+use url::{Host, Url};
 
 // `so` is peer/user input. Bound expansion independently of the index values.
 const MAX_SELECTED_INDICES: usize = 100_000;
@@ -75,7 +77,7 @@ pub fn parse_magnet_uri(raw: &str) -> Result<ParsedMagnet, TorrentError> {
                     magnet.info_hash_v2_hex = Some(hash);
                 }
             }
-            "tr" if !value.is_empty() => magnet.trackers.push(value.into_owned()),
+            "tr" if allowed_tracker_url(&value) => magnet.trackers.push(value.into_owned()),
             "xs" if !value.is_empty() => magnet.exact_sources.push(value.into_owned()),
             "xl" => magnet.exact_length = Some(decimal(&value)?),
             "so" => {
@@ -89,6 +91,32 @@ pub fn parse_magnet_uri(raw: &str) -> Result<ParsedMagnet, TorrentError> {
         magnet.select_only = Some(selection.into_iter().collect());
     }
     Ok(magnet)
+}
+
+pub(crate) fn allowed_tracker_url(raw: &str) -> bool {
+    let Ok(url) = Url::parse(raw) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https" | "udp") || raw.chars().any(char::is_control) {
+        return false;
+    }
+    // UDP is a non-special URL scheme, so normalize its opaque host as an HTTP host
+    // before checking alternate spellings of IPv4 addresses and localhost.
+    match url
+        .host_str()
+        .map(|host| Host::parse(host.trim_end_matches('.')))
+    {
+        Some(Ok(Host::Ipv4(ip))) => !is_private_or_loopback_ip(ip.into()),
+        Some(Ok(Host::Ipv6(ip))) => {
+            !is_private_or_loopback_ip(ip.into())
+                && (ip.segments()[0] != 0x2001 || ip.segments()[1] != 0xdb8)
+        }
+        Some(Ok(Host::Domain(host))) => {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            !host.is_empty() && host != "localhost" && !host.ends_with(".localhost")
+        }
+        _ => false,
+    }
 }
 
 fn is_hex(hash: &str, len: usize) -> bool {
@@ -150,8 +178,47 @@ fn parse_selection(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) const PUBLIC_TRACKERS: &[&str] = &[
+        "http://tracker.example.com/announce",
+        "https://tracker.example.net/announce",
+        "udp://tracker.example.org:6969/announce",
+    ];
+    pub(crate) const BLOCKED_TRACKERS: &[&str] = &[
+        "file:///tmp/tracker",
+        "ftp://tracker.example.org",
+        "http://localhost/announce",
+        "udp://FoO.LocalHost.:6969/announce",
+        "https://127.0.0.1/announce",
+        "udp://0x7f000001:6969",
+        "http://10.0.0.1/announce",
+        "http://169.254.169.254/announce",
+        "http://100.64.0.1/announce",
+        "http://192.0.2.1/announce",
+        "udp://0.0.0.0:6969",
+        "udp://224.0.0.1:6969",
+        "http://[::1]/announce",
+        "udp://[::ffff:127.0.0.1]:6969",
+        "http://[fe80::1]/announce",
+        "http://[fc00::1]/announce",
+        "https://[2001:db8::1]/announce",
+    ];
+
+    #[test]
+    fn filters_trackers_without_rejecting_the_magnet() {
+        let mut magnet =
+            Url::parse("magnet:?xt=urn:btih:0000000000000000000000000000000000000000").unwrap();
+        magnet.query_pairs_mut().extend_pairs(
+            PUBLIC_TRACKERS
+                .iter()
+                .chain(BLOCKED_TRACKERS)
+                .map(|url| ("tr", *url)),
+        );
+        let parsed = parse_magnet_uri(magnet.as_str()).unwrap();
+        assert_eq!(parsed.trackers, PUBLIC_TRACKERS);
+    }
 
     #[test]
     fn parses_hashes_selection_and_optional_fields() {

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use url::Url;
 
-const MAX_FILENAME_BYTES: usize = 200;
+pub const MAX_FILENAME_BYTES: usize = 200;
 
 const WINDOWS_RESERVED_STEMS: &[&str] = &[
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",

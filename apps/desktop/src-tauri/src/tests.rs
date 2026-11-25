@@ -152,14 +152,14 @@ fn directory_junction(link: &Path, destination: &Path) {
 }
 
 #[test]
-fn playlist_subfolder_sanitizes_reuses_and_avoids_file_collisions() {
+fn playlist_subfolder_sanitizes_and_avoids_file_and_directory_collisions() {
     let temp = TempDir::new();
     let base = fs::canonicalize(&temp.0).unwrap();
     let sanitized = ensure_playlist_subfolder(&base, " Season 1: Intro / Preview? ").unwrap();
     assert_eq!(sanitized, base.join("Season 1_ Intro _ Preview_"));
     assert_eq!(
         ensure_playlist_subfolder(&base, "Season 1: Intro / Preview?").unwrap(),
-        sanitized
+        base.join("Season 1_ Intro _ Preview_ (2)")
     );
     assert_eq!(
         ensure_playlist_subfolder(&base, "").unwrap(),
@@ -173,7 +173,7 @@ fn playlist_subfolder_sanitizes_reuses_and_avoids_file_collisions() {
     assert_eq!(suffixed, base.join("Season 2 (2)"));
     assert_eq!(
         ensure_playlist_subfolder(&base, "Season 2").unwrap(),
-        suffixed
+        base.join("Season 2 (3)")
     );
     assert_eq!(
         fs::read_to_string(base.join("Season 2")).unwrap(),

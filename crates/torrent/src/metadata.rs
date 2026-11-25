@@ -1,4 +1,4 @@
-use crate::{bencode, bencode::BencodeValue as Value, TorrentError};
+use crate::{bencode, bencode::BencodeValue as Value, magnet::allowed_tracker_url, TorrentError};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use slipstream_protocol::{
@@ -184,19 +184,18 @@ fn parse_metadata(
         .collect();
     let announce_list = root
         .get(b"announce-list".as_slice())
-        .map(|tiers| {
-            list(tiers)?
-                .iter()
-                .map(|tier| {
-                    list(tier)?
-                        .iter()
-                        .map(|url| string(url).map(str::to_owned))
-                        .collect()
-                })
-                .collect::<Result<_, TorrentError>>()
+        .and_then(|tiers| list(tiers).ok())
+        .into_iter()
+        .flatten()
+        .filter_map(|tier| list(tier).ok())
+        .map(|tier| {
+            tier.iter()
+                .filter_map(tracker_text)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
         })
-        .transpose()?
-        .unwrap_or_default();
+        .filter(|tier| !tier.is_empty())
+        .collect();
     let private = match info.get(b"private".as_slice()) {
         None | Some(Value::Int(0)) => false,
         Some(Value::Int(1)) => true,
@@ -212,7 +211,10 @@ fn parse_metadata(
         total_bytes,
         total_pieces,
         private,
-        announce: optional_text(root, b"announce")?,
+        announce: root
+            .get(b"announce".as_slice())
+            .and_then(tracker_text)
+            .map(str::to_owned),
         announce_list,
         comment: optional_text(root, b"comment")?,
         created_by: optional_text(root, b"created by")?,
@@ -222,6 +224,10 @@ fn parse_metadata(
         files,
         resolved_paths,
     })
+}
+
+fn tracker_text(value: &Value) -> Option<&str> {
+    string(value).ok().filter(|url| allowed_tracker_url(url))
 }
 
 fn v1_files(
@@ -625,4 +631,43 @@ fn build_v1<P: AsRef<str>, B: AsRef<[u8]>>(
     )])));
     parse_torrent_bytes(&bytes, Path::new(""))?;
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::magnet::tests::{BLOCKED_TRACKERS, PUBLIC_TRACKERS};
+
+    #[test]
+    fn filters_announce_and_announce_list_without_rejecting_the_torrent() {
+        let original = build_v1_single_file_torrent("example.bin", b"data", 4).unwrap();
+        let (root, _) = bencode::decode_with_info(&original).unwrap();
+        let Value::Dict(mut root) = root else {
+            unreachable!()
+        };
+        let tier = |urls: &[&str]| {
+            Value::List(
+                urls.iter()
+                    .map(|url| Value::Bytes(url.as_bytes().to_vec()))
+                    .collect(),
+            )
+        };
+        let mut mixed = PUBLIC_TRACKERS.to_vec();
+        mixed.extend_from_slice(BLOCKED_TRACKERS);
+        root.insert(
+            b"announce-list".to_vec(),
+            Value::List(vec![tier(BLOCKED_TRACKERS), tier(&mixed)]),
+        );
+        for url in PUBLIC_TRACKERS.iter().chain(BLOCKED_TRACKERS) {
+            root.insert(b"announce".to_vec(), Value::Bytes(url.as_bytes().to_vec()));
+            let parsed =
+                parse_torrent_bytes(&bencode::encode(&Value::Dict(root.clone())), Path::new(""))
+                    .unwrap();
+            assert_eq!(
+                parsed.announce.as_deref(),
+                PUBLIC_TRACKERS.contains(url).then_some(*url)
+            );
+            assert_eq!(parsed.announce_list, [PUBLIC_TRACKERS]);
+        }
+    }
 }

@@ -23,7 +23,7 @@ use crate::{
         validate_local_path, validate_subtitle_language, DOWNLOAD_PROGRESS_PREFIX,
     },
     motw::{is_regular_file, is_reparse_point, write_mark_of_the_web},
-    toolchain::{command, ResolvedBinary},
+    toolchain::{command, spawn_sidecar, ResolvedBinary},
     BuildFfmpegArgs, BuildYtDlpArgs, MediaError, MediaToolchain, ProbeOptions,
 };
 
@@ -1060,6 +1060,8 @@ async fn count_video_streams(
     cmd.args([
         "-v",
         "error",
+        "-protocol_whitelist",
+        "file",
         "-f",
         demuxer,
         "-select_streams",
@@ -1284,11 +1286,10 @@ async fn run_streaming(
     if let Some(cwd) = cwd {
         cmd.current_dir(sidecar_path(cwd)?);
     }
-    let mut child = cmd
-        .spawn()
+    let mut child = spawn_sidecar(&mut cmd)
         .map_err(|err| MediaError::io("start sidecar", &binary.path, err))?;
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
+    let stdout = child.child.stdout.take().expect("stdout is piped");
+    let stderr = child.child.stderr.take().expect("stderr is piped");
     let mut parser = FfmpegProgressParser::default();
     let (_, stderr, status) = tokio::try_join!(
         read_progress(stdout, false, |line| {

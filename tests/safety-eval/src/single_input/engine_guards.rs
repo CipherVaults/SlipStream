@@ -686,15 +686,15 @@ pub(super) async fn run_http_redirect_cases(suite: &mut Suite) {
                     && landing.iter().all(|r| {
                         !r.headers.contains_key("cookie")
                             && r.headers.get("referer").map(String::as_str)
-                                == Some("https://ref.example.test/watch?v=1")
+                                == Some("https://ref.example.test/")
                     })
                     && fs::read(ref_dir.join("ref.bin")).ok().as_deref()
                         == Some(payload.as_slice());
                 if ok {
-                    Outcome::Pass("DownloadEngine sanitized Referer credentials/fragment and stripped Cookie cross-origin.")
+                    Outcome::Pass("DownloadEngine kept an origin-only Referer and stripped Cookie across origins.")
                 } else {
                     Outcome::Fail(
-                        "Referer sanitization or cross-origin Cookie strip failed on redirect"
+                        "Origin-only Referer or cross-origin Cookie stripping failed on redirect"
                             .into(),
                     )
                 }
