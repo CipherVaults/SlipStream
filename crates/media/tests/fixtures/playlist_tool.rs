@@ -1,4 +1,4 @@
-use std::{env, fs, process};
+use std::{env, fs, path::Path, process};
 
 fn main() {
     let args: Vec<_> = env::args().skip(1).collect();
@@ -48,10 +48,14 @@ fn single_video(args: &[String]) {
     };
     let executable = env::current_exe().unwrap();
     let dir = executable.parent().unwrap();
-    let cache = dir.join("probe-cache");
+    let cache_arg = Path::new(option("--cache-dir").expect("missing --cache-dir"));
     assert_eq!(
-        option("--cache-dir").map(std::path::Path::new),
-        Some(cache.as_path())
+        cache_arg.file_name().and_then(|n| n.to_str()),
+        Some("probe-cache")
+    );
+    assert_eq!(
+        fs::canonicalize(cache_arg.parent().expect("cache parent")).unwrap(),
+        fs::canonicalize(dir).unwrap()
     );
     assert_eq!(option("--add-header"), Some("User-Agent:SlipStream Test"));
     assert!(!args.iter().any(|arg| arg == "--no-cache-dir"));
