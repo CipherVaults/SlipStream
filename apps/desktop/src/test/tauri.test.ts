@@ -1,6 +1,7 @@
 import { emit } from "@tauri-apps/api/event";
 import { clearMocks, mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { version } from "../../package.json";
 import { DEFAULT_SETTINGS, demo } from "../lib/demo";
 import { desktop, isTauri } from "../lib/tauri";
 import { DEFAULT_CHROMIUM_EXTENSION_ID, DEFAULT_FIREFOX_EXTENSION_ID } from "../types/ipc";
@@ -46,6 +47,9 @@ describe("Tauri v2 adapter", () => {
     await desktop.setTorrentFiles(id, [1, 3]);
     await desktop.pauseTransfer(id);
     await desktop.resumeTransfer(id);
+    await desktop.pausePlaylist("playlist-1");
+    await desktop.resumePlaylist("playlist-1");
+    await desktop.revealPlaylistFolder("playlist-1");
     await desktop.cancelTransfer(id, true);
     await desktop.refreshDownloadUrl(refresh);
     await desktop.setSpeedLimit(null);
@@ -69,6 +73,8 @@ describe("Tauri v2 adapter", () => {
       ["add_media_download", { request: media }], ["add_torrent", { request: torrent }],
       ["list_torrent_files", { transfer_id: id }], ["set_torrent_files", { transfer_id: id, selected_indices: [1, 3] }],
       ["pause_transfer", { transfer_id: id }], ["resume_transfer", { transfer_id: id }],
+      ["pause_playlist", { playlist_id: "playlist-1" }], ["resume_playlist", { playlist_id: "playlist-1" }],
+      ["reveal_playlist_folder", { playlist_id: "playlist-1" }],
       ["cancel_transfer", { transfer_id: id, delete_files: true }], ["refresh_download_url", { request: refresh }],
       ["set_speed_limit", { limit_bps: null }], ["verify_transfer_checksum", { transfer_id: id, expected_sha256: digest }],
       ["reveal_in_explorer", { transfer_id: id }], ["get_settings", {}], ["save_settings", { settings: DEFAULT_SETTINGS }],
@@ -183,7 +189,7 @@ describe("Tauri v2 adapter", () => {
 describe("browser demo", () => {
   it("reports the current version and has no updates to install", async () => {
     await expect(desktop.checkForUpdates()).resolves.toEqual({
-      available: false, current_version: "1.1.1", version: null, notes: null, pub_date: null,
+      available: false, current_version: version, version: null, notes: null, pub_date: null,
     });
     await expect(desktop.installUpdate()).resolves.toBe(false);
     expect(invoke).not.toHaveBeenCalled();
@@ -253,5 +259,48 @@ describe("browser demo", () => {
     }
     demo.openPicker(null);
     expect(open).toHaveBeenCalledTimes(1);
+  });
+
+  it("downloads selected demo videos in sequence and keeps queued videos idle while paused", async () => {
+    vi.useFakeTimers();
+    const off = await desktop.onTelemetry(() => {});
+    try {
+      const url = "https://www.youtube.com/playlist?list=PL1";
+      const probe = await desktop.probeMedia(url);
+      const items = probe.playlist_items!;
+      expect(items).toHaveLength(5);
+      expect(probe.playlist_entries).toEqual(items.map(item => item.title));
+      const selected = [items[3], items[1]].map(({ index, title, url }) => ({ index, title, url: url! }));
+      const id = await desktop.addMediaDownload({
+        url, selected_entries: selected, playlist_folder_name: "  Evening: Walks.  ",
+        embed_subtitles_langs: [], lossless_remux: true, normalize_audio: false,
+      });
+      const snapshot = await desktop.getSnapshot();
+      const first = snapshot.transfers.find(transfer => transfer.id === id)!;
+      expect(first.playlist_id).toBeTruthy();
+      const group = async () => (await desktop.getSnapshot()).transfers.filter(item => item.playlist_id === first.playlist_id);
+      const statuses = async () => (await group()).map(item => item.status);
+      expect(await group()).toMatchObject([
+        { source_url: selected[1].url, playlist_index: 1, playlist_total: 2, save_dir: "D:\\Downloads\\Evening_ Walks" },
+        { source_url: selected[0].url, playlist_index: 2, playlist_total: 2, save_dir: "D:\\Downloads\\Evening_ Walks" },
+      ]);
+      expect(await statuses()).toEqual(["active", "queued"]);
+
+      await desktop.pausePlaylist(first.playlist_id!);
+      vi.advanceTimersByTime(9 * 2400);
+      expect(await statuses()).toEqual(["paused", "queued"]);
+      expect((await group()).map(item => item.downloaded_bytes)).toEqual([0, 0]);
+      await desktop.resumePlaylist(first.playlist_id!);
+      expect(await statuses()).toEqual(["active", "queued"]);
+      vi.advanceTimersByTime(9 * 2400);
+      expect(await statuses()).toEqual(["completed", "active"]);
+      vi.advanceTimersByTime(9 * 2400);
+      expect(await statuses()).toEqual(["completed", "completed"]);
+      await expect(desktop.revealPlaylistFolder(first.playlist_id!)).resolves.toBeUndefined();
+      expect(invoke).not.toHaveBeenCalled();
+    } finally {
+      off();
+      vi.useRealTimers();
+    }
   });
 });

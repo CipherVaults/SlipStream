@@ -13,9 +13,9 @@ pub use pipeline::{
 };
 pub use probe::{
     audio_preset_recommendations, parse_ytdlp_probe_json, pick_format_option, probe_url,
-    quality_summary_tags, AudioPresetRecommendation, ProbeOptions,
+    probe_url_with_binary, quality_summary_tags, AudioPresetRecommendation, ProbeOptions,
 };
-pub use toolchain::{MediaToolchain, ResolvedBinary, ToolchainConfig};
+pub use toolchain::{discover_ytdlp_only, MediaToolchain, ResolvedBinary, ToolchainConfig};
 
 pub fn media_version() -> &'static str {
     env!("CARGO_PKG_VERSION")

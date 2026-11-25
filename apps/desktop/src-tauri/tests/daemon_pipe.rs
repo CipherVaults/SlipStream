@@ -5,7 +5,8 @@ use slipstream_native_host::{pipe::PipeClient, token::SessionToken};
 use slipstream_protocol::{
     AccentMode, AddHttpDownloadRequest, AddMediaDownloadRequest, AddTorrentRequest, AppSettings,
     NativeBridgeRequest as Request, NativeBridgeResponse as Response, RefreshDownloadUrlRequest,
-    TelemetryBatch, ThemeMode, TransferKind, TransferSnapshot, TransferStatus,
+    SelectedPlaylistEntry, TelemetryBatch, ThemeMode, TransferKind, TransferSnapshot,
+    TransferStatus,
 };
 use slipstream_torrent::TorrentManagerConfig;
 use std::{
@@ -274,6 +275,63 @@ async fn media_tool_fixture(directory: &Path) -> PathBuf {
     exe
 }
 
+fn media_request(url: &str) -> AddMediaDownloadRequest {
+    AddMediaDownloadRequest {
+        url: url.into(),
+        format_id: None,
+        audio_only_preset: None,
+        target_container: None,
+        embed_subtitles_langs: Vec::new(),
+        lossless_remux: false,
+        normalize_audio: false,
+        save_dir: None,
+        filename: None,
+        playlist_items: None,
+        download_playlist: false,
+        max_height: None,
+        selected_entries: None,
+        playlist_folder_name: None,
+        headers: Default::default(),
+    }
+}
+
+fn media_tool_log(directory: &Path) -> String {
+    match fs::read_to_string(directory.join("media-tool.log")) {
+        Ok(log) => log,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => panic!("could not read media fixture log: {error}"),
+    }
+}
+
+async fn wait_for_media_tool_log(directory: &Path, line: &str, count: usize) {
+    timeout(Duration::from_secs(10), async {
+        while media_tool_log(directory)
+            .lines()
+            .filter(|record| *record == line)
+            .count()
+            < count
+        {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("fixture log did not include {line:?} {count} time(s)"));
+}
+
+async fn playlist_members(state: &AppState, first_id: &str) -> Vec<TransferSnapshot> {
+    let mut transfers = state.snapshot().await.transfers;
+    let id = transfers
+        .iter()
+        .find(|job| job.id == first_id)
+        .unwrap()
+        .playlist_id
+        .clone()
+        .unwrap();
+    transfers.retain(|job| job.playlist_id.as_deref() == Some(&id));
+    transfers.sort_by_key(|job| job.playlist_index);
+    transfers
+}
+
 fn torrent_file(directory: &Path) -> PathBuf {
     // A single four-byte file with one SHA-1 piece, SHA-1("test").
     let mut bytes =
@@ -442,7 +500,7 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
 
     let media_url = "https://example.com/video";
     assert!(matches!(
-        bridge.request(Request::ProbeMedia { url: media_url.into() }).await,
+        bridge.request(Request::ProbeMedia { url: media_url.into(), playlist: None }).await,
         Response::MediaProbed { probe } if probe.title == "Fixture video"
     ));
     let media = bridge
@@ -460,6 +518,9 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
                 playlist_items: None,
                 download_playlist: false,
                 max_height: None,
+                selected_entries: None,
+                playlist_folder_name: None,
+                headers: Default::default(),
             },
         })
         .await;
@@ -540,6 +601,9 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
                     playlist_items: None,
                     download_playlist: false,
                     max_height: None,
+                    selected_entries: None,
+                    playlist_folder_name: None,
+                    headers: Default::default(),
                 },
             })
             .await,
@@ -947,11 +1011,16 @@ async fn media_playlist_publishes_successful_items_with_original_indices_and_mot
     );
     let pure = "https://example.com/playlist?list=PL1";
     assert!(matches!(
-        bridge.request(Request::ProbeMedia { url: pure.into() }).await,
+        bridge.request(Request::ProbeMedia { url: pure.into(), playlist: None }).await,
+        Response::MediaProbed { probe } if probe.is_playlist
+    ));
+    assert!(matches!(
+        bridge.request(Request::ProbeMedia { url: mixed.into(), playlist: Some(true) }).await,
         Response::MediaProbed { probe } if probe.is_playlist
     ));
     let large = Request::ProbeMedia {
         url: "https://example.com/playlist?list=PL6000".into(),
+        playlist: None,
     };
     let large = bridge.request(large).await;
     assert!(matches!(&large, Response::MediaProbed { probe }
@@ -975,12 +1044,19 @@ async fn media_playlist_publishes_successful_items_with_original_indices_and_mot
                 playlist_items: None,
                 download_playlist: false,
                 max_height: Some(720),
+                selected_entries: None,
+                playlist_folder_name: None,
+                headers: Default::default(),
             },
         })
         .await;
     let active = wait_for(&state, &id, TransferStatus::Active).await;
     assert_eq!(active.filename, "Fixture playlist");
+    assert!(active.playlist_id.is_some());
+    assert_eq!(active.playlist_title.as_deref(), Some("Fixture playlist"));
+    assert_eq!(active.playlist_total, Some(4));
     let done = wait_for(&state, &id, TransferStatus::Completed).await;
+    assert_eq!(done.playlist_index, Some(3));
     assert_eq!(done.filename, "Fixture playlist (2 files)");
     assert_eq!(
         done.completion_notice.as_deref(),
@@ -989,6 +1065,7 @@ async fn media_playlist_publishes_successful_items_with_original_indices_and_mot
     assert!(done.error_message.is_none());
     assert_eq!(done.downloaded_bytes, 11);
     assert_eq!(done.total_bytes, Some(11));
+    let downloads = downloads.join("Fixture playlist");
     for (name, payload) in [
         ("Fixture playlist-000001.mp4", &b"first"[..]),
         ("Fixture playlist-000004.mp4", &b"fourth"[..]),
@@ -1004,6 +1081,403 @@ async fn media_playlist_publishes_successful_items_with_original_indices_and_mot
     assert_eq!(fs::read_dir(&downloads).unwrap().count(), 2);
     state.cancel_transfer(&id, true).await.unwrap();
     assert_eq!(fs::read_dir(&downloads).unwrap().count(), 0);
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn media_probes_coalesce_across_the_pipe_and_reuse_toolchain_and_download_metadata() {
+    let temp = TempDir::new();
+    let downloads = temp.0.join("Downloads");
+    let executable = media_tool_fixture(&temp.0).await;
+    let path = executable.to_string_lossy().into_owned();
+    let settings = installed_settings(&temp.0, &downloads);
+    let pipe = format!(r"\\.\pipe\SlipStream.Probes.{}", Uuid::new_v4());
+    let registry_key = RegistryKey::isolated();
+    let state = AppState::start(
+        temp.0.clone(),
+        Arc::new(FakeUi::default()),
+        options(&pipe, &registry_key.0),
+    )
+    .await
+    .unwrap();
+    let settings = AppSettings {
+        ytdlp_path: Some(path.clone()),
+        ffmpeg_path: Some(path),
+        ..settings
+    };
+    state.save_settings(settings.clone()).await.unwrap();
+    let token = SessionToken::read(&temp.0.join("session.token")).unwrap();
+    let mut bridge = Bridge(Some(
+        PipeClient::connect(&pipe, &token, "probe-integration")
+            .await
+            .unwrap(),
+    ));
+
+    let url = "https://example.com/coalesced";
+    let (native, normalized, desktop) = tokio::join!(
+        bridge.request(Request::ProbeMedia {
+            url: url.into(),
+            playlist: None
+        }),
+        state.probe_media("HTTPS://EXAMPLE.COM:443/coalesced", Some(false)),
+        state.probe_media(url, None),
+    );
+    assert!(matches!(native, Response::MediaProbed { probe } if probe.source_url == url));
+    assert_eq!(normalized.unwrap().source_url, url);
+    assert_eq!(desktop.unwrap().title, "Fixture video");
+    assert_eq!(
+        state.probe_media(url, None).await.unwrap().title,
+        "Fixture video"
+    );
+    assert_eq!(
+        media_tool_log(&temp.0),
+        format!("yt-dlp version\nprobe false {url}\n")
+    );
+    assert!(temp.0.join("yt-dlp-cache").is_dir());
+
+    let request = media_request(url);
+    let id = bridge.created(Request::AddMediaDownload { request }).await;
+    wait_for(&state, &id, TransferStatus::Completed).await;
+    assert_eq!(
+        fs::read(downloads.join("Fixture video.mp4")).unwrap(),
+        b"test"
+    );
+    assert_eq!(
+        media_tool_log(&temp.0),
+        format!("yt-dlp version\nprobe false {url}\nffmpeg version\n")
+    );
+    let mut request = media_request(url);
+    request
+        .headers
+        .insert("user-agent".into(), "Probe Fixture".into());
+    let id = bridge.created(Request::AddMediaDownload { request }).await;
+    wait_for(&state, &id, TransferStatus::Completed).await;
+    assert!(downloads.join("Header-specific video.mp4").is_file());
+    assert_eq!(
+        media_tool_log(&temp.0)
+            .lines()
+            .filter(|line| *line == format!("probe false {url}"))
+            .count(),
+        2
+    );
+
+    let no_ffmpeg = AppSettings {
+        ffmpeg_path: Some(
+            temp.0
+                .join("missing-ffmpeg.exe")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        ..settings
+    };
+    state.save_settings(no_ffmpeg).await.unwrap();
+    assert!(!state.probe_media(url, None).await.unwrap().is_playlist);
+    assert!(
+        state
+            .probe_media(url, Some(true))
+            .await
+            .unwrap()
+            .is_playlist
+    );
+    let log = media_tool_log(&temp.0);
+    assert_eq!(
+        log.lines().filter(|line| *line == "yt-dlp version").count(),
+        2
+    );
+    assert_eq!(
+        log.lines()
+            .filter(|line| *line == format!("probe false {url}"))
+            .count(),
+        3
+    );
+    assert_eq!(
+        log.lines().filter(|line| *line == "ffmpeg version").count(),
+        1
+    );
+
+    let binary = fs::OpenOptions::new()
+        .write(true)
+        .open(&executable)
+        .unwrap();
+    binary
+        .set_modified(binary.metadata().unwrap().modified().unwrap() - Duration::from_secs(10))
+        .unwrap();
+    drop(binary);
+    state
+        .probe_media("https://example.com/after-binary-change", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        media_tool_log(&temp.0)
+            .lines()
+            .filter(|line| *line == "yt-dlp version")
+            .count(),
+        3
+    );
+    state.shutdown().await.unwrap();
+}
+
+async fn start_playlist_fixture(temp: &TempDir) -> (Arc<AppState>, Bridge) {
+    let executable = media_tool_fixture(&temp.0)
+        .await
+        .to_string_lossy()
+        .into_owned();
+    let settings = installed_settings(&temp.0, &temp.0.join("Downloads"));
+    let pipe = format!(r"\\.\pipe\SlipStream.SelectivePlaylist.{}", Uuid::new_v4());
+    let registry_key = RegistryKey::isolated();
+    let state = AppState::start(
+        temp.0.clone(),
+        Arc::new(FakeUi::default()),
+        options(&pipe, &registry_key.0),
+    )
+    .await
+    .unwrap();
+    state
+        .save_settings(AppSettings {
+            ytdlp_path: Some(executable.clone()),
+            ffmpeg_path: Some(executable),
+            ..settings
+        })
+        .await
+        .unwrap();
+    let token = SessionToken::read(&temp.0.join("session.token")).unwrap();
+    let bridge = Bridge(Some(
+        PipeClient::connect(&pipe, &token, "selective-playlist")
+            .await
+            .unwrap(),
+    ));
+    (state, bridge)
+}
+
+fn playlist_request() -> AddMediaDownloadRequest {
+    let mut request = media_request("https://example.com/playlist?list=PL-links");
+    request.max_height = Some(720);
+    request.lossless_remux = true;
+    request
+        .headers
+        .insert("User-Agent".into(), "Playlist Fixture".into());
+    request
+        .headers
+        .insert("oRigin".into(), "https://example.com".into());
+    request.headers.insert(
+        "referer".into(),
+        "https://example.com/playlist?list=PL-links&token=fixture".into(),
+    );
+    request
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn selected_playlist_runs_sequentially_with_pause_resume_and_middle_failure() {
+    let temp = TempDir::new();
+    let (state, mut bridge) = start_playlist_fixture(&temp).await;
+    let mut request = playlist_request();
+    request.playlist_folder_name = Some("Selected: clips".into());
+    request.selected_entries = Some(
+        [
+            (11, "Three", "three"),
+            (2, "One: video", "one"),
+            (7, "Two", "two"),
+        ]
+        .map(|(index, title, slug)| SelectedPlaylistEntry {
+            index,
+            title: title.into(),
+            url: Some(if slug == "three" {
+                format!("https://cdn.example.com/sequence/{slug}")
+            } else {
+                format!("https://example.com/sequence/{slug}")
+            }),
+        })
+        .into(),
+    );
+    // Validate the full selection before any job or folder is created.
+    let mut invalid = request.clone();
+    invalid.selected_entries.as_mut().unwrap()[2].url = Some("http://169.254.169.254/video".into());
+    assert!(state.add_media_download(invalid).await.is_err());
+    let mut invalid = request.clone();
+    invalid.selected_entries = Some(Vec::new());
+    assert!(state.add_media_download(invalid).await.is_err());
+    let mut invalid = request.clone();
+    invalid
+        .headers
+        .insert("User-Agent".into(), "line\r\nbreak".into());
+    assert!(state.add_media_download(invalid).await.is_err());
+    assert!(state.snapshot().await.transfers.is_empty());
+
+    let first_id = bridge.created(Request::AddMediaDownload { request }).await;
+    wait_for_media_tool_log(&temp.0, "start one", 1).await;
+    let jobs = playlist_members(&state, &first_id).await;
+    let playlist_id = jobs[0].playlist_id.as_deref().unwrap();
+    let folder = fs::canonicalize(temp.0.join("Downloads/Selected_ clips")).unwrap();
+    let names = ["02 - One_ video", "07 - Two", "11 - Three"];
+    assert_eq!(jobs.len(), 3);
+    assert_eq!(jobs[0].id, first_id);
+    for (position, job) in jobs.iter().enumerate() {
+        assert_eq!(job.playlist_id.as_deref(), Some(playlist_id));
+        assert_eq!(job.playlist_title.as_deref(), Some("Selected: clips"));
+        assert_eq!(job.playlist_index, Some(position as u32 + 1));
+        assert_eq!(job.playlist_total, Some(3));
+        assert_eq!(job.filename, names[position]);
+        assert_eq!(Path::new(&job.save_dir), folder);
+    }
+    assert_eq!(jobs[1].status, TransferStatus::Queued);
+    assert_eq!(jobs[2].status, TransferStatus::Queued);
+    assert!(state.resume_transfer(&jobs[1].id).await.is_err());
+    state.pause_playlist(playlist_id).await.unwrap();
+    assert!(playlist_members(&state, &first_id)
+        .await
+        .iter()
+        .all(|job| job.playlist_paused == Some(true)));
+    wait_for(&state, &first_id, TransferStatus::Paused).await;
+    assert_eq!(
+        playlist_members(&state, &first_id).await[1].status,
+        TransferStatus::Queued
+    );
+    assert!(!media_tool_log(&temp.0).contains("start two"));
+
+    state.resume_playlist(playlist_id).await.unwrap();
+    assert!(playlist_members(&state, &first_id)
+        .await
+        .iter()
+        .all(|job| job.playlist_paused == Some(false)));
+    wait_for_media_tool_log(&temp.0, "start one", 2).await;
+    fs::write(temp.0.join("release-one"), "").unwrap();
+    wait_for(&state, &first_id, TransferStatus::Completed).await;
+    wait_for_media_tool_log(&temp.0, "start two", 1).await;
+    assert_eq!(
+        playlist_members(&state, &first_id).await[2].status,
+        TransferStatus::Queued
+    );
+    fs::write(temp.0.join("release-two"), "").unwrap();
+    let failed = wait_for(&state, &jobs[1].id, TransferStatus::Failed).await;
+    assert!(failed
+        .error_message
+        .unwrap()
+        .contains("fixture playlist entry failed"));
+    wait_for_media_tool_log(&temp.0, "start three", 1).await;
+    fs::write(temp.0.join("release-three"), "").unwrap();
+    wait_for(&state, &jobs[2].id, TransferStatus::Completed).await;
+    let log = media_tool_log(&temp.0);
+    let lifecycle = log
+        .lines()
+        .filter(|line| line.starts_with("start ") || line.starts_with("finish "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lifecycle,
+        [
+            "start one",
+            "start one",
+            "finish one",
+            "start two",
+            "finish two",
+            "start three",
+            "finish three"
+        ]
+    );
+    assert_eq!(
+        fs::read(folder.join("02 - One_ video.mp4")).unwrap(),
+        b"one"
+    );
+    assert!(!folder.join("07 - Two.mp4").exists());
+    assert_eq!(fs::read(folder.join("11 - Three.mp4")).unwrap(), b"three");
+    assert_eq!(
+        log.lines().filter(|line| *line == "yt-dlp version").count(),
+        1
+    );
+    assert_eq!(
+        log.lines().filter(|line| *line == "ffmpeg version").count(),
+        1
+    );
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn probed_playlist_filter_keeps_original_numbers_and_cancel_advances() {
+    let temp = TempDir::new();
+    let (state, mut bridge) = start_playlist_fixture(&temp).await;
+    let mut request = playlist_request();
+    request.playlist_items = Some("2, 11-12".into());
+    let first_id = bridge.created(Request::AddMediaDownload { request }).await;
+    wait_for_media_tool_log(&temp.0, "start one", 1).await;
+    let jobs = playlist_members(&state, &first_id).await;
+    assert_eq!(jobs.len(), 3);
+    assert_eq!(jobs[1].status, TransferStatus::Queued);
+    assert_eq!(jobs[1].playlist_index, Some(2));
+    assert_eq!(jobs[1].playlist_total, Some(3));
+    assert_eq!(jobs[1].filename, "11 - Three");
+    assert_eq!(jobs[2].filename, "12 - Video 12");
+    state.cancel_transfer(&first_id, true).await.unwrap();
+    wait_for_media_tool_log(&temp.0, "start three", 1).await;
+    fs::write(temp.0.join("release-three"), "").unwrap();
+    let done = wait_for(&state, &jobs[1].id, TransferStatus::Completed).await;
+    let folder = temp.0.join("Downloads/Linked_ playlist");
+    assert_eq!(done.playlist_title.as_deref(), Some("Linked: playlist"));
+    assert_eq!(fs::read(folder.join("11 - Three.mp4")).unwrap(), b"three");
+    let unpreviewed = wait_for(&state, &jobs[2].id, TransferStatus::Completed).await;
+    assert_eq!(unpreviewed.playlist_index, Some(3));
+    assert_eq!(unpreviewed.playlist_total, Some(3));
+    assert_eq!(
+        fs::read(folder.join("12 - Video 12.mp4")).unwrap(),
+        b"item 12"
+    );
+    assert!(!folder.join("02 - One_ video.mp4").exists());
+    assert!(!media_tool_log(&temp.0).contains("start two"));
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn paused_playlist_stays_paused_when_its_current_video_is_removed() {
+    let temp = TempDir::new();
+    let (state, mut bridge) = start_playlist_fixture(&temp).await;
+    let id = bridge
+        .created(Request::AddMediaDownload {
+            request: playlist_request(),
+        })
+        .await;
+    wait_for_media_tool_log(&temp.0, "start one", 1).await;
+    let jobs = playlist_members(&state, &id).await;
+    let playlist_id = jobs[0].playlist_id.as_deref().unwrap();
+    state.pause_transfer(&id).await.unwrap();
+    state.cancel_transfer(&jobs[1].id, false).await.unwrap();
+    // Let the coordinator handle the cancellation while the first job is paused.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let waiting = playlist_members(&state, &id).await;
+    assert_eq!(waiting[0].status, TransferStatus::Paused);
+    assert_eq!(waiting[1].status, TransferStatus::Queued);
+    assert!(waiting.iter().all(|job| job.playlist_paused == Some(false)));
+
+    state.pause_playlist(playlist_id).await.unwrap();
+    state.cancel_transfer(&id, false).await.unwrap();
+    let waiting = playlist_members(&state, &jobs[2].id).await;
+    assert_eq!(waiting[0].status, TransferStatus::Queued);
+    assert_eq!(waiting[0].playlist_paused, Some(true));
+    state.resume_playlist(playlist_id).await.unwrap();
+    wait_for_media_tool_log(&temp.0, "start three", 1).await;
+    assert_eq!(
+        playlist_members(&state, &jobs[2].id).await[0].playlist_paused,
+        Some(false)
+    );
+    fs::write(temp.0.join("release-three"), "").unwrap();
+    wait_for(&state, &jobs[2].id, TransferStatus::Completed).await;
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn playlist_larger_than_the_preview_downloads_as_one_unrestricted_job() {
+    let temp = TempDir::new();
+    let (state, mut bridge) = start_playlist_fixture(&temp).await;
+    let mut request = media_request("https://example.com/playlist?list=PL6000");
+    request.max_height = Some(720);
+    request.lossless_remux = true;
+    request.playlist_folder_name = Some("Full playlist".into());
+    let id = bridge.created(Request::AddMediaDownload { request }).await;
+    let done = wait_for(&state, &id, TransferStatus::Completed).await;
+    assert_eq!(done.playlist_total, Some(6000));
+    assert_eq!(playlist_members(&state, &id).await.len(), 1);
+    let folder = temp.0.join("Downloads/Full playlist");
+    assert_eq!(
+        fs::read(folder.join("download-006000.mp4")).unwrap(),
+        b"last"
+    );
     state.shutdown().await.unwrap();
 }
 
@@ -1063,6 +1537,9 @@ async fn completed_media_shutdown_ssrf_guard_and_reparse_tool_rejection() {
                     playlist_items: None,
                     download_playlist: false,
                     max_height: None,
+                    selected_entries: None,
+                    playlist_folder_name: None,
+                    headers: Default::default(),
                 })
                 .await
                 .is_err(),
@@ -1095,6 +1572,9 @@ async fn completed_media_shutdown_ssrf_guard_and_reparse_tool_rejection() {
             playlist_items: None,
             download_playlist: false,
             max_height: None,
+            selected_entries: None,
+            playlist_folder_name: None,
+            headers: Default::default(),
         })
         .await
         .unwrap();
@@ -1142,6 +1622,9 @@ async fn completed_media_shutdown_ssrf_guard_and_reparse_tool_rejection() {
             playlist_items: None,
             download_playlist: false,
             max_height: None,
+            selected_entries: None,
+            playlist_folder_name: None,
+            headers: Default::default(),
         })
         .await
         .unwrap();

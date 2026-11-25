@@ -6,11 +6,11 @@ import { Palette, type QuickCommand } from "./components/Palette";
 import { formatUpdateProgress, SettingsDialog, type SettingsLoadState } from "./components/SettingsDialog";
 import { Sidebar, Toolbar, matchesStatus, matchesView, type StatusFilter, type View } from "./components/Shell";
 import { TransferDialog } from "./components/TransferDialog";
-import { TransferList, type OnTransferAction } from "./components/TransferList";
+import { TransferList, type OnPlaylistAction, type OnTransferAction } from "./components/TransferList";
 import { IconButton } from "./components/ui";
 import { DEFAULT_SETTINGS } from "./lib/demo";
 import { desktop, isTauri } from "./lib/tauri";
-import { errorMessage, isDownloadSource, isRemoteTorrentUrl, isRunning, isTorrentSource, MB, SPEED_CAP } from "./lib/transfers";
+import { errorMessage, isDownloadSource, isPlaylistPending, isRemoteTorrentUrl, isRunning, isTorrentSource, MB, SPEED_CAP } from "./lib/transfers";
 import type { AppSettings, TelemetryBatch, TorrentFileEntry, TransferSnapshot, UpdateProgress, UpdateStatus } from "./types/ipc";
 
 type Overlay = { type: "add"; seed: AddSeed; key: number } | { type: "settings"; focusUpdates?: boolean } | { type: "palette" }
@@ -106,9 +106,19 @@ export default function App() {
   const theme = useTheme(settings);
   const transfers = batch?.transfers.filter(transfer => !removed.has(transfer.id)) ?? [];
   const term = search.trim().toLowerCase();
-  const items = transfers.filter(transfer => matchesView(transfer, view) && matchesStatus(transfer, filter)
-    && [transfer.filename, transfer.source_domain, transfer.protocol_label, ...transfer.format_tags]
-      .some(value => value.toLowerCase().includes(term)));
+  const unfinishedPlaylists = new Set(transfers.flatMap(transfer =>
+    transfer.playlist_id && isPlaylistPending(transfer) ? [transfer.playlist_id] : []));
+  const items = transfers.filter(transfer => {
+    let inView = matchesView(transfer, view);
+    if (transfer.playlist_id) {
+      const unfinished = unfinishedPlaylists.has(transfer.playlist_id);
+      if (view === "completed") inView = !unfinished;
+      if (view === "active" || view === "queues") inView = unfinished && transfer.status !== "canceled";
+    }
+    return inView && matchesStatus(transfer, filter)
+      && [transfer.filename, transfer.source_domain, transfer.protocol_label, transfer.playlist_title ?? "", ...transfer.format_tags]
+        .some(value => value.toLowerCase().includes(term));
+  });
   const selected = items.find(transfer => transfer.id === selectedId) ?? items[0];
   const speedLimit = (batch ? batch.speed_limit_bps : settings.global_speed_limit_bps) ?? null;
 
@@ -635,6 +645,26 @@ export default function App() {
     });
   };
 
+  async function changePlaylistPause(playlistId: string, pause: boolean) {
+    await (pause ? desktop.pausePlaylist(playlistId) : desktop.resumePlaylist(playlistId));
+  }
+
+  const onPlaylistAction: OnPlaylistAction = (action, playlistId) => {
+    void perform(async () => {
+      switch (action) {
+        case "pause_playlist": await changePlaylistPause(playlistId, true); break;
+        case "resume_playlist": await changePlaylistPause(playlistId, false); break;
+        case "reveal_playlist": {
+          await desktop.revealPlaylistFolder(playlistId);
+          const folder = transfers.find(transfer => transfer.playlist_id === playlistId)?.save_dir;
+          if (preview && folder) notify("Save folder: " + folder);
+          break;
+        }
+      }
+      await pullSnapshot();
+    });
+  };
+
   function dragEnter(event: DragEvent<HTMLDivElement>) {
     if (!Array.from(event.dataTransfer.types).some(type => ["Files", "text/uri-list", "text/plain"].includes(type))) return;
     event.preventDefault();
@@ -661,9 +691,14 @@ export default function App() {
 
   async function groupAction(group: "pause" | "resume") {
     const eligible = transfers.filter(transfer => group === "pause" ? isRunning(transfer) || transfer.status === "queued"
-      : transfer.status === "paused");
-    const operations = await Promise.allSettled(eligible.map(transfer => group === "pause"
-      ? desktop.pauseTransfer(transfer.id) : desktop.resumeTransfer(transfer.id)));
+      : transfer.status === "paused" || (transfer.status === "queued"
+        && transfer.playlist_paused === true));
+    const playlistIds = new Set(eligible.flatMap(transfer => transfer.playlist_id ? [transfer.playlist_id] : []));
+    const operations = await Promise.allSettled([
+      ...eligible.filter(transfer => !transfer.playlist_id).map(transfer => group === "pause"
+        ? desktop.pauseTransfer(transfer.id) : desktop.resumeTransfer(transfer.id)),
+      ...[...playlistIds].map(id => changePlaylistPause(id, group === "pause")),
+    ]);
     await pullSnapshot();
     const failed = operations.find(result => result.status === "rejected");
     if (failed?.status === "rejected") throw failed.reason;
@@ -717,7 +752,8 @@ export default function App() {
           </section>}
         <div className="workspace-body">
           <TransferList items={items} selected={selected?.id} setSelected={id => { setSelectedId(id); setInspectorOpen(true); }}
-            onAction={onTransferAction} view={view} preview={preview} loading={!batch && !notice} />
+            onAction={onTransferAction} onPlaylistAction={onPlaylistAction} allTransfers={transfers}
+            view={view} preview={preview} loading={!batch && !notice} />
           {inspectorOpen && <Inspector key={selected?.id} transfer={selected} samples={selected ? history[selected.id] ?? emptySamples : emptySamples}
             preview={preview} torrentEntry={selected ? torrentFilesMap[selected.id] : undefined}
             onLoadTorrentFiles={loadTorrentFiles} onSelectTorrentFile={selectTorrentFile}

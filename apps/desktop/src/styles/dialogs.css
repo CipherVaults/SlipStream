@@ -387,6 +387,44 @@ html[data-theme="light"] .sheet-card {
 .check-row:last-child { border-bottom: 0; }
 .check-row input, .file-option input { accent-color: var(--dialog-accent, var(--accent)); }
 .playlist-subtitles { padding: 8px 12px; }
+.playlist-checklist {
+  border: 1px solid var(--dialog-border-strong);
+  border-radius: 9px;
+  background: var(--dialog-surface);
+  min-width: 0;
+}
+.playlist-checklist-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--dialog-border);
+  border-radius: 8px 8px 0 0;
+  background: var(--dialog-raised);
+}
+.playlist-checklist-heading { flex: 1; min-width: max-content; }
+.playlist-checklist-heading h3 { font-size: 12px; font-weight: 650; }
+.playlist-checklist-actions { display: flex; flex-wrap: wrap; gap: 4px; }
+.playlist-checklist-actions .btn-ghost { height: 27px; padding-inline: 8px; font-size: 11.5px; }
+.playlist-filter { flex: 1 1 138px; min-height: 30px; }
+.playlist-checklist-items { max-height: min(192px, 28vh); overflow-y: auto; scrollbar-width: thin; }
+.playlist-checklist-row {
+  display: grid;
+  grid-template-columns: auto 34px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+.playlist-checklist-row + .playlist-checklist-row { border-top: 1px solid var(--dialog-border); }
+.playlist-checklist-row:hover, .playlist-checklist-row:focus-within { background: var(--dialog-hover); }
+.playlist-checklist-row input { width: 14px; height: 14px; accent-color: var(--dialog-accent); }
+.playlist-entry-index { font-size: 11px; color: var(--dialog-muted); }
+.playlist-entry-title, .playlist-path { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.playlist-path { font-weight: 400; user-select: text; }
+.playlist-checklist-empty { padding: 8px 10px; }
 .subtitle-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .subtitle-chip { padding-inline: 10px; }
 .subtitle-chip[aria-pressed="true"] { border-color: var(--dialog-accent, var(--accent)); }

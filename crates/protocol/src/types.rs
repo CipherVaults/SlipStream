@@ -77,6 +77,16 @@ pub struct TransferSnapshot {
     pub error_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_notice: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playlist_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playlist_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playlist_paused: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playlist_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playlist_total: Option<u32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -175,6 +185,21 @@ pub struct SubtitleTrack {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistEntry {
+    /// 1-based index within the playlist.
+    pub index: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaProbeResult {
     pub title: String,
     pub source_url: String,
@@ -185,8 +210,19 @@ pub struct MediaProbeResult {
     pub playlist_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub playlist_entries: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub playlist_items: Vec<PlaylistEntry>,
     pub formats: Vec<MediaFormatOption>,
     pub subtitles: Vec<SubtitleTrack>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectedPlaylistEntry {
+    /// 1-based index within the playlist.
+    pub index: u32,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +241,12 @@ pub struct AddMediaDownloadRequest {
     pub download_playlist: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_entries: Option<Vec<SelectedPlaylistEntry>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playlist_folder_name: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub headers: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -374,6 +416,8 @@ pub enum NativeBridgeRequest {
     },
     ProbeMedia {
         url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        playlist: Option<bool>,
     },
     AddMediaDownload {
         request: AddMediaDownloadRequest,
@@ -426,9 +470,10 @@ pub enum NativeBridgeResponse {
 #[cfg(test)]
 mod media_wire_tests {
     use super::*;
+    use serde_json::{json, to_value};
 
     #[test]
-    fn older_media_messages_default_new_playlist_fields() {
+    fn media_download_playlist_fields_default_and_round_trip() {
         let request: NativeBridgeRequest = serde_json::from_str(
             r#"{
             "type":"add_media_download",
@@ -443,14 +488,48 @@ mod media_wire_tests {
         assert!(!request.download_playlist);
         assert_eq!(request.max_height, None);
         assert_eq!(request.playlist_items, None);
-        let wire = serde_json::to_value(&request).unwrap();
-        assert!(wire.get("download_playlist").is_none());
-        assert!(wire.get("max_height").is_none());
+        assert!(request.selected_entries.is_none());
+        assert!(request.playlist_folder_name.is_none());
+        assert!(request.headers.is_empty());
+        let legacy = to_value(&request).unwrap();
+        for key in [
+            "download_playlist",
+            "max_height",
+            "selected_entries",
+            "playlist_folder_name",
+            "headers",
+        ] {
+            assert!(legacy.get(key).is_none(), "unexpected {key}");
+        }
         request.download_playlist = true;
         request.max_height = Some(1080);
-        let wire = serde_json::to_value(&request).unwrap();
+        request.selected_entries = Some(vec![SelectedPlaylistEntry {
+            index: 2,
+            title: "Second clip".into(),
+            url: Some("https://example.com/second".into()),
+        }]);
+        request.playlist_folder_name = Some("Playlist".into());
+        request
+            .headers
+            .insert("User-Agent".into(), "SlipStream".into());
+        let wire = to_value(NativeBridgeRequest::AddMediaDownload { request }).unwrap();
+        let decoded: NativeBridgeRequest = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(to_value(decoded).unwrap(), wire);
+        let wire = &wire["request"];
         assert_eq!(wire["download_playlist"], true);
         assert_eq!(wire["max_height"], 1080);
+        assert_eq!(
+            wire["selected_entries"],
+            json!([
+                {"index": 2, "title": "Second clip", "url": "https://example.com/second"}
+            ])
+        );
+        assert_eq!(wire["playlist_folder_name"], "Playlist");
+        assert_eq!(wire["headers"], json!({"User-Agent": "SlipStream"}));
+    }
+
+    #[test]
+    fn media_probe_keeps_legacy_playlist_titles_and_round_trips_items() {
         let probe: MediaProbeResult = serde_json::from_str(
             r#"{
             "title":"Older probe","source_url":"https://example.com/video","extractor":"generic",
@@ -459,9 +538,95 @@ mod media_wire_tests {
         )
         .unwrap();
         assert!(probe.playlist_entries.is_empty());
-        assert!(serde_json::to_value(probe)
-            .unwrap()
-            .get("playlist_entries")
-            .is_none());
+        assert!(probe.playlist_items.is_empty());
+        let mut wire = to_value(probe).unwrap();
+        assert!(wire.get("playlist_entries").is_none());
+        assert!(wire.get("playlist_items").is_none());
+
+        wire["is_playlist"] = json!(true);
+        wire["playlist_entries"] = json!(["First clip", "Second clip"]);
+        let older_playlist: MediaProbeResult = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            older_playlist.playlist_entries,
+            ["First clip", "Second clip"]
+        );
+        assert!(older_playlist.playlist_items.is_empty());
+        assert_eq!(to_value(older_playlist).unwrap(), wire);
+
+        wire["playlist_items"] = json!([
+            {"index": 1, "title": "First clip"},
+            {"index": 2, "id": "clip02", "title": "Second clip", "url": "https://example.com/second",
+             "duration_seconds": 42, "thumbnail_url": "https://example.com/second.jpg"}
+        ]);
+        let decoded: MediaProbeResult = serde_json::from_value(wire.clone()).unwrap();
+        assert!(decoded.playlist_items[0].id.is_none());
+        assert!(decoded.playlist_items[0].url.is_none());
+        assert!(decoded.playlist_items[0].duration_seconds.is_none());
+        assert!(decoded.playlist_items[0].thumbnail_url.is_none());
+        assert_eq!(to_value(decoded).unwrap(), wire);
+    }
+
+    #[test]
+    fn transfer_snapshot_playlist_fields_default_and_round_trip() {
+        let ui_segments = [0.0_f32; UI_SEGMENT_COUNT];
+        let mut wire = json!({
+            "id": "transfer", "kind": "media", "status": "queued", "filename": "clip.mp4",
+            "source_url": "https://example.com/video", "source_domain": "example.com", "save_dir": "Downloads",
+            "total_bytes": null, "downloaded_bytes": 0, "uploaded_bytes": 0, "download_speed_bps": 0,
+            "upload_speed_bps": 0, "eta_seconds": null, "active_connections": 0, "active_peers": 0,
+            "protocol_label": "Media", "format_tags": [], "ui_segments": ui_segments,
+            "segments": [], "sha256_verified": null, "resumable": false, "queue_id": "default",
+            "error_message": null, "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+        });
+        let legacy: TransferSnapshot = serde_json::from_value(wire.clone()).unwrap();
+        assert!(legacy.playlist_id.is_none());
+        assert!(legacy.playlist_title.is_none());
+        assert!(legacy.playlist_paused.is_none());
+        assert!(legacy.playlist_index.is_none());
+        assert!(legacy.playlist_total.is_none());
+        assert_eq!(to_value(legacy).unwrap(), wire);
+
+        wire["playlist_id"] = json!("playlist01");
+        wire["playlist_title"] = json!("Playlist");
+        wire["playlist_paused"] = json!(true);
+        wire["playlist_index"] = json!(2);
+        wire["playlist_total"] = json!(10);
+        let decoded: TransferSnapshot = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(to_value(decoded).unwrap(), wire);
+    }
+
+    #[test]
+    fn selected_playlist_entries_accept_index_only_wire_data() {
+        for wire in [
+            json!({"index": 8, "title": "Video 8"}),
+            json!({"index": 8, "title": "Video 8", "url": null}),
+        ] {
+            let entry: SelectedPlaylistEntry = serde_json::from_value(wire).unwrap();
+            assert!(entry.url.is_none());
+            assert_eq!(
+                to_value(entry).unwrap(),
+                json!({"index": 8, "title": "Video 8"})
+            );
+        }
+    }
+
+    #[test]
+    fn native_probe_media_playlist_defaults_and_round_trips() {
+        let mut wire = json!({"type": "probe_media", "url": "https://example.com/video"});
+        let legacy: NativeBridgeRequest = serde_json::from_value(wire.clone()).unwrap();
+        assert!(matches!(
+            legacy,
+            NativeBridgeRequest::ProbeMedia { playlist: None, .. }
+        ));
+        assert_eq!(to_value(legacy).unwrap(), wire);
+
+        for playlist in [true, false] {
+            wire["playlist"] = json!(playlist);
+            let decoded: NativeBridgeRequest = serde_json::from_value(wire.clone()).unwrap();
+            assert!(
+                matches!(decoded, NativeBridgeRequest::ProbeMedia { playlist: Some(value), .. } if value == playlist)
+            );
+            assert_eq!(to_value(decoded).unwrap(), wire);
+        }
     }
 }

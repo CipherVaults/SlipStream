@@ -2,10 +2,13 @@ import { version } from "../../package.json";
 import { DEFAULT_CHROMIUM_EXTENSION_ID, DEFAULT_FIREFOX_EXTENSION_ID } from "../types/ipc";
 import type {
   AddHttpDownloadRequest, AddMediaDownloadRequest, AddTorrentRequest, AppSettings, BrowserKind,
-  BrowserSetupResult, BrowserStatus, MediaFormatOption,
+  BrowserSetupResult, BrowserStatus, MediaFormatOption, MediaProbeResult, PlaylistEntry,
   RefreshDownloadUrlRequest, SegmentSnapshot, TelemetryBatch, ToolchainStatus, TorrentFileEntry, TransferSnapshot, UpdateStatus,
 } from "../types/ipc";
-import { MB, SEGMENT_COUNT, isHttpUrl, isPurePlaylistUrl, isRunning, ratio, sourceName } from "./transfers";
+import {
+  MB, SEGMENT_COUNT, folderSeparator, isHttpUrl, isPurePlaylistUrl, isRunning, parsePlaylistRanges, ratio,
+  sanitizeMediaStem, sourceName,
+} from "./transfers";
 
 export const DEFAULT_SETTINGS: AppSettings = {
   theme: "dark", accent: "blue", default_download_dir: "", default_connections: 16,
@@ -16,6 +19,18 @@ export const DEFAULT_SETTINGS: AppSettings = {
 
 const demoFolder = "D:\\Downloads";
 const mediaUrl = "https://youtube.com/watch?v=alpine-cinema";
+const demoPlaylistTitle = "Cinema Playlist";
+const demoPlaylistTitles = [
+  ["alpine-cinema", "Alpine Cinema in 4K", 362],
+  ["tokyo-architecture", "Tokyo Architecture in 4K HDR", 478],
+  ["dolomites-dawn", "Dolomites at Dawn", 216],
+  ["lisbon-trams", "Lisbon by Tram", 295],
+  ["kyoto-rain", "A Rainy Evening in Kyoto", 548],
+] as const;
+const demoPlaylistItems: (PlaylistEntry & { url: string })[] = demoPlaylistTitles.map(([id, title, duration_seconds], position) => ({
+  index: position + 1, id, title, url: "https://www.youtube.com/watch?v=" + id, duration_seconds,
+}));
+const pausedPlaylists = new Set<string>();
 const timestamp = new Date().toISOString();
 const telemetryListeners = new Set<(batch: TelemetryBatch) => void>();
 const pickerListeners = new Set<(url: string | null) => void>();
@@ -166,7 +181,9 @@ function snapshot(): TelemetryBatch {
   const now = Math.max(Date.now(), lastBatchTime + 1);
   lastBatchTime = now;
   return {
-    timestamp: new Date(now).toISOString(), transfers,
+    timestamp: new Date(now).toISOString(),
+    transfers: transfers.map(transfer => transfer.playlist_id
+      ? { ...transfer, playlist_paused: pausedPlaylists.has(transfer.playlist_id) } : transfer),
     aggregate_down_bps: active.reduce((sum, transfer) => sum + transfer.download_speed_bps, 0),
     aggregate_up_bps: active.reduce((sum, transfer) => sum + transfer.upload_speed_bps, 0),
     active_count: active.length, active_threads: active.reduce((sum, transfer) => sum + transfer.active_connections, 0),
@@ -186,7 +203,23 @@ function update(id: string, change: (transfer: TransferSnapshot) => Partial<Tran
   emit();
 }
 
-function refreshRates(advance = false) {
+function activate(transfer: TransferSnapshot) {
+  return { ...transfer, status: "active" as const, active_connections: settings.default_connections,
+    error_message: null, updated_at: new Date().toISOString() };
+}
+
+function advancePlaylist(playlistId: string, resumePaused = false) {
+  const items = transfers.filter(transfer => transfer.playlist_id === playlistId);
+  if (pausedPlaylists.has(playlistId) || items.some(isRunning)) return;
+  const paused = items.find(item => item.status === "paused");
+  if (paused && !resumePaused) return;
+  const next = paused ?? items.find(item => item.status === "queued");
+  if (next) transfers = transfers.map(transfer => transfer.id === next.id ? activate(transfer) : transfer);
+  return Boolean(next);
+}
+
+function updateRates(advance: boolean) {
+  const completedPlaylists = new Set<string>();
   const uncapped = transfers.filter(item => item.status === "active")
     .reduce((sum, item) => sum + (rates.get(item.id)?.[0] ?? 0), 0);
   const limit = settings.global_speed_limit_bps;
@@ -200,6 +233,7 @@ function refreshRates(advance = false) {
     // Keep the sample transfers on screen long enough to explore the preview.
     const downloaded = Math.min(total ?? Infinity, transfer.downloaded_bytes + (advance ? Math.floor(downloadSpeed * .06) : 0));
     const finished = total !== null && downloaded >= total;
+    if (finished && transfer.playlist_id) completedPlaylists.add(transfer.playlist_id);
     const uniformProgress = total ? downloaded / total * SEGMENT_COUNT : 0;
     const delta = total ? (downloaded - transfer.downloaded_bytes) / total : 0;
     const uiSegments = transfer.ui_segments.map((value, index) => transfer.id.startsWith("demo-")
@@ -207,7 +241,8 @@ function refreshRates(advance = false) {
     return {
       ...transfer, downloaded_bytes: downloaded, uploaded_bytes: transfer.uploaded_bytes + (advance ? Math.floor(up * .06) : 0),
       download_speed_bps: finished ? 0 : downloadSpeed, upload_speed_bps: finished ? 0 : up,
-      eta_seconds: total && downloadSpeed ? Math.ceil((total - downloaded) / downloadSpeed) : null,
+      eta_seconds: !finished && total && downloadSpeed ? Math.ceil((total - downloaded) / downloadSpeed) : null,
+      active_connections: finished ? 0 : transfer.active_connections,
       ui_segments: finished ? Array<number>(SEGMENT_COUNT).fill(1) : uiSegments,
       status: finished ? "completed" : "active", updated_at: finished ? new Date().toISOString() : transfer.updated_at,
       segments: transfer.segments.map(segment => {
@@ -221,6 +256,16 @@ function refreshRates(advance = false) {
       }),
     };
   });
+  return completedPlaylists;
+}
+
+function refreshRates(advance = false) {
+  const completedPlaylists = updateRates(advance);
+  let started = false;
+  for (const playlistId of completedPlaylists) {
+    if (advancePlaylist(playlistId)) started = true;
+  }
+  if (started) updateRates(false);
   emit();
 }
 
@@ -286,13 +331,13 @@ export const demo = {
   openPicker(url: string | null) {
     for (const listener of pickerListeners) listener(url);
   },
-  probe(url: string, playlist = isPurePlaylistUrl(url)) {
+  probe(url: string, playlist = isPurePlaylistUrl(url)): MediaProbeResult {
     if (!isHttpUrl(url)) throw new Error("Enter an HTTP or HTTPS media URL.");
     if (playlist) {
-      const entries = ["Alpine Cinema in 4K", "Tokyo Architecture in 4K HDR", "Dolomites at Dawn"];
       return {
-        title: "Cinema Playlist", source_url: url, extractor: sourceName(url), duration_seconds: null,
-        thumbnail_url: null, is_playlist: true, playlist_count: entries.length, playlist_entries: entries,
+        title: demoPlaylistTitle, source_url: url, extractor: sourceName(url), duration_seconds: null,
+        thumbnail_url: null, is_playlist: true, playlist_count: demoPlaylistItems.length,
+        playlist_entries: demoPlaylistItems.map(entry => entry.title), playlist_items: demoPlaylistItems.map(entry => ({ ...entry })),
         formats: [], subtitles: [],
       };
     }
@@ -315,12 +360,41 @@ export const demo = {
   addMedia(request: AddMediaDownloadRequest) {
     const format = seededFormats.find(item => item.format_id === request.format_id) ?? seededFormats[0];
     const extension = request.audio_only_preset?.split("_")[0] ?? request.target_container ?? format.container;
-    const name = request.download_playlist ? "Cinema Playlist" : "Tokyo_Architecture." + extension;
-    return add(baseTransfer("demo-" + ++sequence, request.filename || name, request.url), {
-      kind: "media", save_dir: request.save_dir || settings.default_download_dir,
-      total_bytes: request.audio_only_preset ? 48 * MB : format.filesize_bytes, download_speed_bps: 27 * MB,
+    const saveDir = request.save_dir || settings.default_download_dir || demoFolder;
+    const media: Partial<TransferSnapshot> = {
+      kind: "media", save_dir: saveDir, download_speed_bps: 27 * MB,
       active_connections: settings.default_connections, format_tags: [extension.toUpperCase(), format.label],
-    });
+      total_bytes: request.audio_only_preset ? 48 * MB : format.filesize_bytes,
+    };
+    if (request.selected_entries || request.download_playlist || request.playlist_items || isPurePlaylistUrl(request.url)) {
+      const ranges = parsePlaylistRanges(request.playlist_items ?? "");
+      if (!request.selected_entries && !ranges) throw new Error("Enter valid playlist item numbers or ranges.");
+      const entries = [...(request.selected_entries ?? demoPlaylistItems.filter(entry => !ranges?.length
+        || ranges.some(([first, last]) => entry.index >= first && entry.index <= last)))].sort((a, b) => a.index - b.index);
+      if (!entries.length) throw new Error("Select at least one available playlist video.");
+      const title = request.playlist_folder_name?.trim() || demoPlaylistTitle;
+      const separator = folderSeparator(saveDir);
+      const directory = saveDir.replace(/[\\/]+$/, "") + separator + sanitizeMediaStem(title);
+      const playlistId = "demo-playlist-" + ++sequence;
+      const now = new Date().toISOString();
+      const width = Math.max(2, String(entries.at(-1)?.index).length);
+      const jobs = entries.map(({ index, title: entryTitle, url }, position): TransferSnapshot => {
+        const id = "demo-" + ++sequence;
+        const filename = String(index).padStart(width, "0") + " - " + sanitizeMediaStem(entryTitle, "Video") + "." + extension;
+        rates.set(id, [27 * MB, 0]);
+        return {
+          ...baseTransfer(id, filename, url ?? request.url), ...media, save_dir: directory,
+          status: position === 0 ? "active" : "queued", total_bytes: (request.audio_only_preset ? 5 : 12) * MB,
+          download_speed_bps: 0, active_connections: position === 0 ? settings.default_connections : 0,
+          playlist_id: playlistId, playlist_title: title, playlist_index: position + 1, playlist_total: entries.length,
+          created_at: now, updated_at: now,
+        };
+      });
+      transfers = [...jobs, ...transfers];
+      refreshRates();
+      return jobs[0].id;
+    }
+    return add(baseTransfer("demo-" + ++sequence, request.filename || "Tokyo_Architecture." + extension, request.url), media);
   },
   addTorrent(request: AddTorrentRequest) {
     const id = "demo-" + ++sequence;
@@ -344,11 +418,38 @@ export const demo = {
     refreshRates();
   },
   resume(id: string) {
-    update(id, () => ({ status: "active", error_message: null }));
+    const playlistId = transfers.find(transfer => transfer.id === id)?.playlist_id;
+    if (playlistId && (pausedPlaylists.has(playlistId)
+      || transfers.some(transfer => transfer.playlist_id === playlistId && isRunning(transfer)))) {
+      throw new Error("The playlist is paused or already has a running transfer.");
+    }
+    update(id, transfer => playlistId ? activate(transfer) : { status: "active", error_message: null });
+    refreshRates();
+  },
+  pausePlaylist(id: string) {
+    if (!transfers.some(transfer => transfer.playlist_id === id)) throw new Error("Playlist not found.");
+    pausedPlaylists.add(id);
+    transfers = transfers.map(transfer => transfer.playlist_id === id && isRunning(transfer)
+      ? { ...transfer, status: "paused", download_speed_bps: 0, eta_seconds: null, active_connections: 0,
+        updated_at: new Date().toISOString() } : transfer);
+    refreshRates();
+  },
+  resumePlaylist(id: string) {
+    if (!transfers.some(transfer => transfer.playlist_id === id)) throw new Error("Playlist not found.");
+    pausedPlaylists.delete(id);
+    advancePlaylist(id, true);
     refreshRates();
   },
   cancel(id: string) {
-    update(id, () => ({ status: "canceled", download_speed_bps: 0, upload_speed_bps: 0, eta_seconds: null }));
+    const playlistId = transfers.find(transfer => transfer.id === id)?.playlist_id;
+    if (playlistId) {
+      transfers = transfers.filter(transfer => transfer.id !== id);
+      rates.delete(id);
+      if (transfers.some(transfer => transfer.playlist_id === playlistId)) advancePlaylist(playlistId);
+      else pausedPlaylists.delete(playlistId);
+    } else {
+      update(id, () => ({ status: "canceled", download_speed_bps: 0, upload_speed_bps: 0, eta_seconds: null }));
+    }
     refreshRates();
   },
   refresh(request: RefreshDownloadUrlRequest) {

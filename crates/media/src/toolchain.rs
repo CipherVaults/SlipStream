@@ -41,6 +41,7 @@ impl From<&AppSettings> for ToolchainConfig {
 pub struct ResolvedBinary {
     pub path: PathBuf,
     pub version: String,
+    /// Verified digest, or an empty string when no checksum was pinned.
     pub sha256: String,
 }
 
@@ -54,50 +55,30 @@ pub struct MediaToolchain {
 impl MediaToolchain {
     pub async fn discover(config: impl Into<ToolchainConfig>) -> Result<Self, MediaError> {
         let config = config.into();
-        let ytdlp = resolve(
-            YTDLP,
-            config.ytdlp_path.as_deref(),
-            None,
-            config.expected_ytdlp_sha256.as_deref(),
-        )
-        .await?
-        .ok_or(MediaError::BinaryNotFound { tool: YTDLP.name })?;
-        let mut tools = Self::discover_ffmpeg_only(config).await?;
-        tools.ytdlp = Some(ytdlp);
-        Ok(tools)
+        let (ytdlp, (ffmpeg, ffprobe)) =
+            tokio::try_join!(resolve_ytdlp(&config), resolve_ffmpeg_tools(&config))?;
+        Ok(Self {
+            ytdlp: Some(ytdlp),
+            ffmpeg,
+            ffprobe,
+        })
     }
 
     pub async fn discover_ffmpeg_only(
         config: impl Into<ToolchainConfig>,
     ) -> Result<Self, MediaError> {
-        let config = config.into();
-        let ffmpeg = resolve(
-            FFMPEG,
-            config.ffmpeg_path.as_deref(),
-            None,
-            config.expected_ffmpeg_sha256.as_deref(),
-        )
-        .await?
-        .ok_or(MediaError::BinaryNotFound { tool: FFMPEG.name })?;
-        let sibling = config
-            .ffmpeg_path
-            .as_ref()
-            .and_then(|_| ffmpeg.path.parent());
-        let ffprobe = resolve(
-            FFPROBE,
-            config.ffprobe_path.as_deref(),
-            sibling,
-            config.expected_ffprobe_sha256.as_deref(),
-        )
-        .await?;
-        if ffprobe.is_none() && config.expected_ffprobe_sha256.is_some() {
-            return Err(MediaError::BinaryNotFound { tool: FFPROBE.name });
-        }
+        let (ffmpeg, ffprobe) = resolve_ffmpeg_tools(&config.into()).await?;
         Ok(Self {
             ytdlp: None,
             ffmpeg,
             ffprobe,
         })
+    }
+
+    /// Combines independently discovered yt-dlp and FFmpeg tools.
+    pub fn with_ytdlp(mut self, binary: ResolvedBinary) -> Self {
+        self.ytdlp = Some(binary);
+        self
     }
 
     pub fn ytdlp(&self) -> Option<&ResolvedBinary> {
@@ -116,6 +97,52 @@ impl MediaToolchain {
         self.ytdlp()
             .ok_or(MediaError::MissingTool { tool: YTDLP.name })
     }
+}
+
+/// Resolves yt-dlp without looking up FFmpeg or FFprobe.
+pub async fn discover_ytdlp_only(
+    config: impl Into<ToolchainConfig>,
+) -> Result<ResolvedBinary, MediaError> {
+    resolve_ytdlp(&config.into()).await
+}
+
+async fn resolve_ytdlp(config: &ToolchainConfig) -> Result<ResolvedBinary, MediaError> {
+    resolve(
+        YTDLP,
+        config.ytdlp_path.as_deref(),
+        None,
+        config.expected_ytdlp_sha256.as_deref(),
+    )
+    .await?
+    .ok_or(MediaError::BinaryNotFound { tool: YTDLP.name })
+}
+
+async fn resolve_ffmpeg_tools(
+    config: &ToolchainConfig,
+) -> Result<(ResolvedBinary, Option<ResolvedBinary>), MediaError> {
+    let expected_ffmpeg = config.expected_ffmpeg_sha256.as_deref();
+    let ffmpeg_path = resolve_path(FFMPEG, config.ffmpeg_path.as_deref(), None, expected_ffmpeg)
+        .await?
+        .ok_or(MediaError::BinaryNotFound { tool: FFMPEG.name })?;
+    // A custom FFmpeg may have FFprobe beside its canonical executable.
+    let sibling = config
+        .ffmpeg_path
+        .as_ref()
+        .and_then(|_| ffmpeg_path.parent());
+    let expected_ffprobe = config.expected_ffprobe_sha256.as_deref();
+    let (ffmpeg, ffprobe) = tokio::try_join!(
+        inspect_binary(FFMPEG, &ffmpeg_path, expected_ffmpeg),
+        resolve(
+            FFPROBE,
+            config.ffprobe_path.as_deref(),
+            sibling,
+            expected_ffprobe
+        ),
+    )?;
+    if ffprobe.is_none() && expected_ffprobe.is_some() {
+        return Err(MediaError::BinaryNotFound { tool: FFPROBE.name });
+    }
+    Ok((ffmpeg, ffprobe))
 }
 
 #[derive(Clone, Copy)]
@@ -149,6 +176,18 @@ async fn resolve(
     sibling: Option<&Path>,
     expected_sha256: Option<&str>,
 ) -> Result<Option<ResolvedBinary>, MediaError> {
+    let Some(path) = resolve_path(tool, configured, sibling, expected_sha256).await? else {
+        return Ok(None);
+    };
+    inspect_binary(tool, &path, expected_sha256).await.map(Some)
+}
+
+async fn resolve_path(
+    tool: Tool,
+    configured: Option<&Path>,
+    sibling: Option<&Path>,
+    expected_sha256: Option<&str>,
+) -> Result<Option<PathBuf>, MediaError> {
     if let Some(expected) = expected_sha256 {
         validate_checksum(tool.name, expected)?;
     }
@@ -165,11 +204,18 @@ async fn resolve(
             path
         }
     };
-    let path = canonical_binary(tool.name, &candidate).await?;
-    let sha256 = verify_sha256(tool.name, &path, expected_sha256).await?;
-    let mut cmd = command(&path, tool.name);
+    canonical_binary(tool.name, &candidate).await.map(Some)
+}
+
+async fn inspect_binary(
+    tool: Tool,
+    path: &Path,
+    expected_sha256: Option<&str>,
+) -> Result<ResolvedBinary, MediaError> {
+    let sha256 = verify_sha256(tool.name, path, expected_sha256).await?;
+    let mut cmd = command(path, tool.name);
     cmd.arg(tool.version_flag);
-    let output = capture(cmd, &path, tool.name, Duration::from_secs(8), 64 * 1024).await?;
+    let output = capture(cmd, path, tool.name, Duration::from_secs(8), 64 * 1024).await?;
     let version = String::from_utf8_lossy(&output)
         .lines()
         .map(str::trim)
@@ -179,11 +225,11 @@ async fn resolve(
             kind: "version",
         })?
         .to_owned();
-    Ok(Some(ResolvedBinary {
-        path,
+    Ok(ResolvedBinary {
+        path: path.to_owned(),
         version,
         sha256,
-    }))
+    })
 }
 
 fn search_path(executable: &str) -> Option<PathBuf> {
@@ -258,6 +304,9 @@ async fn verify_sha256(
     path: &Path,
     expected: Option<&str>,
 ) -> Result<String, MediaError> {
+    let Some(expected) = expected else {
+        return Ok(String::new());
+    };
     let mut file = fs::File::open(path)
         .await
         .map_err(|err| MediaError::io("open binary", path, err))?;
@@ -274,15 +323,13 @@ async fn verify_sha256(
         hash.update(&buffer[..size]);
     }
     let actual = hex::encode(hash.finalize());
-    if let Some(expected) = expected {
-        if !actual.eq_ignore_ascii_case(expected) {
-            return Err(MediaError::ChecksumMismatch {
-                tool,
-                path: path.to_owned(),
-                expected: expected.into(),
-                actual,
-            });
-        }
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(MediaError::ChecksumMismatch {
+            tool,
+            path: path.to_owned(),
+            expected: expected.into(),
+            actual,
+        });
     }
     Ok(actual)
 }
@@ -383,6 +430,13 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[tokio::test]
+    async fn unpinned_discovery_does_not_open_the_binary_for_hashing() {
+        let dir = TempDir::new();
+        let missing = dir.0.join("missing.exe");
+        assert_eq!(verify_sha256("yt-dlp", &missing, None).await.unwrap(), "");
     }
 
     #[tokio::test]

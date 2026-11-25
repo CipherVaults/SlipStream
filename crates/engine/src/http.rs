@@ -1,9 +1,9 @@
 use crate::{EngineError, Result};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{
-    HeaderMap, HeaderName, HeaderValue, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_DISPOSITION,
-    CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, COOKIE, ETAG, IF_RANGE, LAST_MODIFIED,
-    LOCATION, PROXY_AUTHORIZATION, RANGE, REFERER,
+    HeaderMap, HeaderName, HeaderValue, ACCEPT, ACCEPT_ENCODING, AUTHORIZATION,
+    CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, COOKIE, ETAG, IF_RANGE,
+    LAST_MODIFIED, LOCATION, ORIGIN, PROXY_AUTHORIZATION, RANGE, REFERER, USER_AGENT,
 };
 use reqwest::{Client, Method, Response, StatusCode, Version};
 use serde::{Deserialize, Serialize};
@@ -238,6 +238,12 @@ impl Source {
                 .map_err(|_| EngineError::InvalidRequest("invalid referrer header value".into()))?;
             request_headers.insert(REFERER, referrer);
         }
+        request_headers.entry(USER_AGENT).or_insert(HeaderValue::from_static(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        ));
+        request_headers
+            .entry(ACCEPT)
+            .or_insert(HeaderValue::from_static("*/*"));
         request_headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
         Ok(Self {
             url,
@@ -362,7 +368,7 @@ impl Http {
             }
         }
 
-        let response = self
+        let mut response = self
             .request(source, Method::GET, Some((0, 0)), None)
             .await?;
         let (total, ranges) = match response.status() {
@@ -378,6 +384,14 @@ impl Http {
                     .is_some_and(|range| range == "bytes */0") =>
             {
                 (Some(0), true)
+            }
+            StatusCode::FORBIDDEN
+            | StatusCode::BAD_REQUEST
+            | StatusCode::METHOD_NOT_ALLOWED
+            | StatusCode::RANGE_NOT_SATISFIABLE => {
+                drop(response);
+                response = self.request(source, Method::GET, None, None).await?;
+                (full_length(&response)?, false)
             }
             status => return Err(EngineError::Status(status)),
         };
@@ -439,14 +453,10 @@ impl Http {
                 return Ok(GetOutcome::Restart(RestartReason::RepresentationChanged));
             }
         } else {
-            if response.status() != StatusCode::OK {
-                return Err(EngineError::Status(response.status()));
-            }
+            let length = full_length(&response)?;
             ensure_identity(&response)?;
             if validators.changed(&response, false)
-                || total
-                    .zip(length(&response)?)
-                    .is_some_and(|(old, new)| old != new)
+                || total.zip(length).is_some_and(|(old, new)| old != new)
             {
                 return Ok(GetOutcome::Restart(RestartReason::RepresentationChanged));
             }
@@ -485,6 +495,7 @@ fn apply_redirect_header_policy(
 ) {
     if previous.scheme() == "https" && next.scheme() == "http" {
         headers.remove(REFERER);
+        headers.remove(ORIGIN);
     }
     if next.origin() != *initial_origin {
         for name in [
@@ -530,6 +541,24 @@ fn length(response: &Response) -> Result<Option<u64>> {
                 .ok_or(EngineError::InvalidResponse("invalid Content-Length"))
         })
         .transpose()
+}
+
+fn full_length(response: &Response) -> Result<Option<u64>> {
+    match response.status() {
+        StatusCode::OK => length(response),
+        StatusCode::PARTIAL_CONTENT => {
+            // A plain GET can only use a 206 response that covers the complete representation.
+            let incomplete = || EngineError::InvalidResponse("incomplete response to plain GET");
+            let total = length(response)?
+                .filter(|&total| total > 0)
+                .ok_or_else(incomplete)?;
+            if content_range(response, 0, total - 1)? != Some(total) {
+                return Err(incomplete());
+            }
+            Ok(Some(total))
+        }
+        status => Err(EngineError::Status(status)),
+    }
 }
 
 fn ensure_identity(response: &Response) -> Result<()> {
@@ -708,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn redirect_strips_referer_on_https_downgrade_and_credentials_from_referrer() {
+    fn redirect_strips_page_headers_on_https_downgrade_and_credentials_from_referrer() {
         let https_origin = validate_http_url("https://cdn.example.com/start").unwrap();
         let https_other = validate_http_url("https://mirror.example.com/file").unwrap();
         let http_other = validate_http_url("http://mirror.example.com/file").unwrap();
@@ -716,6 +745,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(COOKIE, HeaderValue::from_static("sid=secret"));
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
+        headers.insert(ORIGIN, HeaderValue::from_static("https://app.example.com"));
         let clean_ref =
             sanitize_http_url_credentials("https://user:pass@app.example.com/page#secret").unwrap();
         assert_eq!(clean_ref, "https://app.example.com/page");
@@ -752,6 +782,7 @@ mod tests {
             headers.get(REFERER).and_then(|v| v.to_str().ok()),
             Some("https://app.example.com/page")
         );
+        assert_eq!(headers.get(ORIGIN).unwrap(), "https://app.example.com");
 
         apply_redirect_header_policy(
             &mut headers,
@@ -760,6 +791,7 @@ mod tests {
             &http_other,
         );
         assert!(headers.get(REFERER).is_none());
+        assert!(headers.get(ORIGIN).is_none());
     }
 
     #[test]

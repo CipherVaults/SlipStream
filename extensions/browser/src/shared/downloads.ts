@@ -1,5 +1,6 @@
 export interface InterceptionSettings {
   enabled: boolean;
+  showInFullscreen: boolean;
   extensions: string[];
   minBytes: number;
   excludedSites: string[];
@@ -8,6 +9,7 @@ export interface InterceptionSettings {
 
 export const defaults: InterceptionSettings = {
   enabled: true,
+  showInFullscreen: false,
   extensions: ["zip", "7z", "rar", "iso", "exe", "msi", "mp4", "webm", "mkv"],
   minBytes: 0,
   excludedSites: [],
@@ -21,6 +23,7 @@ export function readSettings(value: unknown): InterceptionSettings {
   const minBytes = saved?.minBytes;
   return {
     enabled: typeof saved?.enabled === "boolean" ? saved.enabled : defaults.enabled,
+    showInFullscreen: saved?.showInFullscreen === true,
     extensions: strings(saved?.extensions, defaults.extensions),
     minBytes: typeof minBytes === "number" && Number.isSafeInteger(minBytes) && minBytes >= 0 ? minBytes : defaults.minBytes,
     excludedSites: strings(saved?.excludedSites, defaults.excludedSites),

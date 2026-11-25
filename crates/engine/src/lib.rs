@@ -959,6 +959,11 @@ impl Job {
             queue_id: record.queue_id.clone(),
             error_message: record.error.clone(),
             completion_notice: None,
+            playlist_id: None,
+            playlist_title: None,
+            playlist_paused: None,
+            playlist_index: None,
+            playlist_total: None,
             created_at: record.created_at,
             updated_at: record.updated_at,
         }

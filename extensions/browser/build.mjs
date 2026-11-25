@@ -12,7 +12,7 @@ await build({
   ...options,
   build: { outDir, rollupOptions: { input: path("popup.html") } },
 });
-for (const entry of ["background", "content"]) {
+for (const entry of ["early", "background", "content"]) {
   await build({
     ...options,
     build: {

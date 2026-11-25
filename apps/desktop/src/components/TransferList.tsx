@@ -1,17 +1,19 @@
 import {
-  Archive, Check, Disc, Ellipsis, File, FileCheck2, Film, Folder, Magnet, Music, Pause, Play, RefreshCw, Trash2, X,
+  Archive, Check, ChevronDown, ChevronRight, Disc, Ellipsis, File, FileCheck2, Film, Folder, ListVideo, Magnet, Music,
+  Pause, Play, RefreshCw, Trash2, X,
 } from "lucide-react";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import tile from "../assets/alpine-tile.svg";
 import type { TransferSnapshot } from "../types/ipc";
 import {
-  SEGMENT_COUNT, bytePair, bytes, clock, fileCategory, isDone, isRunning, percentage, ratio, speed, statusLabel,
+  SEGMENT_COUNT, bytePair, bytes, clock, fileCategory, isDone, isPlaylistPending, isRunning, parentFolder, percentage, ratio, speed, statusLabel,
 } from "../lib/transfers";
 import type { View } from "./Shell";
 import { IconButton } from "./ui";
 
 export type TransferAction = "pause" | "resume" | "refresh" | "reveal" | "cancel" | "remove" | "verify";
 export type OnTransferAction = (action: TransferAction, transfer: TransferSnapshot) => void;
+export type OnPlaylistAction = (action: "pause_playlist" | "resume_playlist" | "reveal_playlist", playlistId: string) => void;
 
 export function primaryAction(transfer: TransferSnapshot): "pause" | "resume" | null {
   if (transfer.status === "paused") return "resume";
@@ -96,6 +98,7 @@ function TransferRow({ transfer, selected, select, onAction, preview }: {
               {torrent && <><span className="badge green">{transfer.protocol_label}</span><span className="badge">{transfer.active_peers} peers</span></>}
               {tags.map((tag, index) => <span className={"badge" + (index === 0 && transfer.kind === "media" ? " accent" : "")}
                 key={tag + index}>{tag}</span>)}
+              {transfer.playlist_id && transfer.playlist_index != null && <span className="badge">#{transfer.playlist_index}</span>}
               {paused && <span className="badge amber">Paused</span>}
               <span className="source-text">{source}</span>
             </span>
@@ -120,6 +123,10 @@ function TransferRow({ transfer, selected, select, onAction, preview }: {
       </IconButton>}
       {transfer.status === "failed" && transfer.kind === "http" && <IconButton label="Refresh Link"
         onClick={() => onAction("refresh", transfer)}><RefreshCw size={13} /></IconButton>}
+      {transfer.playlist_id && transfer.status === "failed" && <IconButton label="Retry"
+        onClick={() => onAction("resume", transfer)}><RefreshCw size={13} /></IconButton>}
+      {transfer.playlist_id && isDone(transfer) && <IconButton label="Show in Explorer" className="folder-ghost"
+        onClick={() => onAction("reveal", transfer)}><Folder size={14} /></IconButton>}
       <TransferMenu transfer={transfer} onAction={onAction} />
     </div>
   </article>;
@@ -147,42 +154,135 @@ function CompletedRow({ transfer, select, onAction }: {
   </article>;
 }
 
+type TransferGroup = { playlistId?: string; transfers: TransferSnapshot[] };
+
+function groupTransfers(items: TransferSnapshot[]) {
+  const groups: TransferGroup[] = [];
+  const playlists = new Map<string, TransferGroup>();
+  for (const transfer of items) {
+    const playlistId = transfer.playlist_id || undefined;
+    const group = playlistId ? playlists.get(playlistId) : undefined;
+    if (group) {
+      group.transfers.push(transfer);
+    } else {
+      const next = { playlistId, transfers: [transfer] };
+      groups.push(next);
+      if (playlistId) playlists.set(playlistId, next);
+    }
+  }
+  return groups;
+}
+
+function PlaylistGroup({ playlistId, transfers, members, onAction, renderRow }: {
+  playlistId: string; transfers: TransferSnapshot[]; members: TransferSnapshot[]; onAction?: OnPlaylistAction;
+  renderRow: (transfer: TransferSnapshot) => ReactNode;
+}) {
+  const bodyId = useId();
+  const [expanded, setExpanded] = useState<boolean>();
+  const items = [...transfers].sort((a, b) => (a.playlist_index ?? Infinity) - (b.playlist_index ?? Infinity));
+  const current = members.find(isRunning);
+  const waiting = members.filter(isPlaylistPending);
+  const queued = waiting.filter(item => item.status === "queued").length;
+  const paused = waiting.length > 0 && (members.some(item => item.playlist_paused === true)
+    || waiting.every(item => item.status === "paused"));
+  const done = members.filter(isDone).length;
+  const failed = members.filter(item => item.status === "failed").length;
+  const canceled = members.filter(item => item.status === "canceled").length;
+  const total = members.find(item => item.playlist_total != null)?.playlist_total ?? members.length;
+  const title = members.find(item => item.playlist_title?.trim())?.playlist_title?.trim() || "Playlist";
+  const directory = members[0].save_dir;
+  const folder = parentFolder(directory);
+  const open = expanded ?? waiting.length > 0;
+  const progress = paused ? "Paused" : current
+    ? statusLabel[current.status] + (current.playlist_index != null ? ` #${current.playlist_index} of ${total}` : "")
+    : "";
+  const summary = done === members.length ? `${done}/${total} completed`
+    : [progress, `${done}/${total} done`, queued ? queued + " queued" : "", failed ? failed + " failed" : "",
+      canceled ? canceled + " canceled" : ""].filter(Boolean).join(" · ");
+
+  return <section className="playlist-group" aria-label={"Playlist: " + title}>
+    <header className="playlist-group-header">
+      <button type="button" className="playlist-group-toggle" aria-expanded={open} aria-controls={bodyId}
+        aria-label={(open ? "Collapse " : "Expand ") + title} aria-describedby={bodyId + "-summary"}
+        onClick={() => setExpanded(!open)}>
+        {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+        <span className="playlist-group-icon" aria-hidden="true"><ListVideo size={17} /></span>
+        <span className="playlist-group-details">
+          <span className="playlist-group-title" title={title}>{title}</span>
+          <span id={bodyId + "-summary"} className="playlist-group-summary tabular">{summary}</span>
+        </span>
+      </button>
+      {folder && <span className="badge playlist-group-folder" title={directory}>{folder}</span>}
+      {onAction && <div className="playlist-group-actions">
+        {paused ? <button type="button" className="btn-ghost" onClick={() => onAction("resume_playlist", playlistId)}>
+          <Play size={12} />Resume All
+        </button> : (current || queued > 0) && <button type="button" className="btn-ghost"
+          onClick={() => onAction("pause_playlist", playlistId)}><Pause size={12} />Pause All</button>}
+        <button type="button" className="btn-ghost" onClick={() => onAction("reveal_playlist", playlistId)}>
+          <Folder size={14} />Open Folder
+        </button>
+      </div>}
+    </header>
+    <div id={bodyId} className="playlist-group-body" hidden={!open}>{open && items.map(renderRow)}</div>
+  </section>;
+}
+
 function Section({ title, meta, children }: { title: string; meta?: string; children: ReactNode }) {
   return <section aria-label={title}><div className="section-head"><h2 className="section-title">{title}</h2>
     {meta && <span className="section-meta tabular">{meta}</span>}</div>{children}</section>;
 }
 
-export function TransferList({ items, selected, setSelected, onAction, view, preview, loading }: {
+export function TransferList({ items, selected, setSelected, onAction, onPlaylistAction, allTransfers, view, preview, loading }: {
   items: TransferSnapshot[]; selected: string | undefined; setSelected: (id: string) => void; onAction: OnTransferAction;
-  view: View; preview: boolean; loading: boolean;
+  onPlaylistAction?: OnPlaylistAction; allTransfers: TransferSnapshot[]; view: View; preview: boolean; loading: boolean;
 }) {
-  const active = items.filter(transfer => !isDone(transfer));
-  const complete = items.filter(isDone);
-  const running = active.filter(isRunning);
-  const paused = active.filter(transfer => transfer.status === "paused").length;
+  const groups = groupTransfers(items);
+  const playlists = new Map(groupTransfers(allTransfers).map(group => [group.playlistId, group.transfers]));
+  const members = (group: TransferGroup) => (group.playlistId && playlists.get(group.playlistId)) || group.transfers;
+  const finished = (group: TransferGroup) => group.playlistId
+    ? !members(group).some(isPlaylistPending) : group.transfers.every(isDone);
+  const active = groups.filter(group => !finished(group));
+  const complete = groups.filter(finished);
+  const running = items.filter(isRunning);
+  const paused = items.filter(transfer => transfer.status === "paused").length;
   const peers = running.reduce((sum, transfer) => sum + transfer.active_peers, 0);
   const threads = running.reduce((sum, transfer) => sum + (transfer.kind === "torrent" ? 0 : transfer.active_connections), 0);
   const activeMeta = [running.length + " downloading", paused + " paused", threads + " HTTP threads" + (peers ? " + " + peers + " peers" : "")].join(" · ");
-  const queueGroups = new Map<string, TransferSnapshot[]>();
+  const queueGroups = new Map<string, TransferGroup[]>();
   if (view === "queues" || view === "schedule") {
-    for (const transfer of active) {
-      const queue = queueGroups.get(transfer.queue_id) ?? [];
-      queue.push(transfer);
-      queueGroups.set(transfer.queue_id, queue);
+    for (const group of active) {
+      const id = group.transfers[0].queue_id;
+      const queue = queueGroups.get(id) ?? [];
+      queue.push(group);
+      queueGroups.set(id, queue);
     }
   }
-  const rows = (transfers: TransferSnapshot[]) => <div className="transfer-list">{transfers.map(transfer =>
+  const renderRow = (transfer: TransferSnapshot) =>
     <TransferRow key={transfer.id} transfer={transfer} selected={transfer.id === selected} select={() => setSelected(transfer.id)}
-      onAction={onAction} preview={preview} />)}</div>;
+      onAction={onAction} preview={preview} />;
+  const renderGroup = (group: TransferGroup, completed = false) => {
+    const { playlistId, transfers } = group;
+    if (playlistId) return <PlaylistGroup key={"playlist:" + playlistId} playlistId={playlistId} transfers={transfers}
+      onAction={onPlaylistAction} members={members(group)} renderRow={renderRow} />;
+    const [transfer] = transfers;
+    return completed
+      ? <CompletedRow key={transfer.id} transfer={transfer} select={() => setSelected(transfer.id)} onAction={onAction} />
+      : renderRow(transfer);
+  };
+  const rows = (entries: TransferGroup[]) => <div className="transfer-list">{entries.map(group => renderGroup(group))}</div>;
   const today = new Date().toDateString();
-  const recent = complete.filter(transfer => new Date(transfer.updated_at).toDateString() === today);
-  const older = complete.filter(transfer => new Date(transfer.updated_at).toDateString() !== today);
-  const completedRows = (title: string, transfers: TransferSnapshot[]) => transfers.length > 0 &&
-    <Section title={title} meta={transfers.length + (transfers.length === 1 ? " file" : " files") + " · "
+  const completedToday = (group: TransferGroup) =>
+    new Date(Math.max(...members(group).map(transfer => Date.parse(transfer.updated_at)))).toDateString() === today;
+  const recent = complete.filter(completedToday);
+  const older = complete.filter(group => !completedToday(group));
+  const completedRows = (title: string, entries: TransferGroup[]) => {
+    if (!entries.length) return null;
+    const transfers = entries.flatMap(group => group.transfers);
+    return <Section title={title} meta={transfers.length + (transfers.length === 1 ? " file" : " files") + " · "
       + bytes(transfers.reduce((sum, transfer) => sum + (transfer.total_bytes ?? transfer.downloaded_bytes), 0))}>
-      <div className="completed-list">{transfers.map(transfer => <CompletedRow key={transfer.id} transfer={transfer}
-        select={() => setSelected(transfer.id)} onAction={onAction} />)}</div>
+      <div className="completed-list">{entries.map(group => renderGroup(group, true))}</div>
     </Section>;
+  };
 
   return <main className="transfer-pane" aria-label="Transfers" aria-busy={loading}>
     {view === "queues" || view === "schedule"

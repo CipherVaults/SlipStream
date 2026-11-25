@@ -17,6 +17,10 @@ export function isDone(transfer: TransferSnapshot) {
   return transfer.status === "completed";
 }
 
+export function isPlaylistPending(transfer: TransferSnapshot) {
+  return ["queued", "probing", "active", "remuxing", "paused"].includes(transfer.status);
+}
+
 export function bytes(value: number | null, mbDecimals = 1) {
   if (value === null) return "—";
   if (value >= 1e12) return (value / 1e12).toFixed(1) + " TB";
@@ -140,4 +144,39 @@ export function errorMessage(error: unknown) {
 
 export function parentFolder(path: string) {
   return path.split(/[\\/]/).filter(Boolean).slice(-2).join(path.includes("\\") ? "\\" : "/");
+}
+
+export function sanitizeMediaStem(title: string, fallback = "Playlist") {
+  // Match the desktop's Windows filename cleanup and UTF-8 stem limit.
+  const cleaned = title.replace(/[\p{Cc}\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, "")
+    .replace(/[<>:"/\\|?*]/g, "_").trim().replace(/^\.+|\.+$/g, "").trim().replace(/\.{2,}/g, ".");
+  const reserved = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i.test(cleaned.split(".")[0].trim());
+  const name = reserved ? "_" + cleaned : cleaned;
+  const bytes = new TextEncoder().encode(name).subarray(0, 120);
+  const stem = new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes, { stream: true }).replace(/[. ]+$/, "");
+  return !stem || /^download$/i.test(stem) ? fallback : stem;
+}
+
+export function folderSeparator(folder: string) {
+  return folder.includes("/") && !folder.includes("\\") ? "/" : "\\";
+}
+
+export function parsePlaylistRanges(value: string): Array<[number, number]> | null {
+  if (!value) return [];
+  if (value.length > 512 || !/^\d+(-\d+)?(,\d+(-\d+)?)*$/.test(value)) return null;
+  const ranges = value.split(",").map((part): [number, number] => {
+    const [first, last = first] = part.split("-");
+    return [Number(first), Number(last)];
+  });
+  return ranges.some(([first, last]) => first < 1 || first > last || last > 0xffffffff) ? null : ranges;
+}
+
+export function formatPlaylistRanges(indices: Set<number>) {
+  const ranges: Array<[number, number]> = [];
+  for (const index of [...indices].sort((a, b) => a - b)) {
+    const last = ranges.at(-1);
+    if (last && index === last[1] + 1) last[1] = index;
+    else ranges.push([index, index]);
+  }
+  return ranges.map(([first, last]) => first === last ? String(first) : `${first}-${last}`).join(",");
 }

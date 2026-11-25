@@ -1,18 +1,23 @@
 use crate::{
-    media_jobs::{MediaJob, ScanRequest},
+    media_jobs::{MediaJob, MediaJobRunOptions, PlaylistJobMeta, ScanRequest},
     paths::{
-        build_defender_scan_args, decode_sha256, delete_files, ensure_safe_directory, hash_file,
-        local_drive_path, reveal_action, write_zone_identifier, RevealAction,
+        build_defender_scan_args, decode_sha256, delete_files, ensure_playlist_subfolder,
+        ensure_safe_directory, ensure_safe_tree, hash_file, local_drive_path, media_title_stem,
+        reveal_action, write_zone_identifier, RevealAction,
     },
     settings::{normalize, read_json, torrent_rate, write_json_atomically, SETTINGS_FILE},
     tools::{
-        defender_executable, discover_media_toolchain, explorer_executable, toolchain_status,
-        ToolchainStatus,
+        defender_executable, discover_ytdlp_for_probe, explorer_executable, toolchain_status,
+        ToolchainCache, ToolchainStatus,
     },
 };
 use serde::{Deserialize, Serialize};
 use slipstream_engine::{DownloadEngine, EngineConfig, EngineEvent};
-use slipstream_media::{probe_url, ProbeOptions};
+use slipstream_media::{
+    args::{canonical_media_headers, validate_playlist_items},
+    probe::{MAX_PLAYLIST_PREVIEW_ENTRIES, MAX_PLAYLIST_TITLE_CHARS},
+    probe_url_with_binary, DownloadOptions, ProbeOptions,
+};
 use slipstream_native_host::{
     pipe::{error_response, PipeRequestHandler, PipeServer},
     registry::DEFAULT_BASE_KEY,
@@ -21,8 +26,8 @@ use slipstream_native_host::{
 use slipstream_protocol::{
     is_private_or_loopback_ip, validate_http_url, validate_magnet_uri, AddHttpDownloadRequest,
     AddMediaDownloadRequest, AddTorrentRequest, AppSettings, MediaProbeResult, NativeBridgeRequest,
-    NativeBridgeResponse, RefreshDownloadUrlRequest, TelemetryBatch, TorrentFileEntry,
-    TransferSnapshot, TransferStatus, UpdateMode,
+    NativeBridgeResponse, RefreshDownloadUrlRequest, SelectedPlaylistEntry, TelemetryBatch,
+    TorrentFileEntry, TransferSnapshot, TransferStatus, UpdateMode, MAX_NATIVE_MESSAGE_BYTES,
 };
 use slipstream_torrent::{TorrentManager, TorrentManagerConfig};
 use std::{
@@ -48,6 +53,7 @@ use tokio::{
     time::{timeout, Instant},
 };
 use url::Url;
+use uuid::Uuid;
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 type Result<T> = std::result::Result<T, String>;
@@ -55,6 +61,9 @@ const DISMISSED_FILE: &str = "dismissed-http.json";
 const TELEMETRY_INTERVAL: Duration = Duration::from_millis(50);
 const DEFENDER_SCAN_QUEUE_CAPACITY: usize = 128;
 const DEFENDER_SCAN_TIMEOUT: Duration = Duration::from_secs(60);
+const PROBE_CACHE_TTL: Duration = Duration::from_secs(300);
+const PROBE_CACHE_CAPACITY: usize = 128;
+const MAX_SELECTED_ENTRIES: usize = 512;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpenPickerEvent {
@@ -91,6 +100,66 @@ struct Picker {
     pending: VecDeque<OpenPickerEvent>,
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ProbeKey {
+    url: String,
+    playlist: bool,
+    headers: Vec<(String, String)>,
+}
+
+impl ProbeKey {
+    fn new(url: &str, playlist: bool, headers: &HashMap<String, String>) -> Result<Self> {
+        Ok(Self {
+            url: url.to_owned(),
+            playlist,
+            headers: canonical_media_headers(headers).map_err(message)?,
+        })
+    }
+}
+type ProbeResult = Result<Arc<MediaProbeResult>>;
+
+#[derive(Default)]
+struct ProbeCache {
+    entries: HashMap<ProbeKey, (Instant, Arc<MediaProbeResult>)>,
+    in_flight: HashMap<ProbeKey, watch::Sender<Option<ProbeResult>>>,
+}
+
+impl ProbeCache {
+    fn get(&self, key: &ProbeKey) -> Option<Arc<MediaProbeResult>> {
+        let (created, probe) = self.entries.get(key)?;
+        (created.elapsed() < PROBE_CACHE_TTL).then(|| probe.clone())
+    }
+
+    fn insert(&mut self, key: ProbeKey, probe: Arc<MediaProbeResult>) {
+        let now = Instant::now();
+        self.entries
+            .retain(|_, (created, _)| now.duration_since(*created) < PROBE_CACHE_TTL);
+        if self.entries.len() >= PROBE_CACHE_CAPACITY && !self.entries.contains_key(&key) {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (created, _))| *created)
+                .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(key, (now, probe));
+    }
+}
+
+struct PlaylistCoordinator {
+    title: String,
+    directory: PathBuf,
+    job_ids: Vec<String>,
+    paused: bool,
+}
+
+struct PlaylistSelection {
+    entries: Vec<SelectedPlaylistEntry>,
+    probe: Option<Arc<MediaProbeResult>>,
+}
+
 pub struct AppState {
     data_dir: PathBuf,
     registry_base_key: String,
@@ -101,6 +170,10 @@ pub struct AppState {
     torrent: AsyncRwLock<TorrentSession>,
     torrent_config: TorrentManagerConfig,
     media: RwLock<HashMap<String, Arc<MediaJob>>>,
+    toolchain_cache: Arc<ToolchainCache>,
+    probe_cache: Arc<Mutex<ProbeCache>>,
+    playlists: Mutex<HashMap<String, PlaylistCoordinator>>,
+    playlist_finished: mpsc::UnboundedSender<String>,
     settings: RwLock<AppSettings>,
     dismissed_http: RwLock<HashSet<String>>,
     verified: RwLock<HashMap<String, bool>>,
@@ -181,6 +254,7 @@ impl AppState {
             .map(|snapshot| snapshot.id)
             .collect();
         let (scans, scan_requests) = mpsc::channel(DEFENDER_SCAN_QUEUE_CAPACITY);
+        let (playlist_finished, playlist_events) = mpsc::unbounded_channel();
         let (stop, _) = watch::channel(false);
         let ready = ui.has_main_window();
         let registry_base_key = options
@@ -196,6 +270,10 @@ impl AppState {
             torrent: AsyncRwLock::new(torrent),
             torrent_config: options.torrent,
             media: RwLock::default(),
+            toolchain_cache: Arc::default(),
+            probe_cache: Arc::default(),
+            playlists: Mutex::default(),
+            playlist_finished,
             settings: RwLock::new(settings),
             dismissed_http: RwLock::new(dismissed_http),
             verified: RwLock::default(),
@@ -237,6 +315,11 @@ impl AppState {
                 state.stop.subscribe(),
                 scan_requests,
             )),
+            tokio::spawn(watch_playlists(
+                Arc::downgrade(&state),
+                state.stop.subscribe(),
+                playlist_events,
+            )),
         ];
         *state.tasks.lock().await = Some(tasks);
         Ok(state)
@@ -270,7 +353,14 @@ impl AppState {
     pub async fn save_settings(&self, mut settings: AppSettings) -> Result<()> {
         let _operation = self.operation().await?;
         normalize(&mut settings, &self.data_dir).map_err(message)?;
-        self.apply_settings(settings).await
+        self.apply_settings(settings).await?;
+        self.invalidate_toolchain_cache().await;
+        Ok(())
+    }
+
+    pub(crate) async fn invalidate_toolchain_cache(&self) {
+        self.toolchain_cache.invalidate().await;
+        *self.probe_cache.lock().unwrap() = ProbeCache::default();
     }
 
     pub async fn set_speed_limit(&self, limit_bps: Option<u64>) -> Result<()> {
@@ -344,7 +434,13 @@ impl AppState {
         batch.aggregate_up_bps = 0;
         batch.active_count = 0;
         batch.active_threads = 0;
+        let playlists = self.playlists.lock().unwrap();
         for transfer in &mut batch.transfers {
+            transfer.playlist_paused = transfer
+                .playlist_id
+                .as_ref()
+                .and_then(|id| playlists.get(id))
+                .map(|playlist| playlist.paused);
             if let Some(result) = verified.get(&transfer.id) {
                 transfer.sha256_verified = Some(*result);
             }
@@ -424,21 +520,94 @@ impl AppState {
     pub async fn probe_media(&self, url: &str, playlist: Option<bool>) -> Result<MediaProbeResult> {
         let url = validate_media_url(url, self.allow_loopback)?;
         let playlist = playlist.unwrap_or_else(|| is_pure_playlist_url(&url));
-        let tools = discover_media_toolchain(self.settings(), self.resource_dir.clone()).await?;
-        probe_url(&tools, url.as_str(), ProbeOptions { playlist })
-            .await
-            .map_err(message)
+        let key = ProbeKey::new(url.as_str(), playlist, &HashMap::new())?;
+        Ok((*self.probe_media_shared(key).await?).clone())
+    }
+
+    fn ytdlp_cache_path(&self) -> PathBuf {
+        self.data_dir.join("yt-dlp-cache")
+    }
+
+    async fn probe_media_shared(&self, key: ProbeKey) -> ProbeResult {
+        let stopped = self.stop.subscribe();
+        if *stopped.borrow() {
+            return Err("SlipStream is shutting down".into());
+        }
+        // The validated URL is normalized by Url. Keep the path, query, and
+        // credentials in the key so different authenticated URLs stay isolated.
+        let mut result = {
+            let mut cache = self.probe_cache.lock().unwrap();
+            if let Some(probe) = cache.get(&key) {
+                return Ok(probe);
+            }
+            if let Some(running) = cache.in_flight.get(&key) {
+                running.subscribe()
+            } else {
+                let (sender, receiver) = watch::channel(None);
+                cache.in_flight.insert(key.clone(), sender.clone());
+                let toolchain_cache = self.toolchain_cache.clone();
+                let probe_cache = self.probe_cache.clone();
+                let settings = self.settings();
+                let resource_dir = self.resource_dir.clone();
+                let cache_dir = self.ytdlp_cache_path();
+                // Own the probe independently of the first caller's lifetime.
+                tokio::spawn(async move {
+                    let result = tokio::select! {
+                        biased;
+                        _ = stopped_signal(stopped) => Err("SlipStream is shutting down".into()),
+                        result = run_media_probe(&toolchain_cache, settings, resource_dir, &key.url, ProbeOptions {
+                            playlist: key.playlist,
+                            cache_dir: Some(cache_dir),
+                            headers: key.headers.iter().cloned().collect(),
+                        }) => result.map(Arc::new),
+                    };
+                    let mut cache = probe_cache.lock().unwrap();
+                    if cache
+                        .in_flight
+                        .get(&key)
+                        .is_some_and(|current| current.same_channel(&sender))
+                    {
+                        cache.in_flight.remove(&key);
+                        if let Ok(probe) = &result {
+                            cache.insert(key, probe.clone());
+                        }
+                    }
+                    sender.send_replace(Some(result));
+                });
+                receiver
+            }
+        };
+        let ready = result.wait_for(Option::is_some).await.map_err(message)?;
+        ready.as_ref().expect("probe result is ready").clone()
     }
 
     pub async fn add_media_download(&self, mut request: AddMediaDownloadRequest) -> Result<String> {
         let url = validate_media_url(&request.url, self.allow_loopback)?;
-        if !request.download_playlist
-            && request.playlist_items.is_none()
-            && request.format_id.is_none()
-            && is_pure_playlist_url(&url)
-        {
-            request.download_playlist = true;
+        if let Some(items) = &mut request.playlist_items {
+            *items = items
+                .split(',')
+                .map(|part| match part.split_once('-') {
+                    Some((first, last)) => format!("{}-{}", first.trim(), last.trim()),
+                    None => part.trim().to_owned(),
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            validate_playlist_items(items).map_err(message)?;
         }
+        let explicit_entries = request.selected_entries.take();
+        let playlist = explicit_entries.is_some()
+            || request.download_playlist
+            || request.playlist_items.is_some()
+            || is_pure_playlist_url(&url);
+        let key = ProbeKey::new(url.as_str(), playlist, &request.headers)?;
+        let selection = if playlist {
+            Some(
+                self.select_playlist_entries(key, explicit_entries, &request)
+                    .await?,
+            )
+        } else {
+            None
+        };
         request.url = url.into();
         let _operation = self.operation().await?;
         let settings = self.settings();
@@ -453,12 +622,236 @@ impl AppState {
             .await
             .map_err(message)?
             .map_err(message)?;
-        let job = Arc::new(MediaJob::new(request, directory)?);
+        if let Some(selection) = selection {
+            return self.enqueue_playlist(request, directory, selection).await;
+        }
+        let job = Arc::new(MediaJob::new(request, directory, None)?);
         let id = job.snapshot().id;
-        job.start(settings, self.resource_dir.clone(), self.scans.clone())
-            .await?;
+        self.start_media_job(&job, None).await?;
         self.media.write().unwrap().insert(id.clone(), job);
         Ok(id)
+    }
+
+    async fn select_playlist_entries(
+        &self,
+        key: ProbeKey,
+        explicit_entries: Option<Vec<SelectedPlaylistEntry>>,
+        request: &AddMediaDownloadRequest,
+    ) -> Result<PlaylistSelection> {
+        if let Some(mut selected) = explicit_entries {
+            if !(1..=MAX_SELECTED_ENTRIES).contains(&selected.len()) {
+                return Err("select between 1 and 512 playlist entries".into());
+            }
+            for entry in selected.iter_mut() {
+                if entry.index == 0 {
+                    return Err("playlist entry indices must be positive".into());
+                }
+                if let Some(url) = &mut entry.url {
+                    *url = validate_media_url(url, self.allow_loopback)?.into();
+                }
+            }
+            return Ok(PlaylistSelection {
+                entries: selected,
+                probe: self.probe_cache.lock().unwrap().get(&key),
+            });
+        }
+        let probe = self.probe_media_shared(key).await?;
+        let incomplete = probe.playlist_count.unwrap_or(0) as usize > probe.playlist_items.len();
+        let entries = if let Some(items) = &request.playlist_items {
+            let mut indices = std::collections::BTreeSet::new();
+            for index in playlist_ranges(items)?.into_iter().flatten() {
+                indices.insert(index);
+                if indices.len() > MAX_SELECTED_ENTRIES {
+                    // Keep the full selector on one playlist job when expanding it
+                    // would exceed the coordinator's child limit.
+                    return Ok(PlaylistSelection {
+                        entries: Vec::new(),
+                        probe: Some(probe),
+                    });
+                }
+            }
+            if indices.is_empty() {
+                return Err("the playlist selection contains no video indices".into());
+            }
+            indices
+                .into_iter()
+                .map(|index| {
+                    let item = probe.playlist_items.iter().find(|item| item.index == index);
+                    SelectedPlaylistEntry {
+                        index,
+                        title: item
+                            .map(|item| item.title.clone())
+                            .filter(|title| !title.is_empty())
+                            .unwrap_or_else(|| format!("Video {index}")),
+                        url: item
+                            .and_then(|item| item.url.as_deref())
+                            .and_then(|url| validate_media_url(url, self.allow_loopback).ok())
+                            .map(Into::into),
+                    }
+                })
+                .collect()
+        } else if incomplete
+            || probe.playlist_count.unwrap_or(0) as usize > MAX_PLAYLIST_PREVIEW_ENTRIES
+            || probe.playlist_items.iter().all(|item| item.url.is_none())
+        {
+            Vec::new()
+        } else {
+            probe
+                .playlist_items
+                .iter()
+                .map(|item| SelectedPlaylistEntry {
+                    index: item.index,
+                    title: item.title.clone(),
+                    url: item
+                        .url
+                        .as_deref()
+                        .and_then(|url| validate_media_url(url, self.allow_loopback).ok())
+                        .map(Into::into),
+                })
+                .collect()
+        };
+        Ok(PlaylistSelection {
+            entries,
+            probe: Some(probe),
+        })
+    }
+
+    async fn enqueue_playlist(
+        &self,
+        mut request: AddMediaDownloadRequest,
+        directory: PathBuf,
+        PlaylistSelection {
+            mut entries,
+            probe: playlist_probe,
+        }: PlaylistSelection,
+    ) -> Result<String> {
+        let title = request
+            .playlist_folder_name
+            .take()
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                playlist_probe
+                    .as_ref()
+                    .map(|probe| probe.title.clone())
+                    .filter(|title| !title.eq_ignore_ascii_case("download"))
+            })
+            .unwrap_or_else(|| "Playlist".into());
+        let directory = tokio::task::spawn_blocking({
+            let title = title.clone();
+            move || ensure_playlist_subfolder(&directory, &title)
+        })
+        .await
+        .map_err(message)?
+        .map_err(message)?;
+        let playlist_id = Uuid::new_v4().to_string();
+        let mut playlist = PlaylistCoordinator {
+            title: title
+                .trim()
+                .chars()
+                .take(MAX_PLAYLIST_TITLE_CHARS)
+                .collect(),
+            directory,
+            job_ids: Vec::new(),
+            paused: false,
+        };
+        let meta = |index, total| {
+            Some(PlaylistJobMeta {
+                id: playlist_id.clone(),
+                title: playlist.title.clone(),
+                index,
+                total,
+            })
+        };
+        if request.audio_only_preset.is_some() {
+            request.format_id = None;
+        }
+        if request.audio_only_preset.is_some() || request.format_id.is_some() {
+            request.max_height = None;
+        }
+        let jobs = if entries.is_empty() {
+            request.download_playlist = true;
+            let total = playlist_probe
+                .as_ref()
+                .and_then(|probe| probe.playlist_count)
+                .filter(|_| request.playlist_items.is_none());
+            vec![Arc::new(MediaJob::new(
+                request,
+                playlist.directory.clone(),
+                meta(None, total),
+            )?)]
+        } else {
+            entries.sort_by_key(|entry| entry.index);
+            let total = entries.len() as u32;
+            let width = entries.last().unwrap().index.to_string().len().max(2);
+            let parent_url = Url::parse(&request.url).map_err(message)?;
+            entries
+                .into_iter()
+                .enumerate()
+                .map(|(position, entry)| {
+                    let title = media_title_stem(&entry.title, "Video");
+                    let mut child = AddMediaDownloadRequest {
+                        filename: Some(format!("{:0width$} - {title}", entry.index)),
+                        ..request.clone()
+                    };
+                    child.download_playlist = entry.url.is_none();
+                    child.playlist_items = child.download_playlist.then(|| entry.index.to_string());
+                    if let Some(url) = entry.url {
+                        let entry_url = Url::parse(&url).map_err(message)?;
+                        if entry_url.origin() != parent_url.origin() {
+                            child.headers.retain(|name, _| {
+                                !name.eq_ignore_ascii_case("Referer")
+                                    && !name.eq_ignore_ascii_case("Origin")
+                            });
+                        }
+                        child.url = url;
+                    }
+                    MediaJob::new(
+                        child,
+                        playlist.directory.clone(),
+                        meta(Some(position as u32 + 1), Some(total)),
+                    )
+                    .map(Arc::new)
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        {
+            let mut media = self.media.write().unwrap();
+            for job in &jobs {
+                let id = job.snapshot().id;
+                playlist.job_ids.push(id.clone());
+                media.insert(id, job.clone());
+            }
+        }
+        let first_id = playlist.job_ids[0].clone();
+        self.playlists.lock().unwrap().insert(playlist_id, playlist);
+        let pre_probe = playlist_probe.filter(|_| jobs[0].request().download_playlist);
+        self.start_media_job(&jobs[0], pre_probe).await?;
+        Ok(first_id)
+    }
+
+    async fn start_media_job(
+        &self,
+        job: &Arc<MediaJob>,
+        pre_probe: Option<Arc<MediaProbeResult>>,
+    ) -> Result<()> {
+        let request = job.request();
+        let playlist = request.download_playlist;
+        let key = ProbeKey::new(&request.url, playlist, &request.headers)?;
+        let pre_probe = pre_probe.or_else(|| self.probe_cache.lock().unwrap().get(&key));
+        job.start(MediaJobRunOptions {
+            settings: self.settings(),
+            resource_dir: self.resource_dir.clone(),
+            toolchain_cache: self.toolchain_cache.clone(),
+            download: DownloadOptions {
+                playlist,
+                pre_probe: pre_probe.map(|probe| (*probe).clone()),
+                cache_dir: Some(self.ytdlp_cache_path()),
+                ..DownloadOptions::default()
+            },
+            scans: self.scans.clone(),
+            playlist_finished: self.playlist_finished.clone(),
+        })
+        .await
     }
 
     pub async fn add_torrent(&self, mut request: AddTorrentRequest) -> Result<String> {
@@ -544,12 +937,17 @@ impl AppState {
         if self.http_snapshot(id).is_some() {
             self.engine.resume_transfer(id).await.map_err(message)?;
         } else if let Some(job) = self.media_job(id) {
-            job.start(
-                self.settings(),
-                self.resource_dir.clone(),
-                self.scans.clone(),
-            )
-            .await?;
+            let snapshot = job.snapshot();
+            if let Some(playlist_id) = &snapshot.playlist_id {
+                let (paused, jobs) = self.playlist_jobs(playlist_id)?;
+                if paused || jobs.iter().any(|job| active(job.snapshot().status)) {
+                    return Err("the playlist is paused or already has a running transfer".into());
+                }
+                if snapshot.status == TransferStatus::Queued {
+                    return self.advance_playlist(playlist_id, true).await;
+                }
+            }
+            self.start_media_job(&job, None).await?;
         } else {
             self.torrent
                 .read()
@@ -564,8 +962,18 @@ impl AppState {
     }
 
     pub async fn change_all(&self, pause: bool) {
+        let mut handled_playlists = HashSet::new();
         for snapshot in self.snapshot().await.transfers {
-            let result = if pause
+            let result = if let Some(playlist_id) = &snapshot.playlist_id {
+                if !handled_playlists.insert(playlist_id.clone()) {
+                    continue;
+                }
+                if pause {
+                    self.pause_playlist(playlist_id).await
+                } else {
+                    self.resume_playlist(playlist_id).await
+                }
+            } else if pause
                 && (active(snapshot.status) || snapshot.status == TransferStatus::Queued)
             {
                 self.pause_transfer(&snapshot.id).await
@@ -578,6 +986,82 @@ impl AppState {
                 tracing::warn!(transfer_id = %snapshot.id, %error, "could not change transfer state");
             }
         }
+    }
+
+    // All scheduling and playlist control methods use the daemon operation lock.
+    fn playlist_jobs(&self, id: &str) -> Result<(bool, Vec<Arc<MediaJob>>)> {
+        let playlists = self.playlists.lock().unwrap();
+        let playlist = playlists.get(id).ok_or("playlist was not found")?;
+        let media = self.media.read().unwrap();
+        let jobs = playlist
+            .job_ids
+            .iter()
+            .filter_map(|id| media.get(id).cloned())
+            .collect();
+        Ok((playlist.paused, jobs))
+    }
+
+    async fn advance_playlist(&self, id: &str, resume_paused: bool) -> Result<()> {
+        let (paused, jobs) = self.playlist_jobs(id)?;
+        if paused || jobs.iter().any(|job| active(job.snapshot().status)) {
+            return Ok(());
+        }
+        let paused_job = jobs
+            .iter()
+            .find(|job| job.snapshot().status == TransferStatus::Paused);
+        if paused_job.is_some() && !resume_paused {
+            return Ok(());
+        }
+        let next = paused_job.or_else(|| {
+            jobs.iter()
+                .find(|job| job.snapshot().status == TransferStatus::Queued)
+        });
+        if let Some(job) = next {
+            self.start_media_job(job, None).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn pause_playlist(&self, playlist_id: &str) -> Result<()> {
+        let _operation = self.operation().await?;
+        let (_, jobs) = self.playlist_jobs(playlist_id)?;
+        self.playlists
+            .lock()
+            .unwrap()
+            .get_mut(playlist_id)
+            .unwrap()
+            .paused = true;
+        if let Some(job) = jobs.iter().find(|job| active(job.snapshot().status)) {
+            if let Err(error) = job.stop(TransferStatus::Paused).await {
+                if job.snapshot().status != TransferStatus::Completed {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn resume_playlist(&self, playlist_id: &str) -> Result<()> {
+        let _operation = self.operation().await?;
+        self.playlists
+            .lock()
+            .unwrap()
+            .get_mut(playlist_id)
+            .ok_or("playlist was not found")?
+            .paused = false;
+        self.advance_playlist(playlist_id, true).await
+    }
+
+    pub fn reveal_playlist_folder(&self, playlist_id: &str) -> Result<()> {
+        let directory = self
+            .playlists
+            .lock()
+            .unwrap()
+            .get(playlist_id)
+            .ok_or("playlist was not found")?
+            .directory
+            .clone();
+        open_reveal_action(reveal_action(&directory, None).map_err(message)?)
     }
 
     pub async fn cancel_transfer(&self, id: &str, remove_files: bool) -> Result<()> {
@@ -611,10 +1095,23 @@ impl AppState {
             *self.dismissed_http.write().unwrap() = dismissed;
         } else if let Some(job) = self.media_job(id) {
             job.stop(TransferStatus::Canceled).await?;
+            let snapshot = job.snapshot();
+            if let Some(playlist_id) = &snapshot.playlist_id {
+                let _ = self.playlist_finished.send(playlist_id.clone());
+            }
             if remove_files {
-                remove_outputs(job.snapshot().save_dir.into(), job.outputs()).await?;
+                remove_outputs(snapshot.save_dir.into(), job.outputs()).await?;
             }
             self.media.write().unwrap().remove(id);
+            if let Some(playlist_id) = snapshot.playlist_id {
+                let mut playlists = self.playlists.lock().unwrap();
+                if let Some(playlist) = playlists.get_mut(&playlist_id) {
+                    playlist.job_ids.retain(|job_id| job_id != id);
+                    if playlist.job_ids.is_empty() {
+                        playlists.remove(&playlist_id);
+                    }
+                }
+            }
         } else {
             self.torrent
                 .read()
@@ -680,19 +1177,9 @@ impl AppState {
 
     pub async fn reveal_in_explorer(&self, id: &str) -> Result<()> {
         let (root, files) = self.transfer_paths(id).await?;
-        let action = reveal_action(&root, files.first().map(String::as_str)).map_err(message)?;
-        let explorer = explorer_executable().map_err(message)?;
-        let mut command = StdCommand::new(explorer);
-        match action {
-            RevealAction::SelectFile(raw) => {
-                command.raw_arg(raw);
-            }
-            RevealAction::OpenDir(dir) => {
-                command.arg(dir);
-            }
-        }
-        command.spawn().map_err(message)?;
-        Ok(())
+        open_reveal_action(
+            reveal_action(&root, files.first().map(String::as_str)).map_err(message)?,
+        )
     }
 
     pub async fn get_toolchain_status(&self) -> ToolchainStatus {
@@ -868,7 +1355,7 @@ impl AppState {
                     transfer.source_url = browser_source_url(&transfer.source_url);
                     transfer.save_dir = String::new();
                 }
-                return Ok(NativeBridgeResponse::Status {
+                return bounded_native_status(NativeBridgeResponse::Status {
                     batch,
                     theme: settings.theme,
                     accent: settings.accent,
@@ -881,9 +1368,9 @@ impl AppState {
                 request.save_dir = None;
                 return self.add_http_download(request).await.map(created);
             }
-            ProbeMedia { url } => {
+            ProbeMedia { url, playlist } => {
                 return self
-                    .probe_media(&url, None)
+                    .probe_media(&url, playlist)
                     .await
                     .map(|probe| NativeBridgeResponse::MediaProbed { probe })
             }
@@ -965,6 +1452,59 @@ fn browser_source_url(raw: &str) -> String {
     }
 }
 
+fn bounded_native_status(mut response: NativeBridgeResponse) -> Result<NativeBridgeResponse> {
+    const BUDGET: usize = MAX_NATIVE_MESSAGE_BYTES - 16 * 1024;
+    if serde_json::to_vec(&response).map_err(message)?.len() < BUDGET {
+        return Ok(response);
+    }
+    let NativeBridgeResponse::Status { batch, .. } = &mut response else {
+        unreachable!();
+    };
+    let mut transfers = std::mem::take(&mut batch.transfers);
+    let mut size = serde_json::to_vec(&response).map_err(message)?.len();
+    let mut sizes = Vec::with_capacity(transfers.len());
+    for transfer in &mut transfers {
+        transfer.segments.clear();
+        transfer.error_message = transfer
+            .error_message
+            .take()
+            .filter(|text| text.len() <= 256);
+        transfer.completion_notice = transfer
+            .completion_notice
+            .take()
+            .filter(|text| text.len() <= 256);
+        let bytes = serde_json::to_vec(transfer).map_err(message)?.len() + 1;
+        size += bytes;
+        sizes.push(bytes);
+    }
+    // Snapshot order is oldest first. Preserve live transfers even when they
+    // predate completed ones. If live transfers alone fill a frame, keep the newest.
+    for terminal_only in [true, false] {
+        for (transfer, bytes) in transfers.iter().zip(&mut sizes) {
+            if size < BUDGET {
+                break;
+            }
+            if !terminal_only
+                || matches!(
+                    transfer.status,
+                    TransferStatus::Completed | TransferStatus::Failed | TransferStatus::Canceled
+                )
+            {
+                size -= std::mem::take(bytes);
+            }
+        }
+    }
+    let NativeBridgeResponse::Status { batch, .. } = &mut response else {
+        unreachable!();
+    };
+    batch.transfers = transfers
+        .into_iter()
+        .zip(sizes)
+        .filter_map(|(transfer, bytes)| (bytes > 0).then_some(transfer))
+        .collect();
+    Ok(response)
+}
+
 fn check_media_ip(ip: std::net::IpAddr, allow_loopback: bool) -> Result<()> {
     let mapped = matches!(ip, std::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some());
     if mapped || (is_private_or_loopback_ip(ip) && !(allow_loopback && ip.is_loopback())) {
@@ -1009,6 +1549,49 @@ fn is_pure_playlist_url(url: &Url) -> bool {
                 .any(|(key, value)| key == "list" && !value.is_empty()))
 }
 
+fn playlist_ranges(items: &str) -> Result<Vec<std::ops::RangeInclusive<u32>>> {
+    validate_playlist_items(items).map_err(message)?;
+    items
+        .split(',')
+        .map(|part| {
+            let (first, last) = part.split_once('-').unwrap_or((part, part));
+            Ok(first.parse::<u32>().map_err(message)?..=last.parse::<u32>().map_err(message)?)
+        })
+        .collect()
+}
+
+async fn run_media_probe(
+    toolchain_cache: &ToolchainCache,
+    settings: AppSettings,
+    resource_dir: Option<PathBuf>,
+    url: &str,
+    mut options: ProbeOptions,
+) -> Result<MediaProbeResult> {
+    let binary = discover_ytdlp_for_probe(toolchain_cache, settings, resource_dir).await?;
+    if let Some(cache_dir) = options.cache_dir.take() {
+        options.cache_dir = Some(
+            tokio::task::spawn_blocking(move || ensure_safe_tree(&cache_dir))
+                .await
+                .map_err(message)?
+                .map_err(message)?,
+        );
+    }
+    probe_url_with_binary(&binary, url, options)
+        .await
+        .map_err(message)
+}
+
+fn open_reveal_action(action: RevealAction) -> Result<()> {
+    let explorer = explorer_executable().map_err(message)?;
+    let mut command = StdCommand::new(explorer);
+    match action {
+        RevealAction::SelectFile(raw) => command.raw_arg(raw),
+        RevealAction::OpenDir(dir) => command.arg(dir),
+    };
+    command.spawn().map_err(message)?;
+    Ok(())
+}
+
 fn created(transfer_id: String) -> NativeBridgeResponse {
     NativeBridgeResponse::TransferCreated { transfer_id }
 }
@@ -1026,6 +1609,30 @@ pub fn expand_wildcard_urls(pattern: &str) -> Result<Vec<String>> {
 
 async fn stopped_signal(mut stop: watch::Receiver<bool>) {
     let _ = stop.wait_for(|stopped| *stopped).await;
+}
+
+async fn watch_playlists(
+    state: Weak<AppState>,
+    stop: watch::Receiver<bool>,
+    mut finished: mpsc::UnboundedReceiver<String>,
+) {
+    let stopped = stopped_signal(stop);
+    tokio::pin!(stopped);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut stopped => return,
+            Some(id) = finished.recv() => {
+                let Some(state) = state.upgrade() else { return };
+                let Ok(_operation) = state.operation().await else { return };
+                if state.playlists.lock().unwrap().contains_key(&id) {
+                    if let Err(error) = state.advance_playlist(&id, false).await {
+                        tracing::warn!(playlist_id = %id, %error, "could not advance playlist");
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn emit_telemetry(state: Arc<AppState>, stop: watch::Receiver<bool>) {
@@ -1367,6 +1974,38 @@ mod tests {
     }
 
     #[test]
+    fn probe_cache_expires_entries_before_evicting_the_oldest() {
+        let url = "https://example.com/video";
+        let probe = Arc::new(
+            slipstream_media::parse_ytdlp_probe_json(r#"{"title":"Video"}"#, url).unwrap(),
+        );
+        let past = Instant::now();
+        let key = |url: &str, playlist| ProbeKey::new(url, playlist, &HashMap::new()).unwrap();
+        let expired = key(url, true);
+        let oldest = key(url, false);
+        let mut cache = ProbeCache::default();
+        cache
+            .entries
+            .insert(expired.clone(), (past - PROBE_CACHE_TTL, probe.clone()));
+        cache.entries.insert(
+            oldest.clone(),
+            (past - Duration::from_secs(1), probe.clone()),
+        );
+        for i in 0..PROBE_CACHE_CAPACITY - 2 {
+            cache.insert(key(&format!("{url}/{i}"), false), probe.clone());
+        }
+        assert!(cache.get(&expired).is_none());
+        assert!(cache.get(&oldest).is_some());
+        cache.insert(key(&format!("{url}/new"), false), probe.clone());
+        assert_eq!(cache.entries.len(), PROBE_CACHE_CAPACITY);
+        assert!(cache.get(&oldest).is_some());
+        cache.insert(expired.clone(), probe);
+        assert_eq!(cache.entries.len(), PROBE_CACHE_CAPACITY);
+        assert!(cache.get(&oldest).is_none());
+        assert!(cache.get(&expired).is_some());
+    }
+
+    #[test]
     fn browser_status_source_url_strips_private_details() {
         assert_eq!(
             browser_source_url("https://user:pass@example.com:8443/a%20b?token=private#fragment"),
@@ -1377,6 +2016,77 @@ mod tests {
             "magnet:"
         );
         assert!(browser_source_url(r"C:\private\example.torrent").is_empty());
+    }
+
+    #[test]
+    fn native_status_budget_compacts_large_batches_and_keeps_live_transfers() {
+        let request = serde_json::from_value(serde_json::json!({
+            "url": "https://example.com/video", "embed_subtitles_langs": [],
+            "lossless_remux": false, "normalize_audio": false
+        }))
+        .unwrap();
+        let job = MediaJob::new(request, PathBuf::new(), None).unwrap();
+        let mut snapshot = job.snapshot();
+        snapshot.id = "oldest-live".into();
+        snapshot.status = TransferStatus::Active;
+        snapshot.error_message = Some("e".repeat(4096));
+        snapshot.completion_notice = Some("n".repeat(4096));
+        snapshot
+            .segments
+            .push(slipstream_protocol::SegmentSnapshot {
+                index: 0,
+                start_byte: 0,
+                end_byte: 99,
+                downloaded_bytes: 0,
+                speed_bps: 0,
+                state: slipstream_protocol::SegmentState::Active,
+            });
+        let mut transfers = vec![snapshot.clone()];
+        snapshot.status = TransferStatus::Completed;
+        for id in 0..2000 {
+            snapshot.id = format!("terminal-{id}");
+            transfers.push(snapshot.clone());
+        }
+        let response = bounded_native_status(NativeBridgeResponse::Status {
+            batch: TelemetryBatch {
+                aggregate_down_bps: 50,
+                aggregate_up_bps: 0,
+                active_count: 1,
+                active_threads: 1,
+                speed_limit_bps: None,
+                transfers,
+                timestamp: chrono::Utc::now(),
+            },
+            theme: slipstream_protocol::ThemeMode::System,
+            accent: slipstream_protocol::AccentMode::Blue,
+        })
+        .unwrap();
+        assert!(
+            serde_json::to_vec(&response).unwrap().len() < MAX_NATIVE_MESSAGE_BYTES - 16 * 1024
+        );
+        let NativeBridgeResponse::Status { batch, .. } = response else {
+            panic!("expected status")
+        };
+        assert_eq!(batch.aggregate_down_bps, 50);
+        assert_eq!(batch.transfers.first().unwrap().id, "oldest-live");
+        assert_eq!(batch.transfers.last().unwrap().id, "terminal-1999");
+        assert!(batch.transfers.len() < 2001);
+        assert!(batch.transfers.iter().all(|item| item.segments.is_empty()
+            && item.error_message.is_none()
+            && item.completion_notice.is_none()));
+    }
+
+    #[test]
+    fn probe_cache_keys_match_header_names_values_and_playlist_mode() {
+        let url = "https://example.com/video";
+        let key = |mode, name: &str, value: &str| {
+            ProbeKey::new(url, mode, &HashMap::from([(name.into(), value.into())])).unwrap()
+        };
+        let a = key(false, "user-agent", "fixture");
+        assert!(a == key(false, "User-Agent", "fixture"));
+        assert!(a != key(false, "User-Agent", "other"));
+        assert!(a != key(true, "User-Agent", "fixture"));
+        assert!(a != ProbeKey::new(url, false, &HashMap::new()).unwrap());
     }
 
     #[test]

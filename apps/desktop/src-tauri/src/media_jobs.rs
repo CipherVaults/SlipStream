@@ -1,6 +1,6 @@
 use crate::{
-    paths::{canonical_directory, confined_target, invalid},
-    tools::discover_media_toolchain,
+    paths::{canonical_directory, confined_target, ensure_safe_tree, invalid},
+    tools::{discover_media_toolchain_cached, ToolchainCache},
 };
 use chrono::Utc;
 use slipstream_media::{
@@ -25,9 +25,27 @@ use uuid::Uuid;
 
 pub(crate) type ScanRequest = (PathBuf, Vec<String>);
 
+pub(crate) struct PlaylistJobMeta {
+    pub id: String,
+    pub title: String,
+    pub index: Option<u32>,
+    pub total: Option<u32>,
+}
+
+pub(crate) struct MediaJobRunOptions {
+    pub settings: AppSettings,
+    pub resource_dir: Option<PathBuf>,
+    pub toolchain_cache: Arc<ToolchainCache>,
+    pub download: DownloadOptions,
+    pub scans: mpsc::Sender<ScanRequest>,
+    pub playlist_finished: mpsc::UnboundedSender<String>,
+}
+
 pub(crate) struct MediaJob {
     request: AddMediaDownloadRequest,
     directory: PathBuf,
+    // The coordinator owns the snapshot position and total for each child job.
+    coordinated_entry: bool,
     data: Mutex<MediaData>,
     run: AsyncMutex<Option<MediaRun>>,
 }
@@ -99,6 +117,7 @@ impl MediaJob {
     pub(crate) fn new(
         mut request: AddMediaDownloadRequest,
         directory: PathBuf,
+        playlist: Option<PlaylistJobMeta>,
     ) -> Result<Self, String> {
         let mut url = validate_http_url(&request.url).map_err(|error| error.to_string())?;
         let filename = request
@@ -131,6 +150,7 @@ impl MediaJob {
             format_tags.push("Normalized".into());
         }
         let now = Utc::now();
+        let coordinated_entry = playlist.as_ref().is_some_and(|meta| meta.index.is_some());
         let snapshot = TransferSnapshot {
             id: Uuid::new_v4().to_string(),
             kind: TransferKind::Media,
@@ -156,12 +176,18 @@ impl MediaJob {
             queue_id: "default".into(),
             error_message: None,
             completion_notice: None,
+            playlist_id: playlist.as_ref().map(|meta| meta.id.clone()),
+            playlist_title: playlist.as_ref().map(|meta| meta.title.clone()),
+            playlist_paused: None,
+            playlist_index: playlist.as_ref().and_then(|meta| meta.index),
+            playlist_total: playlist.and_then(|meta| meta.total),
             created_at: now,
             updated_at: now,
         };
         Ok(Self {
             request,
             directory,
+            coordinated_entry,
             data: Mutex::new(MediaData {
                 snapshot,
                 outputs: Vec::new(),
@@ -179,12 +205,11 @@ impl MediaJob {
         self.data.lock().unwrap().outputs.clone()
     }
 
-    pub(crate) async fn start(
-        self: &Arc<Self>,
-        settings: AppSettings,
-        resource_dir: Option<PathBuf>,
-        scans: mpsc::Sender<ScanRequest>,
-    ) -> Result<(), String> {
+    pub(crate) fn request(&self) -> &AddMediaDownloadRequest {
+        &self.request
+    }
+
+    pub(crate) async fn start(self: &Arc<Self>, options: MediaJobRunOptions) -> Result<(), String> {
         let mut run = self.run.lock().await;
         {
             let mut data = self.data.lock().unwrap();
@@ -204,6 +229,9 @@ impl MediaJob {
             snapshot.error_message = None;
             snapshot.completion_notice = None;
             snapshot.updated_at = Utc::now();
+            if self.request.download_playlist && !self.coordinated_entry {
+                snapshot.playlist_index = None;
+            }
             *playlist = PlaylistProgress::default();
         }
         if let Some(previous) = run.as_mut() {
@@ -211,8 +239,7 @@ impl MediaJob {
         }
         let (stop, stopped) = watch::channel(false);
         let job = self.clone();
-        let task =
-            tokio::spawn(async move { job.download(settings, resource_dir, scans, stopped).await });
+        let task = tokio::spawn(async move { job.download(options, stopped).await });
         *run = Some(MediaRun { stop, task });
         Ok(())
     }
@@ -253,16 +280,19 @@ impl MediaJob {
         Ok(())
     }
 
-    async fn download(
-        &self,
-        settings: AppSettings,
-        resource_dir: Option<PathBuf>,
-        scans: mpsc::Sender<ScanRequest>,
-        mut stopped: watch::Receiver<bool>,
-    ) {
+    async fn download(&self, options: MediaJobRunOptions, mut stopped: watch::Receiver<bool>) {
+        let MediaJobRunOptions {
+            settings,
+            resource_dir,
+            toolchain_cache,
+            download,
+            scans,
+            playlist_finished,
+        } = options;
         let (tx, mut rx) = mpsc::channel(16);
         let result = {
-            let operation = self.stage_download(settings, resource_dir, tx);
+            let operation =
+                self.stage_download(&toolchain_cache, settings, resource_dir, download, tx);
             tokio::pin!(operation);
             loop {
                 tokio::select! {
@@ -325,15 +355,30 @@ impl MediaJob {
                 snapshot.error_message = Some(error.to_string());
             }
         }
+        if let Some(id) = &snapshot.playlist_id {
+            let _ = playlist_finished.send(id.clone());
+        }
     }
 
     async fn stage_download(
         &self,
+        toolchain_cache: &ToolchainCache,
         settings: AppSettings,
         resource_dir: Option<PathBuf>,
+        mut options: DownloadOptions,
         progress: mpsc::Sender<MediaProgressEvent>,
     ) -> Result<(StagingDir, DownloadOutcome), String> {
-        let tools = discover_media_toolchain(settings, resource_dir).await?;
+        let tools =
+            discover_media_toolchain_cached(toolchain_cache, settings, resource_dir).await?;
+        if let Some(cache_dir) = options.cache_dir.take() {
+            options.cache_dir = Some(
+                tokio::task::spawn_blocking(move || ensure_safe_tree(&cache_dir))
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        canonical_directory(&self.directory).map_err(|error| error.to_string())?;
         let path = self
             .directory
             .join(format!(".slipstream-media-{}", Uuid::new_v4()));
@@ -342,10 +387,6 @@ impl MediaJob {
         let mut request = self.request.clone();
         request.save_dir = Some(stage.0.to_string_lossy().into_owned());
         let pipeline = MediaPipeline::new(tools, &stage.0).create_save_dir(false);
-        let options = DownloadOptions {
-            playlist: request.download_playlist || request.playlist_items.is_some(),
-            ..DownloadOptions::default()
-        };
         let outcome = pipeline
             .download_with_summary(&request, &options, Some(&progress))
             .await
@@ -365,12 +406,15 @@ impl MediaJob {
                 is_playlist,
                 playlist_count,
             } => {
-                if is_playlist || self.request.filename.is_none() {
+                if (is_playlist && !self.coordinated_entry) || self.request.filename.is_none() {
                     if let Ok(name) = sanitize_title_to_filename(&title, "txt") {
                         snapshot.filename = name.strip_suffix(".txt").unwrap_or(&name).to_owned();
                     }
                 }
                 playlist.count = playlist_count.filter(|&count| count > 0);
+                if is_playlist && !self.coordinated_entry {
+                    snapshot.playlist_total = playlist.count;
+                }
             }
             MediaProgressEvent::Downloading(progress) => {
                 update_download(snapshot, &progress, progress.percent(), false);
@@ -383,6 +427,10 @@ impl MediaJob {
             } => {
                 let (progress, percent) =
                     playlist.observe(playlist_index, playlist_count, format_id, progress);
+                if !self.coordinated_entry {
+                    snapshot.playlist_index = playlist.index;
+                    snapshot.playlist_total = playlist.count;
+                }
                 update_download(snapshot, &progress, percent, true);
             }
             MediaProgressEvent::Remuxing(_) => {
@@ -486,6 +534,58 @@ fn publish(root: &Path, stage: StagingDir, paths: &[PathBuf]) -> (Vec<String>, i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_only_child_keeps_coordinator_position_through_progress() {
+        let request = AddMediaDownloadRequest {
+            url: "https://example.com/playlist".into(),
+            format_id: None,
+            audio_only_preset: None,
+            target_container: None,
+            embed_subtitles_langs: Vec::new(),
+            lossless_remux: false,
+            normalize_audio: false,
+            save_dir: None,
+            filename: Some("12 - Video 12".into()),
+            playlist_items: Some("12".into()),
+            download_playlist: true,
+            max_height: None,
+            selected_entries: None,
+            playlist_folder_name: None,
+            headers: HashMap::new(),
+        };
+        let job = MediaJob::new(
+            request,
+            PathBuf::new(),
+            Some(PlaylistJobMeta {
+                id: "playlist".into(),
+                title: "Playlist".into(),
+                index: Some(3),
+                total: Some(3),
+            }),
+        )
+        .unwrap();
+        for event in [
+            MediaProgressEvent::Probing,
+            MediaProgressEvent::Probed {
+                title: "Playlist".into(),
+                is_playlist: true,
+                playlist_count: Some(1),
+            },
+            MediaProgressEvent::PlaylistDownloading {
+                progress: DownloadProgress::default(),
+                playlist_index: 1,
+                playlist_count: Some(1),
+                format_id: None,
+            },
+            MediaProgressEvent::Completed { paths: Vec::new() },
+        ] {
+            job.progress(event);
+            let snapshot = job.snapshot();
+            assert_eq!(snapshot.playlist_index, Some(3));
+            assert_eq!(snapshot.playlist_total, Some(3));
+        }
+    }
 
     #[test]
     fn playlist_progress_advances_during_final_items_audio_stream() {

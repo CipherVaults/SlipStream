@@ -9,10 +9,11 @@ use std::{
 };
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use slipstream_media::{
-    probe_url, DownloadOptions, LocalMediaOptions, MediaError, MediaMetadata, MediaPipeline,
-    MediaProgressEvent, MediaToolchain, ProbeOptions, ResolvedBinary, SubtitleInput,
-    ToolchainConfig,
+    discover_ytdlp_only, probe_url, probe_url_with_binary, DownloadOptions, LocalMediaOptions,
+    MediaError, MediaMetadata, MediaPipeline, MediaProgressEvent, MediaToolchain, ProbeOptions,
+    ResolvedBinary, SubtitleInput, ToolchainConfig,
 };
 use slipstream_protocol::{AddMediaDownloadRequest, AudioPreset, MediaContainer, TransferStatus};
 use tokio::{
@@ -105,7 +106,7 @@ async fn packet_hashes(binary: &ResolvedBinary, path: &Path, selector: &str) -> 
         .collect()
 }
 
-async fn check_playlist_recovery(root: &Path, ffmpeg: &ResolvedBinary, ffprobe: &ResolvedBinary) {
+async fn build_playlist_tool(root: &Path) -> PathBuf {
     let executable = root.join("playlist-tool.exe");
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/playlist_tool.rs");
     let status = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
@@ -117,6 +118,11 @@ async fn check_playlist_recovery(root: &Path, ffmpeg: &ResolvedBinary, ffprobe: 
         .await
         .unwrap();
     assert!(status.success());
+    executable
+}
+
+async fn check_playlist_recovery(root: &Path, ffmpeg: &ResolvedBinary, ffprobe: &ResolvedBinary) {
+    let executable = build_playlist_tool(root).await;
     let tools = MediaToolchain::discover(ToolchainConfig {
         ytdlp_path: Some(executable),
         ffmpeg_path: Some(ffmpeg.path.clone()),
@@ -142,6 +148,9 @@ async fn check_playlist_recovery(root: &Path, ffmpeg: &ResolvedBinary, ffprobe: 
             playlist_items: None,
             download_playlist: true,
             max_height: None,
+            selected_entries: None,
+            playlist_folder_name: None,
+            headers: Default::default(),
         };
         let outcome = pipeline
             .download_with_summary(&request, &DownloadOptions::default(), None)
@@ -175,6 +184,142 @@ async fn check_playlist_recovery(root: &Path, ffmpeg: &ResolvedBinary, ffprobe: 
 }
 
 #[tokio::test]
+async fn fast_probe_and_single_video_download_reuse_matching_probe() {
+    let temp = TempDir::new();
+    let executable = build_playlist_tool(&temp.0).await;
+    let binary = discover_ytdlp_only(ToolchainConfig {
+        ytdlp_path: Some(executable.clone()),
+        ffmpeg_path: Some(temp.0.join("missing-ffmpeg.exe")),
+        ffprobe_path: Some(temp.0.join("missing-ffprobe.exe")),
+        ..ToolchainConfig::default()
+    })
+    .await
+    .unwrap();
+    let cache_dir = temp.0.join("probe-cache");
+    let request = AddMediaDownloadRequest {
+        url: "https://example.com/video".into(),
+        format_id: None,
+        audio_only_preset: None,
+        target_container: None,
+        embed_subtitles_langs: Vec::new(),
+        lossless_remux: false,
+        normalize_audio: false,
+        save_dir: None,
+        filename: None,
+        playlist_items: None,
+        download_playlist: false,
+        max_height: Some(720),
+        selected_entries: None,
+        playlist_folder_name: None,
+        headers: [("user-agent".into(), "SlipStream Test".into())].into(),
+    };
+    let mut cached = probe_url_with_binary(
+        &binary,
+        &request.url,
+        ProbeOptions {
+            cache_dir: Some(cache_dir.clone()),
+            headers: request.headers.clone(),
+            ..ProbeOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(cached.title, "Fresh video");
+    let marker = temp.0.join("probed");
+    fs::remove_file(&marker).unwrap();
+    cached.title = "Cached video".into();
+    cached.source_url = "https://EXAMPLE.com:443/video".into();
+    let tools = MediaToolchain::discover(ToolchainConfig {
+        ytdlp_path: Some(executable.clone()),
+        ffmpeg_path: Some(executable.clone()),
+        ffprobe_path: Some(executable),
+        ..ToolchainConfig::default()
+    })
+    .await
+    .unwrap();
+
+    for (name, source_url, is_playlist, expected_file, expected_probe) in [
+        (
+            "match",
+            cached.source_url.as_str(),
+            false,
+            "Cached video.mp4",
+            false,
+        ),
+        (
+            "url-mismatch",
+            "https://example.com/another",
+            false,
+            "Fresh video.mp4",
+            true,
+        ),
+        (
+            "mode-mismatch",
+            cached.source_url.as_str(),
+            true,
+            "Fresh video.mp4",
+            true,
+        ),
+    ] {
+        let mut pre_probe = cached.clone();
+        pre_probe.source_url = source_url.into();
+        pre_probe.is_playlist = is_playlist;
+        let pipeline = MediaPipeline::new(tools.clone(), temp.0.join(name));
+        let paths = pipeline
+            .download(
+                &request,
+                &DownloadOptions {
+                    cache_dir: Some(cache_dir.clone()),
+                    pre_probe: Some(pre_probe),
+                    ..DownloadOptions::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(paths[0].file_name().unwrap(), expected_file);
+        assert_eq!(marker.exists(), expected_probe, "{name}");
+        if expected_probe {
+            fs::remove_file(&marker).unwrap();
+        }
+    }
+
+    let request = AddMediaDownloadRequest {
+        filename: Some("02 - Transport Stream".into()),
+        download_playlist: true,
+        playlist_items: Some("2".into()),
+        ..request
+    };
+    let directory = temp.0.join("Numbered playlist");
+    let result = MediaPipeline::new(tools, &directory)
+        .download(
+            &request,
+            &DownloadOptions {
+                pre_probe: Some(cached),
+                cache_dir: Some(cache_dir),
+                ..DownloadOptions::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(temp.0.join("playlist-probed").is_file());
+    assert_eq!(
+        result,
+        [fs::canonicalize(directory)
+            .unwrap()
+            .join("02 - Transport Stream.webm")]
+    );
+    assert_eq!(fs::read(&result[0]).unwrap(), b"single playlist item");
+}
+
+fn sha256(path: &Path) -> String {
+    let mut hash = Sha256::new();
+    std::io::copy(&mut fs::File::open(path).unwrap(), &mut hash).unwrap();
+    hex::encode(hash.finalize())
+}
+
+#[tokio::test]
 async fn real_ffmpeg_pipeline() {
     let tools = match MediaToolchain::discover_ffmpeg_only(ToolchainConfig::default()).await {
         Ok(tools) => tools,
@@ -189,7 +334,7 @@ async fn real_ffmpeg_pipeline() {
         return;
     };
     assert!(tools.ytdlp().is_none());
-    assert_eq!(tools.ffmpeg().sha256.len(), 64);
+    assert!(tools.ffmpeg().sha256.is_empty());
     assert!(tools.ffmpeg().version.starts_with("ffmpeg version"));
     assert!(ffprobe.version.starts_with("ffprobe version"));
     let ffmpeg_bin = tools.ffmpeg().clone();
@@ -543,15 +688,18 @@ async fn real_ffmpeg_pipeline() {
     assert_eq!(stream(&details, "audio")["codec_name"], "aac");
     assert_eq!(stream(&details, "video")["disposition"]["attached_pic"], 1);
 
+    let ffmpeg_pin = sha256(&ffmpeg_bin.path);
+    let ffprobe_pin = sha256(&ffprobe.path);
     let pinned_tools = MediaToolchain::discover_ffmpeg_only(ToolchainConfig {
         ffmpeg_path: Some(ffmpeg_bin.path.clone()),
-        expected_ffmpeg_sha256: Some(ffmpeg_bin.sha256.clone()),
-        expected_ffprobe_sha256: Some(ffprobe.sha256.clone()),
+        expected_ffmpeg_sha256: Some(ffmpeg_pin.clone()),
+        expected_ffprobe_sha256: Some(ffprobe_pin.clone()),
         ..ToolchainConfig::default()
     })
     .await
     .unwrap();
-    assert_eq!(pinned_tools.ffmpeg().sha256, ffmpeg_bin.sha256);
+    assert_eq!(pinned_tools.ffmpeg().sha256, ffmpeg_pin);
+    assert_eq!(pinned_tools.ffprobe().unwrap().sha256, ffprobe_pin);
 
     for (preset, extension, codec) in [
         (AudioPreset::Mp3_320, "mp3", "mp3"),
@@ -795,7 +943,7 @@ async fn real_ytdlp_probe_and_download_loopback() {
     .await;
     let url = format!("{base}/synthetic_clip.mp4");
 
-    let probe_res = probe_url(&tools, &url, ProbeOptions { playlist: false })
+    let probe_res = probe_url(&tools, &url, ProbeOptions::default())
         .await
         .unwrap();
     assert!(!probe_res.is_playlist);
@@ -817,6 +965,9 @@ async fn real_ytdlp_probe_and_download_loopback() {
         playlist_items: None,
         download_playlist: false,
         max_height: None,
+        selected_entries: None,
+        playlist_folder_name: None,
+        headers: Default::default(),
     };
     let (download, events) = tokio::join!(
         async {

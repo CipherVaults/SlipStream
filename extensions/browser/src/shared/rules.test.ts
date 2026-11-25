@@ -1,9 +1,9 @@
 import type { MediaProbeResult } from "@slipstream/ipc-types";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { canAttributeTab, defaults, sameDownloadOrigin, shouldIntercept } from "./downloads";
-import { ObservedNetwork } from "./network";
+import { isPublicHttpUrl, ObservedNetwork } from "./network";
 import { isRefreshableHttpTransfer } from "./state";
-import { isMediaStream, mediaMime, scopedHeaders, selectPillFormatId, StreamNavigationState } from "./streams";
+import { isMediaStream, mediaMime, parseHlsMaster, scopedHeaders, selectPillFormatId, StreamNavigationState } from "./streams";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -23,11 +23,62 @@ describe("media streams", () => {
     expect(isMediaStream("javascript:alert(1)", "video/mp4")).toBe(false);
     expect(mediaMime([{ name: "Content-Type", value: "Video/MP4; charset=UTF-8" }])).toBe("video/mp4");
   });
+
+  it("filters segment paths, transport streams, range parameters and payloads below 300 KB", () => {
+    for (const path of ["seg.ts", "seg.M4S", "file.mp4?range=0-500", "file.mp4?ByteStart=0", "file.mp4?byteend=500"]) {
+      expect(isMediaStream("https://media.example/" + path, "video/mp4", 500_000)).toBe(false);
+    }
+    expect(isMediaStream("https://media.example/chunk", "video/MP2T", 500_000)).toBe(false);
+    expect(isMediaStream("https://media.example/file.mp4", "", 299_999)).toBe(false);
+    expect(isMediaStream("https://media.example/file.mp4", "", 300_000)).toBe(true);
+    expect(isMediaStream("https://media.example/master.m3u8", "", 100)).toBe(true);
+    expect(isMediaStream("https://media.example/manifest", "application/dash+xml", 100)).toBe(true);
+  });
+
+  it("parses, resolves, sorts and deduplicates HLS variants by quality", () => {
+    const text = [
+      "#EXTM3U",
+      "#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720",
+      "720/index.m3u8",
+      '#EXT-X-STREAM-INF:CODECS="avc1.640028,mp4a.40.2",BANDWIDTH=8000000,RESOLUTION=1920x1080',
+      "../1080.m3u8",
+      "#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080",
+      "/lower-1080.m3u8",
+      "#EXT-X-STREAM-INF:BANDWIDTH=9000000,RESOLUTION=3840x2160",
+      "javascript:alert(1)",
+      "#EXT-X-STREAM-INF:RESOLUTION=3840x2160",
+      "no-bandwidth.m3u8",
+      "#EXT-X-STREAM-INF:BANDWIDTH=0,RESOLUTION=3840x2160",
+      "zero.m3u8",
+      "#EXT-X-STREAM-INF:BANDWIDTH=not-a-number",
+      "invalid.m3u8",
+    ].join("\r\n");
+    const base = "https://media.example/hls/master.m3u8";
+    expect(parseHlsMaster(text, base)).toEqual([
+      { url: "https://media.example/1080.m3u8", height: 1080, bandwidth: 8_000_000, label: "1080p · HLS" },
+      { url: "https://media.example/hls/720/index.m3u8", height: 720, bandwidth: 2_000_000, label: "720p · HLS" },
+    ]);
+    expect(parseHlsMaster("#EXTM3U\n#EXTINF:4,\nsegment.ts", base)).toEqual([]);
+  });
+
+  it("rejects local, private and noncanonical destinations before fetching manifests", () => {
+    for (const host of [
+      "localhost.", "nested.localhost", "intranet", "dev.local", "0.1.2.3", "127.99.1.2", "2130706433",
+      "10.12.0.3", "172.31.1.2", "192.168.1.1", "169.254.169.254", "100.127.1.2",
+      "[::1]", "[::ffff:8.8.8.8]", "[fc00::1]", "[fd00::1]", "[fe90::1]",
+    ]) expect(isPublicHttpUrl("https://" + host + "/master.m3u8")).toBe(false);
+    expect(isPublicHttpUrl("https://user@media.example/master.m3u8")).toBe(false);
+    expect(isPublicHttpUrl("https://cdn.media.example/master.m3u8")).toBe(true);
+    expect(isPublicHttpUrl("http://8.8.8.8/master.m3u8")).toBe(true);
+    expect(isPublicHttpUrl("https://[2606:4700::1111]/master.m3u8")).toBe(true);
+  });
 });
 
 describe("header handoff", () => {
   const page = "https://media.example/player";
+  const origin = "https://media.example";
   const stream = "https://media.example/stream.m3u8";
+  const cdn = "https://cdn.media.example/stream.mp4";
   const headers = [
     { name: "cOoKiE", value: "session=test" },
     { name: "referer", value: page },
@@ -36,6 +87,8 @@ describe("header handoff", () => {
     { name: "Other", value: "test" },
   ];
   const expected = { Cookie: "session=test", Referer: page, "User-Agent": "Example Agent" };
+  const withOrigin = [...headers, { name: "Origin", value: origin }];
+  const cdnHeaders = { Referer: page, Origin: origin, "User-Agent": "Example Agent" };
 
   it("returns only allowed same-origin headers and checks referrer origin independently", () => {
     expect(scopedHeaders(stream, page, "https://media.example", headers)).toEqual(expected);
@@ -43,12 +96,21 @@ describe("header handoff", () => {
     expect(scopedHeaders(stream, page, page, [{ name: "Cookie", value: "a=b\r\nInjected: yes" }])).toEqual({});
   });
 
-  it.each(["http://media.example/stream", "https://media.example:8443/stream", "https://cdn.media.example/stream"])(
-    "strips every captured header for %s", (url) => {
-      expect(scopedHeaders(url, page, page, headers)).toEqual({});
-      expect(scopedHeaders(stream, page, url, headers)).toEqual({});
+  it.each([cdn, "https://media.example:8443/stream"])(
+    "passes anti-hotlink headers without credentials for %s", (url) => {
+      expect(scopedHeaders(url, page, page, withOrigin)).toEqual(cdnHeaders);
+      expect(scopedHeaders(url, page, "https://other.example", withOrigin)).toEqual({});
     },
   );
+
+  it("accepts a target-origin Referer and strips its fragment", () => {
+    expect(scopedHeaders(cdn, page, page, [{ name: "Referer", value: cdn + "#secret" }])).toEqual({ Referer: cdn });
+    expect(scopedHeaders(cdn, page, page, [{ name: "Referer", value: "https://user:secret@media.example/player" }])).toEqual({});
+  });
+
+  it("drops page Referer, Origin and credentials on HTTPS to HTTP downgrade", () => {
+    expect(scopedHeaders("http://media.example/stream", page, page, withOrigin)).toEqual({ "User-Agent": "Example Agent" });
+  });
 
   it("isolates tabs, URL matches, redirects and navigation", () => {
     const network = new ObservedNetwork();
@@ -58,14 +120,63 @@ describe("header handoff", () => {
     expect(network.headers(7, stream, page)).toEqual({});
     expect(network.headers(8, stream + "?other", page)).toEqual({});
     expect(network.headers(8, stream, "https://another.example")).toEqual({});
-    const redirect = "https://other.example/stream.mp4";
-    network.recordHeaders({ ...request, url: redirect }, headers);
-    expect(network.headers(8, redirect, page)).toEqual({});
-    expect(network.recordStream({ ...request, url: redirect }, page, [])).toBe(true);
-    expect(network.stream(8, page)?.url).toBe(redirect);
+    network.recordHeaders({ ...request, url: cdn, incognito: true }, withOrigin);
+    network.recordHeaders({ ...request, url: cdn, documentUrl: page, initiator: "https://other.example" }, withOrigin);
+    expect(network.headers(8, cdn, page)).toEqual({});
+    network.recordHeaders({ ...request, url: cdn }, withOrigin);
+    expect(network.headers(8, cdn, page)).toEqual(cdnHeaders);
+    expect(network.headers(8, stream, page)).toEqual({});
+    expect(network.headers(8, cdn + "?different", page)).toEqual({});
+    expect(network.recordStream({ ...request, url: cdn }, page, [])).toBe(true);
+    expect(network.stream(8, page)?.url).toBe(cdn);
     network.clear(8);
     expect(network.stream(8, page)).toBeUndefined();
-    expect(network.headers(8, stream, page)).toEqual({});
+    expect(network.headers(8, cdn, page)).toEqual({});
+  });
+
+  it("scopes media headers to the frame origin and excludes Cookie and authorization", () => {
+    const network = new ObservedNetwork();
+    const top = "https://container.example";
+    const request = { tabId: 8, frameId: 2, requestId: "1", url: stream, initiator: page };
+    const values = [...headers, { name: "Origin", value: "https://media.example" }, { name: "Accept-Language", value: "en-US" }];
+    network.recordHeaders(request, values, top);
+    expect(network.mediaHeaders(8, stream, top, 2, page)).toEqual({
+      Referer: page, Origin: "https://media.example", "User-Agent": "Example Agent", "Accept-Language": "en-US",
+    });
+    expect(network.mediaHeaders(8, stream, top, 3, page)).toEqual({});
+    expect(network.mediaHeaders(8, stream, top, 2, top)).toEqual({});
+    expect(network.mediaHeaders(8, stream, top)).toEqual({});
+    expect(network.headers(8, stream, top)).toEqual({});
+    expect(scopedHeaders(stream, page, page, [{ name: "Origin", value: "https://other.example" }], true)).toEqual({});
+    network.recordHeaders({ ...request, frameId: 0, requestId: "2" }, values, page);
+    expect(network.headers(8, stream, page)).toEqual({ ...expected, Origin: "https://media.example" });
+    expect(network.mediaHeaders(8, stream, page)).not.toHaveProperty("Cookie");
+    network.recordHeaders({ ...request, url: cdn }, values, top);
+    expect(network.mediaHeaders(8, cdn, top, 2, page)).toEqual({ ...cdnHeaders, "Accept-Language": "en-US" });
+    expect(network.mediaHeaders(8, cdn, "https://other.example", 2, page)).toEqual({});
+  });
+
+  it("isolates stream observations by frame, top origin and incognito and keeps parsed HLS variants", () => {
+    const network = new ObservedNetwork();
+    const top = "https://container.example";
+    const request = { tabId: 8, frameId: 2, requestId: "master", url: stream, initiator: page };
+    expect(network.recordStream({ ...request, incognito: true }, top, [])).toBe(false);
+    expect(network.recordStream(request, top, [])).toBe(true);
+    const master = network.stream(8, top, 2, page)!;
+    expect(master.url).toBe(stream);
+    expect(network.stream(8, top, 3, page)).toBeUndefined();
+    expect(network.stream(8, top)).toBeUndefined();
+    expect(network.stream(8, "https://other.example", 2, page)).toBeUndefined();
+    const child = "https://media.example/720.m3u8";
+    network.recordStream({ ...request, requestId: "variant", url: child }, top, []);
+    expect(network.setHlsVariants(master, [{ url: child, height: 720, label: "720p · HLS" }], false)).toBe(true);
+    expect(network.stream(8, top, 2, page)?.variants?.[0].url).toBe(child);
+    network.recordStream({ ...request, frameId: 4, initiator: top }, top, []);
+    expect(network.stream(8, top)?.frameId).toBe(4);
+    expect(network.stream(8, top, 5, top)).toBeUndefined();
+    network.clear(8, 4);
+    expect(network.stream(8, top, 4, top)).toBeUndefined();
+    expect(network.stream(8, top, 2, page)?.variants?.[0].url).toBe(child);
   });
 });
 
@@ -98,7 +209,7 @@ describe("download interception", () => {
     expect(shouldIntercept(item, { ...settings, excludedSites: ["dn.example"] }, context)).toBe(true);
   });
 
-  it("rejects incognito, container, and cross-origin redirect header attribution", () => {
+  it("checks browser contexts and compares the redirect's endpoint origins", () => {
     expect(canAttributeTab({ referrer: "https://source.example/p", incognito: true }, { url: "https://source.example/p", incognito: false })).toBe(false);
     expect(canAttributeTab({ referrer: "https://source.example/p", incognito: true }, { url: "https://source.example/p" })).toBe(false);
     expect(canAttributeTab({ referrer: "https://source.example/p" }, { url: "https://source.example/p", incognito: false })).toBe(false);

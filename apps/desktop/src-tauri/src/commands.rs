@@ -85,6 +85,21 @@ pub(crate) async fn resume_transfer(state: Daemon<'_>, transfer_id: String) -> R
 }
 
 #[tauri::command(rename_all = "snake_case")]
+pub(crate) async fn pause_playlist(state: Daemon<'_>, playlist_id: String) -> Result<()> {
+    state.pause_playlist(&playlist_id).await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub(crate) async fn resume_playlist(state: Daemon<'_>, playlist_id: String) -> Result<()> {
+    state.resume_playlist(&playlist_id).await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub(crate) fn reveal_playlist_folder(state: Daemon<'_>, playlist_id: String) -> Result<()> {
+    state.reveal_playlist_folder(&playlist_id)
+}
+
+#[tauri::command(rename_all = "snake_case")]
 pub(crate) async fn cancel_transfer(
     state: Daemon<'_>,
     transfer_id: String,
@@ -140,6 +155,7 @@ pub(crate) async fn get_toolchain_status(state: Daemon<'_>) -> Result<ToolchainS
 #[tauri::command(rename_all = "snake_case")]
 pub(crate) async fn update_ytdlp(state: Daemon<'_>) -> Result<ToolchainStatus> {
     tools::update_ytdlp_managed().await?;
+    state.invalidate_toolchain_cache().await;
     Ok(state.get_toolchain_status().await)
 }
 

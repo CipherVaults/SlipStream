@@ -38,6 +38,12 @@ export const desktop = {
     command<void>("pause_transfer", { transfer_id }, () => demo.pause(transfer_id)),
   resumeTransfer: (transfer_id: string) =>
     command<void>("resume_transfer", { transfer_id }, () => demo.resume(transfer_id)),
+  pausePlaylist: (playlist_id: string) =>
+    command<void>("pause_playlist", { playlist_id }, () => demo.pausePlaylist(playlist_id)),
+  resumePlaylist: (playlist_id: string) =>
+    command<void>("resume_playlist", { playlist_id }, () => demo.resumePlaylist(playlist_id)),
+  revealPlaylistFolder: (playlist_id: string) =>
+    command<void>("reveal_playlist_folder", { playlist_id }, () => undefined),
   cancelTransfer: (transfer_id: string, delete_files = false) =>
     command<void>("cancel_transfer", { transfer_id, delete_files }, () => demo.cancel(transfer_id)),
   refreshDownloadUrl: (request: RefreshDownloadUrlRequest) =>

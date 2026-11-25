@@ -74,13 +74,20 @@ function Overview({ transfer, samples, preview, onAction }: {
     ["Integrity", integrity, transfer.sha256_verified === false ? "error-text" : "integrity-ok"],
     ["Save Folder", parentFolder(transfer.save_dir) || "Default"],
   ];
+  const playlistTitle = transfer.playlist_title?.trim() || "Playlist";
+  const playlistPosition = transfer.playlist_index != null
+    ? "#" + transfer.playlist_index + (transfer.playlist_total != null ? " of " + transfer.playlist_total : "") : "";
 
   return <div className="insp-content">
     <div className="kv-grid tabular">
-      {specs.map(([label, value, tone]) => <div className="kv-card" key={label}>
+      {specs.map(([label, value, tone]) => <div className={"kv-card" + (label === "Save Folder" && transfer.playlist_id ? " playlist-save-folder" : "")} key={label}>
         <span className="kv-label">{label}</span><span className={"kv-val " + (tone ?? "")}
           title={label === "Save Folder" ? transfer.save_dir : value}>{value}</span>
       </div>)}
+      {transfer.playlist_id && <div className="kv-card playlist-spec">
+        <span className="kv-label">Playlist</span>
+        <span className="kv-val" title={playlistTitle}>{playlistPosition && playlistPosition + " · "}{playlistTitle}</span>
+      </div>}
     </div>
     <div className="speed-card">
       <div className="speed-card-top"><span className="speed-card-title">Live Transfer Speed</span>

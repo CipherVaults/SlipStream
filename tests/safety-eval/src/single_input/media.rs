@@ -355,3 +355,18 @@ pub(super) fn run(suite: &mut Suite) {
         }
     }
 }
+
+#[cfg(test)]
+#[test]
+fn rejects_cache_expansion_and_unsafe_media_headers() {
+    for component in ["%TEMP%", "~", "$HOME"] {
+        let path = std::env::temp_dir().join(component);
+        rejected(BuildYtDlpArgs::probe(false).cache_dir(&path), component).unwrap();
+    }
+    for value in ["https://example.com/path", "https://example.com?query"] {
+        rejected(BuildYtDlpArgs::probe(false).header("Origin", value), value).unwrap();
+    }
+    for name in ["Cookie", "Authorization"] {
+        rejected(BuildYtDlpArgs::probe(false).header(name, "fixture"), name).unwrap();
+    }
+}

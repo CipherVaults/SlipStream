@@ -999,6 +999,127 @@ async fn queue_caps_promote_waiters_and_emit_post_actions() {
 }
 
 #[tokio::test]
+async fn sends_default_http_headers_and_preserves_caller_values() {
+    let data = payload(KIB, 12);
+    let server = Server::new(move |req| Reply::resource(req, &data, "\"headers\"")).await;
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    let default_id = engine
+        .add_http_download(request(server.url("/default"), None, 1))
+        .await
+        .unwrap();
+    completed(&engine, &default_id).await;
+    let mut custom = request(server.url("/custom"), None, 1);
+    custom
+        .headers
+        .insert("uSeR-aGeNt".into(), "Fixture Player/1.0".into());
+    custom.headers.insert("Accept".into(), "video/mp4".into());
+    let custom_id = engine.add_http_download(custom).await.unwrap();
+    completed(&engine, &custom_id).await;
+
+    let requests = server.requests();
+    for (path, accept, user_agent_prefix) in [
+        ("/default", "*/*", "Mozilla/5.0 "),
+        ("/custom", "video/mp4", "Fixture Player/1.0"),
+    ] {
+        let matching: Vec<_> = requests.iter().filter(|req| req.path == path).collect();
+        assert!(matching.iter().any(|req| req.method == "GET"));
+        for req in matching {
+            assert_eq!(req.header("accept"), Some(accept));
+            assert_eq!(req.header("accept-encoding"), Some("identity"));
+            let user_agent = req.header("user-agent").unwrap();
+            if path == "/custom" {
+                assert_eq!(user_agent, user_agent_prefix);
+            } else {
+                assert!(user_agent.starts_with(user_agent_prefix));
+            }
+        }
+    }
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn retries_rejected_range_probes_with_one_plain_get() {
+    let data = payload(4 * KIB, 13);
+    let source = Arc::clone(&data);
+    let server = Server::new(move |req| {
+        if req.method == "HEAD" {
+            return Reply::empty("403 Forbidden");
+        }
+        if req.header("range").is_some() {
+            let status = match req.path.as_str() {
+                "/400" => "400 Bad Request",
+                "/403" | "/206" | "/partial" => "403 Forbidden",
+                "/405" => "405 Method Not Allowed",
+                "/416" => "416 Range Not Satisfiable",
+                _ => unreachable!(),
+            };
+            let mut reply = Reply::empty(status);
+            if req.path == "/416" {
+                reply
+                    .headers
+                    .push(("Content-Range", format!("bytes */{}", source.len())));
+            }
+            return reply;
+        }
+        let mut reply = Reply::resource(req, &source, "\"signed-cdn\"");
+        if matches!(req.path.as_str(), "/206" | "/partial") {
+            let length = source.len();
+            let total = if req.path == "/206" {
+                length
+            } else {
+                length + 1
+            };
+            reply.status = "206 Partial Content";
+            reply
+                .headers
+                .push(("Content-Range", format!("bytes 0-{}/{total}", length - 1)));
+        }
+        reply
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    for path in ["/400", "/403", "/405", "/416", "/206"] {
+        let id = engine
+            .add_http_download(request(server.url(path), None, 4))
+            .await
+            .unwrap();
+        let done = completed(&engine, &id).await;
+        assert_eq!(done.total_bytes, Some(data.len() as u64));
+        assert_eq!(done.segments.len(), 1);
+        assert!(!done.resumable);
+        dir.assert_output(&done.filename, &data).await;
+        let requests = server.requests();
+        let methods_and_ranges: Vec<_> = requests
+            .iter()
+            .filter(|req| req.path == path)
+            .map(|req| (req.method.as_str(), req.header("range")))
+            .collect();
+        assert_eq!(
+            methods_and_ranges,
+            [
+                ("HEAD", None),
+                ("GET", Some("bytes=0-0")),
+                ("GET", None),
+                ("GET", None),
+            ]
+        );
+    }
+    let partial = engine
+        .add_http_download(request(server.url("/partial"), None, 4))
+        .await
+        .unwrap();
+    let failed = failed(&engine, &partial).await;
+    assert!(failed
+        .error_message
+        .unwrap()
+        .contains("incomplete response to plain GET"));
+    assert!(!dir.config().default_download_dir.join("partial").exists());
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn probes_unknown_lengths_empty_files_and_utf8_disposition() {
     let data = payload(90 * KIB, 12);
     let source = Arc::clone(&data);

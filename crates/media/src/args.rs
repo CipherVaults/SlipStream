@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ffi::OsString,
     path::{Path, PathBuf},
 };
@@ -11,6 +12,8 @@ const YTDLP_FLAGS: &[&str] = &[
     "--ignore-config",
     "--no-config-locations",
     "--no-cache-dir",
+    "--cache-dir",
+    "--add-header",
     "--no-exec",
     "--no-warnings",
     "--dump-single-json",
@@ -253,6 +256,48 @@ pub struct BuildYtDlpArgs {
     args: Vec<OsString>,
 }
 
+fn media_header<'a>(name: &str, value: &'a str) -> Result<(&'static str, &'a str), MediaError> {
+    let name = ["Referer", "Origin", "User-Agent", "Accept-Language"]
+        .into_iter()
+        .find(|allowed| allowed.eq_ignore_ascii_case(name))
+        .ok_or_else(|| MediaError::argument("yt-dlp header", name))?;
+    if value.is_empty() || value.len() > 2048 || value.bytes().any(|b| b.is_ascii_control()) {
+        return Err(MediaError::argument("yt-dlp header value", name));
+    }
+    if name == "Origin" {
+        let value = value.trim();
+        if validate_http_url(value)?.origin().ascii_serialization() != value {
+            return Err(MediaError::argument("yt-dlp header value", name));
+        }
+        return Ok((name, value));
+    }
+    if name == "Referer" {
+        validate_http_url(value)?;
+    }
+    Ok((name, value))
+}
+
+pub fn canonical_media_headers(
+    headers: &HashMap<String, String>,
+) -> Result<Vec<(String, String)>, MediaError> {
+    let mut canonical = headers
+        .iter()
+        .map(|(name, value)| media_header(name, value))
+        .collect::<Result<Vec<_>, _>>()?;
+    canonical.sort_unstable();
+    canonical.dedup();
+    if let Some(duplicate) = canonical.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(MediaError::argument(
+            "duplicate yt-dlp header",
+            duplicate[0].0,
+        ));
+    }
+    Ok(canonical
+        .into_iter()
+        .map(|(name, value)| (name.into(), value.into()))
+        .collect())
+}
+
 impl BuildYtDlpArgs {
     pub fn probe(playlist: bool) -> Self {
         let mut builder = Self::base();
@@ -358,6 +403,38 @@ impl BuildYtDlpArgs {
             ));
         }
         self.option("--ffmpeg-location", binary);
+        Ok(self)
+    }
+
+    pub fn cache_dir(mut self, dir: &Path) -> Result<Self, MediaError> {
+        let dir = sidecar_path(dir)?;
+        let raw = dir.to_string_lossy();
+        if !dir.is_absolute()
+            || raw.contains(['%', '$'])
+            || dir
+                .components()
+                .any(|part| part.as_os_str().to_string_lossy().starts_with('~'))
+        {
+            return Err(MediaError::argument(
+                "yt-dlp cache directory",
+                dir.to_string_lossy(),
+            ));
+        }
+        self.args.retain(|arg| arg != "--no-cache-dir");
+        self.option("--cache-dir", dir);
+        Ok(self)
+    }
+
+    pub fn header(mut self, name: &str, value: &str) -> Result<Self, MediaError> {
+        let (name, value) = media_header(name, value)?;
+        self.option("--add-header", format!("{name}:{value}"));
+        Ok(self)
+    }
+
+    pub fn headers(mut self, headers: &HashMap<String, String>) -> Result<Self, MediaError> {
+        for (name, value) in canonical_media_headers(headers)? {
+            self.option("--add-header", format!("{name}:{value}"));
+        }
         Ok(self)
     }
 
@@ -580,6 +657,104 @@ fn container_muxer(container: MediaContainer) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_directory_is_explicit_and_validated() {
+        let url = "https://example.com/video";
+        let dir = std::env::temp_dir().join("SlipStream Cache");
+        let args = BuildYtDlpArgs::probe(false)
+            .cache_dir(&dir)
+            .unwrap()
+            .build(url)
+            .unwrap();
+        assert!(!args.iter().any(|arg| arg == "--no-cache-dir"));
+        let expected = sidecar_path(&dir).unwrap();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--cache-dir" && pair[1] == expected.as_os_str()));
+        for invalid in [
+            PathBuf::from("relative"),
+            dir.join("..").join("cache"),
+            dir.join("cache:stream"),
+            dir.join("%TEMP%"),
+            dir.join("$HOME"),
+            dir.join("~someone").join("cache"),
+        ] {
+            assert!(BuildYtDlpArgs::probe(false).cache_dir(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn header_names_are_allowlisted_and_values_are_literal_arguments() {
+        let headers = HashMap::from([
+            ("rEfErEr".into(), "https://example.com/page".into()),
+            ("origin".into(), "https://example.com".into()),
+            ("USER-AGENT".into(), "Player/1.0 (Platform; Device)".into()),
+            ("accept-language".into(), "en-US,en;q=0.9".into()),
+        ]);
+        let args = BuildYtDlpArgs::probe(false)
+            .headers(&headers)
+            .unwrap()
+            .build("https://example.com/video")
+            .unwrap();
+        for value in [
+            "https://example.com/",
+            "https://example.com/path",
+            "https://example.com?query",
+            "https://example.com#fragment",
+            "https://user@example.com",
+        ] {
+            assert!(
+                BuildYtDlpArgs::probe(false)
+                    .header("Origin", value)
+                    .is_err(),
+                "{value}"
+            );
+        }
+        for header in [
+            "Referer:https://example.com/page",
+            "Origin:https://example.com",
+            "User-Agent:Player/1.0 (Platform; Device)",
+            "Accept-Language:en-US,en;q=0.9",
+        ] {
+            assert!(args
+                .windows(2)
+                .any(|pair| pair[0] == "--add-header" && pair[1] == header));
+        }
+        for name in [
+            "Cookie",
+            "Authorization",
+            "Proxy-Authorization",
+            "Referer:",
+            " Origin",
+            "User-Agent\t",
+        ] {
+            assert!(matches!(
+                BuildYtDlpArgs::probe(false).header(name, "https://example.com"),
+                Err(MediaError::InvalidArgument { kind: "yt-dlp header", value }) if value == name
+            ));
+        }
+        for value in [
+            "",
+            "bad\0",
+            "bad\r\n",
+            "bad\t",
+            "bad\u{7f}",
+            &"é".repeat(1025),
+        ] {
+            assert!(BuildYtDlpArgs::download(false)
+                .header("User-Agent", value)
+                .is_err());
+        }
+        assert!(BuildYtDlpArgs::download(false)
+            .header("User-Agent", &"é".repeat(1024))
+            .is_ok());
+        for name in ["Origin", "Referer"] {
+            assert!(BuildYtDlpArgs::probe(false)
+                .header(name, "file:///page")
+                .is_err());
+        }
+    }
 
     #[test]
     fn playlist_selectors_cap_every_branch_and_keep_user_selectors_strict() {

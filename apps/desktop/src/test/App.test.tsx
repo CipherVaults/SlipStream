@@ -4,11 +4,12 @@ import { clearMocks, mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { version } from "../../package.json";
 import App from "../App";
 import { demo } from "../lib/demo";
 import { desktop } from "../lib/tauri";
 import { DEFAULT_CHROMIUM_EXTENSION_ID, DEFAULT_FIREFOX_EXTENSION_ID } from "../types/ipc";
-import type { AppSettings, TelemetryBatch, ToolchainStatus, UpdateStatus } from "../types/ipc";
+import type { AppSettings, TelemetryBatch, ToolchainStatus, TransferSnapshot, UpdateStatus } from "../types/ipc";
 
 const alpine = "Alpine_Cinema_4K_60fps.mp4";
 const ubuntu = "Ubuntu-26.04-desktop-amd64.iso";
@@ -98,6 +99,85 @@ describe("desktop browser guards", () => {
 });
 
 describe("workspace and inspector", () => {
+  it("keeps playlist videos in order in one group and wires playlist actions through the app", async () => {
+    const base = demo.snapshot();
+    const template = base.transfers.find(item => item.id === "alpine")!;
+    const directory = "D:\\Downloads\\Weekend films";
+    const playlistId = "weekend";
+    const videos: TransferSnapshot[] = ["Arrival.mp4", "Old Town.mp4", "The Coast.mp4"].map((filename, i) => ({
+      ...template, id: "video-" + i, filename, save_dir: directory, queue_id: "night",
+      playlist_id: playlistId, playlist_title: "Weekend films", playlist_index: i + 1, playlist_total: 3,
+      status: (["completed", "active", "queued"] as const)[i], updated_at: new Date().toISOString(),
+    }));
+    const snapshot = () => ({
+      ...base, transfers: [{ ...videos[1] }, ...base.transfers, { ...videos[2] }, { ...videos[0] }],
+    });
+    const pull = vi.spyOn(desktop, "getSnapshot").mockImplementation(async () => snapshot());
+    const pause = vi.spyOn(desktop, "pausePlaylist").mockImplementation(async () => {
+      videos[1].status = "paused";
+      videos.forEach(video => { video.playlist_paused = true; });
+    });
+    const resume = vi.spyOn(desktop, "resumePlaylist").mockImplementation(async () => {
+      videos[1].status = "active";
+      videos.forEach(video => { video.playlist_paused = false; });
+    });
+    const reveal = vi.spyOn(desktop, "revealPlaylistFolder").mockResolvedValue(undefined);
+    const user = await start();
+    const active = () => within(screen.getByRole("region", { name: "Active Transfers" }));
+    const playlist = () => within(screen.getByRole("region", { name: "Playlist: Weekend films" }));
+    expect(active().getByRole("region", { name: "Playlist: Weekend films" })).toBeVisible();
+    expect(playlist().getByText("Downloading #2 of 3 · 1/3 done · 1 queued")).toBeVisible();
+    const search = screen.getByRole("searchbox", { name: "Search downloads" });
+    await user.type(search, "Arrival");
+    expect(playlist().getAllByRole("article")).toHaveLength(1);
+    expect(playlist().getByText("Downloading #2 of 3 · 1/3 done · 1 queued")).toBeVisible();
+    expect(playlist().getByRole("button", { name: "Pause All" })).toBeVisible();
+    await user.clear(search);
+    expect(playlist().getAllByRole("article").map(item => item.getAttribute("aria-label")))
+      .toEqual(["Arrival.mp4", "Old Town.mp4", "The Coast.mp4"]);
+    expect(playlist().getByText("Downloads\\Weekend films")).toHaveAttribute("title", directory);
+    const collapse = playlist().getByRole("button", { name: "Collapse Weekend films" });
+    expect(collapse).toHaveAttribute("aria-expanded", "true");
+    await user.click(collapse);
+    expect(playlist().queryByRole("article")).not.toBeInTheDocument();
+    await user.click(playlist().getByRole("button", { name: "Expand Weekend films" }));
+    await user.click(playlist().getByRole("button", { name: "Inspect Old Town.mp4" }));
+    expect(inspector().getByText("#2 of 3 · Weekend films")).toBeVisible();
+    expect(inspector().getByText("Downloads\\Weekend films")).toHaveAttribute("title", directory);
+
+    const nav = within(screen.getByRole("navigation", { name: "Download views" }));
+    for (const view of ["Queues", "Night Schedule"]) {
+      await user.click(nav.getByRole("button", { name: new RegExp(view, "i") }));
+      const queue = within(screen.getByRole("region", { name: view }));
+      expect(queue.getByRole("region", { name: "Playlist: Weekend films" })).toBeVisible();
+      expect(playlist().getAllByRole("article")).toHaveLength(3);
+    }
+    await user.click(nav.getByRole("button", { name: /All Downloads/ }));
+    await user.click(playlist().getByRole("button", { name: "Pause All" }));
+    expect(pause).toHaveBeenCalledExactlyOnceWith(playlistId);
+    expect(await playlist().findByText("Paused · 1/3 done · 1 queued")).toBeVisible();
+    expect(playlist().queryByRole("button", { name: "Pause All" })).not.toBeInTheDocument();
+    videos[1].status = "queued";
+    act(() => pushTelemetry(snapshot()));
+    expect(playlist().getByText("Paused · 1/3 done · 2 queued")).toBeVisible();
+    await user.click(playlist().getByRole("button", { name: "Resume All" }));
+    expect(resume).toHaveBeenCalledExactlyOnceWith(playlistId);
+    expect(await playlist().findByText("Downloading #2 of 3 · 1/3 done · 1 queued")).toBeVisible();
+    await user.click(playlist().getByRole("button", { name: "Open Folder" }));
+    expect(reveal).toHaveBeenCalledExactlyOnceWith(playlistId);
+    expect(pull).toHaveBeenCalledTimes(4);
+
+    videos.forEach(video => { video.status = "completed"; });
+    videos[1].status = "failed";
+    act(() => pushTelemetry(snapshot()));
+    expect(active().queryByRole("region", { name: "Playlist: Weekend films" })).not.toBeInTheDocument();
+    const completed = within(screen.getByRole("region", { name: "Completed Today" }));
+    expect(completed.getByRole("region", { name: "Playlist: Weekend films" })).toBeVisible();
+    expect(playlist().getByText("2/3 done · 1 failed")).toBeVisible();
+    expect(playlist().getByRole("button", { name: "Expand Weekend films" })).toHaveAttribute("aria-expanded", "false");
+    expect(playlist().queryByRole("article")).not.toBeInTheDocument();
+  });
+
   it("filters by sidebar, segmented status, search, queue and night schedule", async () => {
     const user = await start();
     const nav = within(screen.getByRole("navigation", { name: "Download views" }));
@@ -487,7 +567,7 @@ describe("workspace and inspector", () => {
 describe("add and command palette", () => {
   it("handles Ctrl+K, command filtering, Ctrl+N, Escape and picker events", async () => {
     const user = await start();
-    expect(screen.getByText("v1.1.1")).toBeVisible();
+    expect(screen.getByText(`v${version}`)).toBeVisible();
     await user.keyboard("{Control>}k{/Control}");
     const palette = dialog("Command Palette");
     expect(palette.getByRole("button", { name: /Toggle Inspector/ })).toBeVisible();
@@ -640,7 +720,9 @@ describe("add and command palette", () => {
 
   it("switches a watch URL between single video and whole playlist and submits a validated range", async () => {
     const url = mediaUrl + "&list=PL1";
-    const probe = vi.spyOn(desktop, "probeMedia");
+    const probe = vi.spyOn(desktop, "probeMedia").mockImplementation(async (source, playlist) => ({
+      ...demo.probe(source, playlist), playlist_items: [],
+    }));
     const add = vi.spyOn(desktop, "addMediaDownload").mockResolvedValue("playlist-id");
     const http = vi.spyOn(desktop, "addHttpDownload");
     const user = await start();
@@ -650,7 +732,8 @@ describe("add and command palette", () => {
     expect(sheet.getByRole("button", { name: "Single Video" })).toHaveAttribute("aria-pressed", "true");
     await user.click(sheet.getByRole("button", { name: "Whole Playlist" }));
     expect(probe).toHaveBeenLastCalledWith(url, true);
-    expect(await sheet.findByText("Playlist · 3 videos")).toBeVisible();
+    expect(await sheet.findByText("Playlist · 5 videos")).toBeVisible();
+    expect(sheet.queryByRole("group", { name: "Playlist Videos" })).not.toBeInTheDocument();
     expect(sheet.queryByText("Direct HTTP download")).toBeNull();
     await user.click(sheet.getByRole("button", { name: "Single Video" }));
     expect(probe).toHaveBeenLastCalledWith(url, false);
@@ -669,6 +752,111 @@ describe("add and command palette", () => {
       url, format_id: null, download_playlist: true, playlist_items: "1-5,8", max_height: 1080,
     }));
     expect(http).not.toHaveBeenCalled();
+  });
+
+  it("selects playlist videos, preserves hidden selections, and sends the selected URLs and folder", async () => {
+    const url = "https://www.youtube.com/playlist?list=PL1";
+    const probe = { ...demo.probe(url), title: "  Weekend: City / Nature.  " };
+    vi.spyOn(desktop, "probeMedia").mockResolvedValue(probe);
+    const add = vi.spyOn(desktop, "addMediaDownload").mockResolvedValue("first-video");
+    const user = await start();
+    act(() => openPicker(url));
+    const sheet = dialog("Add Download");
+    const checklist = within(await sheet.findByRole("group", { name: "Playlist Videos" }));
+    const download = sheet.getByRole("button", { name: "Download Playlist" });
+
+    expect(checklist.getByRole("status")).toHaveTextContent("5 of 5 selected");
+    expect(checklist.getAllByRole("checkbox").every(box => (box as HTMLInputElement).checked)).toBe(true);
+    expect(checklist.getByText("06:02")).toBeVisible();
+    await user.click(checklist.getByRole("button", { name: "Clear" }));
+    expect(download).toBeDisabled();
+    expect(checklist.getByText("Select at least one video to download.")).toBeVisible();
+    await user.click(checklist.getByRole("button", { name: "Select All" }));
+    expect(download).toBeEnabled();
+
+    const search = checklist.getByRole("searchbox", { name: "Filter videos" });
+    await user.type(search, "tokyo");
+    await user.click(checklist.getByRole("checkbox", { name: /Tokyo Architecture/ }));
+    expect(checklist.getAllByRole("checkbox")).toHaveLength(1);
+    expect(checklist.getByRole("status")).toHaveTextContent("4 of 5 selected");
+    await user.clear(search);
+    await user.type(search, "#4");
+    expect(checklist.getByRole("checkbox", { name: /Lisbon by Tram/ })).toBeChecked();
+    await user.clear(search);
+    expect(checklist.getByRole("checkbox", { name: /Tokyo Architecture/ })).not.toBeChecked();
+    await user.click(checklist.getByRole("button", { name: "Invert" }));
+    expect(checklist.getByRole("status")).toHaveTextContent("1 of 5 selected");
+    expect(checklist.getByRole("checkbox", { name: /Tokyo Architecture/ })).toBeChecked();
+
+    const range = sheet.getByRole("textbox", { name: "Playlist Items" });
+    await user.type(range, "1-2, 5");
+    expect(checklist.getByRole("status")).toHaveTextContent("3 of 5 selected");
+    await user.click(checklist.getByRole("checkbox", { name: /Tokyo Architecture/ }));
+    expect(range).toHaveValue("");
+    expect(checklist.getByRole("status")).toHaveTextContent("2 of 5 selected");
+
+    const folder = sheet.getByRole("textbox", { name: "Playlist Folder" });
+    expect(folder).toHaveValue("Weekend_ City _ Nature");
+    expect(sheet.getByText("D:\\Downloads\\Weekend_ City _ Nature\\")).toBeVisible();
+    await user.clear(folder);
+    await user.type(folder, " Weekend films ");
+    const destination = sheet.getByRole("textbox", { name: "Save folder" });
+    await user.clear(destination);
+    await user.type(destination, "/home/media/");
+    expect(sheet.getByText("/home/media/Weekend films/")).toBeVisible();
+    await user.click(download);
+
+    expect(add).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      url, download_playlist: true, save_dir: "/home/media/", playlist_folder_name: "Weekend films", playlist_items: null,
+      selected_entries: probe.playlist_items!.filter(item => [1, 5].includes(item.index))
+        .map(({ index, title, url }) => ({ index, title, url })),
+    }));
+  });
+
+  it("keeps custom ranges outside the preview", async () => {
+    const url = "https://example.org/playlist?list=PL1";
+    const probe = demo.probe(url);
+    vi.spyOn(desktop, "probeMedia").mockResolvedValue({
+      ...probe, playlist_items: probe.playlist_items!.map(item => item.index === 2 ? { ...item, url: null } : item),
+    });
+    const add = vi.spyOn(desktop, "addMediaDownload").mockResolvedValue("playlist");
+    const user = await start();
+    act(() => openPicker(url));
+    const sheet = dialog("Add Download");
+    await sheet.findByRole("group", { name: "Playlist Videos" });
+    await user.type(sheet.getByRole("textbox", { name: "Playlist Items" }), "500-520, 530");
+    await user.click(sheet.getByRole("button", { name: "Download Playlist" }));
+    expect(add).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      url, download_playlist: true, playlist_folder_name: "Cinema Playlist", playlist_items: "500-520,530",
+      selected_entries: null,
+    }));
+  });
+
+  it.each([true, false])("uses the full playlist only when the truncated preview is entirely checked (%s)", async all => {
+    const url = "https://example.org/playlist?list=PL1";
+    const probe = demo.probe(url);
+    const entries = probe.playlist_items!.map(item => item.index === 2 ? { ...item, url: undefined } : item);
+    const response = { ...probe, playlist_count: 600, playlist_items: entries };
+    const runProbe = vi.spyOn(desktop, "probeMedia").mockResolvedValue(response);
+    const add = vi.spyOn(desktop, "addMediaDownload").mockResolvedValue("playlist");
+    const user = await start();
+    act(() => openPicker(url));
+    const sheet = dialog("Add Download");
+    const checklist = within(await sheet.findByRole("group", { name: "Playlist Videos" }));
+    expect(sheet.getByText(/Showing 5 of 600 videos/)).toBeVisible();
+    if (!all) {
+      let resolveProbe!: (value: typeof response) => void;
+      runProbe.mockImplementationOnce(() => new Promise(resolve => { resolveProbe = resolve; }));
+      await user.click(sheet.getByRole("button", { name: "Probe" }));
+      await user.click(checklist.getAllByRole("checkbox")[0]);
+      await act(async () => resolveProbe(response));
+      expect(checklist.getByRole("status")).toHaveTextContent("4 of 5 selected");
+    }
+    await user.click(sheet.getByRole("button", { name: "Download Playlist" }));
+    expect(add).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      url, download_playlist: true, playlist_items: null, playlist_folder_name: "Cinema Playlist",
+      selected_entries: all ? null : entries.slice(1).map(({ index, title, url }) => ({ index, title, url: url ?? null })),
+    }));
   });
 
   it.each([
@@ -695,7 +883,7 @@ describe("add and command palette", () => {
     const user = await start();
     act(() => openPicker(url));
     const sheet = dialog("Add Download");
-    await sheet.findByText("Playlist · 3 videos");
+    await sheet.findByText("Playlist · 5 videos");
     await user.click(sheet.getByRole("tab", { name: "Subtitles" }));
     const chips = within(sheet.getByRole("group", { name: "Subtitle languages" }));
     for (const name of ["en", "ar", "es", "fr", "de", "ja"]) {
@@ -878,7 +1066,7 @@ describe("appearance, settings and transfer dialogs", () => {
     const settings = dialog("Settings & Browser Integration");
     const about = within(settings.getByRole("region", { name: "About & Updates" }));
 
-    expect(about.getByText("SlipStream v1.1.1")).toBeVisible();
+    expect(about.getByText(`SlipStream v${version}`)).toBeVisible();
     expect(about.getByText("CipherVaults · Windows 10/11 · MIT License")).toBeVisible();
     expect(about.getByText("Signed NSIS Auto-Update (GitHub Releases)")).toBeVisible();
     await user.click(about.getByRole("button", { name: "Check for Updates" }));

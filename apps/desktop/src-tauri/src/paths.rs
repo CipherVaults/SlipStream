@@ -1,4 +1,8 @@
-use slipstream_protocol::{safe_join_under, validate_safe_filename_component};
+use slipstream_media::{args::validate_local_path, MediaError};
+use slipstream_protocol::{
+    safe_join_under, sanitize_title_to_filename, validate_safe_filename_component,
+    PathSecurityError,
+};
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
@@ -85,6 +89,94 @@ pub(crate) fn ensure_safe_directory(root: &Path) -> io::Result<PathBuf> {
     validate_existing_ancestors(&clean)?;
     fs::create_dir_all(&clean)?;
     canonical_directory(&clean)
+}
+
+pub(crate) fn ensure_safe_tree(root: &Path) -> io::Result<PathBuf> {
+    const MAX_DEPTH: usize = 32;
+    const MAX_ENTRIES: usize = 16_384;
+    let root = ensure_safe_directory(root)?;
+    let mut directories = vec![(root.clone(), 0)];
+    let mut count = 0;
+    while let Some((directory, depth)) = directories.pop() {
+        for entry in fs::read_dir(directory)? {
+            count += 1;
+            if count > MAX_ENTRIES || depth >= MAX_DEPTH {
+                return Err(invalid("cache directory tree exceeds inspection limits"));
+            }
+            let path = entry?.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if reparse(&metadata) || !(metadata.is_file() || metadata.is_dir()) {
+                return Err(invalid(
+                    "cache directory contains a reparse point or special file",
+                ));
+            }
+            if metadata.is_dir() {
+                directories.push((path, depth + 1));
+            }
+        }
+    }
+    Ok(root)
+}
+
+pub(crate) fn media_title_stem(title: &str, fallback: &str) -> String {
+    let name = sanitize_title_to_filename(title, "txt").unwrap_or_default();
+    let stem = name.strip_suffix(".txt").unwrap_or(&name);
+    let mut end = stem.len().min(120);
+    while !stem.is_char_boundary(end) {
+        end -= 1;
+    }
+    let stem = stem[..end].trim_end_matches(['.', ' ']);
+    if stem.is_empty() || stem.eq_ignore_ascii_case("download") {
+        fallback.to_owned()
+    } else {
+        stem.to_owned()
+    }
+}
+
+pub(crate) fn ensure_playlist_subfolder(base_dir: &Path, raw_name: &str) -> io::Result<PathBuf> {
+    if Path::new(raw_name.trim()).has_root()
+        || raw_name
+            .split(['/', '\\'])
+            .any(|part| matches!(part.trim(), "." | ".."))
+    {
+        return Err(invalid("playlist title contains path traversal"));
+    }
+    let raw_stem = raw_name.split('.').next().unwrap_or_default().trim();
+    if matches!(
+        validate_local_path(Path::new(raw_stem)),
+        Err(MediaError::Path(PathSecurityError::ReservedDeviceName))
+    ) {
+        return Err(invalid("playlist title is a Windows reserved device name"));
+    }
+    let base = canonical_directory(base_dir)?;
+    let stem = media_title_stem(raw_name, "Playlist");
+    for number in 1..=1000 {
+        let name = if number == 1 {
+            stem.clone()
+        } else {
+            format!("{stem} ({number})")
+        };
+        validate_local_path(Path::new(&name)).map_err(|error| invalid(error.to_string()))?;
+        let target = safe_join_under(&base, &name).map_err(|error| invalid(error.to_string()))?;
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if reparse(&metadata) => {
+                return Err(invalid("playlist folder is a reparse point"))
+            }
+            Ok(metadata) if metadata.is_file() => continue,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let directory = ensure_safe_directory(&target)?;
+        if directory.parent() != Some(base.as_path()) {
+            return Err(invalid("playlist folder is outside the save directory"));
+        }
+        return Ok(directory);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no available playlist folder name",
+    ))
 }
 
 pub(crate) fn canonical_directory(root: &Path) -> io::Result<PathBuf> {

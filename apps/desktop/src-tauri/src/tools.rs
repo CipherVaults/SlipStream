@@ -4,7 +4,9 @@ use crate::paths::{
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use slipstream_media::{args::validate_local_path, MediaToolchain, ToolchainConfig};
+use slipstream_media::{
+    args::validate_local_path, discover_ytdlp_only, MediaToolchain, ResolvedBinary, ToolchainConfig,
+};
 use slipstream_native_host::{
     manifest::{
         chromium_origin, valid_firefox_id, Browser, DEFAULT_CHROMIUM_EXTENSION_ID,
@@ -28,7 +30,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command as StdCommand, Stdio},
     ptr::{null, null_mut},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -245,19 +247,111 @@ fn hardened_toolchain_config(
     )
 }
 
-pub(crate) async fn discover_media_toolchain(
+#[derive(Default)]
+pub(crate) struct ToolchainCache {
+    ytdlp: Mutex<Option<(BinaryStamp, ResolvedBinary)>>,
+    ffmpeg: Mutex<Option<([BinaryStamp; 2], MediaToolchain)>>,
+}
+
+#[derive(Default, PartialEq, Eq)]
+struct BinaryStamp(Option<PathBuf>, u64, Option<SystemTime>);
+
+impl BinaryStamp {
+    fn read(path: Option<&Path>) -> io::Result<Self> {
+        let Some(path) = path else {
+            return Ok(Self::default());
+        };
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(invalid("expected a regular .exe file"));
+        }
+        Ok(Self(
+            Some(path.to_owned()),
+            metadata.len(),
+            metadata.modified().ok(),
+        ))
+    }
+}
+
+impl ToolchainCache {
+    pub(crate) async fn invalidate(&self) {
+        *self.ytdlp.lock().await = None;
+        *self.ffmpeg.lock().await = None;
+    }
+
+    async fn ytdlp(&self, stamp: BinaryStamp) -> Result<ResolvedBinary, String> {
+        let mut cached = self.ytdlp.lock().await;
+        if let Some((_, binary)) = cached.as_ref().filter(|(key, _)| *key == stamp) {
+            return Ok(binary.clone());
+        }
+        let binary = discover_ytdlp_only(ToolchainConfig {
+            ytdlp_path: stamp.0.clone(),
+            ..ToolchainConfig::default()
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        *cached = Some((stamp, binary.clone()));
+        Ok(binary)
+    }
+}
+
+pub(crate) async fn discover_ytdlp_for_probe(
+    cache: &ToolchainCache,
     settings: AppSettings,
     resource_dir: Option<PathBuf>,
-) -> std::result::Result<MediaToolchain, String> {
-    let config = tokio::task::spawn_blocking(move || {
-        hardened_toolchain_config(&settings, resource_dir.as_deref())
+) -> Result<ResolvedBinary, String> {
+    let stamp = tokio::task::spawn_blocking(move || {
+        let custom = settings
+            .ytdlp_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let (path, _) = resolve_tool(
+            "yt-dlp.exe",
+            custom.map(Path::new),
+            default_managed_bin_dir().as_deref(),
+            &bundled_tool_dirs(resource_dir.as_deref()),
+            env::var_os("PATH").as_deref(),
+        )?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "yt-dlp.exe was not found"))?;
+        BinaryStamp::read(Some(&path))
     })
     .await
     .map_err(|error| error.to_string())?
     .map_err(|error| error.to_string())?;
-    MediaToolchain::discover(config)
-        .await
-        .map_err(|error| error.to_string())
+    cache.ytdlp(stamp).await
+}
+
+pub(crate) async fn discover_media_toolchain_cached(
+    cache: &ToolchainCache,
+    settings: AppSettings,
+    resource_dir: Option<PathBuf>,
+) -> Result<MediaToolchain, String> {
+    let (config, ytdlp_stamp, ffmpeg_stamps) = tokio::task::spawn_blocking(move || {
+        let config = hardened_toolchain_config(&settings, resource_dir.as_deref())?;
+        let ytdlp = BinaryStamp::read(config.ytdlp_path.as_deref())?;
+        let ffmpeg = [
+            BinaryStamp::read(config.ffmpeg_path.as_deref())?,
+            BinaryStamp::read(config.ffprobe_path.as_deref())?,
+        ];
+        Ok::<_, io::Error>((config, ytdlp, ffmpeg))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())?;
+    let discover_ffmpeg = async {
+        let mut cached = cache.ffmpeg.lock().await;
+        if let Some((_, tools)) = cached.as_ref().filter(|(key, _)| *key == ffmpeg_stamps) {
+            return Ok(tools.clone());
+        }
+        let tools = MediaToolchain::discover_ffmpeg_only(config)
+            .await
+            .map_err(|error| error.to_string())?;
+        *cached = Some((ffmpeg_stamps, tools.clone()));
+        Ok::<_, String>(tools)
+    };
+    let (ytdlp, ffmpeg) = tokio::try_join!(cache.ytdlp(ytdlp_stamp), discover_ffmpeg)?;
+    Ok(ffmpeg.with_ytdlp(ytdlp))
 }
 
 pub(crate) async fn toolchain_status(

@@ -8,7 +8,7 @@ use std::{
 use slipstream_protocol::{
     safe_join_under, sanitize_filename, sanitize_title_to_filename, validate_http_url,
     validate_safe_filename_component, AddMediaDownloadRequest, AudioPreset, MediaContainer,
-    TransferStatus,
+    MediaProbeResult, TransferStatus,
 };
 use tokio::{
     fs,
@@ -213,6 +213,8 @@ pub struct DownloadOptions {
     pub playlist: bool,
     pub embed_cover_art: bool,
     pub metadata: MediaMetadata,
+    pub pre_probe: Option<MediaProbeResult>,
+    pub cache_dir: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -343,35 +345,42 @@ impl MediaPipeline {
         options: &DownloadOptions,
         progress: Option<&Sender<MediaProgressEvent>>,
     ) -> Result<DownloadOutcome, MediaError> {
-        validate_http_url(&request.url)?;
+        let url = validate_http_url(&request.url)?;
         let playlist =
             options.playlist || request.download_playlist || request.playlist_items.is_some();
+        let named_single_item = request.filename.is_some()
+            && request
+                .playlist_items
+                .as_deref()
+                .is_some_and(|items| items.parse::<u32>().is_ok());
         let binary = self.tools.require_ytdlp()?;
         let preset = download_audio_preset(request)?;
         let filename = prevalidate_download_filename(
             request.filename.as_deref(),
             preset,
             request.target_container,
-            playlist,
+            playlist && !named_single_item,
         )?;
-        if request.max_height.is_some()
-            && (!playlist || preset.is_some() || request.format_id.is_some())
-        {
+        if request.max_height.is_some() && (preset.is_some() || request.format_id.is_some()) {
             return Err(MediaError::argument(
                 "maximum video height",
-                "requires a playlist video preset",
+                "cannot be combined with an audio preset or explicit format ID",
             ));
         }
         let mut builder = BuildYtDlpArgs::download(playlist)
             .ffmpeg_location(&self.tools.ffmpeg().path)?
-            .merge_output_format(request.target_container);
+            .merge_output_format(request.target_container)
+            .headers(&request.headers)?;
+        if let Some(dir) = &options.cache_dir {
+            builder = builder.cache_dir(dir)?;
+        }
         if let Some(format) = request
             .format_id
             .as_deref()
             .or(preset.map(|_| "bestaudio/best"))
         {
             builder = builder.format(format)?;
-        } else if playlist {
+        } else if playlist || request.max_height.is_some() {
             builder = builder.playlist_video(request.max_height)?;
         }
         if let Some(items) = &request.playlist_items {
@@ -391,7 +400,24 @@ impl MediaPipeline {
         let save_dir = canonical_save_dir(save_dir, self.create_save_dir).await?;
         let stage = Stage::create(&save_dir).await?;
         emit(progress, MediaProgressEvent::Probing).await;
-        let probe = crate::probe_url(&self.tools, &request.url, ProbeOptions { playlist }).await?;
+        let probe = match options.pre_probe.as_ref().filter(|probe| {
+            validate_http_url(&probe.source_url).is_ok_and(|source| source == url)
+                && validate_probe_matches_mode(playlist, probe, &request.url).is_ok()
+        }) {
+            Some(probe) => probe.clone(),
+            None => {
+                crate::probe_url(
+                    &self.tools,
+                    &request.url,
+                    ProbeOptions {
+                        playlist,
+                        cache_dir: options.cache_dir.clone(),
+                        headers: request.headers.clone(),
+                    },
+                )
+                .await?
+            }
+        };
         validate_probe_matches_mode(playlist, &probe, &request.url)?;
         let selected_count =
             playlist_selection_count(probe.playlist_count, request.playlist_items.as_deref());
@@ -432,7 +458,7 @@ impl MediaPipeline {
         if let Err(error) = download {
             tracing::warn!(%error, items = media.len(), "continuing with downloaded playlist items");
         }
-        let numbered = playlist || media.len() > 1;
+        let numbered = (playlist && !named_single_item) || media.len() > 1;
         let media_count = media.len();
         // Some extractors omit unavailable entries from the flat probe. Only
         // use its titles when every downloaded index aligns with the full list.
@@ -1426,12 +1452,16 @@ fn prevalidate_download_filename(
 
 fn validate_probe_matches_mode(
     playlist: bool,
-    probe: &slipstream_protocol::MediaProbeResult,
+    probe: &MediaProbeResult,
     url: &str,
 ) -> Result<(), MediaError> {
-    if !playlist && probe.is_playlist {
+    if playlist != probe.is_playlist {
         return Err(MediaError::argument(
-            "playlist URL requires playlist mode",
+            if playlist {
+                "playlist mode requires a playlist URL"
+            } else {
+                "playlist URL requires playlist mode"
+            },
             url,
         ));
     }
@@ -2018,7 +2048,7 @@ mod tests {
             Some(exact.as_str())
         );
 
-        let playlist_probe = slipstream_protocol::MediaProbeResult {
+        let playlist_probe = MediaProbeResult {
             title: "Playlist".into(),
             source_url: "https://example.com/playlist?list=PL1".into(),
             extractor: "youtube:tab".into(),
@@ -2027,6 +2057,7 @@ mod tests {
             is_playlist: true,
             playlist_count: Some(2),
             playlist_entries: Vec::new(),
+            playlist_items: Vec::new(),
             formats: Vec::new(),
             subtitles: Vec::new(),
         };

@@ -2,8 +2,9 @@ use crate::{
     commands::friendly_updater_error,
     expand_wildcard_urls, install_browser_hosts_into,
     paths::{
-        build_defender_scan_args, decode_sha256, delete_files, ensure_safe_directory, hash_file,
-        local_drive_path, reveal_action, write_zone_identifier, RevealAction,
+        build_defender_scan_args, decode_sha256, delete_files, ensure_playlist_subfolder,
+        ensure_safe_directory, ensure_safe_tree, hash_file, local_drive_path, reveal_action,
+        write_zone_identifier, RevealAction,
     },
     settings::{normalize, read_json, torrent_rate, write_json_atomically, SETTINGS_FILE},
     tools::{
@@ -76,6 +77,21 @@ impl Drop for TempDir {
 
 struct RegistryKey(String);
 
+#[test]
+fn cache_paths_reject_descendant_junctions() {
+    let temp = TempDir::new();
+    let outside = TempDir::new();
+    let cache = temp.0.join("yt-dlp-cache");
+    let nested = cache.join("extractor");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("fixture.json"), b"{}").unwrap();
+    assert!(ensure_safe_tree(&cache).is_ok());
+    let link = nested.join("junction");
+    directory_junction(&link, &outside.0);
+    assert!(ensure_safe_tree(&cache).is_err());
+    fs::remove_dir(link).unwrap();
+}
+
 impl Drop for RegistryKey {
     fn drop(&mut self) {
         let wide: Vec<_> = self.0.encode_utf16().chain([0]).collect();
@@ -133,6 +149,56 @@ fn directory_junction(link: &Path, destination: &Path) {
         fs::symlink_metadata(link).unwrap().file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT,
         0
     );
+}
+
+#[test]
+fn playlist_subfolder_sanitizes_reuses_and_avoids_file_collisions() {
+    let temp = TempDir::new();
+    let base = fs::canonicalize(&temp.0).unwrap();
+    let sanitized = ensure_playlist_subfolder(&base, " Season 1: Intro / Preview? ").unwrap();
+    assert_eq!(sanitized, base.join("Season 1_ Intro _ Preview_"));
+    assert_eq!(
+        ensure_playlist_subfolder(&base, "Season 1: Intro / Preview?").unwrap(),
+        sanitized
+    );
+    assert_eq!(
+        ensure_playlist_subfolder(&base, "").unwrap(),
+        base.join("Playlist")
+    );
+    let long_name = ensure_playlist_subfolder(&base, &"あ".repeat(100)).unwrap();
+    assert!(long_name.file_name().unwrap().to_str().unwrap().len() <= 120);
+
+    fs::write(base.join("Season 2"), "existing file").unwrap();
+    let suffixed = ensure_playlist_subfolder(&base, "Season 2").unwrap();
+    assert_eq!(suffixed, base.join("Season 2 (2)"));
+    assert_eq!(
+        ensure_playlist_subfolder(&base, "Season 2").unwrap(),
+        suffixed
+    );
+    assert_eq!(
+        fs::read_to_string(base.join("Season 2")).unwrap(),
+        "existing file"
+    );
+}
+
+#[test]
+fn playlist_subfolder_rejects_traversal_devices_and_reparse_points() {
+    let temp = TempDir::new();
+    let outside = TempDir::new();
+    directory_junction(&temp.0.join("Linked"), &outside.0);
+    for bad in [
+        "../Outside",
+        "nested\\..\\Outside",
+        "..",
+        "CON.txt",
+        "CONOUT$",
+        "LPT\u{00b2}",
+        "Linked",
+    ] {
+        let error = ensure_playlist_subfolder(&temp.0, bad).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{bad}");
+    }
+    assert!(fs::read_dir(&outside.0).unwrap().next().is_none());
 }
 
 #[test]

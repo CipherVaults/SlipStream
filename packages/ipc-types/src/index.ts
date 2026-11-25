@@ -51,6 +51,11 @@ export interface TransferSnapshot {
   queue_id: string;
   error_message: string | null;
   completion_notice?: string | null;
+  playlist_id?: string | null;
+  playlist_title?: string | null;
+  playlist_paused?: boolean | null;
+  playlist_index?: number | null;
+  playlist_total?: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -102,6 +107,16 @@ export interface SubtitleTrack {
   is_auto: boolean;
 }
 
+export interface PlaylistEntry {
+  /** 1-based index within the playlist. */
+  index: number;
+  id?: string | null;
+  title: string;
+  url?: string | null;
+  duration_seconds?: number | null;
+  thumbnail_url?: string | null;
+}
+
 export interface MediaProbeResult {
   title: string;
   source_url: string;
@@ -111,8 +126,16 @@ export interface MediaProbeResult {
   is_playlist: boolean;
   playlist_count: number | null;
   playlist_entries?: string[];
+  playlist_items?: PlaylistEntry[];
   formats: MediaFormatOption[];
   subtitles: SubtitleTrack[];
+}
+
+export interface SelectedPlaylistEntry {
+  /** 1-based index within the playlist. */
+  index: number;
+  title: string;
+  url?: string | null;
 }
 
 export interface AddMediaDownloadRequest {
@@ -128,6 +151,9 @@ export interface AddMediaDownloadRequest {
   playlist_items?: string | null;
   download_playlist?: boolean;
   max_height?: number | null;
+  selected_entries?: SelectedPlaylistEntry[] | null;
+  playlist_folder_name?: string | null;
+  headers?: Record<string, string>;
 }
 
 export interface TorrentFileEntry {
@@ -207,7 +233,7 @@ export type NativeBridgeRequest =
   | { type: "ping" }
   | { type: "get_status" }
   | { type: "add_http_download"; request: AddHttpDownloadRequest }
-  | { type: "probe_media"; url: string }
+  | { type: "probe_media"; url: string; playlist?: boolean | null }
   | { type: "add_media_download"; request: AddMediaDownloadRequest }
   | { type: "add_torrent"; request: AddTorrentRequest }
   | {

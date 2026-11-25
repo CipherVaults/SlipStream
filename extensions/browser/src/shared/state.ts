@@ -13,6 +13,28 @@ export const emptyState: BridgeState = { connected: false, theme: "system", acce
 export const STATE_KEY = "bridgeState";
 export const SETTINGS_KEY = "interceptionSettings";
 export const APPEARANCE_KEY = "appearance";
+export const PILL_SPOTS_KEY = "pillSpots";
+export const PLAYER_PORT = "slipstream-player";
+
+export interface PillSpot { x: number; y: number }
+
+export function readPillSpot(value: unknown): PillSpot | undefined {
+  const spot = value as Partial<PillSpot> | null;
+  const { x, y } = spot ?? {};
+  if (typeof x === "number" && x >= 0 && x <= 1 && typeof y === "number" && y >= 0 && y <= 1) {
+    return { x, y };
+  }
+}
+
+export function rememberPillSpot(saved: unknown, site: string, spot: PillSpot): Record<string, PillSpot> {
+  const entries = Object.entries(saved && typeof saved === "object" ? saved : {})
+    .filter(([key, value]) => key !== site && readPillSpot(value));
+  return Object.fromEntries([...entries.slice(-199), [site, spot]]);
+}
+
+export function canUseSiteStorage(inIncognitoContext?: boolean, tabIncognito?: boolean): boolean {
+  return !inIncognitoContext && !tabIncognito;
+}
 
 export function readAppearance(value: unknown): Pick<BridgeState, "theme" | "accent"> {
   const saved = value as Partial<BridgeState> | undefined;
@@ -27,13 +49,30 @@ export function readState(value: unknown): BridgeState {
   const batch = saved?.batch && Array.isArray(saved.batch.transfers) ? saved.batch : null;
   return { ...readAppearance(saved), connected: !!batch && saved?.connected === true, batch };
 }
-export type MediaAction = "4k" | "1080p" | "mp3_320" | "flac" | "picker" | "mute" | "links";
+export type MediaAction = "4k" | "1080p" | "mp3_320" | "flac" | "picker" | "playlist" | "mute" | "links"
+  | `format:${string}` | `hls:${string}`;
+export interface PillFormat {
+  id: MediaAction;
+  label: string;
+  sub?: string;
+}
+export interface PillFormatsMessage {
+  kind: "pill-formats";
+  url: string;
+  requestId?: number;
+  formats: PillFormat[];
+  isPlaylist: boolean;
+}
 export type PopupAction =
   | { type: "pause_transfer" | "resume_transfer"; transfer_id: string }
   | { type: "open_desktop_window" };
 export type BrowserMessage =
   | { kind: "alt"; held: boolean }
   | { kind: "stream" }
+  | { kind: "pill-spot"; spot?: PillSpot }
+  | { kind: "video-seen"; url: string }
+  | { kind: "pill-open"; url: string; isPlaylist: boolean; requestId?: number }
+  | { kind: "frame-reset" }
   | { kind: "wake" }
   | { kind: "media"; action: MediaAction; url: string; links?: string[] }
   | { kind: "desktop"; request: PopupAction }

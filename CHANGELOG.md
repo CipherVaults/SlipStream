@@ -2,6 +2,20 @@
 
 All notable changes to **SlipStream** are documented in this file following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-11-25
+
+### Added
+
+- **Faster media probing.** Repeat probes can return immediately from `ProbeCache`, which holds up to 128 results for five minutes and coalesces concurrent requests by normalized URL, playlist mode, and canonical headers. The probe path uses cached toolchain discovery and needs only `yt-dlp`, skipping unpinned executable hashing and `ffmpeg` and `ffprobe` version checks. Full toolchain discovery runs concurrently, and downloads can reuse a matching probe via `pre_probe`. The isolated `<data_dir>/yt-dlp-cache` rejects expandable paths and descendant reparse points.
+- **Selective playlist downloads.** Structured `PlaylistEntry` results (`playlist_items`) power a searchable checklist in **Add Download**, with **Select All**, **Clear**, **Invert**, an item range field, and a live destination folder preview. The `PlaylistCoordinator` downloads selected videos one at a time into a sanitized `<save_dir>/<Playlist Title>/` folder, continues after individual failures, and preserves explicit selections beyond the 512-item preview. Folder creation guards against reparse points and Windows reserved device names, and cross-origin child URLs drop the parent `Referer` and `Origin`. Collapsible playlist groups in **Transfers** show live counts and offer **Pause All**, **Resume All**, and **Open Folder**. The daemon reports `playlist_paused` across tray hibernation.
+- **Upgraded browser media pill (Chrome and Firefox v1.2.0).** A capture-phase guard in `early.js` runs at `document_start` with `all_frames: true` and `match_about_blank: true` to protect pill clicks from page handlers. Integer `left` and `top` coordinates, a 2 px movement threshold, debounced hiding, and interaction locking reduce flicker. Drag the pill to snap it to a player edge, dismiss it in one click, or enable it in fullscreen from the popup. Per-site positions are saved outside incognito windows.
+- **More player and stream detection.** The extension detects videos in open shadow roots, covered iframe players, and social feed video post links via `resolveVideoPostUrl`. A trusted pill interaction can read an HLS master playlist (`.m3u8`) or request native probe results for the dynamic quality menu. Supported playlist pages offer **Download Playlist…**. Stream detection filters out `206` or `Content-Range` responses, media chunks under 300 KB, and `.ts` and `.m4s` segments.
+
+### Fixed
+
+- **HTTP 403 failures on direct CDN and video-host downloads.** Requests supply a browser-compatible `User-Agent` and `Accept: */*` when omitted and preserve caller overrides. A `Range: bytes=0-0` probe rejected with `400`, `403`, `405`, or `416` falls back once to a plain `GET`. The extension can forward `Referer`, `Origin`, and `User-Agent` for same-tab cross-origin CDN requests. Cookies stay same-origin, and HTTPS-to-HTTP downgrades strip `Referer` and `Origin`.
+- **Native IPC and browser isolation.** `MediaProbed` and `Status` responses enforce frame budgets below 1 MiB, with progressive compaction of terminal transfer history in `Status`. Subframes use their own stream observations, and Chromium incognito popups cannot write extension settings.
+
 ## [1.1.1] - 2026-11-23
 
 ### Added

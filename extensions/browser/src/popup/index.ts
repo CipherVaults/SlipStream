@@ -159,24 +159,40 @@ if (refreshId) {
     if (refreshSelect.value) void perform({ kind: "refresh", id: refreshId, transferId: refreshSelect.value }, refreshId);
   });
 } else {
+  const preferencesPanel = element("preferences");
+  preferencesPanel.hidden = true;
+  const canEdit = async () => {
+    if (api.extension?.inIncognitoContext || !api.tabs?.query) return false;
+    const [activeTab] = await api.tabs.query({ active: true, currentWindow: true });
+    return activeTab?.incognito !== true;
+  };
   const settingsForm = element<HTMLFormElement>("settings");
   const input = (id: string) => element<HTMLInputElement>(id);
   const parseList = (id: string) => [...new Set(input(id).value.split(/[,\s]+/).map((item) => item.toLowerCase()).filter(Boolean))];
   const mib = 1024 * 1024;
-  void api.storage.local.get(SETTINGS_KEY).then((values) => {
+  void canEdit().then(async (allowed) => {
+    if (!allowed) return;
+    const values = await api.storage.local.get(SETTINGS_KEY);
     const preferences = readSettings(values[SETTINGS_KEY]);
     input("enabled").checked = preferences.enabled;
+    input("show-in-fullscreen").checked = preferences.showInFullscreen;
     input("extensions").value = preferences.extensions.join(", ");
     input("min-size").value = String(preferences.minBytes / mib);
     input("excluded").value = preferences.excludedSites.join(", ");
     input("muted").value = preferences.mutedSites.join(", ");
+    preferencesPanel.hidden = false;
   }).catch(() => { feedback.textContent = "Could not load preferences."; });
-  settingsForm.addEventListener("submit", (event) => {
+  settingsForm.addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (preferencesPanel.hidden || !await canEdit().catch(() => false)) {
+      preferencesPanel.hidden = true;
+      return;
+    }
     void perform({
       kind: "save-settings",
       settings: {
         enabled: input("enabled").checked,
+        showInFullscreen: input("show-in-fullscreen").checked,
         extensions: parseList("extensions"),
         minBytes: Math.min(Number.MAX_SAFE_INTEGER, Math.round(input("min-size").valueAsNumber * mib)),
         excludedSites: parseList("excluded"),

@@ -1,9 +1,12 @@
-import { Download, Folder, Link2, Upload } from "lucide-react";
+import { Download, Folder, Link2, Search, Upload } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import mediaArtwork from "../assets/media-sheet.svg";
 import { desktop, isTauri } from "../lib/tauri";
-import { bytes, clock, errorMessage, hasListParam, isHttpUrl, isPurePlaylistUrl, isRemoteTorrentUrl, isTorrentSource, isWildcard, sourceName } from "../lib/transfers";
-import type { AppSettings, AudioPreset, MediaFormatOption, MediaProbeResult } from "../types/ipc";
+import {
+  bytes, clock, errorMessage, folderSeparator, hasListParam, isHttpUrl, isPurePlaylistUrl,
+  isRemoteTorrentUrl, isTorrentSource, isWildcard, parsePlaylistRanges, sanitizeMediaStem, sourceName,
+} from "../lib/transfers";
+import type { AppSettings, AudioPreset, MediaFormatOption, MediaProbeResult, SelectedPlaylistEntry } from "../types/ipc";
 import { Dialog, FormatRow, Switch, Tabs } from "./ui";
 
 const tabs = [["video", "Video"], ["audio", "Audio Only"], ["subs", "Subtitles"], ["torrent", "Torrent / Magnet"]] as const;
@@ -73,6 +76,9 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
   });
   const [maxHeight, setMaxHeight] = useState<number | null>(null);
   const [playlistItems, setPlaylistItems] = useState("");
+  const [selectedIndices, setSelectedIndices] = useState(() => new Set(seed.probe?.playlist_items?.map(item => item.index)));
+  const [playlistFilter, setPlaylistFilter] = useState("");
+  const [playlistFolder, setPlaylistFolder] = useState<string | null>(null);
   const [videoFormat, setVideoFormat] = useState<string | null>(seed.format?.is_audio_only ? null : seed.format?.format_id ?? null);
   const [audio, setAudio] = useState<{ preset: AudioPreset } | { format: string }>(
     seed.format?.is_audio_only ? { format: seed.format.format_id } : { preset: "mp3_320" }
@@ -105,6 +111,42 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
   const direct = !isPlaylistActive && !torrent && (wildcard || (tab === "video" && !videoFormat));
   const mediaOptions = [...new Map(probe?.subtitles.map(track => [track.lang, track]) ?? []).values()];
   const choosePlaylistLanguages = isPlaylistActive && mediaOptions.length === 0;
+  const entries = isPlaylistActive && !torrent ? probe?.playlist_items ?? [] : [];
+  const previewIncomplete = probe?.playlist_count != null && probe.playlist_count > entries.length;
+  const noPlaylistSelection = entries.length > 0 && selectedIndices.size === 0 && !playlistItems.trim();
+  const filter = playlistFilter.trim().toLowerCase();
+  const indexFilter = /^#?\s*(\d+)$/.exec(filter)?.[1];
+  const visibleEntries = filter ? entries.filter(entry => entry.title.toLowerCase().includes(filter)
+    || (indexFilter && String(entry.index).includes(indexFilter))) : entries;
+  const defaultPlaylistFolder = sanitizeMediaStem(probe?.title ?? "");
+  const playlistFolderValue = playlistFolder ?? (probe ? defaultPlaylistFolder : "");
+  const destination = folder.trim() || settings.default_download_dir.trim() || "Default download folder";
+  const separator = folderSeparator(destination);
+  const playlistPath = destination.replace(/[\\/]+$/, "") + separator
+    + (playlistFolderValue.trim() ? sanitizeMediaStem(playlistFolderValue) : defaultPlaylistFolder) + separator;
+
+  function resetPlaylistSelection(next?: MediaProbeResult) {
+    setSelectedIndices(new Set(next?.playlist_items?.map(item => item.index)));
+    setPlaylistItems("");
+    setPlaylistFilter("");
+  }
+
+  function selectPlaylistIndices(indices: Set<number>) {
+    setSelectedIndices(indices);
+    setPlaylistItems("");
+    setMessage("");
+  }
+
+  function changePlaylistRange(value: string) {
+    setPlaylistItems(value);
+    setMessage("");
+    const normalized = value.trim().replace(/\s*([,-])\s*/g, "$1");
+    const ranges = parsePlaylistRanges(normalized);
+    if (entries.length && normalized && ranges) {
+      setSelectedIndices(new Set(entries.filter(entry => ranges.some(([first, last]) =>
+        entry.index >= first && entry.index <= last)).map(entry => entry.index)));
+    }
+  }
 
   function changeSource(value: string) {
     setUrl(value);
@@ -123,7 +165,8 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
     const playlist = isPurePlaylistUrl(next);
     setPlaylistMode(playlist);
     setMaxHeight(null);
-    setPlaylistItems("");
+    resetPlaylistSelection();
+    setPlaylistFolder(null);
     if (!playlist && (isTorrentSource(next) || isWildcard(next))) setTab("torrent");
     else if (isRemoteTorrentUrl(next)) setTab("video");
     else if (isHttpUrl(next) && tab === "torrent") setTab("video");
@@ -161,6 +204,12 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
         const result = await probePromise;
         if (request !== probeRequest.current) return;
         setProbe(result);
+        if (probe && value === source && (playlist === undefined || playlist === playlistMode)) {
+          const indices = result.playlist_items?.map(item => item.index) ?? [];
+          setSelectedIndices(current => new Set(indices.filter(index => current.has(index))));
+        } else {
+          resetPlaylistSelection(result);
+        }
         if (result.is_playlist) {
           setPlaylistMode(true);
           setAudio({ preset: "mp3_320" });
@@ -184,6 +233,8 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
     if (playlist === playlistMode) return;
     setPlaylistMode(playlist);
     setProbe(undefined);
+    resetPlaylistSelection();
+    setPlaylistFolder(null);
     setVideoFormat(null);
     setLanguages([]);
     setCustomLanguage("");
@@ -256,12 +307,16 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
         : "Probe the URL and select at least one subtitle language.");
       return;
     }
-    const items = isPlaylistActive ? playlistItems.trim().replace(/\s*([,-])\s*/g, "$1") : "";
-    if (items && (items.length > 512 || !/^\d+(-\d+)?(,\d+(-\d+)?)*$/.test(items)
-      || items.split(/[,-]/).some(value => Number(value) < 1 || Number(value) > 0xFFFFFFFF))) {
+    if (noPlaylistSelection) return;
+    const items = isPlaylistActive && !torrent ? playlistItems.trim().replace(/\s*([,-])\s*/g, "$1") : "";
+    if (!parsePlaylistRanges(items)) {
       setMessage("Enter playlist item numbers or ranges, such as 1-5, 8.");
       return;
     }
+    const selectedEntries: SelectedPlaylistEntry[] | null = !items && entries.length
+      && !(previewIncomplete && selectedIndices.size === entries.length)
+      ? entries.filter(item => selectedIndices.has(item.index)).map(({ index, title, url }) => ({ index, title, url: url ?? null }))
+      : null;
     submitLock.current = true;
     setSubmitting(true);
     onBusyChange(true);
@@ -298,7 +353,11 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
           audio_only_preset: tab === "audio" && "preset" in audio ? audio.preset : null,
           embed_subtitles_langs: tab === "audio" ? [] : tab === "subs" || embed ? languages : [],
           lossless_remux: remux, normalize_audio: normalize, save_dir: saveDir, filename: outputName,
-          ...(isPlaylistActive && { download_playlist: true, max_height: tab === "audio" ? null : maxHeight, playlist_items: items || null }),
+          ...(isPlaylistActive && {
+            download_playlist: true, max_height: tab === "audio" ? null : maxHeight,
+            playlist_items: items || null, playlist_folder_name: playlistFolderValue.trim() || null,
+            selected_entries: selectedEntries,
+          }),
         });
       }
       onAdded("Download added.", id);
@@ -426,10 +485,61 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
             <Switch label="Sequential" checked={sequential} onChange={setSequential} />
           </div>)}
         </Tabs>
-        {isPlaylistActive && !torrent && <label className="field">Playlist Items
-          <input value={playlistItems} onChange={event => setPlaylistItems(event.target.value)}
-            placeholder="All videos (e.g. 1-5, 8)" />
-        </label>}
+        {isPlaylistActive && !torrent && <>
+          {entries.length > 0 && <div className="playlist-checklist" role="group" aria-labelledby="playlist-videos-label">
+            <div className="playlist-checklist-toolbar">
+              <div className="playlist-checklist-heading">
+                <h3 id="playlist-videos-label">Playlist Videos</h3>
+                <span className="field-note tabular" role="status">{selectedIndices.size} of {entries.length} selected</span>
+              </div>
+              <div className="playlist-checklist-actions">
+                <button type="button" className="btn-ghost form-button"
+                  onClick={() => selectPlaylistIndices(new Set(entries.map(entry => entry.index)))}>Select All</button>
+                <button type="button" className="btn-ghost form-button"
+                  onClick={() => selectPlaylistIndices(new Set())}>Clear</button>
+                <button type="button" className="btn-ghost form-button"
+                  onClick={() => selectPlaylistIndices(new Set(entries.filter(entry => !selectedIndices.has(entry.index))
+                    .map(entry => entry.index)))}>Invert</button>
+              </div>
+              <label className="field-inline playlist-filter"><Search size={14} aria-hidden="true" />
+                <input type="search" aria-label="Filter videos" placeholder="Filter videos…" value={playlistFilter}
+                  onChange={event => setPlaylistFilter(event.target.value)}
+                  onKeyDown={event => { if (event.key === "Enter") event.preventDefault(); }} />
+              </label>
+            </div>
+            <div className="playlist-checklist-items">
+              {visibleEntries.map(entry => <label className="playlist-checklist-row" key={entry.index}>
+                <input type="checkbox" checked={selectedIndices.has(entry.index)} onChange={event => {
+                  const next = new Set(selectedIndices);
+                  if (event.target.checked) next.add(entry.index);
+                  else next.delete(entry.index);
+                  selectPlaylistIndices(next);
+                }} />
+                <span className="playlist-entry-index tabular">#{entry.index}</span>
+                <span className="playlist-entry-title" title={entry.title}>{entry.title}</span>
+                {entry.duration_seconds != null && <span className="field-note tabular">{clock(entry.duration_seconds)}</span>}
+              </label>)}
+              {!visibleEntries.length && <p className="field-note playlist-checklist-empty">No videos match your filter.</p>}
+            </div>
+            {noPlaylistSelection && <p className="field-note playlist-checklist-empty">Select at least one video to download.</p>}
+          </div>}
+          {previewIncomplete && <p className="field-note playlist-checklist-empty tabular">
+            {entries.length
+              ? `Showing ${entries.length} of ${probe.playlist_count} videos. Select all previewed videos to download the full playlist.`
+              : `Preview unavailable for this ${probe.playlist_count}-video playlist. Leave Playlist Items empty to download it in full.`}
+            {" "}Use Playlist Items to specify a range outside the preview.
+          </p>}
+          <label className="field">Playlist Items
+            <input value={playlistItems} onChange={event => changePlaylistRange(event.target.value)}
+              placeholder={entries.length ? "Select by number (e.g. 1-5, 8)" : "All videos (e.g. 1-5, 8)"} />
+          </label>
+          <div className="field">
+            <label htmlFor="playlist-folder">Playlist Folder</label>
+            <input id="playlist-folder" value={playlistFolderValue} aria-describedby="playlist-path"
+              placeholder={probe ? defaultPlaylistFolder : "Playlist title"} onChange={event => setPlaylistFolder(event.target.value)} />
+            <span id="playlist-path" className="field-note playlist-path" title={playlistPath}>{playlistPath}</span>
+          </div>
+        </>}
 
         {tab !== "torrent" && <div className="sheet-toggles">
           {tab !== "audio" && <Switch label="Embed Subtitles" checked={embed} onChange={setEmbed} />}
@@ -458,7 +568,7 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
         <span className="sheet-foot-note tabular">{torrent ? "BitTorrent" : isPlaylistActive ? "Playlist download" : direct ? threads + " HTTP threads" : "Media download"}</span>
         <div className="sheet-foot-btns">
           <button type="button" className="btn-ghost form-button" disabled={submitting} onClick={onClose}>Cancel</button>
-          <button type="submit" className="btn-primary" disabled={submitting || probeBusy || !source}>
+          <button type="submit" className="btn-primary" disabled={submitting || probeBusy || !source || noPlaylistSelection}>
             <Download size={14} />{submitting ? "Adding…" : isPlaylistActive && !torrent ? "Download Playlist" : "Download"}
           </button>
         </div>

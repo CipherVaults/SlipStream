@@ -1,36 +1,60 @@
-use std::{cmp::Ordering, collections::HashSet, time::Duration};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    time::Duration,
+};
 
 use serde_json::Value;
 use slipstream_protocol::{
     sanitize_title_to_filename, validate_http_url, AudioPreset, AudioTrackKind, MediaContainer,
-    MediaFormatOption, MediaProbeResult, SubtitleTrack,
+    MediaFormatOption, MediaProbeResult, NativeBridgeResponse, PlaylistEntry, SubtitleTrack,
+    MAX_NATIVE_MESSAGE_BYTES,
 };
 
 use crate::{
     args::{validate_format_id, validate_subtitle_language},
     toolchain::{capture, command},
-    BuildYtDlpArgs, MediaError, MediaToolchain,
+    BuildYtDlpArgs, MediaError, MediaToolchain, ResolvedBinary,
 };
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ProbeOptions {
     pub playlist: bool,
+    pub cache_dir: Option<PathBuf>,
+    pub headers: HashMap<String, String>,
 }
 
 // Keep the preview comfortably below the native IPC frame limit. The count
 // is calculated from the full probe before taking the preview.
-const MAX_PLAYLIST_PREVIEW_ENTRIES: usize = 512;
-const MAX_PLAYLIST_TITLE_CHARS: usize = 160;
+pub const MAX_PLAYLIST_PREVIEW_ENTRIES: usize = 512;
+pub const MAX_PLAYLIST_TITLE_CHARS: usize = 160;
+const MAX_FORMATS: usize = 64;
+const MAX_SUBTITLES: usize = 64;
+// The filename sanitizer caps each legacy title at 200 bytes. Reserve 128 KiB
+// for those titles and their array overhead before budgeting structured items.
+const MAX_PLAYLIST_ITEMS_BYTES: usize = MAX_NATIVE_MESSAGE_BYTES / 2 - 128 * 1024;
+const MAX_PLAYLIST_THUMBNAIL_URL_BYTES: usize = 512;
 
 pub async fn probe_url(
     tools: &MediaToolchain,
     url: &str,
     options: ProbeOptions,
 ) -> Result<MediaProbeResult, MediaError> {
-    let args = BuildYtDlpArgs::probe(options.playlist)
-        .ffmpeg_location(&tools.ffmpeg().path)?
-        .build(url)?;
-    let binary = tools.require_ytdlp()?;
+    probe_url_with_binary(tools.require_ytdlp()?, url, options).await
+}
+
+/// Probes media using a discovered yt-dlp binary.
+pub async fn probe_url_with_binary(
+    binary: &ResolvedBinary,
+    url: &str,
+    options: ProbeOptions,
+) -> Result<MediaProbeResult, MediaError> {
+    let mut builder = BuildYtDlpArgs::probe(options.playlist).headers(&options.headers)?;
+    if let Some(dir) = &options.cache_dir {
+        builder = builder.cache_dir(dir)?;
+    }
+    let args = builder.build(url)?;
     let mut cmd = command(&binary.path, "yt-dlp");
     cmd.args(args);
     let output = capture(
@@ -70,6 +94,28 @@ pub fn parse_ytdlp_probe_json(
                 .or_else(|| entries.and_then(|items| items.len().try_into().ok()))
         })
         .flatten();
+    let youtube_playlist =
+        is_youtube_extractor(&value["extractor"]) || is_youtube_extractor(&value["extractor_key"]);
+    let mut playlist_entries = Vec::new();
+    let mut playlist_items = Vec::new();
+    let mut playlist_items_bytes = 0;
+    for (position, entry) in entries
+        .into_iter()
+        .flatten()
+        .take(MAX_PLAYLIST_PREVIEW_ENTRIES)
+        .enumerate()
+    {
+        let title = playlist_entry_title(entry);
+        if entry.is_object() && playlist_items_bytes < MAX_PLAYLIST_ITEMS_BYTES {
+            let item = parse_playlist_entry(entry, (position + 1) as u32, &title, youtube_playlist);
+            playlist_items_bytes += serde_json::to_vec(&item)?.len() + 1;
+            if playlist_items_bytes <= MAX_PLAYLIST_ITEMS_BYTES {
+                playlist_items.push(item);
+            }
+        }
+        // The legacy array uses positions to map titles to staged downloads.
+        playlist_entries.push(title);
+    }
 
     let mut formats: Vec<_> = value["formats"]
         .as_array()
@@ -80,10 +126,23 @@ pub fn parse_ytdlp_probe_json(
     if formats.is_empty() && !is_playlist {
         formats.extend(parse_format(&value));
     }
-    let formats = rank_formats(formats);
+    let mut formats = rank_formats(formats);
+    if formats.len() > MAX_FORMATS
+        && !formats[..MAX_FORMATS]
+            .iter()
+            .any(|format| format.is_audio_only)
+    {
+        if let Some(audio) = formats[MAX_FORMATS..]
+            .iter()
+            .position(|format| format.is_audio_only)
+        {
+            formats.swap(MAX_FORMATS - 1, MAX_FORMATS + audio);
+        }
+    }
+    formats.truncate(MAX_FORMATS);
 
     let mut subtitles = Vec::new();
-    for (key, is_auto) in [("subtitles", false), ("automatic_captions", true)] {
+    'tracks: for (key, is_auto) in [("subtitles", false), ("automatic_captions", true)] {
         if let Some(tracks) = value[key].as_object() {
             for (lang, versions) in tracks {
                 if validate_subtitle_language(lang).is_err()
@@ -99,56 +158,166 @@ pub fn parse_ytdlp_probe_json(
                     .unwrap_or(lang);
                 subtitles.push(SubtitleTrack {
                     lang: lang.clone(),
-                    name: name.to_owned(),
+                    name: name.chars().take(80).collect(),
                     is_auto,
                 });
+                if subtitles.len() == MAX_SUBTITLES {
+                    break 'tracks;
+                }
             }
         }
     }
 
-    Ok(MediaProbeResult {
-        title: value["title"]
-            .as_str()
-            .map(str::trim)
-            .filter(|title| !title.is_empty())
-            .unwrap_or("download")
-            .to_owned(),
-        source_url,
-        extractor: value["extractor"]
-            .as_str()
-            .or_else(|| value["extractor_key"].as_str())
-            .unwrap_or_default()
-            .to_owned(),
-        duration_seconds: duration_seconds(&value["duration"]),
-        thumbnail_url: value["thumbnail"]
-            .as_str()
-            .and_then(|url| validate_http_url(url).ok())
-            .map(|url| url.to_string()),
-        is_playlist,
-        playlist_count,
-        playlist_entries: entries
-            .into_iter()
-            .flatten()
-            .take(MAX_PLAYLIST_PREVIEW_ENTRIES)
-            .map(|entry| {
-                entry["title"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|title| !title.is_empty())
-                    .and_then(|title| {
-                        let end = title
-                            .char_indices()
-                            .nth(MAX_PLAYLIST_TITLE_CHARS)
-                            .map_or(title.len(), |(end, _)| end);
-                        sanitize_title_to_filename(&title[..end], "txt").ok()
-                    })
-                    .and_then(|name| name.strip_suffix(".txt").map(str::to_owned))
-                    .unwrap_or_default()
-            })
-            .collect(),
-        formats,
-        subtitles,
+    let mut response = NativeBridgeResponse::MediaProbed {
+        probe: MediaProbeResult {
+            title: value["title"]
+                .as_str()
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .unwrap_or("download")
+                .chars()
+                .take(240)
+                .collect(),
+            source_url,
+            extractor: value["extractor"]
+                .as_str()
+                .or_else(|| value["extractor_key"].as_str())
+                .unwrap_or_default()
+                .chars()
+                .take(64)
+                .collect(),
+            duration_seconds: duration_seconds(&value["duration"]),
+            thumbnail_url: value["thumbnail"]
+                .as_str()
+                .and_then(|url| bounded_http_url(url, 1024)),
+            is_playlist,
+            playlist_count,
+            playlist_entries,
+            playlist_items,
+            formats,
+            subtitles,
+        },
+    };
+    let mut size = serde_json::to_vec(&response)?.len();
+    let NativeBridgeResponse::MediaProbed { probe } = &mut response else {
+        unreachable!();
+    };
+    while size >= MAX_NATIVE_MESSAGE_BYTES - 16 * 1024 {
+        if !probe.playlist_items.is_empty() || !probe.playlist_entries.is_empty() {
+            size -= pop_wire_bytes(&mut probe.playlist_items)?
+                + pop_wire_bytes(&mut probe.playlist_entries)?;
+        } else if !probe.subtitles.is_empty() {
+            size -= pop_wire_bytes(&mut probe.subtitles)?;
+        } else if !probe.formats.is_empty() {
+            size -= pop_wire_bytes(&mut probe.formats)?;
+        } else {
+            return Err(MediaError::InvalidToolOutput {
+                tool: "yt-dlp",
+                kind: "probe frame size",
+            });
+        }
+    }
+    let NativeBridgeResponse::MediaProbed { probe } = response else {
+        unreachable!();
+    };
+    Ok(probe)
+}
+
+fn pop_wire_bytes<T: serde::Serialize>(items: &mut Vec<T>) -> Result<usize, MediaError> {
+    let Some(item) = items.pop() else {
+        return Ok(0);
+    };
+    Ok(serde_json::to_vec(&item)?.len() + usize::from(!items.is_empty()))
+}
+
+fn playlist_entry_title(entry: &Value) -> String {
+    entry["title"]
+        .as_str()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .and_then(|title| sanitize_title_to_filename(clamp_playlist_title(title), "txt").ok())
+        .and_then(|name| {
+            let stem = name.strip_suffix(".txt")?;
+            // Sanitization can prepend an underscore to a reserved Windows name.
+            Some(
+                clamp_playlist_title(stem)
+                    .trim_end_matches(['.', ' '])
+                    .to_owned(),
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn clamp_playlist_title(title: &str) -> &str {
+    let end = title
+        .char_indices()
+        .nth(MAX_PLAYLIST_TITLE_CHARS)
+        .map_or(title.len(), |(end, _)| end);
+    &title[..end]
+}
+
+fn parse_playlist_entry(entry: &Value, position: u32, title: &str, youtube: bool) -> PlaylistEntry {
+    let id = entry["id"].as_str().map(str::trim).filter(|id| {
+        !id.is_empty() && id.chars().count() <= 128 && !id.chars().any(char::is_control)
+    });
+    let url = ["webpage_url", "url"]
+        .into_iter()
+        .filter_map(|key| entry[key].as_str())
+        .find_map(|url| bounded_http_url(url, MAX_PLAYLIST_ITEMS_BYTES))
+        .or_else(|| {
+            let id = id.filter(|id| {
+                (6..=32).contains(&id.len())
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+            })?;
+            if youtube || is_youtube_extractor(&entry["ie_key"]) {
+                bounded_http_url(
+                    &format!("https://www.youtube.com/watch?v={id}"),
+                    MAX_PLAYLIST_ITEMS_BYTES,
+                )
+            } else {
+                None
+            }
+        });
+    let thumbnail_url = entry["thumbnail"]
+        .as_str()
+        .and_then(|url| bounded_http_url(url, MAX_PLAYLIST_THUMBNAIL_URL_BYTES))
+        .or_else(|| {
+            entry["thumbnails"]
+                .as_array()?
+                .iter()
+                .rev()
+                .find_map(|thumbnail| {
+                    bounded_http_url(thumbnail["url"].as_str()?, MAX_PLAYLIST_THUMBNAIL_URL_BYTES)
+                        .filter(|url| url.starts_with("https://"))
+                })
+        });
+
+    PlaylistEntry {
+        index: u32_value(&entry["playlist_index"])
+            .filter(|&index| index > 0)
+            .unwrap_or(position),
+        id: id.map(str::to_owned),
+        title: title.to_owned(),
+        url,
+        duration_seconds: duration_seconds(&entry["duration"]),
+        thumbnail_url,
+    }
+}
+
+fn is_youtube_extractor(value: &Value) -> bool {
+    value.as_str().is_some_and(|name| {
+        name.eq_ignore_ascii_case("youtube") || name.eq_ignore_ascii_case("youtube:tab")
     })
+}
+
+fn bounded_http_url(raw: &str, max_bytes: usize) -> Option<String> {
+    if raw.len() > max_bytes {
+        return None;
+    }
+    let url = validate_http_url(raw).ok()?;
+    (url.as_str().len() <= max_bytes).then(|| url.to_string())
 }
 
 fn u32_value(value: &Value) -> Option<u32> {
@@ -610,16 +779,148 @@ mod tests {
     fn large_playlist_probe_fits_native_frame_and_preserves_count() {
         use slipstream_protocol::{NativeBridgeResponse, MAX_NATIVE_MESSAGE_BYTES};
 
-        let entries = vec![serde_json::json!({ "title": "🎬".repeat(512) }); 6000];
+        let mut entries = vec![serde_json::json!({ "title": "🎬".repeat(512) }); 6000];
+        entries[0]["title"] = serde_json::json!(format!("CON.{}", "a".repeat(170)));
         let json = serde_json::json!({ "_type": "playlist", "entries": entries }).to_string();
         let probe = parse_ytdlp_probe_json(&json, URL).unwrap();
         assert_eq!(probe.playlist_count, Some(6000));
         assert_eq!(probe.playlist_entries.len(), MAX_PLAYLIST_PREVIEW_ENTRIES);
+        assert_eq!(probe.playlist_items.len(), MAX_PLAYLIST_PREVIEW_ENTRIES);
+        assert!(probe.playlist_items[0].title.starts_with("_CON."));
         assert!(probe.playlist_entries.iter().all(|title| {
             !title.is_empty() && title.chars().count() <= MAX_PLAYLIST_TITLE_CHARS
         }));
         let response = serde_json::to_vec(&NativeBridgeResponse::MediaProbed { probe }).unwrap();
         assert!(response.len() < MAX_NATIVE_MESSAGE_BYTES / 2);
+    }
+
+    #[test]
+    fn oversized_playlist_metadata_preserves_legacy_preview_and_frame_headroom() {
+        let entry = serde_json::json!({
+            "id": "🎬".repeat(128), "title": "🎬".repeat(160),
+            "url": format!("https://example.com/{}", "a".repeat(2000)),
+            "thumbnail": format!("https://example.com/{}", "b".repeat(450))
+        });
+        let json = serde_json::json!({ "entries": vec![entry; 768] }).to_string();
+        let probe = parse_ytdlp_probe_json(&json, URL).unwrap();
+        assert_eq!(probe.playlist_count, Some(768));
+        assert_eq!(probe.playlist_entries.len(), MAX_PLAYLIST_PREVIEW_ENTRIES);
+        assert!(!probe.playlist_items.is_empty());
+        assert!(probe.playlist_items.len() < MAX_PLAYLIST_PREVIEW_ENTRIES);
+        assert_eq!(
+            probe.playlist_items.last().unwrap().index as usize,
+            probe.playlist_items.len()
+        );
+        let response =
+            serde_json::to_vec(&slipstream_protocol::NativeBridgeResponse::MediaProbed { probe })
+                .unwrap();
+        assert!(response.len() < MAX_NATIVE_MESSAGE_BYTES / 2);
+    }
+
+    #[test]
+    fn probe_wire_budget_covers_all_fields_and_prefers_manual_subtitles() {
+        use serde_json::{json, Map};
+        let tracks = (0..200)
+            .map(|i| (format!("en-{i}"), json!([{ "name": "\u{1}".repeat(4000) }])))
+            .collect::<Map<_, _>>();
+        let formats = (1..=300)
+            .map(|height| {
+                json!({
+                    "format_id": format!("id-{height}"), "height": height, "vcodec": "avc1",
+                    "ext": "mp4", "format_note": "format ".repeat(512)
+                })
+            })
+            .collect::<Vec<_>>();
+        let json = json!({
+            "title": "🎬".repeat(300), "extractor": "x".repeat(300),
+            "thumbnail": format!("https://example.com/{}", "t".repeat(2048)),
+            "entries": vec![json!({ "title": "🎬".repeat(160) }); 600],
+            "formats": formats, "subtitles": &tracks, "automatic_captions": &tracks,
+        });
+        // This long source forces the overall frame budget to trim the
+        // playlist even after each metadata field has been capped.
+        let source = format!("https://example.com/{}", "a".repeat(930_000));
+        let probe = parse_ytdlp_probe_json(&json.to_string(), &source).unwrap();
+        assert_eq!(probe.title.chars().count(), 240);
+        assert_eq!(probe.extractor.chars().count(), 64);
+        assert!(probe.thumbnail_url.is_none());
+        assert_eq!(probe.formats.len(), 64);
+        assert_eq!(probe.subtitles.len(), 64);
+        assert!(probe
+            .subtitles
+            .iter()
+            .all(|track| !track.is_auto && track.name.chars().count() == 80));
+        assert_eq!(probe.playlist_count, Some(600));
+        assert!(probe.playlist_items.len() < MAX_PLAYLIST_PREVIEW_ENTRIES);
+        let encoded = serde_json::to_vec(&NativeBridgeResponse::MediaProbed { probe }).unwrap();
+        assert!(encoded.len() < MAX_NATIVE_MESSAGE_BYTES - 16 * 1024);
+    }
+
+    #[test]
+    fn parses_playlist_entry_links_and_skips_invalid_fields() {
+        let playlist = serde_json::json!({
+            "extractor": "YouTube:Tab",
+            "entries": [
+                {"id":" abc_123 ", "title":"First/Clip", "url":"abc_123", "duration":42.9},
+                null,
+                {"id":"xyz_456", "title":"Explicit URL", "playlist_index":7,
+                 "webpage_url":"https://example.com/watch", "url":"https://example.com/direct",
+                 "thumbnail":"https://example.com/primary.jpg"},
+                {"id":"bad\u{7f}id", "title":"Last", "playlist_index":0,
+                 "webpage_url":"file:///bad", "url":"https://example.com/fallback",
+                 "duration":-1, "thumbnail":format!("https://example.com/{}", "x".repeat(512)),
+                 "thumbnails":[{"url":"https://example.com/first.jpg"}, {"url":"https://example.com/last.jpg"},
+                               {"url":"http://example.com/plain.jpg"}, {"url":"file:///bad.jpg"}]},
+                {"id":"bad?id", "url":"javascript:alert(1)", "thumbnail":"file:///bad.jpg"},
+                {"id":"a".repeat(129)}
+            ]
+        });
+        let probe = parse_ytdlp_probe_json(&playlist.to_string(), URL).unwrap();
+        assert_eq!(probe.playlist_count, Some(6));
+        assert_eq!(
+            probe.playlist_entries,
+            ["First_Clip", "", "Explicit URL", "Last", "", ""]
+        );
+        let [first, explicit, last, unsafe_entry, overlong] = probe.playlist_items.as_slice()
+        else {
+            panic!("expected five structured entries");
+        };
+        assert_eq!(first.index, 1);
+        assert_eq!(first.id.as_deref(), Some("abc_123"));
+        assert_eq!(first.title, "First_Clip");
+        assert_eq!(
+            first.url.as_deref(),
+            Some("https://www.youtube.com/watch?v=abc_123")
+        );
+        assert_eq!(first.duration_seconds, Some(42));
+        assert_eq!(explicit.index, 7);
+        assert_eq!(explicit.url.as_deref(), Some("https://example.com/watch"));
+        assert_eq!(
+            explicit.thumbnail_url.as_deref(),
+            Some("https://example.com/primary.jpg")
+        );
+        assert_eq!(last.index, 4);
+        assert!(last.id.is_none());
+        assert!(last.duration_seconds.is_none());
+        assert_eq!(last.url.as_deref(), Some("https://example.com/fallback"));
+        assert_eq!(
+            last.thumbnail_url.as_deref(),
+            Some("https://example.com/last.jpg")
+        );
+        assert!(unsafe_entry.url.is_none());
+        assert!(unsafe_entry.thumbnail_url.is_none());
+        assert!(overlong.id.is_none());
+
+        let untyped = parse_ytdlp_probe_json(
+            r#"{"entries":[{"id":"abc123"},{"id":"abc123","ie_key":"Youtube"}]}"#,
+            URL,
+        )
+        .unwrap();
+        assert!(untyped.playlist_items[0].url.is_none());
+        assert_eq!(
+            untyped.playlist_items[1].url.as_deref(),
+            Some("https://www.youtube.com/watch?v=abc123")
+        );
     }
 
     #[test]

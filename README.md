@@ -12,7 +12,7 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 
 - **Target OS:** Windows 10 / Windows 11 (`x86_64`)
 - **Public repository** [CipherVaults/SlipStream](https://github.com/CipherVaults/SlipStream)
-- **Release** [v1.1.1](https://github.com/CipherVaults/SlipStream/releases/tag/v1.1.1)
+- **Release** [v1.2.0](https://github.com/CipherVaults/SlipStream/releases/tag/v1.2.0)
 
 ---
 
@@ -28,7 +28,8 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 ### 2. Hardened Media & Format Pipeline (`crates/media`)
 - **Bundled tools** The installer and portable ZIP include yt-dlp 2026.10.26 and the FFmpeg 9.1 Essentials builds of `ffmpeg.exe` and `ffprobe.exe`, with license files in `bin/`. **Settings → Toolchain → Update yt-dlp** resolves a single upstream release, checks the executable against that release’s SHA-256 checksum, and installs it in your per-user tool directory. Settings shows the active versions and sources of all three tools and supports custom paths.
 - **Zero Shell Interpolation:** Invokes `yt-dlp.exe`, `ffmpeg.exe`, and `ffprobe.exe` strictly with discrete argument arrays, allowlisted flags, `--`, forced local FFmpeg demuxers, `YTDLP_NO_PLUGINS=1`, and junction-free canonical `.exe` checks.
-- **Format, Container & Audio Selection:** Structured `4K 2160p60` / codec (`AV1`, `VP9`, `H.264`) / container (`MP4`, `MKV`, `WebM`) selection, lossless stream remuxing, audio extraction (`MP3 320k`, `M4A`, `Opus`, `FLAC`, `WAV`) with optional EBU R128 loudness normalization, subtitle language embedding (`.srt`, `.vtt`, `.ass`, `.ssa`), and playlist item selection.
+- **Format, Container & Audio Selection:** Structured `4K 2160p60` / codec (`AV1`, `VP9`, `H.264`) / container (`MP4`, `MKV`, `WebM`) selection, lossless stream remuxing, audio extraction (`MP3 320k`, `M4A`, `Opus`, `FLAC`, `WAV`) with optional EBU R128 loudness normalization, and subtitle language embedding (`.srt`, `.vtt`, `.ass`, `.ssa`).
+- **Selective playlists.** Use the searchable checklist or enter item ranges in **Add Download** to choose videos and preview the destination. SlipStream downloads the selection in order into a dedicated playlist subfolder. Use the collapsible group in **Transfers** to track progress, pause or resume the playlist, or open its folder.
 - **Isolated Staging & MotW:** Downloads to scoped UUID staging directories, tags outputs with `:Zone.Identifier`, and publishes atomically via non-overwriting `fs::hard_link`.
 
 ### 3. Native BitTorrent & Magnet (`crates/torrent`)
@@ -38,7 +39,7 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 ### 4. Browser Integration (`crates/native-host` + `extensions/browser`)
 - **Cross-Browser MV3:** Supports **Chrome**, **Edge**, **Brave**, and **Firefox** (`slipstream@ciphervaults.com`) using `4`-byte little-endian `1 MiB` Native Messaging framing and per-user `HKCU` registration.
 - **One-click Browser Picker** Choose **Add Extension** or **Open Setup** for your browser in **Settings → Browser Integration**. SlipStream opens the browser’s extension setup page and reveals the bundled extension folder. Chrome, Edge, and Brave share the fixed ID `nikdbkenglojniombimjdkneanmponcp`.
-- **Floating Shadow-DOM Media Pill:** Closed Shadow DOM page overlay for 1-click `4K`, `1080p`, `MP3 320k`, `FLAC`, Format Picker, Mute Site, or Grab All Links—guarded by `event.isTrusted`, top-frame origin verification, and SPA navigation invalidation.
+- **Floating media pill.** Open the closed Shadow DOM pill for available video qualities, audio presets, or **Download Playlist…** on supported pages. The extension detects embedded players and HLS streams. Drag the pill to snap it to a player edge, dismiss it in one click, or enable it in fullscreen from the extension popup. Capture-phase protection helps keep page click handlers from interfering with the pill.
 - **Privacy & Context Isolation:** `downloads.onCreated` honors `Alt`-key bypass, file extensions, size thresholds, muted/excluded sites, and **Incognito / Firefox `cookieStoreId` isolation**. Browser `GetStatus` responses redact desktop query tokens and filesystem paths before leaving the daemon.
 
 ### 5. Dual-Theme Windows Desktop App & Auto-Updater (`apps/desktop`)
@@ -51,6 +52,8 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 
 ## Security & Verification
 
+The figures below are the historical audit and evaluation results recorded for v1.0.0. [v1.0.0 changelog entry](CHANGELOG.md#100---2026-11-21)
+
 - **6-Phase `/security-audit`:** Completed 3 hunting waves across 19 coverage units, 3 independent coverage critics, cross-model candidate validation, and fresh record verification (`0` confirmed vulnerabilities; proactive hardening landed for browser `GetStatus` redaction, cancel credential scrubbing, torrent `:Zone.Identifier` tagging, and trailing-dot `localhost.` SSRF normalization).
 - **Part II Safety & Resilience Evaluation (`tests/safety-eval`):** Preregistered (`slipstream-safety-v1`) deterministic oracle suite passing **1,200 / 1,200** adversarial + benign single-input boundary cases and **108 / 108** orthogonal 5-factor stateful HTTP chaos chains (`0` broken items, `0` escapes, `0` benign false rejections, strict `bias-audit` Cramér's `V = 0.0`).
 
@@ -58,8 +61,8 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 
 ## Download, Installation & Browser Setup
 
-1. **Installer** Download `SlipStream_1.1.1_x64-setup.exe` and run the per-user installer. It includes the native messaging host, media tools, and both browser extension builds. [v1.1.1 release assets](https://github.com/CipherVaults/SlipStream/releases/tag/v1.1.1)
-2. **Portable ZIP** Extract `SlipStream-1.1.1-windows-x64-portable.zip` and run `SlipStream.exe`. Keep the extracted `bin/` and `extensions/` directories beside it.
+1. **Installer** Download `SlipStream_1.2.0_x64-setup.exe` and run the per-user installer. It includes the native messaging host, media tools, and both browser extension builds. [v1.2.0 release assets](https://github.com/CipherVaults/SlipStream/releases/tag/v1.2.0)
+2. **Portable ZIP** Extract `SlipStream-1.2.0-windows-x64-portable.zip` and run `SlipStream.exe`. Keep the extracted `bin/` and `extensions/` directories beside it.
 3. **Browser extension** In **Settings → Browser Integration**, select your browser. For Chrome, Edge, or Brave, enable **Developer mode**, select **Load unpacked**, and choose the revealed folder. In Firefox, choose **Load Temporary Add-on** and select the revealed `manifest.json`. Separate browser extension ZIPs are also available on the release page.
 
 **Upgrading from v1.0.0** SlipStream keeps the valid native messaging IDs already registered for each browser and adds the bundled extension ID. If an older unpacked copy’s ID is missing from the registration, copy the ID from the browser’s extensions page and enter it in **Settings → Browser Integration** for that browser.

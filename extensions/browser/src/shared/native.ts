@@ -79,6 +79,33 @@ export class NativeClient {
     return this.enqueue(request);
   }
 
+  probe(request: Extract<NativeBridgeRequest, { type: "probe_media" }>, signal: AbortSignal): Promise<NativeBridgeResponse> {
+    if (!this.state.connected || signal.aborted) return Promise.resolve(disconnected);
+    // Native Messaging has no request IDs. Isolate discovery so a slow probe
+    // cannot hold the status and user-action connection.
+    return new Promise((resolve) => {
+      let port: chrome.runtime.Port | undefined;
+      const finish = (response: NativeBridgeResponse, disconnect = true) => {
+        signal.removeEventListener("abort", abort);
+        resolve(response);
+        if (disconnect) port?.disconnect();
+      };
+      const abort = () => finish({ type: "error", code: "request_timeout", message: "Media discovery timed out." });
+      try {
+        port = extension.runtime.connectNative(NATIVE_HOST_NAME);
+        signal.addEventListener("abort", abort, { once: true });
+        port.onMessage.addListener((response: NativeBridgeResponse) => finish(response));
+        port.onDisconnect.addListener(() => {
+          void extension.runtime.lastError;
+          finish(disconnected, false);
+        });
+        port.postMessage(request);
+      } catch {
+        finish(disconnected);
+      }
+    });
+  }
+
   private enqueue(request: NativeBridgeRequest): Promise<NativeBridgeResponse> {
     if (!this.port) return Promise.resolve(disconnected);
     if (this.queue.length >= 32) {
