@@ -41,8 +41,11 @@ export function TransferDialog({ mode, transfer, onClose, onBusyChange, onChange
         const pairs = headers.split(/\r?\n/).filter(line => line.trim()).map(line => {
           const separator = line.indexOf(":");
           const key = line.slice(0, separator).trim();
-          if (separator < 1 || !/^[\w-]+$/.test(key)) throw new Error("Enter one HTTP header per line using Name: value.");
-          return [key, line.slice(separator + 1).trim()];
+          const val = line.slice(separator + 1).trim();
+          if (separator < 1 || !/^[\w-]+$/.test(key) || /[\u0000-\u001f\u007f]/.test(val)) {
+            throw new Error("Enter one HTTP header per line using Name: value.");
+          }
+          return [key, val];
         });
         await desktop.refreshDownloadUrl({ transfer_id: transfer.id, new_url: input, headers: Object.fromEntries(pairs),
           referrer: referrer.trim() || null });

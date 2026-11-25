@@ -1,8 +1,9 @@
 import { FileCheck2, Folder, Pause, Play, RefreshCw } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import alpinePreview from "../assets/alpine-preview.svg";
+import mediaArtwork from "../assets/media-sheet.svg";
 import { desktop } from "../lib/tauri";
-import { bytes, errorMessage, isDone, isRunning, parentFolder, percentage, ratio, SEGMENT_COUNT, speed, statusLabel } from "../lib/transfers";
+import { bytes, errorMessage, isDone, isRunning, isSafeThumbnailUrl, parentFolder, percentage, ratio, SEGMENT_COUNT, speed, statusLabel } from "../lib/transfers";
 import type { MediaFormatOption, MediaProbeResult, SegmentState, TorrentFileEntry, TransferSnapshot } from "../types/ipc";
 import { Sparkline } from "./Sparkline";
 import { primaryAction, TransferIcon, type OnTransferAction } from "./TransferList";
@@ -173,6 +174,7 @@ export function Inspector({ transfer, samples, preview, torrentEntry, onLoadTorr
 }) {
   const [tab, setTab] = useState<InspectorTab>("overview");
   const [thumbnail, setThumbnail] = useState<string | null>(null);
+  const [thumbFailed, setThumbFailed] = useState(false);
   const [mediaState, setMediaState] = useState<MediaDetailState>({ status: "idle" });
   const mediaRequestToken = useRef(0);
   const mediaRequestedUrl = useRef<string | null>(null);
@@ -194,6 +196,7 @@ export function Inspector({ transfer, samples, preview, torrentEntry, onLoadTorr
     mediaRequestToken.current++;
     mediaRequestedUrl.current = null;
     setThumbnail(null);
+    setThumbFailed(false);
     setMediaState({ status: "idle" });
   }, [transferId, transferUrl]);
 
@@ -206,6 +209,7 @@ export function Inspector({ transfer, samples, preview, torrentEntry, onLoadTorr
     void desktop.probeMedia(transferUrl).then(probe => {
       if (!mountedRef.current || token !== mediaRequestToken.current) return;
       setThumbnail(probe.thumbnail_url);
+      setThumbFailed(false);
       setMediaState({ status: "ready", probe });
     }, error => {
       if (!mountedRef.current || token !== mediaRequestToken.current) return;
@@ -248,15 +252,17 @@ export function Inspector({ transfer, samples, preview, torrentEntry, onLoadTorr
   if (!transfer) return <aside className="inspector" aria-label="Transfer inspector"><p className="empty-state">Select a transfer to inspect.</p></aside>;
   const torrent = transfer.kind === "torrent";
   const primary = primaryAction(transfer);
-  const sourcePreview = thumbnail?.startsWith("https://") ? thumbnail
-    : preview && transfer.id === "alpine" ? alpinePreview : null;
+  const safeThumb = !thumbFailed ? isSafeThumbnailUrl(thumbnail) : null;
+  const sourcePreview = safeThumb
+    ?? (thumbFailed ? mediaArtwork : preview && transfer.id === "alpine" ? alpinePreview : null);
   const subtitle = transfer.status === "paused"
     ? "Paused at " + percentage(transfer) + "%" + (transfer.resumable ? " · Resumable" : "")
     : torrent ? transfer.active_peers + " Peers"
       : [transfer.active_connections + " Connections", transfer.protocol_label].join(" · ");
 
   return <aside className="inspector" aria-label="Transfer inspector">
-    <div className="insp-preview">{sourcePreview ? <img src={sourcePreview} alt="" onError={() => setThumbnail(null)} />
+    <div className="insp-preview">{sourcePreview ? <img src={sourcePreview} referrerPolicy="no-referrer" alt=""
+      onError={() => { if (safeThumb) setThumbFailed(true); }} />
       : <TransferIcon transfer={transfer} size={42} />}</div>
     <div className="insp-title-block">
       <h2 className="insp-title" title={transfer.filename}>{transfer.filename}</h2>

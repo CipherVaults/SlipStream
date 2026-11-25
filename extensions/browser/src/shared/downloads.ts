@@ -122,9 +122,36 @@ export function magnetUri(value?: string): string | undefined {
   }
 }
 
-export function downloadLinks(values: unknown[]): string[] {
+export const MAX_DOWNLOAD_LINKS = 512;
+
+export function isPublicHttpUrl(raw: string): boolean {
+  const url = httpUrl(raw);
+  if (!url) return false;
+  const host = url.hostname.replace(/\.$/, "");
+  if (host.startsWith("[")) {
+    const ip = host.slice(1, -1);
+    // Global unicast excludes mapped IPv4, loopback, ULA, link-local, documentation, 6to4 and Teredo.
+    return /^[23][0-9a-f]{3}:/.test(ip)
+      && !ip.startsWith("2001:db8:")
+      && !ip.startsWith("2002:")
+      && !/^2001:(?:0{0,4}:|$)/.test(ip);
+  }
+  if (/^\d+(?:\.\d+){3}$/.test(host)) {
+    const [a, b, c] = host.split(".").map(Number);
+    return !(a === 0 || a === 10 || a === 127 || a >= 224 || (a === 100 && b >= 64 && b <= 127)
+      || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)
+      || (a === 192 && b === 0 && (c === 0 || c === 2)) || (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100)))
+      || (a === 203 && b === 0 && c === 113));
+  }
+  const labels = host.split(".");
+  return labels.length > 1 && labels.every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))
+    && !["localhost", "local", "internal"].includes(labels.at(-1)!) && !host.endsWith(".home.arpa");
+}
+
+export function downloadLinks(values: unknown[], limit = MAX_DOWNLOAD_LINKS): string[] {
   const links = new Set<string>();
   for (const value of values) {
+    if (links.size >= limit) break;
     if (typeof value !== "string" || value.length > 8192) continue;
     const url = httpUrl(value);
     if (!url) continue;

@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { canAttributeTab, defaults, sameDownloadOrigin, shouldIntercept } from "./downloads";
 import { isPublicHttpUrl, ObservedNetwork } from "./network";
 import { isRefreshableHttpTransfer } from "./state";
-import { isMediaStream, mediaMime, parseHlsMaster, scopedHeaders, selectPillFormatId, StreamNavigationState } from "./streams";
+import { isMediaStream, mediaMime, parseHlsMaster, probeFormats, scopedHeaders, selectPillFormatId, StreamNavigationState } from "./streams";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -46,6 +46,10 @@ describe("media streams", () => {
       "/lower-1080.m3u8",
       "#EXT-X-STREAM-INF:BANDWIDTH=9000000,RESOLUTION=3840x2160",
       "javascript:alert(1)",
+      "#EXT-X-STREAM-INF:BANDWIDTH=9500000,RESOLUTION=3840x2160",
+      "http://127.0.0.1/internal.m3u8",
+      "#EXT-X-STREAM-INF:BANDWIDTH=9600000,RESOLUTION=3840x2160",
+      "https://[2002:7f00:1::1]/6to4.m3u8",
       "#EXT-X-STREAM-INF:RESOLUTION=3840x2160",
       "no-bandwidth.m3u8",
       "#EXT-X-STREAM-INF:BANDWIDTH=0,RESOLUTION=3840x2160",
@@ -66,11 +70,25 @@ describe("media streams", () => {
       "localhost.", "nested.localhost", "intranet", "dev.local", "0.1.2.3", "127.99.1.2", "2130706433",
       "10.12.0.3", "172.31.1.2", "192.168.1.1", "169.254.169.254", "100.127.1.2",
       "[::1]", "[::ffff:8.8.8.8]", "[fc00::1]", "[fd00::1]", "[fe90::1]",
+      "[2002:7f00:1::1]", "[2001:0:4136:e378:8000:63bf:3fff:fdd2]", "[2001::1]", "[2001:db8::1]",
     ]) expect(isPublicHttpUrl("https://" + host + "/master.m3u8")).toBe(false);
     expect(isPublicHttpUrl("https://user@media.example/master.m3u8")).toBe(false);
     expect(isPublicHttpUrl("https://cdn.media.example/master.m3u8")).toBe(true);
     expect(isPublicHttpUrl("http://8.8.8.8/master.m3u8")).toBe(true);
     expect(isPublicHttpUrl("https://[2606:4700::1111]/master.m3u8")).toBe(true);
+    expect(isPublicHttpUrl("https://[2001:4860:4860::8888]/master.m3u8")).toBe(true);
+  });
+
+  it("formats probed file sizes as byte units rather than transfer speeds", () => {
+    const formats = probeFormats({
+      title: "Demo", source_url: "https://media.example/watch", extractor: "generic",
+      duration_seconds: 60, thumbnail_url: null, is_playlist: false, playlist_count: null, subtitles: [],
+      formats: [
+        { format_id: "137", label: "1080p MP4", container: "mp4", video_codec: "avc1", audio_codec: "aac",
+          height: 1080, fps: 30, filesize_bytes: 5 * 1024 * 1024, is_audio_only: false, has_video: true, has_audio: true },
+      ],
+    });
+    expect(formats[0]?.sub).toBe("5.0 MB");
   });
 });
 

@@ -313,7 +313,7 @@ export function SettingsDialog({
                     {browser.native_host_registered ? "Host ready" : "Host pending"}
                   </span>
                 </div>
-                <button type="button" className="btn-ghost form-button" disabled={checkingTools} aria-label={action + " for " + browser.name}
+                <button type="button" className="btn-ghost form-button" disabled={detectingBrowsers} aria-label={action + " for " + browser.name}
                   onClick={() => void run(browser.id, () => openBrowserSetup(browser.id))}>
                   {busy === browser.id ? "Opening…" : action}
                 </button>

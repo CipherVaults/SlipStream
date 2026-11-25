@@ -277,13 +277,12 @@ function renderFormats(entry: Entry): void {
     entry.isPlaylist ?? isPlaylistPage(entry.url ?? ""));
 }
 
-function updateTarget(entry: Entry, url: string, canProbe: boolean): void {
+function updateTarget(entry: Entry, url: string): void {
   if (entry.url !== url) {
     entry.url = url;
     entry.formats = undefined;
     entry.isPlaylist = undefined;
     entry.requestId = undefined;
-    if (canProbe && siteStorage) void send({ kind: "video-seen", url }).catch(() => {});
   }
   renderFormats(entry);
 }
@@ -315,7 +314,11 @@ function showPlayer(player: Player, bounds: DOMRect, fullscreen: Element | null)
         return { ok: true };
       }
       const url = pills.get(player)?.url ?? resolveTarget(player);
-      return send<ActionResult>({ kind: "media", action, url, links: action === "links" ? collectLinks() : undefined });
+      return send<ActionResult>({
+        kind: "media", action, url,
+        links: action === "links" ? collectLinks() : undefined,
+        ...(player instanceof HTMLIFrameElement && { embedded: true }),
+      });
     }, {
       onOpen() {
         const current = pills.get(player);
@@ -323,7 +326,10 @@ function showPlayer(player: Player, bounds: DOMRect, fullscreen: Element | null)
         if (!siteStorage || !current || !url) return;
         const requestId = ++nextRequestId;
         current.requestId = requestId;
-        void send({ kind: "pill-open", url, isPlaylist: isPlaylistPage(url), requestId }).catch(() => {});
+        void send({
+          kind: "pill-open", url, isPlaylist: isPlaylistPage(url), requestId,
+          ...(player instanceof HTMLIFrameElement && { embedded: true }),
+        }).catch(() => {});
       },
       onDismiss() {
         dismissed.set(player, sourceIdentity(player));
@@ -348,16 +354,22 @@ function showPlayer(player: Player, bounds: DOMRect, fullscreen: Element | null)
   if (!pill.isLocked()) {
     entry.corner ??= spot;
     if (pill.host.parentElement !== container) container.append(pill.host);
-    if (nativeFullscreen && !pill.host.matches(":popover-open") && typeof pill.host.showPopover === "function") {
-      pill.host.setAttribute("popover", "manual");
-      pill.host.showPopover();
+    if (nativeFullscreen && typeof pill.host.showPopover === "function") {
+      if (!pill.host.hasAttribute("popover")) pill.host.setAttribute("popover", "manual");
     } else if (!nativeFullscreen && pill.host.hasAttribute("popover")) {
       pill.host.removeAttribute("popover");
     }
   }
   pill.appearance(appearance, systemTheme.matches);
   pill.position(x, y, innerHeight - y < 250 && y > innerHeight / 2, bounds);
-  updateTarget(entry, entry.pill.isLocked() && entry.url ? entry.url : resolveTarget(player), player instanceof HTMLVideoElement);
+  if (nativeFullscreen && pill.isVisible() && typeof pill.host.showPopover === "function") {
+    try {
+      if (!pill.host.matches(":popover-open")) pill.host.showPopover();
+    } catch {
+      // Ignore InvalidStateError if the document or host transitioned mid-frame.
+    }
+  }
+  updateTarget(entry, entry.pill.isLocked() && entry.url ? entry.url : resolveTarget(player));
   return true;
 }
 

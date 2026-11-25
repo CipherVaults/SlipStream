@@ -6,7 +6,7 @@ import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import tile from "../assets/alpine-tile.svg";
 import type { TransferSnapshot } from "../types/ipc";
 import {
-  SEGMENT_COUNT, bytePair, bytes, clock, fileCategory, isDone, isPlaylistPending, isRunning, parentFolder, percentage, ratio, speed, statusLabel,
+  SEGMENT_COUNT, bytePair, bytes, clock, fileCategory, isDone, isPlaylistCompleted, isPlaylistPending, isRunning, parentFolder, percentage, ratio, speed, statusLabel,
 } from "../lib/transfers";
 import type { View } from "./Shell";
 import { IconButton } from "./ui";
@@ -192,11 +192,12 @@ function PlaylistGroup({ playlistId, transfers, members, onAction, renderRow }: 
   const title = members.find(item => item.playlist_title?.trim())?.playlist_title?.trim() || "Playlist";
   const directory = members[0].save_dir;
   const folder = parentFolder(directory);
-  const open = expanded ?? waiting.length > 0;
+  const open = expanded ?? (waiting.length > 0 || failed > 0);
   const progress = paused ? "Paused" : current
     ? statusLabel[current.status] + (current.playlist_index != null ? ` #${current.playlist_index} of ${total}` : "")
     : "";
-  const summary = done === members.length ? `${done}/${total} completed`
+  const summary = done === members.length && members.length > 0
+    ? `${done}/${members.length === total ? total : members.length} completed`
     : [progress, `${done}/${total} done`, queued ? queued + " queued" : "", failed ? failed + " failed" : "",
       canceled ? canceled + " canceled" : ""].filter(Boolean).join(" · ");
 
@@ -240,7 +241,7 @@ export function TransferList({ items, selected, setSelected, onAction, onPlaylis
   const playlists = new Map(groupTransfers(allTransfers).map(group => [group.playlistId, group.transfers]));
   const members = (group: TransferGroup) => (group.playlistId && playlists.get(group.playlistId)) || group.transfers;
   const finished = (group: TransferGroup) => group.playlistId
-    ? !members(group).some(isPlaylistPending) : group.transfers.every(isDone);
+    ? isPlaylistCompleted(members(group)) : group.transfers.every(isDone);
   const active = groups.filter(group => !finished(group));
   const complete = groups.filter(finished);
   const running = items.filter(isRunning);

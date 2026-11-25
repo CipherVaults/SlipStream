@@ -70,11 +70,10 @@ export type BrowserMessage =
   | { kind: "alt"; held: boolean }
   | { kind: "stream" }
   | { kind: "pill-spot"; spot?: PillSpot }
-  | { kind: "video-seen"; url: string }
-  | { kind: "pill-open"; url: string; isPlaylist: boolean; requestId?: number }
+  | { kind: "pill-open"; url: string; isPlaylist: boolean; requestId?: number; embedded?: boolean }
   | { kind: "frame-reset" }
   | { kind: "wake" }
-  | { kind: "media"; action: MediaAction; url: string; links?: string[] }
+  | { kind: "media"; action: MediaAction; url: string; links?: string[]; embedded?: boolean }
   | { kind: "desktop"; request: PopupAction }
   | { kind: "save-settings"; settings: InterceptionSettings }
   | { kind: "refresh"; id: string; transferId: string };
@@ -93,16 +92,20 @@ export function applyAppearance(element: HTMLElement, state: Pick<BridgeState, "
   element.dataset.accent = state.accent;
 }
 
-export function formatSpeed(bytes: number): string {
-  const units = ["B/s", "KB/s", "MB/s", "GB/s", "TB/s"];
-  const speed = Number.isFinite(bytes) ? Math.max(0, bytes) : 0;
-  let scaled = speed;
+export function formatBytes(bytes: number): string {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const size = Number.isFinite(bytes) ? Math.max(0, bytes) : 0;
+  let scaled = size;
   let unit = 0;
   while (scaled >= 1024 && unit < units.length - 1) {
     scaled /= 1024;
     unit++;
   }
   return scaled.toFixed(unit === 0 ? 0 : 1) + " " + units[unit];
+}
+
+export function formatSpeed(bytes: number): string {
+  return formatBytes(bytes) + "/s";
 }
 
 export function ratio(value: number): number {

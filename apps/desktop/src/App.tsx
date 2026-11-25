@@ -10,7 +10,7 @@ import { TransferList, type OnPlaylistAction, type OnTransferAction } from "./co
 import { IconButton } from "./components/ui";
 import { DEFAULT_SETTINGS } from "./lib/demo";
 import { desktop, isTauri } from "./lib/tauri";
-import { errorMessage, isDownloadSource, isPlaylistPending, isRemoteTorrentUrl, isRunning, isTorrentSource, MB, SPEED_CAP } from "./lib/transfers";
+import { errorMessage, isDownloadSource, isRemoteTorrentUrl, isRunning, isTorrentSource, MB, playlistBuckets, SPEED_CAP } from "./lib/transfers";
 import type { AppSettings, TelemetryBatch, TorrentFileEntry, TransferSnapshot, UpdateProgress, UpdateStatus } from "./types/ipc";
 
 type Overlay = { type: "add"; seed: AddSeed; key: number } | { type: "settings"; focusUpdates?: boolean } | { type: "palette" }
@@ -106,19 +106,12 @@ export default function App() {
   const theme = useTheme(settings);
   const transfers = batch?.transfers.filter(transfer => !removed.has(transfer.id)) ?? [];
   const term = search.trim().toLowerCase();
-  const unfinishedPlaylists = new Set(transfers.flatMap(transfer =>
-    transfer.playlist_id && isPlaylistPending(transfer) ? [transfer.playlist_id] : []));
-  const items = transfers.filter(transfer => {
-    let inView = matchesView(transfer, view);
-    if (transfer.playlist_id) {
-      const unfinished = unfinishedPlaylists.has(transfer.playlist_id);
-      if (view === "completed") inView = !unfinished;
-      if (view === "active" || view === "queues") inView = unfinished && transfer.status !== "canceled";
-    }
-    return inView && matchesStatus(transfer, filter)
-      && [transfer.filename, transfer.source_domain, transfer.protocol_label, transfer.playlist_title ?? "", ...transfer.format_tags]
-        .some(value => value.toLowerCase().includes(term));
-  });
+  const playlists = playlistBuckets(transfers);
+  const items = transfers.filter(transfer =>
+    matchesView(transfer, view, playlists) && matchesStatus(transfer, filter)
+    && [transfer.filename, transfer.source_domain, transfer.protocol_label, transfer.playlist_title ?? "", ...transfer.format_tags]
+      .some(value => value.toLowerCase().includes(term)),
+  );
   const selected = items.find(transfer => transfer.id === selectedId) ?? items[0];
   const speedLimit = (batch ? batch.speed_limit_bps : settings.global_speed_limit_bps) ?? null;
 
@@ -456,6 +449,9 @@ export default function App() {
     });
     void connect(desktop.onOpenPicker(url => {
       if (!cancelled) openAdd({ url: url ?? undefined, autoProbe: Boolean(url) }, true);
+    }).then(stop => {
+      if (!cancelled) void desktop.markUiReady();
+      return stop;
     }));
     void connect(desktop.onUpdateProgress(progress => {
       if (!cancelled && updateInstallLock.current) setUpdateProgress(progress);

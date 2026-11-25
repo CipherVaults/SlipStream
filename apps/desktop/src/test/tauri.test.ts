@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { version } from "../../package.json";
 import { DEFAULT_SETTINGS, demo } from "../lib/demo";
 import { desktop, isTauri } from "../lib/tauri";
+import { classifyPlaylist, isPlaylistCompleted, isSafeThumbnailUrl } from "../lib/transfers";
 import { DEFAULT_CHROMIUM_EXTENSION_ID, DEFAULT_FIREFOX_EXTENSION_ID } from "../types/ipc";
 
 const invoke = vi.fn();
@@ -183,6 +184,36 @@ describe("Tauri v2 adapter", () => {
     useTauri();
     invoke.mockRejectedValueOnce(new Error("Backend offline"));
     await expect(desktop.getSnapshot()).rejects.toThrow("Backend offline");
+  });
+
+  it("calls mark_ui_ready in Tauri, swallows errors, and is a no-op in browser preview", async () => {
+    await desktop.markUiReady();
+    expect(invoke).not.toHaveBeenCalled();
+    useTauri();
+    await desktop.markUiReady();
+    expect(invoke).toHaveBeenCalledWith("mark_ui_ready", {});
+    invoke.mockRejectedValueOnce(new Error("unsupported"));
+    await expect(desktop.markUiReady()).resolves.toBeUndefined();
+  });
+
+  it("classifies playlists and validates remote thumbnail URLs", () => {
+    const base = demo.snapshot().transfers[0];
+    const mk = (status: typeof base.status) => ({ ...base, status, playlist_id: "pl-1" });
+    expect(classifyPlaylist([mk("completed"), mk("failed")])).toBe("active");
+    expect(isPlaylistCompleted([mk("completed"), mk("failed")])).toBe(false);
+    expect(classifyPlaylist([mk("completed"), mk("canceled")])).toBe("completed");
+    expect(isPlaylistCompleted([mk("completed"), mk("canceled")])).toBe(true);
+    expect(classifyPlaylist([mk("canceled"), mk("canceled")])).toBe("canceled");
+    expect(isPlaylistCompleted([mk("canceled"), mk("canceled")])).toBe(false);
+
+    expect(isSafeThumbnailUrl("https://i.ytimg.com/vi/abc/hqdefault.jpg")).toBe("https://i.ytimg.com/vi/abc/hqdefault.jpg");
+    for (const bad of [
+      null, "", "http://i.ytimg.com/a.jpg", "https://localhost/a.jpg", "https://127.0.0.1/a.jpg",
+      "https://192.168.1.1/a.jpg", "https://[::1]/a.jpg", "https://[2002:7f00:1::1]/a.jpg", "https://[2001::1]/a.jpg",
+      "https://user:pass@i.ytimg.com/a.jpg", "https://server.local/a.jpg",
+    ]) {
+      expect(isSafeThumbnailUrl(bad)).toBeNull();
+    }
   });
 });
 

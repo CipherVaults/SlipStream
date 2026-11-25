@@ -85,6 +85,14 @@ export const desktop = {
     return isTauri() ? listen<TelemetryBatch>("slipstream://telemetry", event => handler(event.payload))
       : demo.listenTelemetry(handler);
   },
+  async markUiReady(): Promise<void> {
+    if (!isTauri()) return;
+    try {
+      await invoke("mark_ui_ready");
+    } catch {
+      // Older backends or tests without mark_ui_ready remain usable.
+    }
+  },
   async onOpenPicker(handler: (url: string | null) => void) {
     return isTauri() ? listen<{ url: string | null }>("slipstream://open-picker", ({ payload }) => {
       handler(typeof payload?.url === "string" ? payload.url : null);

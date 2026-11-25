@@ -114,7 +114,7 @@ describe("URL, filename, and preference guards", () => {
     }
   });
 
-  it("deduplicates and strips fragments from downloadable page links", () => {
+  it("deduplicates, strips fragments, and caps downloadable page links at 512", () => {
     expect(
       downloadLinks([
         "https://cdn.example/a.zip#part1",
@@ -125,6 +125,8 @@ describe("URL, filename, and preference guards", () => {
         "http://cdn.example/b.mp4",
       ]),
     ).toEqual(["https://cdn.example/a.zip", "http://cdn.example/b.mp4"]);
+    const many = Array.from({ length: 600 }, (_, index) => `https://cdn.example/file-${index}.zip`);
+    expect(downloadLinks(many)).toHaveLength(512);
   });
 
   it("sanitizes persisted settings and state", () => {
@@ -628,6 +630,15 @@ describe("direct HTTP handoff", () => {
     } }));
     port.emitMessage({ type: "ack", ok: true, message: null });
     expect(await result).toEqual({ ok: true });
+
+    sessionGet.mockResolvedValueOnce({
+      "refresh:priv": { url: cdn, tabId: tab.id, origin: new URL(page).origin, incognito: true, expires: Date.now() + 60_000 },
+    });
+    const mismatch = new Promise((resolve) => onMessage.addListener.mock.calls[0][0](
+      { kind: "refresh", id: "priv", transferId: "tr-1" },
+      { id: "ext-test-id", url: "chrome-extension://ext-test-id/popup.html" }, resolve,
+    ));
+    expect(await mismatch).toEqual({ ok: false, message: "This refresh link belongs to a different browsing context." });
   });
 });
 
@@ -709,7 +720,6 @@ describe("frame-scoped media handoff", () => {
     expect(await request({ kind: "stream" })).toMatchObject({ url: undefined });
     detect(hlsResponse);
     await vi.waitFor(async () => expect(await request({ kind: "stream" })).toMatchObject({ url: master }));
-    expect(await request({ kind: "video-seen", url: master })).toEqual({ ok: true });
     expect(fetchManifest).not.toHaveBeenCalled();
     expect(probePorts).toHaveLength(0);
     expect(await request({ kind: "pill-open", url: master })).toEqual({ ok: true });
@@ -769,7 +779,23 @@ describe("frame-scoped media handoff", () => {
     expect(await request({ kind: "save-settings", settings: { enabled: false } }, popupSender)).toEqual({
       ok: false, message: "Settings cannot be changed from an incognito window.",
     });
-    expect(query).toHaveBeenCalledWith({ active: true, lastFocusedWindow: true });
+    expect(query).toHaveBeenCalledWith({ active: true, currentWindow: true });
     expect(localSet.mock.calls.every(([values]) => !Object.hasOwn(values, SETTINGS_KEY))).toBe(true);
+
+    // F-03: cross-origin known video page is allowed for pillOpen, private mediaAction probe is blocked, and oversized URLs are rejected.
+    expect(await request({ kind: "pill-open", url: "https://youtu.be/dQw4w9WgXcQ", requestId: 4 })).toEqual({ ok: true });
+    expect(await request({ kind: "media", action: "1080p", url }, privateSender)).toEqual({
+      ok: false, message: "Automatic format probing is disabled in private windows.",
+    });
+    expect(await request({ kind: "media", action: "1080p", url: "https://media.example/" + "a".repeat(8200) })).toEqual({
+      ok: false, message: "Media URL is too long.",
+    });
+
+    // F-08: malformed probe response settles cleanly and releases the probe slot.
+    const badProbePort = probePorts.at(-1)!;
+    badProbePort.emitMessage(null as unknown as NativeBridgeResponse);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(badProbePort.disconnect).toHaveBeenCalledOnce();
   });
 });
