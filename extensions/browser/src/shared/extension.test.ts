@@ -755,7 +755,12 @@ describe("frame-scoped media handoff", () => {
         height: 1080, fps: 60, filesize_bytes: 1_000_000, is_audio_only: false, has_audio: true, has_video: true }],
     } });
     await vi.waitFor(() => expect(push).toHaveBeenCalledWith(7, expect.objectContaining({
-      kind: "pill-formats", requestId: 2, formats: [expect.objectContaining({ id: "format:137" })],
+      kind: "pill-formats",
+      requestId: 2,
+      formats: [
+        expect.objectContaining({ id: `direct:${url}` }),
+        expect.objectContaining({ id: "format:137" }),
+      ],
     }), { frameId: 3 }));
 
     onHeaders.addListener.mock.calls[0][0]({
@@ -950,7 +955,9 @@ describe("frame-scoped media handoff", () => {
     port.emitMessage({ type: "transfer_created", transfer_id: "tr-102" });
     await vi.waitFor(() => expect(suggest2).toHaveBeenCalledOnce());
 
-    // 3. Safety timeout calls suggest() once after 3500ms if desktop hangs, never hanging Chromium.
+    // 3. Safety timeout calls suggest() once after 3500ms if desktop hangs, never hanging Chromium, and late reply does NOT cancel or erase.
+    cancel.mockClear();
+    erase.mockClear();
     const suggest3 = vi.fn();
     onDeterminingFilename.addListener.mock.calls[0][0]({
       id: 103,
@@ -968,12 +975,45 @@ describe("frame-scoped media handoff", () => {
     expect(suggest3).not.toHaveBeenCalled();
     vi.advanceTimersByTime(3500);
     expect(suggest3).toHaveBeenCalledOnce();
-    port.emitMessage({ type: "error", code: "pipe_unavailable", message: "disconnected" });
+    port.emitMessage({ type: "transfer_created", transfer_id: "late-103" });
+    await Promise.resolve();
     await Promise.resolve();
     expect(suggest3).toHaveBeenCalledOnce();
+    expect(cancel).not.toHaveBeenCalled();
+    expect(erase).not.toHaveBeenCalled();
+    if (port.posted.at(-1)?.type === "get_status") {
+      port.emitMessage({
+        type: "status", theme: "dark", accent: "blue",
+        batch: { aggregate_down_bps: 0, aggregate_up_bps: 0, active_count: 0, active_threads: 0, speed_limit_bps: null, transfers: [], timestamp: "2026-11-26T00:00:00Z" },
+      });
+      await Promise.resolve();
+    }
+
+    // 4. Firefox private storeId never leaks private cookies into shared desktop SQLite.
+    getAllCookies.mockClear();
+    const suggest4 = vi.fn();
+    onDeterminingFilename.addListener.mock.calls[0][0]({
+      id: 104,
+      url: "https://releases.example/private.zip",
+      filename: "private.zip",
+      mime: "application/zip",
+      fileSize: 1_000_000,
+      referrer: "https://releases.example/project",
+      cookieStoreId: "firefox-private-1",
+      incognito: false,
+    }, suggest4);
+    await vi.waitFor(() => expect(port.posted.at(-1)).toMatchObject({
+      type: "add_http_download",
+      request: { url: "https://releases.example/private.zip" },
+    }));
+    const privateStoreReq = port.posted.at(-1);
+    expect(privateStoreReq?.type === "add_http_download" ? privateStoreReq.request.headers : {}).not.toHaveProperty("Cookie");
+    expect(getAllCookies).not.toHaveBeenCalled();
+    port.emitMessage({ type: "transfer_created", transfer_id: "tr-104" });
+    await vi.waitFor(() => expect(suggest4).toHaveBeenCalledOnce());
   });
 
-  it("sniffs 206 Partial Content direct MP4 via Content-Range (>= 300KB) and downloads cross-origin video with cookies and Referer", async () => {
+  it("sniffs 206 Partial Content direct MP4 via Content-Range (>= 300KB) and downloads cross-origin video with cookies and origin-scoped Referer", async () => {
     vi.resetModules();
     vi.useFakeTimers();
     vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Fixture Browser/1.0");
@@ -984,9 +1024,15 @@ describe("frame-scoped media handoff", () => {
     const page = "https://vidtube.example/watch/123";
     const cdnVideo = "https://cdn-video.xyz/streams/movie.mp4?token=abc";
     const smallVideo = "https://cdn-video.xyz/streams/preview.mp4";
+    const wildcardRangeVideo = "https://cdn-video.xyz/streams/live.mp4";
     const tab = { id: 12, url: page, incognito: false } as chrome.tabs.Tab;
     const getAllCookies = vi.fn(async ({ url }: { url: string }) =>
-      url.startsWith("https://cdn-video.xyz/") ? [{ name: "cdn_sid", value: "xyz789" }] : [],
+      url.startsWith("https://cdn-video.xyz/")
+        ? [
+            { name: "cdn_sid", value: "xyz789", sameSite: "no_restriction", secure: true },
+            { name: "strict_sid", value: "withheld", sameSite: "strict", secure: true },
+          ]
+        : [],
     );
     (globalThis as Record<string, unknown>).chrome = {
       runtime: {
@@ -1036,6 +1082,20 @@ describe("frame-scoped media handoff", () => {
     await Promise.resolve();
     expect(await request({ kind: "stream" })).toMatchObject({ url: undefined });
 
+    // 206 with Content-Range /* keeps total size unknown instead of reporting chunk length as file size.
+    detect({
+      tabId: 12, frameId: 0, initiator: page, url: wildcardRangeVideo, statusCode: 206, requestId: "wild-206",
+      responseHeaders: [
+        { name: "Content-Type", value: "video/mp4" },
+        { name: "Content-Length", value: "500000" },
+        { name: "Content-Range", value: "bytes 0-499999/*" },
+      ],
+    });
+    await vi.waitFor(async () => expect(await request({ kind: "stream" })).toMatchObject({
+      url: wildcardRangeVideo,
+      formats: [{ id: `direct:${wildcardRangeVideo}`, label: "Download Video", sub: "MP4" }],
+    }));
+
     // 206 Partial Content >= 300KB is accepted and exposes direct Download Video choice
     detect({
       tabId: 12, frameId: 0, initiator: page, url: cdnVideo, statusCode: 206, requestId: "big-206",
@@ -1049,16 +1109,16 @@ describe("frame-scoped media handoff", () => {
       formats: [{ id: `direct:${cdnVideo}`, label: "Download Video", sub: "MP4 · 1.4 GB" }],
     }));
 
-    // Clicking direct: or 1080p on cross-origin <video src> sends add_http_download with Referer, Origin, UA, Accept-Language, and target Cookie
+    // Clicking direct: on cross-origin <video src> sends add_http_download with origin-only Referer, Origin, UA, Accept-Language, and cross-site Cookie (filtering out SameSite=Strict).
     const downloadPromise = request({ kind: "media", action: `direct:${cdnVideo}`, url: cdnVideo, embedded: true });
     await vi.waitFor(() => expect(port.posted.at(-1)).toEqual({
       type: "add_http_download",
       request: {
         url: cdnVideo,
         filename: "movie.mp4",
-        referrer: page,
+        referrer: "https://vidtube.example/",
         headers: {
-          Referer: page,
+          Referer: "https://vidtube.example/",
           Origin: "https://vidtube.example",
           "User-Agent": "Fixture Browser/1.0",
           "Accept-Language": "en-US,en;q=0.9",

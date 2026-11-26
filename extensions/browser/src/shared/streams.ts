@@ -203,13 +203,17 @@ export function validFormatId(id: string): boolean {
   return id.length <= 256 && /^[\w][\w.-]*(?:[+/][\w][\w.-]*)*$/.test(id);
 }
 
+function hasSeparateAudio(probe: MediaProbeResult): boolean {
+  return probe.formats.some((format) => format.is_audio_only || (!format.has_video && format.has_audio));
+}
+
 export function probeFormats(probe: MediaProbeResult): PillFormat[] {
-  const hasAudio = probe.formats.some((format) => format.has_audio);
+  const separateAudio = hasSeparateAudio(probe);
   return probe.formats.filter((format) => format.has_video && validFormatId(format.format_id))
     .sort((a, b) => (b.height ?? 0) - (a.height ?? 0) || (b.fps ?? 0) - (a.fps ?? 0))
     .slice(0, 20)
     .map(({ format_id, label, has_audio, filesize_bytes }) => ({
-      id: "format:" + (hasAudio && !has_audio && validFormatId(format_id + "+bestaudio") ? format_id + "+bestaudio" : format_id) as PillFormat["id"],
+      id: "format:" + (separateAudio && !has_audio && validFormatId(format_id + "+bestaudio") ? format_id + "+bestaudio" : format_id) as PillFormat["id"],
       label,
       sub: filesize_bytes && filesize_bytes > 0 ? formatBytes(filesize_bytes) : undefined,
     }));
@@ -237,13 +241,14 @@ export function selectPillFormatId(probe: MediaProbeResult, expectedHeight: numb
       candidates = withinCap.filter((format) => format.height === bestHeight);
     } else {
       const withoutHeight = videoFormats.filter((format) => format.height === null);
-      candidates = withoutHeight.length ? withoutHeight : videoFormats;
+      if (!withoutHeight.length) return undefined;
+      candidates = withoutHeight;
     }
   }
 
   const muxed = candidates.find((format) => format.has_audio);
   if (muxed) return muxed.format_id;
-  if (probe.formats.some((format) => format.has_audio)) {
+  if (hasSeparateAudio(probe)) {
     const combinable = candidates.find((format) => (format.format_id + BEST_AUDIO_SUFFIX).length <= MAX_FORMAT_ID_LEN);
     if (combinable) return combinable.format_id + BEST_AUDIO_SUFFIX;
   }

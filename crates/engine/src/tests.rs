@@ -160,6 +160,13 @@ struct Server {
 impl Server {
     async fn new(reply: impl Fn(&Request) -> Reply + Send + Sync + 'static) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Self::with_listener(listener, reply)
+    }
+
+    fn with_listener(
+        listener: TcpListener,
+        reply: impl Fn(&Request) -> Reply + Send + Sync + 'static,
+    ) -> Self {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let log = Arc::clone(&requests);
@@ -1157,7 +1164,6 @@ async fn retries_rejected_range_probes_with_one_plain_get() {
                 "/412" => "412 Precondition Failed",
                 "/416" => "416 Range Not Satisfiable",
                 "/501" => "501 Not Implemented",
-                "/503" => "503 Service Unavailable",
                 _ => unreachable!(),
             };
             let mut reply = Reply::empty(status);
@@ -1186,9 +1192,7 @@ async fn retries_rejected_range_probes_with_one_plain_get() {
     .await;
     let dir = TestDir::new().await;
     let engine = DownloadEngine::new(dir.config()).await.unwrap();
-    for path in [
-        "/400", "/403", "/405", "/412", "/416", "/501", "/503", "/206",
-    ] {
+    for path in ["/400", "/403", "/405", "/412", "/416", "/501", "/206"] {
         let id = engine
             .add_http_download(request(server.url(path), None, 4))
             .await
@@ -1303,6 +1307,71 @@ async fn restarts_rejected_single_worker_ranges_with_one_full_get() {
         dir.assert_output(&done.filename, &data).await;
     }
     engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn rejected_ranges_after_a_socket_drop_wait_for_a_successful_full_get() {
+    let data = payload(64 * KIB, 29);
+    let source = Arc::clone(&data);
+    let server = Server::new(move |req| match req.range() {
+        Some(range) if range.start == 0 => {
+            let mut reply = Reply::resource(req, &source, "\"restart\"");
+            reply.cutoff = Some(CHUNK);
+            reply
+        }
+        Some(_) if req.path == "/503" => Reply::empty("503 Service Unavailable"),
+        Some(_) => Reply::empty("403 Forbidden"),
+        None if req.method == "GET" && req.path == "/failed" => Reply::empty("410 Gone"),
+        None => Reply::resource(req, &source, "\"restart\""),
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let config = dir.config();
+    let engine = DownloadEngine::new(config.clone()).await.unwrap();
+    for path in ["/403", "/503"] {
+        let id = engine
+            .add_http_download(request(server.url(path), None, 1))
+            .await
+            .unwrap();
+        let done = completed(&engine, &id).await;
+        dir.assert_output(&done.filename, &data).await;
+    }
+    let id = engine
+        .add_http_download(request(server.url("/failed"), None, 1))
+        .await
+        .unwrap();
+    let snapshot = failed(&engine, &id).await;
+    assert!(snapshot.error_message.unwrap().contains("410 Gone"));
+    assert_eq!(snapshot.downloaded_bytes, CHUNK as u64);
+    let (part, final_path) = engine
+        .inner
+        .lock()
+        .job(&id)
+        .unwrap()
+        .record
+        .paths()
+        .unwrap();
+    let bytes = tokio::fs::read(part).await.unwrap();
+    assert_eq!(bytes.len(), data.len());
+    assert_eq!(&bytes[..CHUNK], &data[..CHUNK]);
+    assert!(!final_path.exists());
+
+    let requests = server.requests();
+    for path in ["/403", "/503", "/failed"] {
+        let gets: Vec<_> = requests
+            .iter()
+            .filter(|req| req.method == "GET" && req.path == path)
+            .map(|req| req.range().map(|range| range.start))
+            .collect();
+        assert_eq!(gets, [Some(0), Some(CHUNK), None]);
+    }
+    engine.shutdown().await.unwrap();
+    let reopened = DownloadEngine::new(config).await.unwrap();
+    assert_eq!(
+        reopened.snapshot(&id).unwrap().downloaded_bytes,
+        CHUNK as u64
+    );
+    reopened.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1426,6 +1495,52 @@ async fn forbidden_cookie_and_hotlink_headers_fall_back_to_winning_profiles() {
 }
 
 #[tokio::test]
+async fn ipv6_forbidden_responses_can_still_retry_without_cookie_or_referer() {
+    let data = payload(16 * KIB, 32);
+    let source = Arc::clone(&data);
+    let listener = TcpListener::bind("[::1]:0").await.unwrap();
+    let server = Server::with_listener(listener, move |req| {
+        if req.method == "GET"
+            && (req.path == "/forbidden"
+                || req.header("cookie").is_some()
+                || req.header("referer").is_some())
+        {
+            return Reply::empty("403 Forbidden");
+        }
+        Reply::resource(req, &source, "\"ipv6\"")
+    });
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    let mut download = request(server.url("/ipv6"), None, 1);
+    download
+        .headers
+        .insert("Cookie".into(), "session=stale".into());
+    download.referrer = Some("https://example.com/watch".into());
+    let id = engine.add_http_download(download).await.unwrap();
+    completed(&engine, &id).await;
+    let requests = server.requests();
+    let gets: Vec<_> = requests.iter().filter(|req| req.method == "GET").collect();
+    let [with_cookie, without_cookie, bare] = gets.as_slice() else {
+        panic!("expected three GET profiles: {gets:?}");
+    };
+    assert_eq!(with_cookie.header("cookie"), Some("session=stale"));
+    assert_eq!(without_cookie.header("cookie"), None);
+    assert!(without_cookie.header("referer").is_some());
+    assert_eq!(bare.header("referer"), None);
+    dir.assert_output("ipv6", &data).await;
+
+    let id = engine
+        .add_http_download(request(server.url("/forbidden"), None, 1))
+        .await
+        .unwrap();
+    assert_eq!(
+        failed(&engine, &id).await.error_message.as_deref(),
+        Some("HTTP 403 Forbidden")
+    );
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn retries_429_after_the_server_delay() {
     let data = payload(64 * KIB, 26);
     let source = Arc::clone(&data);
@@ -1461,15 +1576,73 @@ async fn retries_429_after_the_server_delay() {
 }
 
 #[tokio::test]
+async fn range_probe_503_retries_the_range_after_the_server_delay() {
+    let data = payload(16 * KIB, 31);
+    let source = Arc::clone(&data);
+    let times = Arc::new(Mutex::new(Vec::new()));
+    let attempts = Arc::clone(&times);
+    let server = Server::new(move |req| {
+        if req.method == "HEAD" {
+            return Reply::empty("405 Method Not Allowed");
+        }
+        if req.header("range") == Some("bytes=0-0") {
+            let mut attempts = attempts.lock().unwrap();
+            attempts.push(Instant::now());
+            if attempts.len() == 1 {
+                let mut reply = Reply::empty("503 Service Unavailable");
+                reply.headers.push(("Retry-After", "1".into()));
+                return reply;
+            }
+        }
+        Reply::resource(req, &source, "\"range-retry\"")
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    let id = engine
+        .add_http_download(request(server.url("/range-retry"), None, 1))
+        .await
+        .unwrap();
+    completed(&engine, &id).await;
+    {
+        let times = times.lock().unwrap();
+        assert_eq!(times.len(), 2);
+        assert!(times[1] - times[0] >= Duration::from_secs(1));
+    }
+    assert!(server
+        .requests()
+        .iter()
+        .filter(|req| req.method == "GET")
+        .all(|req| req.range().is_some()));
+    dir.assert_output("range-retry", &data).await;
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn keeps_redirect_cookies_on_the_same_origin_and_in_the_same_chain() {
     let data = payload(8 * KIB, 27);
     let source = Arc::clone(&data);
     let server = Server::new(move |req| {
         if req.path == "/start" {
-            let mut reply = Reply::redirect("/final");
+            let mut reply = Reply::redirect("/final/item");
             reply.headers.extend([
                 ("Set-Cookie", "session=new; HttpOnly".into()),
-                ("Set-Cookie", "challenge=passed; Path=/".into()),
+                (
+                    "Set-Cookie",
+                    "challenge=passed; pAtH=/final; Domain=.127.0.0.1".into(),
+                ),
+                ("Set-Cookie", "removed=; Max-Age=0; Path=/".into()),
+                (
+                    "Set-Cookie",
+                    "expired=dead; Expires=Thu, 01 Jan 1970 00:00:00 GMT".into(),
+                ),
+                ("Set-Cookie", "secure=secret; sEcUrE".into()),
+                ("Set-Cookie", "other=secret; Path=/other".into()),
+                ("Set-Cookie", "wrong-prefix=secret; Path=/fin".into()),
+                (
+                    "Set-Cookie",
+                    "wrong-domain=secret; Domain=example.com".into(),
+                ),
             ]);
             return reply;
         }
@@ -1479,14 +1652,15 @@ async fn keeps_redirect_cookies_on_the_same_origin_and_in_the_same_chain() {
     let dir = TestDir::new().await;
     let engine = DownloadEngine::new(dir.config()).await.unwrap();
     let mut download = request(server.url("/start"), Some("cookie.bin"), 1);
-    download
-        .headers
-        .insert("Cookie".into(), "pref=dark; session=old".into());
+    download.headers.insert(
+        "Cookie".into(),
+        "pref=dark; session=old; removed=old; expired=old".into(),
+    );
     let id = engine.add_http_download(download).await.unwrap();
     completed(&engine, &id).await;
     for req in server.requests() {
         let expected = if req.path == "/start" {
-            "pref=dark; session=old"
+            "pref=dark; session=old; removed=old; expired=old"
         } else {
             "pref=dark; session=new; challenge=passed"
         };
@@ -1556,6 +1730,67 @@ async fn compressed_full_responses_use_decoded_lengths_and_keep_206_strict() {
         .iter()
         .all(|req| req.header("accept-encoding") == Some("identity")));
     engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn compressed_members_require_clean_http_eof() {
+    use crate::http::{ContentCoding, FetchProfile, ProbeMode};
+    use async_compression::tokio::write::{BrotliEncoder, ZlibEncoder};
+    use tokio::io::AsyncReadExt;
+
+    let data = b"complete compressed member";
+    let mut deflate = ZlibEncoder::new(Vec::new());
+    deflate.write_all(data).await.unwrap();
+    deflate.shutdown().await.unwrap();
+    let mut brotli = BrotliEncoder::new(Vec::new());
+    brotli.write_all(data).await.unwrap();
+    brotli.shutdown().await.unwrap();
+    let (deflate, brotli) = (deflate.into_inner(), brotli.into_inner());
+    let server = Server::new(move |req| {
+        let (coding, case) = req.path[1..].split_once('/').unwrap();
+        let mut body = if coding == "br" {
+            brotli.clone()
+        } else {
+            deflate.clone()
+        };
+        if case == "trailing" {
+            body.extend_from_slice(b"trailing bytes");
+        }
+        let body = Arc::new(body);
+        let mut reply = Reply::resource(req, &body, "\"encoded\"");
+        reply.headers.push(("Content-Encoding", coding.into()));
+        if case == "truncated" {
+            reply.headers.retain(|(name, _)| *name != "Content-Length");
+            reply
+                .headers
+                .push(("Content-Length", (body.len() + 1).to_string()));
+        }
+        reply
+    })
+    .await;
+    let http = Http::new(true, Duration::from_secs(5)).unwrap();
+    for coding in ["deflate", "br"] {
+        for (case, kind) in [
+            ("truncated", io::ErrorKind::UnexpectedEof),
+            ("trailing", io::ErrorKind::InvalidData),
+        ] {
+            let url = server.url(&format!("/{coding}/{case}"));
+            let source = Source::new(&url, &HashMap::new(), None, true).unwrap();
+            let response = http
+                .probe(&source, FetchProfile::default(), ProbeMode::Full)
+                .await
+                .unwrap()
+                .response
+                .unwrap();
+            let mut reader = ContentCoding::from_response(&response)
+                .unwrap()
+                .reader(response);
+            let mut decoded = Vec::new();
+            let error = reader.read_to_end(&mut decoded).await.unwrap_err();
+            assert_eq!(error.kind(), kind, "{coding}/{case}: {error}");
+            assert_eq!(decoded, data, "{coding}/{case}");
+        }
+    }
 }
 
 #[tokio::test]

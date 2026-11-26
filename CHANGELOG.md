@@ -2,6 +2,27 @@
 
 All notable changes to **SlipStream** are documented in this file following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [1.2.2] - 2026-11-26
+
+### Fixed
+
+- **Direct download reliability across mirrors and CDNs (`crates/engine`):**
+  - Enabled `.http1_title_case_headers()` and default `Accept-Language` so WAF/Cloudflare endpoints no longer reject HTTP/1.1 requests for lowercase headers.
+  - Added an **IPv4-only fallback** and independent **403 header fallback ladder** (`full` → `strip Cookies` → `strip Referer/Origin`), retaining the original `403` cleanly when IPv6-only hosts have no IPv4 route.
+  - Added **adaptive concurrency backdown** on `HTTP 503` / `429` / `403` (staggered worker startup, halving active connections down to `1`, respecting bounded `Retry-After` delays including on `bytes=0-0` probes, retiring excess workers back to `Pending`, and falling back to full `GET` cleanly without erasing partial bytes before replacement succeeds).
+  - Reused the already-open plain `GET` response from `probe()` when ranges are unsupported so single-use signed URLs are never double-spent.
+  - Added transparent single-stream decompression (`gzip`, `deflate`, `brotli`) for non-ranged full `GET` responses with strict underlying HTTP stream EOF verification.
+  - Upgraded same-origin redirect `Set-Cookie` handling to enforce RFC 6265 `Path`, `Domain`, `Secure`, `Max-Age`, and `Expires` attributes (removing deleted/expired cookies instead of forwarding them).
+- **Universal browser download interception (`extensions/browser`):**
+  - Added Chromium `chrome.downloads.onDeterminingFilename` interception (with a 3500 ms `suggest()` deadline, late-reply cancellation guard, and verified `cancel` → `erase`), while preserving `downloads.onCreated` fallback on Firefox.
+  - Expanded default extensions (`.exe`, `.msi`, `.msix`, `.dmg`, `.pkg`, `.deb`, `.rpm`, `.apk`, archives, disk images, media, `.pdf`, `.torrent`) and added extensionless MIME inference that still honors explicit filename extension allowlists.
+  - Added `"cookies"` manifest permission with non-private, non-downgrade, SameSite-aware target cookie retrieval (never reading incognito or `firefox-private-*` stores) and automatic `NativeClient.send()` service-worker wake reconnect.
+- **Floating video pill compatibility across sites (`extensions/browser`, `crates/protocol`, `apps/desktop/src-tauri`):**
+  - Stopped dropping `HTTP 206 Partial Content` direct video streams; parsed `Content-Range` totals (`>= 300 KB`, keeping `/*` totals unknown instead of mistaking slice `Content-Length` for total size) and surfaced instant **Download Video** direct HTTP actions.
+  - Allowed public cross-origin `<video src>` / `<source src>` targets from trusted frames, stopped wrong-player stream substitution when explicit player URLs differ, and preserved direct video actions alongside probed formats.
+  - Forwarded `headers` (`Referer`, `Origin`, `User-Agent`, `Accept-Language`) in `ProbeMedia` (with strict cross-origin origin-only `Referer` scoping) and added pre-launch DNS SSRF verification (`ensure_public_media_host`) before spawning `yt-dlp`.
+  - Fixed `selectPillFormatId` to choose the best format `<= expectedHeight` (never exceeding the requested height cap) and only append `+bestaudio` when an audio-only format exists.
+
 ## [1.2.1] - 2026-11-26
 
 ### Security & Hardening

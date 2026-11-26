@@ -232,7 +232,7 @@ describe("download interception", () => {
     expect(shouldIntercept(item, { ...settings, excludedSites: ["dn.example"] }, context)).toBe(true);
   });
 
-  it("intercepts extensionless URLs by downloadable MIME or clean filename with non-webpage MIME", () => {
+  it("intercepts extensionless URLs only when inferred MIME matches allowed extensions and never overrides explicit mismatched extensions", () => {
     expect(shouldIntercept(
       { url: "https://github.com/org/repo/releases/download/v1/app-linux", filename: "", fileSize: 5_000_000, mime: "application/octet-stream" },
       defaults,
@@ -243,11 +243,22 @@ describe("download interception", () => {
       defaults,
       context,
     )).toBe(true);
+    // Respects explicit filename extension allowlist rather than overriding via MIME.
     expect(shouldIntercept(
-      { url: "https://cdn.example/download?id=123", filename: "package.custom", fileSize: 100_000, mime: "application/x-custom-package" },
+      { url: "https://cdn.example/download?id=123", filename: "package.custom", fileSize: 100_000, mime: "application/octet-stream" },
       defaults,
       context,
-    )).toBe(true);
+    )).toBe(false);
+    expect(shouldIntercept(
+      { url: "https://cdn.example/download?id=124", filename: "report.pdf", fileSize: 100_000, mime: "application/pdf" },
+      { ...defaults, extensions: ["zip"] },
+      context,
+    )).toBe(false);
+    expect(shouldIntercept(
+      { url: "https://cdn.example/download?id=125", filename: "", fileSize: 100_000, mime: "application/pdf" },
+      { ...defaults, extensions: ["zip"] },
+      context,
+    )).toBe(false);
     expect(shouldIntercept(
       { url: "https://cdn.example/page", filename: "index.html", fileSize: 50_000, mime: "text/html" },
       defaults,
@@ -324,7 +335,7 @@ describe("adaptive pill format selection and TTL cache eviction", () => {
     expect(selectPillFormatId({ ...baseProbe, formats: [] }, 2160)).toBeUndefined();
   });
 
-  it("falls back to highest format <= expectedHeight when exact resolution is absent", () => {
+  it("falls back to highest format <= expectedHeight when exact resolution is absent and respects height caps and separate audio", () => {
     const hd720Probe: MediaProbeResult = {
       ...baseProbe,
       formats: [
@@ -335,6 +346,18 @@ describe("adaptive pill format selection and TTL cache eviction", () => {
     };
     expect(selectPillFormatId(hd720Probe, 1080)).toBe("136+bestaudio");
     expect(selectPillFormatId(hd720Probe, 2160)).toBe("136+bestaudio");
+    expect(selectPillFormatId({
+      ...baseProbe,
+      formats: [baseProbe.formats[0]],
+    }, 1080)).toBeUndefined();
+    const muxedPlusVideoOnlyProbe: MediaProbeResult = {
+      ...baseProbe,
+      formats: [
+        { format_id: "136", label: "720p video-only", container: "mp4", video_codec: "avc1", audio_codec: null, height: 720, fps: 30, filesize_bytes: 1200, is_audio_only: false, has_video: true, has_audio: false },
+        baseProbe.formats[2],
+      ],
+    };
+    expect(selectPillFormatId(muxedPlusVideoOnlyProbe, 720)).toBe("136");
     const noHeightProbe: MediaProbeResult = {
       ...baseProbe,
       formats: [

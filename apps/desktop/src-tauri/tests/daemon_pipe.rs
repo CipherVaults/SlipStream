@@ -1296,7 +1296,7 @@ async fn selected_playlist_runs_sequentially_with_pause_resume_and_middle_failur
             index,
             title: title.into(),
             url: Some(if slug == "three" {
-                format!("https://cdn.example.com/sequence/{slug}")
+                format!("https://127.0.0.1/sequence/{slug}")
             } else {
                 format!("https://example.com/sequence/{slug}")
             }),

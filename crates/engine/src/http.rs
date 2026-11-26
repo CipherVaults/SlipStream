@@ -1,7 +1,7 @@
 use crate::{EngineError, Result};
 use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder};
 use chrono::{DateTime, NaiveDateTime, Utc};
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{
     HeaderMap, HeaderName, HeaderValue, ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE,
@@ -16,8 +16,9 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{ready, Context, Poll};
 use std::time::Duration;
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
 use tokio_util::io::StreamReader;
 use url::{Host, Url};
 
@@ -142,14 +143,30 @@ pub(crate) struct Http {
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct FetchProfile {
-    ipv4_only: bool,
+    pub(crate) ipv4_only: bool,
     strip_cookies: bool,
     strip_referer: bool,
 }
 
 impl FetchProfile {
-    pub(crate) fn fallback(mut self, source: &Source, sent_cookie: bool) -> Option<Self> {
-        if !self.ipv4_only {
+    const IPV4_REQUIRED: &str = "IPv4-only requests require an IPv4 destination";
+
+    pub(crate) fn ipv4_unavailable(self, error: &EngineError) -> bool {
+        self.ipv4_only
+            && match error {
+                EngineError::Http(error) => error.is_connect(),
+                EngineError::InvalidRequest(message) => message == Self::IPV4_REQUIRED,
+                _ => false,
+            }
+    }
+
+    pub(crate) fn fallback(
+        mut self,
+        source: &Source,
+        sent_cookie: bool,
+        ipv4_exhausted: bool,
+    ) -> Option<Self> {
+        if !self.ipv4_only && !ipv4_exhausted {
             self.ipv4_only = true;
         } else if !self.strip_cookies && (sent_cookie || source.headers.contains_key(COOKIE)) {
             self.strip_cookies = true;
@@ -389,7 +406,7 @@ impl Http {
         for hop in 0..=10 {
             if profile.ipv4_only && matches!(url.host(), Some(Host::Ipv6(_))) {
                 return Err(EngineError::InvalidRequest(
-                    "IPv4-only requests require an IPv4 destination".into(),
+                    FetchProfile::IPV4_REQUIRED.into(),
                 ));
             }
             let mut response = client
@@ -423,7 +440,7 @@ impl Http {
                 ))?;
             let next = validate_redirect_target(&url, location, self.allow_loopback)?;
             if !profile.strip_cookies && url.origin() == next.origin() {
-                merge_redirect_cookies(&mut headers, response.headers());
+                merge_redirect_cookies(&mut headers, response.headers(), &next);
             }
             apply_redirect_header_policy(&mut headers, &url, &next);
             url = next;
@@ -444,7 +461,7 @@ impl Http {
                 .await
             {
                 Ok(response) => Some(response),
-                Err(error) if error.is_transient() => None,
+                Err(error) if error.is_transient() && !profile.ipv4_unavailable(&error) => None,
                 Err(error) => return Err(error),
             };
             if let Some(response) = head.filter(|response| {
@@ -493,8 +510,7 @@ impl Http {
                 | StatusCode::BAD_REQUEST
                 | StatusCode::METHOD_NOT_ALLOWED
                 | StatusCode::PRECONDITION_FAILED
-                | StatusCode::NOT_IMPLEMENTED
-                | StatusCode::SERVICE_UNAVAILABLE => None,
+                | StatusCode::NOT_IMPLEMENTED => None,
                 StatusCode::RANGE_NOT_SATISFIABLE => response
                     .headers()
                     .get(CONTENT_RANGE)
@@ -631,16 +647,12 @@ fn apply_redirect_header_policy(headers: &mut HeaderMap, previous: &Url, next: &
     *headers = safe;
 }
 
-fn merge_redirect_cookies(headers: &mut HeaderMap, response: &HeaderMap) {
+fn merge_redirect_cookies(headers: &mut HeaderMap, response: &HeaderMap, next: &Url) {
+    let now = Utc::now();
     let mut incoming = response
         .get_all(SET_COOKIE)
         .iter()
-        .filter_map(|value| {
-            let pair = value.to_str().ok()?.split(';').next()?.trim();
-            let (name, _) = pair.split_once('=')?;
-            HeaderName::from_bytes(name.as_bytes()).ok()?;
-            Some((name, pair))
-        })
+        .filter_map(|value| redirect_cookie(value, next, now))
         .peekable();
     if incoming.peek().is_none() {
         return;
@@ -652,14 +664,75 @@ fn merge_redirect_cookies(headers: &mut HeaderMap, response: &HeaderMap) {
         .flat_map(|value| value.split(';').map(str::trim))
         .filter(|pair| !pair.is_empty())
         .collect();
-    for (name, pair) in incoming {
+    for (name, pair, expired) in incoming {
         pairs.retain(|existing| !existing.split_once('=').is_some_and(|(key, _)| key == name));
-        pairs.push(pair);
+        if !expired {
+            pairs.push(pair);
+        }
     }
-    if let Ok(mut value) = HeaderValue::from_str(&pairs.join("; ")) {
+    if pairs.is_empty() {
+        headers.remove(COOKIE);
+    } else if let Ok(mut value) = HeaderValue::from_str(&pairs.join("; ")) {
         value.set_sensitive(true);
         headers.insert(COOKIE, value);
     }
+}
+
+fn redirect_cookie<'a>(
+    value: &'a HeaderValue,
+    next: &Url,
+    now: DateTime<Utc>,
+) -> Option<(&'a str, &'a str, bool)> {
+    let mut fields = value.to_str().ok()?.split(';');
+    let pair = fields.next()?.trim();
+    let (name, _) = pair.split_once('=')?;
+    HeaderName::from_bytes(name.as_bytes()).ok()?;
+    let mut expired = false;
+    for field in fields {
+        let (attribute, value) = field.split_once('=').unwrap_or((field, ""));
+        let value = value.trim();
+        match attribute.trim().to_ascii_lowercase().as_str() {
+            "secure" if next.scheme() != "https" => return None,
+            "domain" => {
+                let host = next.host_str()?.to_ascii_lowercase();
+                let domain = value
+                    .strip_prefix('.')
+                    .unwrap_or(value)
+                    .to_ascii_lowercase();
+                let matches_suffix = matches!(next.host(), Some(Host::Domain(_)))
+                    && host
+                        .strip_suffix(&domain)
+                        .is_some_and(|prefix| prefix.ends_with('.'));
+                if domain.is_empty() || (host != domain && !matches_suffix) {
+                    return None;
+                }
+            }
+            "path" => {
+                let matches_path = next.path().strip_prefix(value).is_some_and(|suffix| {
+                    suffix.is_empty() || value.ends_with('/') || suffix.starts_with('/')
+                });
+                if value.is_empty() || !matches_path {
+                    return None;
+                }
+            }
+            "max-age" => {
+                let digits = value.strip_prefix('-').unwrap_or(value);
+                expired |= !digits.is_empty()
+                    && digits.bytes().all(|byte| byte.is_ascii_digit())
+                    && (value.starts_with('-') || digits.bytes().all(|byte| byte == b'0'));
+            }
+            "expires" => {
+                let date = parse_http_date(value).or_else(|| {
+                    NaiveDateTime::parse_from_str(value, "%a, %d-%b-%Y %H:%M:%S GMT")
+                        .ok()
+                        .map(|date| date.and_utc())
+                });
+                expired |= date.is_some_and(|date| date <= now);
+            }
+            _ => {}
+        }
+    }
+    Some((name, pair, expired))
 }
 
 pub(crate) fn request_error(error: reqwest::Error) -> EngineError {
@@ -797,7 +870,7 @@ impl ContentCoding {
 
     pub(crate) fn reader(self, response: Response) -> Pin<Box<dyn AsyncRead + Send>> {
         let reader =
-            StreamReader::new(response.bytes_stream().map_err(|error| {
+            StreamReader::new(response.bytes_stream().fuse().map_err(|error| {
                 io::Error::new(io::ErrorKind::UnexpectedEof, error.without_url())
             }));
         match self {
@@ -805,11 +878,64 @@ impl ContentCoding {
             Self::Gzip => {
                 let mut decoder = GzipDecoder::new(reader);
                 decoder.multiple_members(true);
-                Box::pin(decoder)
+                Box::pin(VerifiedCompressedReader::new(
+                    decoder,
+                    GzipDecoder::get_pin_mut,
+                ))
             }
-            Self::Deflate => Box::pin(ZlibDecoder::new(reader)),
-            Self::Brotli => Box::pin(BrotliDecoder::new(reader)),
+            Self::Deflate => Box::pin(VerifiedCompressedReader::new(
+                ZlibDecoder::new(reader),
+                ZlibDecoder::get_pin_mut,
+            )),
+            Self::Brotli => Box::pin(VerifiedCompressedReader::new(
+                BrotliDecoder::new(reader),
+                BrotliDecoder::get_pin_mut,
+            )),
         }
+    }
+}
+
+struct VerifiedCompressedReader<D, R> {
+    decoder: D,
+    transport: fn(Pin<&mut D>) -> Pin<&mut R>,
+    verified_eof: bool,
+}
+
+impl<D, R> VerifiedCompressedReader<D, R> {
+    fn new(decoder: D, transport: fn(Pin<&mut D>) -> Pin<&mut R>) -> Self {
+        Self {
+            decoder,
+            transport,
+            verified_eof: false,
+        }
+    }
+}
+
+impl<D: AsyncRead + Unpin, R: AsyncBufRead> AsyncRead for VerifiedCompressedReader<D, R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.verified_eof || buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let mut decoder = Pin::new(&mut this.decoder);
+        let before = buf.filled().len();
+        ready!(decoder.as_mut().poll_read(cx, buf))?;
+        if buf.filled().len() == before {
+            // A finished compressed member can leave buffered bytes or an HTTP error unread.
+            let mut transport = (this.transport)(decoder);
+            if !ready!(transport.as_mut().poll_fill_buf(cx))?.is_empty() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected trailing bytes after compressed stream",
+                )));
+            }
+            this.verified_eof = true;
+        }
+        Poll::Ready(Ok(()))
     }
 }
 

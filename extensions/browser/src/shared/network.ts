@@ -79,8 +79,10 @@ export class ObservedNetwork {
     const scope = this.scope(details, tabUrl, now);
     const target = httpUrl(details.url);
     const mime = mediaMime(headers);
-    const sizeBytes = parseContentRangeTotal(headers) ?? mediaLength(headers);
-    if (!scope || !target || !isMediaStream(target.href, mime, sizeBytes)) return false;
+    const hasRange = headers.some(({ name }) => name.toLowerCase() === "content-range");
+    const sizeBytes = parseContentRangeTotal(headers) ?? (hasRange ? undefined : mediaLength(headers));
+    const detectBytes = sizeBytes ?? mediaLength(headers);
+    if (!scope || !target || !isMediaStream(target.href, mime, detectBytes)) return false;
     const key = frameKey(details.tabId, scope.frameId);
     const current = this.streams.get(key);
     const matchesScope = current?.origin === scope.origin && current.topOrigin === scope.topOrigin;

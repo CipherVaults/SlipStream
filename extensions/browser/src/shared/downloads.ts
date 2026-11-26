@@ -84,6 +84,7 @@ export function sameDownloadOrigin(item: { url: string; finalUrl?: string }): bo
 
 const DOWNLOADABLE_MIMES = new Set([
   "application/octet-stream",
+  "application/binary",
   "application/x-msdownload",
   "application/x-msi",
   "application/zip",
@@ -100,18 +101,65 @@ const DOWNLOADABLE_MIMES = new Set([
   "application/x-bittorrent",
 ]);
 
-function isDownloadableMime(rawMime?: string): boolean {
-  const mime = rawMime?.split(";")[0].trim().toLowerCase() ?? "";
-  if (!mime) return false;
-  return DOWNLOADABLE_MIMES.has(mime) || mime.startsWith("video/") || mime.startsWith("audio/");
-}
+const MIME_TO_EXTENSIONS: Record<string, readonly string[]> = {
+  "application/zip": ["zip"],
+  "application/x-zip-compressed": ["zip"],
+  "application/x-7z-compressed": ["7z"],
+  "application/x-rar-compressed": ["rar"],
+  "application/vnd.rar": ["rar"],
+  "application/x-tar": ["tar"],
+  "application/gzip": ["gz", "tgz"],
+  "application/x-gzip": ["gz", "tgz"],
+  "application/x-bzip2": ["bz2"],
+  "application/x-xz": ["xz"],
+  "application/zstd": ["zst"],
+  "application/x-iso9660-image": ["iso"],
+  "application/x-msdownload": ["exe", "msi"],
+  "application/x-dosexec": ["exe"],
+  "application/x-msi": ["msi"],
+  "application/vnd.apple.installer+xml": ["pkg"],
+  "application/x-apple-diskimage": ["dmg"],
+  "application/vnd.debian.binary-package": ["deb"],
+  "application/x-rpm": ["rpm"],
+  "application/vnd.android.package-archive": ["apk"],
+  "application/pdf": ["pdf"],
+  "application/x-bittorrent": ["torrent"],
+  "video/mp4": ["mp4", "m4v"],
+  "video/webm": ["webm"],
+  "video/x-matroska": ["mkv"],
+  "video/x-msvideo": ["avi"],
+  "video/quicktime": ["mov"],
+  "audio/mpeg": ["mp3"],
+  "audio/flac": ["flac"],
+  "audio/wav": ["wav"],
+  "audio/x-wav": ["wav"],
+  "audio/mp4": ["m4a"],
+  "audio/ogg": ["ogg"],
+  "audio/opus": ["opus"],
+};
 
-function isNonWebpageNonImageMime(rawMime?: string): boolean {
+const GENERIC_BINARY_EXTENSIONS = new Set([
+  "exe", "msi", "msix", "appx", "dmg", "pkg", "deb", "rpm", "apk",
+  "bin", "iso", "img", "zip", "7z", "rar", "tar", "gz", "tgz", "xz", "bz2", "zst", "cab",
+]);
+
+function matchesAllowedMime(rawMime: string | undefined, allowed: ReadonlySet<string>): boolean {
   const mime = rawMime?.split(";")[0].trim().toLowerCase() ?? "";
-  if (!mime) return false;
-  return !mime.startsWith("text/")
-    && !mime.startsWith("image/")
-    && !/^application\/(?:xhtml\+xml|javascript|x-javascript|json|xml)$/i.test(mime);
+  if (!mime || !DOWNLOADABLE_MIMES.has(mime) && !mime.startsWith("video/") && !mime.startsWith("audio/")) {
+    return false;
+  }
+  const inferred = MIME_TO_EXTENSIONS[mime];
+  if (inferred) {
+    return inferred.some((ext) => allowed.has(ext));
+  }
+  if (mime === "application/octet-stream" || mime === "application/binary") {
+    return [...GENERIC_BINARY_EXTENSIONS].some((ext) => allowed.has(ext));
+  }
+  if (mime.startsWith("video/") || mime.startsWith("audio/")) {
+    const sub = mime.split("/")[1]?.replace(/^x-/, "");
+    return Boolean(sub && allowed.has(sub));
+  }
+  return false;
 }
 
 export function shouldIntercept(
@@ -132,9 +180,9 @@ export function shouldIntercept(
   const fileExt = item.filename ? /\.([^.\\/]+)$/.exec(item.filename)?.[1].toLowerCase() : undefined;
   const urlExt = /\.([^.\\/]+)$/.exec(target.pathname)?.[1].toLowerCase();
   if ((fileExt && allowed.has(fileExt)) || (urlExt && allowed.has(urlExt))) return true;
-  if (isDownloadableMime(item.mime)) return true;
-  if (item.filename && safeFilename(item.filename) && isNonWebpageNonImageMime(item.mime)) return true;
-  return false;
+  // Never override an explicit non-matching filename extension via MIME heuristics.
+  if (fileExt) return false;
+  return matchesAllowedMime(item.mime, allowed);
 }
 
 export function safeFilename(path: string): string | undefined {

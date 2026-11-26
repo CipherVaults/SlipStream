@@ -238,11 +238,12 @@ api.webRequest.onHeadersReceived.addListener((details): undefined => {
   if (isManifest(target, mime)) {
     if (details.statusCode === 206 || hasContentRange) return;
   } else {
-    const length = parseContentRangeTotal(headers) ?? mediaLength(headers);
+    const totalLength = parseContentRangeTotal(headers) ?? (details.statusCode === 200 && !hasContentRange ? mediaLength(headers) : undefined);
+    const minCheckLength = totalLength ?? mediaLength(headers);
     if (details.statusCode === 206 || hasContentRange) {
-      if (length === undefined || length < 300_000) return;
+      if (minCheckLength === undefined || minCheckLength < 300_000) return;
     }
-    if (!isMediaStream(details.url, mime, length)) return;
+    if (!isMediaStream(details.url, mime, minCheckLength)) return;
   }
   void observedTab(details.tabId).then((tab) => {
     if (!tab?.url) return;
@@ -251,24 +252,43 @@ api.webRequest.onHeadersReceived.addListener((details): undefined => {
   return undefined;
 }, webFilter, ["responseHeaders"]);
 
+function isSameSiteHostname(siteHost: string, targetHost: string): boolean {
+  const a = siteHost.toLowerCase().replace(/\.$/, "");
+  const b = targetHost.toLowerCase().replace(/\.$/, "");
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const partsA = a.split(".");
+  const partsB = b.split(".");
+  if (partsA.length < 2 || partsB.length < 2) return false;
+  return partsA.slice(-2).join(".") === partsB.slice(-2).join(".");
+}
+
 async function collectCookiesForUrl(
   target: URL,
   storeId?: string,
   incognito?: boolean,
+  siteHostname?: string,
+  isSubresource = false,
 ): Promise<string | undefined> {
   if (!api.cookies?.getAll) return undefined;
-  if (incognito && !storeId) return undefined;
+  if (incognito || api.extension?.inIncognitoContext || storeId?.startsWith("firefox-private")) return undefined;
   try {
     const cookies = await api.cookies.getAll({
       url: target.href,
       ...(storeId ? { storeId } : {}),
     });
     if (!Array.isArray(cookies) || !cookies.length) return undefined;
+    const crossSite = siteHostname ? !isSameSiteHostname(siteHostname, target.hostname) : false;
     const pairs: string[] = [];
     let totalBytes = 0;
     const encoder = new TextEncoder();
     for (const cookie of cookies) {
       if (!cookie || typeof cookie.name !== "string" || typeof cookie.value !== "string") continue;
+      if (cookie.secure && target.protocol !== "https:") continue;
+      if (crossSite) {
+        if (cookie.sameSite === "strict") continue;
+        if (isSubresource && (cookie.sameSite === "lax" || cookie.sameSite === "unspecified")) continue;
+      }
       if (!cookie.name || /[\u0000-\u001f\u007f;=\r\n]/.test(cookie.name) || /[\u0000-\u001f\u007f\r\n]/.test(cookie.value)) {
         continue;
       }
@@ -321,10 +341,13 @@ const handledDownloads = new Set<number>();
 
 async function tryInterceptDownload(
   current: chrome.downloads.DownloadItem,
+  isExpired?: () => boolean,
 ): Promise<boolean> {
   if (!native.state.connected && !(await native.ensureConnected())) return false;
   await settingsReady;
+  if (isExpired?.()) return false;
   const [active] = await api.tabs.query({ active: true, lastFocusedWindow: true });
+  if (isExpired?.()) return false;
   const target = httpUrl(current.finalUrl || current.url);
   if (!target) return false;
   const downloadContext = current as typeof current & { cookieStoreId?: string };
@@ -337,21 +360,26 @@ async function tryInterceptDownload(
   })) return false;
   const referrer = httpUrl(current.referrer);
   const page = httpUrl(tab?.url);
+  const downgrade = Boolean((referrer?.protocol === "https:" || page?.protocol === "https:") && target.protocol === "http:");
+  const sameRedirectOrigin = Boolean(referrer && sameDownloadOrigin(current));
+  const allowCookie = sameRedirectOrigin && !downgrade && !current.incognito && !api.extension?.inIncognitoContext;
   const fallback = tab || (!active && !current.incognito)
     ? referrer ?? (page?.origin === target.origin ? page : undefined)
     : undefined;
-  const context = httpHandoffContext(target, tab, fallback, !!referrer && sameDownloadOrigin(current));
-  if (!context.headers.Cookie) {
-    const cookie = await collectCookiesForUrl(target, downloadContext.cookieStoreId, current.incognito);
+  const context = httpHandoffContext(target, tab, fallback, allowCookie);
+  if (allowCookie && !context.headers.Cookie) {
+    const cookie = await collectCookiesForUrl(target, downloadContext.cookieStoreId, current.incognito, (referrer ?? page)?.hostname, false);
     if (cookie) context.headers.Cookie = cookie;
   }
+  if (isExpired?.()) return false;
   const response = await handoffHttp(target, context, safeFilename(current.filename));
-  return response.type === "transfer_created";
+  return !isExpired?.() && response.type === "transfer_created";
 }
 
 if (api.downloads.onDeterminingFilename) {
   api.downloads.onDeterminingFilename.addListener((item, suggest) => {
     let suggested = false;
+    let expired = false;
     const finishSuggest = () => {
       if (suggested) return;
       suggested = true;
@@ -362,7 +390,10 @@ if (api.downloads.onDeterminingFilename) {
         // Ignore if Chromium already finalized the download.
       }
     };
-    const safetyTimer = setTimeout(finishSuggest, 3500);
+    const safetyTimer = setTimeout(() => {
+      expired = true;
+      finishSuggest();
+    }, 3500);
     if (handledDownloads.has(item.id)) {
       finishSuggest();
       return true;
@@ -370,11 +401,12 @@ if (api.downloads.onDeterminingFilename) {
     handledDownloads.add(item.id);
     void (async () => {
       try {
-        const intercepted = await tryInterceptDownload(item);
+        const intercepted = await tryInterceptDownload(item, () => expired);
+        if (expired) return;
         finishSuggest();
         if (intercepted) {
-          await api.downloads.cancel(item.id);
-          if (api.downloads.erase) {
+          const canceled = await api.downloads.cancel(item.id).then(() => true, () => false);
+          if (canceled && api.downloads.erase) {
             await api.downloads.erase({ id: item.id }).catch(() => {});
           }
         }
@@ -401,8 +433,8 @@ api.downloads.onCreated.addListener((item) => {
       if (!current || current.state !== "in_progress" || current.paused) return;
       const intercepted = await tryInterceptDownload(current);
       if (intercepted) {
-        await api.downloads.cancel(item.id);
-        if (api.downloads.erase) {
+        const canceled = await api.downloads.cancel(item.id).then(() => true, () => false);
+        if (canceled && api.downloads.erase) {
           await api.downloads.erase({ id: item.id }).catch(() => {});
         }
       }
@@ -504,13 +536,22 @@ function buildMediaHeaders(frame: Frame, target: URL): Record<string, string> {
   if (frame.private) return {};
   const headers = { ...network.mediaHeaders(frame.tabId, target.href, frame.tabUrl, frame.frameId, frame.page.href) };
   const downgrade = frame.page.protocol === "https:" && target.protocol === "http:";
-  if (!headers.Referer && !downgrade) {
-    const clean = new URL(frame.page.href);
-    clean.hash = "";
-    headers.Referer = clean.href;
-  }
-  if (!headers.Origin && !downgrade) {
-    headers.Origin = frame.page.origin;
+  if (downgrade) {
+    delete headers.Referer;
+    delete headers.Origin;
+  } else {
+    if (!headers.Referer) {
+      if (target.origin === frame.page.origin) {
+        const clean = new URL(frame.page.href);
+        clean.hash = "";
+        headers.Referer = clean.href;
+      } else {
+        headers.Referer = `${frame.page.origin}/`;
+      }
+    }
+    if (!headers.Origin) {
+      headers.Origin = frame.page.origin;
+    }
   }
   const userAgent = typeof navigator === "undefined" ? undefined : navigator.userAgent;
   if (!headers["User-Agent"] && userAgent?.trim() && !/[\u0000-\u001f\u007f]/.test(userAgent)) {
@@ -534,9 +575,16 @@ function directStreamChoice(url: string, mime = "", sizeBytes?: number): PillFor
 }
 
 async function handoffDirectVideo(frame: Frame, target: URL): Promise<ActionResult> {
+  if (blockedSite(target, settings)) {
+    return { ok: false, message: "SlipStream is disabled for this site." };
+  }
   const headers = buildMediaHeaders(frame, target);
-  if (!frame.private || frame.cookieStoreId) {
-    const cookie = await collectCookiesForUrl(target, frame.cookieStoreId, frame.private);
+  const downgrade = frame.page.protocol === "https:" && target.protocol === "http:";
+  const captured = frame.private ? {} : network.headers(frame.tabId, target.href, frame.tabUrl);
+  if (!frame.private && !downgrade && captured.Cookie) {
+    headers.Cookie = captured.Cookie;
+  } else if (!frame.private && !downgrade && !frame.cookieStoreId?.startsWith("firefox-private")) {
+    const cookie = await collectCookiesForUrl(target, frame.cookieStoreId, frame.private, frame.page.hostname, true);
     if (cookie) headers.Cookie = cookie;
   }
   const referrer = headers.Referer;
@@ -600,17 +648,20 @@ function pillOpen(frame: Frame, message: Extract<BrowserMessage, { kind: "pill-o
     if (!stream.variants) readHls(stream);
     return { ok: true };
   }
-  const directTarget = stream?.kind === "direct" && (stream.url === url.href || !isKnownVideoPage(url.href))
-    ? { url: stream.url, mime: stream.mime, sizeBytes: stream.sizeBytes }
+  const streamAllowed = stream?.kind === "direct" && !blockedSite(httpUrl(stream.url), settings)
+    && (stream.url === url.href || (url.href === frame.page.href && !isKnownVideoPage(url.href)));
+  const directTarget = streamAllowed
+    ? { url: stream!.url, mime: stream!.mime, sizeBytes: stream!.sizeBytes }
     : isDirectMediaUrl(url.href)
       ? { url: url.href, mime: "", sizeBytes: undefined }
       : undefined;
-  if (directTarget) {
+  const directChoice = directTarget ? directStreamChoice(directTarget.url, directTarget.mime, directTarget.sizeBytes) : undefined;
+  if (directChoice) {
     const immediate: PillFormatsMessage = {
       kind: "pill-formats",
       url: url.href,
       requestId: message.requestId,
-      formats: [directStreamChoice(directTarget.url, directTarget.mime, directTarget.sizeBytes)],
+      formats: [directChoice],
       isPlaylist: false,
     };
     postToFrame(frame.tabId, frame.frameId, immediate, frame.documentId);
@@ -618,14 +669,15 @@ function pillOpen(frame: Frame, message: Extract<BrowserMessage, { kind: "pill-o
   const playlist = message.isPlaylist === true && isPlaylistPage(url.href);
   const key = probeKey(frame, url.href, playlist);
   const active = startOrReuseProbe(frame, url.href, playlist, 12_000);
-  if (!active) return { ok: Boolean(directTarget) };
+  if (!active) return { ok: Boolean(directChoice) };
   void active.response.then((response) => {
     if (probes.get(key) !== active || !response || response.type !== "media_probed") return;
     const formats = probeFormats(response.probe);
-    if (!formats.length && directTarget) return;
+    if (!formats.length && directChoice) return;
+    const mergedFormats = directChoice ? [directChoice, ...formats] : formats;
     const update: PillFormatsMessage = {
       kind: "pill-formats", url: url.href, requestId: message.requestId,
-      formats, isPlaylist: playlist || response.probe.is_playlist,
+      formats: mergedFormats, isPlaylist: playlist || response.probe.is_playlist,
     };
     postToFrame(frame.tabId, frame.frameId, update, frame.documentId);
   }).catch(() => {});
@@ -677,12 +729,14 @@ async function mediaAction(action: MediaAction, source: string, links: unknown[]
     if (frame.private) {
       return { ok: false, message: "Automatic format probing is disabled in private windows." };
     }
-    const directTarget = observed?.kind === "direct" && (observed.url === url || !isKnownVideoPage(url))
-      ? httpUrl(observed.url)
+    const useObservedDirect = observed?.kind === "direct" && !blockedSite(httpUrl(observed.url), settings)
+      && (observed.url === url || (url === page.href && !isKnownVideoPage(url)));
+    const directTarget = useObservedDirect
+      ? httpUrl(observed!.url)
       : isDirectMediaUrl(url)
         ? httpUrl(url)
         : undefined;
-    if (directTarget) {
+    if (directTarget && !blockedSite(directTarget, settings)) {
       return handoffDirectVideo(frame, directTarget);
     }
     height = action === "4k" ? 2160 : 1080;

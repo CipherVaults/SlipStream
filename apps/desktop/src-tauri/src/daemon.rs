@@ -587,6 +587,7 @@ impl AppState {
                 let settings = self.settings();
                 let resource_dir = self.resource_dir.clone();
                 let cache_dir = self.ytdlp_cache_path();
+                let allow_loopback = self.allow_loopback;
                 // Own the probe independently of the first caller's lifetime.
                 tokio::spawn(async move {
                     let result = tokio::select! {
@@ -594,7 +595,7 @@ impl AppState {
                         _ = stopped_signal(stopped) => Err("SlipStream is shutting down".into()),
                         result = async {
                             let _permit = probe_permits.acquire().await.map_err(message)?;
-                            run_media_probe(&toolchain_cache, settings, resource_dir, &key.url, ProbeOptions {
+                            run_media_probe(&toolchain_cache, settings, resource_dir, &key.url, allow_loopback, ProbeOptions {
                                 playlist: key.playlist,
                                 cache_dir: Some(cache_dir),
                                 headers: key.headers.iter().cloned().collect(),
@@ -944,6 +945,8 @@ impl AppState {
         let playlist = request.download_playlist;
         let key = ProbeKey::new(&request.url, playlist, &request.headers)?;
         let pre_probe = pre_probe.or_else(|| self.probe_cache.lock().unwrap().get(&key));
+        let url = validate_media_url(&request.url, self.allow_loopback)?;
+        ensure_public_media_host(&url, self.allow_loopback).await?;
         job.start(MediaJobRunOptions {
             settings: self.settings(),
             resource_dir: self.resource_dir.clone(),
@@ -1663,6 +1666,24 @@ pub(crate) fn validate_media_url(raw: &str, allow_loopback: bool) -> Result<Url>
     Ok(url)
 }
 
+async fn ensure_public_media_host(url: &Url, allow_loopback: bool) -> Result<()> {
+    let host = url.host_str().ok_or("missing media URL host")?;
+    let port = url
+        .port_or_known_default()
+        .ok_or("missing media URL port")?;
+    let mut addrs = tokio::net::lookup_host((host.trim_matches(['[', ']']), port))
+        .await
+        .map_err(|error| format!("could not resolve media host: {error}"))?
+        .peekable();
+    if addrs.peek().is_none() {
+        return Err("media host resolved to no addresses".into());
+    }
+    for addr in addrs {
+        check_media_ip(addr.ip(), allow_loopback)?;
+    }
+    Ok(())
+}
+
 fn is_pure_playlist_url(url: &Url) -> bool {
     let host = url.host_str().unwrap_or_default();
     let mut path = url.path_segments().into_iter().flatten();
@@ -1695,8 +1716,10 @@ async fn run_media_probe(
     settings: AppSettings,
     resource_dir: Option<PathBuf>,
     url: &str,
+    allow_loopback: bool,
     mut options: ProbeOptions,
 ) -> Result<MediaProbeResult> {
+    let url = validate_media_url(url, allow_loopback)?;
     let binary = discover_ytdlp_for_probe(toolchain_cache, settings, resource_dir).await?;
     if let Some(cache_dir) = options.cache_dir.take() {
         options.cache_dir = Some(
@@ -1706,7 +1729,8 @@ async fn run_media_probe(
                 .map_err(message)?,
         );
     }
-    probe_url_with_binary(&binary, url, options)
+    ensure_public_media_host(&url, allow_loopback).await?;
+    probe_url_with_binary(&binary, url.as_str(), options)
         .await
         .map_err(message)
 }
@@ -2246,8 +2270,10 @@ mod tests {
         let temp = TestDir::new();
         let state = start_test_daemon(&temp.0).await;
         state.settings.write().unwrap().max_concurrent_downloads = 0;
-        let canceled = state.add_media_download(media_request()).await.unwrap();
-        let next = state.add_media_download(media_request()).await.unwrap();
+        let mut request = media_request();
+        request.url = "http://127.0.0.1:1/video".into();
+        let canceled = state.add_media_download(request.clone()).await.unwrap();
+        let next = state.add_media_download(request).await.unwrap();
         assert_eq!(
             state.media_job(&next).unwrap().status(),
             TransferStatus::Queued
@@ -2547,6 +2573,20 @@ mod tests {
         ] {
             assert!(validate_media_url(url, false).is_err(), "{url}");
         }
+    }
+
+    #[tokio::test]
+    async fn media_host_lookup_enforces_address_policy() {
+        let loopback = Url::parse("http://localhost/video").unwrap();
+        assert_eq!(
+            ensure_public_media_host(&loopback, false)
+                .await
+                .unwrap_err(),
+            "disallowed private or loopback IP address"
+        );
+        ensure_public_media_host(&loopback, true).await.unwrap();
+        let private = Url::parse("https://192.168.1.1/video").unwrap();
+        assert!(ensure_public_media_host(&private, false).await.is_err());
     }
 
     #[test]

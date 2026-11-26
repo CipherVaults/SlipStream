@@ -35,12 +35,14 @@ struct Run<'a> {
     concurrency: Mutex<ConcurrencyState>,
     concurrency_changed: watch::Sender<()>,
     has_written: AtomicBool,
+    range_fallback_tried: AtomicBool,
 }
 
 struct ConcurrencyState {
     effective_max_workers: usize,
     active_workers: usize,
     retry_at: Option<Instant>,
+    retired_on_congestion: bool,
 }
 
 struct Plan {
@@ -123,9 +125,11 @@ impl Inner {
                 effective_max_workers: usize::from(record.max_connections),
                 active_workers: 0,
                 retry_at: None,
+                retired_on_congestion: false,
             }),
             concurrency_changed: watch::channel(()).0,
             has_written: AtomicBool::new(false),
+            range_fallback_tried: AtomicBool::new(false),
         };
         let mut plan = match run.resume_plan(&record, &segments).await? {
             Some(plan) => plan,
@@ -195,32 +199,50 @@ impl Run<'_> {
     ) -> Result<T> {
         let initial = *self.profile.lock().unwrap();
         let mut profile = initial;
-        loop {
-            let result = request(profile).await;
-            if result.is_ok() && profile != initial {
-                let mut winning = self.profile.lock().unwrap();
-                if *winning == initial {
-                    *winning = profile;
-                }
-            }
-            let Err(EngineError::Status {
-                status: StatusCode::FORBIDDEN,
-                sent_cookie,
-                ..
-            }) = &result
-            else {
-                return result;
-            };
+        let mut result = request(profile).await;
+        let mut ipv4_exhausted = false;
+        if result
+            .as_ref()
+            .is_err_and(|error| profile.ipv4_unavailable(error))
+        {
+            ipv4_exhausted = true;
+            profile.ipv4_only = false;
+            result = request(profile).await;
+        }
+        while let Err(EngineError::Status {
+            status: StatusCode::FORBIDDEN,
+            sent_cookie,
+            ..
+        }) = &result
+        {
             // A parallel rejection first reduces concurrency. Only a single worker
             // opening the representation can change its request profile.
             if !probing && (self.has_written.load(Ordering::Relaxed) || self.active_workers() > 1) {
-                return result;
+                break;
             }
-            let Some(next) = profile.fallback(&self.source, *sent_cookie) else {
-                return result;
+            let Some(next) = profile.fallback(&self.source, *sent_cookie, ipv4_exhausted) else {
+                break;
             };
+            let attempted = request(next).await;
+            if attempted
+                .as_ref()
+                .is_err_and(|error| next.ipv4_unavailable(error))
+            {
+                // Keep the 403 that triggered fallback and try header changes on any family.
+                ipv4_exhausted = true;
+                profile.ipv4_only = false;
+                continue;
+            }
             profile = next;
+            result = attempted;
         }
+        if result.is_ok() && profile != initial {
+            let mut winning = self.profile.lock().unwrap();
+            if *winning == initial {
+                *winning = profile;
+            }
+        }
+        result
     }
 
     fn active_workers(&self) -> usize {
@@ -258,6 +280,16 @@ impl Run<'_> {
 
     async fn fresh_plan(&self, stop: &mut Stop, mode: ProbeMode) -> Result<Plan> {
         let meta = self.probe(stop, mode).await?;
+        if mode == ProbeMode::Full
+            && !meta
+                .response
+                .as_ref()
+                .is_some_and(|response| response.status().is_success())
+        {
+            return Err(EngineError::InvalidResponse(
+                "full probe did not return a successful GET",
+            ));
+        }
         stop.check()?;
         self.has_written.store(false, Ordering::Relaxed);
         let plan = {
@@ -323,6 +355,7 @@ impl Run<'_> {
             let mut concurrency = self.concurrency.lock().unwrap();
             let worker_count = plan.indices.len().min(concurrency.effective_max_workers);
             concurrency.active_workers = worker_count;
+            concurrency.retired_on_congestion = false;
             worker_count
         };
         let indices = &plan.indices[..worker_count];
@@ -543,10 +576,17 @@ impl Run<'_> {
             if self.retire_on_congestion(index, &error)? {
                 return Ok(SegmentOutcome::Retired);
             }
-            let single_worker = self.active_workers() == 1;
+            let (single_worker, can_replace_ranges) = {
+                let concurrency = self.concurrency.lock().unwrap();
+                // Keep partial ranges resumable when congestion retired a worker.
+                (
+                    concurrency.active_workers == 1,
+                    untouched || !concurrency.retired_on_congestion,
+                )
+            };
             if single_worker
                 && plan.ranges
-                && untouched
+                && can_replace_ranges
                 && matches!(
                     error,
                     EngineError::Status {
@@ -554,6 +594,7 @@ impl Run<'_> {
                         ..
                     }
                 )
+                && !self.range_fallback_tried.swap(true, Ordering::Relaxed)
             {
                 stop.wait(retry_delay(retry, true, &error)).await?;
                 record_restart(restart, RestartReason::RangeUnsupported);
@@ -638,6 +679,7 @@ impl Run<'_> {
         db.edit_segments(self.id, &[&segment], None)?;
         job.segments.insert(index, segment);
         concurrency.effective_max_workers = (concurrency.effective_max_workers / 2).max(1);
+        concurrency.retired_on_congestion = true;
         let delay = error.retry_after();
         if !delay.is_zero() {
             concurrency.retry_at = concurrency.retry_at.max(Some(Instant::now() + delay));
