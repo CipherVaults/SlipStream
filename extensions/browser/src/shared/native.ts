@@ -21,6 +21,7 @@ export class NativeClient {
   private responseTimeout?: ReturnType<typeof setTimeout>;
   private pollTimer?: ReturnType<typeof setTimeout>;
   private retryTimer?: ReturnType<typeof setTimeout>;
+  private activePoll?: Promise<void>;
   private backoff = 500;
 
   constructor(private readonly changed: (state: BridgeState) => void) {}
@@ -74,8 +75,27 @@ export class NativeClient {
     }
   }
 
-  send(request: NativeBridgeRequest): Promise<NativeBridgeResponse> {
-    if (!this.state.connected) return Promise.resolve(disconnected);
+  async ensureConnected(timeoutMs = 1500): Promise<boolean> {
+    if (this.state.connected) return true;
+    this.wake();
+    const pending = this.activePoll;
+    if (!pending) return this.state.connected;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        pending,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, timeoutMs);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+    return this.state.connected;
+  }
+
+  async send(request: NativeBridgeRequest): Promise<NativeBridgeResponse> {
+    if (!this.state.connected && !(await this.ensureConnected())) return disconnected;
     return this.enqueue(request);
   }
 
@@ -139,19 +159,29 @@ export class NativeClient {
     }
   }
 
-  private async poll(): Promise<void> {
+  private poll(): Promise<void> {
     const port = this.port;
-    const response = await this.enqueue({ type: "get_status" });
-    if (this.port !== port || !port) return;
-    if (isStatus(response)) {
-      this.backoff = 500;
-      this.state = { connected: true, theme: response.theme, accent: response.accent, batch: response.batch };
-      this.changed(this.state);
-    } else if (!this.state.connected || response.type !== "error" || response.code !== "busy") {
-      this.losePort();
-      return;
-    }
-    this.pollTimer = setTimeout(() => void this.poll(), 1500);
+    let run: Promise<void> | undefined;
+    run = (async () => {
+      try {
+        const response = await this.enqueue({ type: "get_status" });
+        if (this.activePoll === run) this.activePoll = undefined;
+        if (this.port !== port || !port) return;
+        if (isStatus(response)) {
+          this.backoff = 500;
+          this.state = { connected: true, theme: response.theme, accent: response.accent, batch: response.batch };
+          this.changed(this.state);
+        } else if (!this.state.connected || response.type !== "error" || response.code !== "busy") {
+          this.losePort();
+          return;
+        }
+        this.pollTimer = setTimeout(() => void this.poll(), 1500);
+      } finally {
+        if (this.activePoll === run) this.activePoll = undefined;
+      }
+    })();
+    this.activePoll = run;
+    return run;
   }
 
   private losePort(disconnect = true): void {

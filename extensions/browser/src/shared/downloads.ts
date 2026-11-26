@@ -10,7 +10,13 @@ export interface InterceptionSettings {
 export const defaults: InterceptionSettings = {
   enabled: true,
   showInFullscreen: false,
-  extensions: ["zip", "7z", "rar", "iso", "exe", "msi", "mp4", "webm", "mkv"],
+  extensions: [
+    "zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "zst", "iso", "img", "bin", "cab",
+    "exe", "msi", "msix", "appx", "dmg", "pkg", "deb", "rpm", "apk",
+    "mp4", "webm", "mkv", "avi", "mov", "m4v",
+    "mp3", "flac", "wav", "m4a", "ogg", "opus",
+    "pdf", "torrent",
+  ],
   minBytes: 0,
   excludedSites: [],
   mutedSites: [],
@@ -76,22 +82,59 @@ export function sameDownloadOrigin(item: { url: string; finalUrl?: string }): bo
   return Boolean(initial && resolved && initial.origin === resolved.origin);
 }
 
+const DOWNLOADABLE_MIMES = new Set([
+  "application/octet-stream",
+  "application/x-msdownload",
+  "application/x-msi",
+  "application/zip",
+  "application/x-7z-compressed",
+  "application/x-rar-compressed",
+  "application/gzip",
+  "application/x-gzip",
+  "application/x-tar",
+  "application/x-bzip2",
+  "application/x-xz",
+  "application/x-iso9660-image",
+  "application/vnd.android.package-archive",
+  "application/pdf",
+  "application/x-bittorrent",
+]);
+
+function isDownloadableMime(rawMime?: string): boolean {
+  const mime = rawMime?.split(";")[0].trim().toLowerCase() ?? "";
+  if (!mime) return false;
+  return DOWNLOADABLE_MIMES.has(mime) || mime.startsWith("video/") || mime.startsWith("audio/");
+}
+
+function isNonWebpageNonImageMime(rawMime?: string): boolean {
+  const mime = rawMime?.split(";")[0].trim().toLowerCase() ?? "";
+  if (!mime) return false;
+  return !mime.startsWith("text/")
+    && !mime.startsWith("image/")
+    && !/^application\/(?:xhtml\+xml|javascript|x-javascript|json|xml)$/i.test(mime);
+}
+
 export function shouldIntercept(
-  item: { url: string; finalUrl?: string; filename: string; fileSize: number; referrer?: string },
+  item: { url: string; finalUrl?: string; filename: string; fileSize: number; referrer?: string; mime?: string },
   settings: InterceptionSettings,
   context: { connected: boolean; altHeld: boolean; tabUrl?: string },
 ): boolean {
   const source = httpUrl(item.url);
   const target = httpUrl(item.finalUrl || item.url);
-  if (!context.connected || context.altHeld || !settings.enabled || !source || !target) return false;
+  if (!context.connected || context.altHeld || !settings.enabled || !source || !target
+    || !isPublicHttpUrl(source.href) || !isPublicHttpUrl(target.href)) return false;
   if (settings.minBytes > 0 && !(item.fileSize >= settings.minBytes)) return false;
   if ([source, target, httpUrl(item.referrer), httpUrl(context.tabUrl)].some((url) => blockedSite(url, settings))) {
     return false;
   }
   if (!settings.extensions.length) return true;
-  const filename = item.filename || target.pathname;
-  const extension = /\.([^.\\/]+)$/.exec(filename)?.[1].toLowerCase();
-  return settings.extensions.some((value) => value.trim().toLowerCase().replace(/^\./, "") === extension);
+  const allowed = new Set(settings.extensions.map((value) => value.trim().toLowerCase().replace(/^\./, "")).filter(Boolean));
+  const fileExt = item.filename ? /\.([^.\\/]+)$/.exec(item.filename)?.[1].toLowerCase() : undefined;
+  const urlExt = /\.([^.\\/]+)$/.exec(target.pathname)?.[1].toLowerCase();
+  if ((fileExt && allowed.has(fileExt)) || (urlExt && allowed.has(urlExt))) return true;
+  if (isDownloadableMime(item.mime)) return true;
+  if (item.filename && safeFilename(item.filename) && isNonWebpageNonImageMime(item.mime)) return true;
+  return false;
 }
 
 export function safeFilename(path: string): string | undefined {

@@ -7,11 +7,14 @@ import {
 import { NativeClient } from "./shared/native";
 import { isPublicHttpUrl, ObservedNetwork } from "./shared/network";
 import {
-  APPEARANCE_KEY, canUseSiteStorage, isRefreshableHttpTransfer, PILL_SPOTS_KEY, PLAYER_PORT,
+  APPEARANCE_KEY, canUseSiteStorage, formatBytes, isRefreshableHttpTransfer, PILL_SPOTS_KEY, PLAYER_PORT,
   readPillSpot, readState, rememberPillSpot, SETTINGS_KEY, STATE_KEY,
-  type ActionResult, type BrowserMessage, type MediaAction, type PillFormatsMessage,
+  type ActionResult, type BrowserMessage, type MediaAction, type PillFormat, type PillFormatsMessage,
 } from "./shared/state";
-import { isHls, isKnownVideoPage, isMediaStream, isPlaylistPage, mediaLength, mediaMime, parseHlsMaster, probeFormats, selectPillFormatId, validFormatId } from "./shared/streams";
+import {
+  isDirectMediaUrl, isHls, isKnownVideoPage, isManifest, isMediaStream, isPlaylistPage,
+  mediaLength, mediaMime, parseContentRangeTotal, parseHlsMaster, probeFormats, selectPillFormatId, validFormatId,
+} from "./shared/streams";
 
 const popupUrl = api.runtime.getURL("popup.html");
 const refreshKey = (id: string) => "refresh:" + id;
@@ -61,7 +64,15 @@ api.alarms.onAlarm.addListener(({ name }) => {
 api.alarms.create("slipstream-connect", { periodInMinutes: 1 });
 native.start();
 
-type Frame = { page: URL; tabId: number; tabUrl: string; frameId: number; documentId?: string; private: boolean };
+type Frame = {
+  page: URL;
+  tabId: number;
+  tabUrl: string;
+  frameId: number;
+  documentId?: string;
+  cookieStoreId?: string;
+  private: boolean;
+};
 type Probe = { frame: Frame; expires: number; controller: AbortController; response: Promise<NativeBridgeResponse>; settled: boolean };
 const probes = new Map<string, Probe>();
 const childPlayers = new Map<number, Set<chrome.runtime.Port>>();
@@ -70,7 +81,7 @@ const tabLookups = new Map<number, Promise<chrome.tabs.Tab | undefined>>();
 
 function getFrame(sender: chrome.runtime.MessageSender): Frame | undefined {
   const page = httpUrl(sender.url);
-  const tab = sender.tab;
+  const tab = sender.tab as (chrome.tabs.Tab & { cookieStoreId?: string }) | undefined;
   const top = httpUrl(tab?.url);
   const frameId = sender.frameId;
   if (sender.id !== api.runtime.id || !page || !top || tab?.id === undefined || frameId === undefined || frameId < 0
@@ -78,6 +89,7 @@ function getFrame(sender: chrome.runtime.MessageSender): Frame | undefined {
     || (sender.documentLifecycle !== undefined && sender.documentLifecycle !== "active")) return;
   return {
     page, tabId: tab.id, tabUrl: top.href, frameId, documentId: sender.documentId,
+    cookieStoreId: tab.cookieStoreId,
     private: !canUseSiteStorage(api.extension?.inIncognitoContext, tab.incognito),
   };
 }
@@ -221,15 +233,56 @@ api.webRequest.onHeadersReceived.addListener((details): undefined => {
   const origin = details as typeof details & RequestOrigin;
   const page = requestPage(origin);
   const target = httpUrl(details.url);
-  if (details.tabId < 0 || origin.incognito || !page || !target || details.statusCode < 200 || details.statusCode >= 300
-    || details.statusCode === 206 || headers.some(({ name }) => name.toLowerCase() === "content-range")
-    || !isMediaStream(details.url, mime, mediaLength(headers))) return;
+  if (details.tabId < 0 || origin.incognito || !page || !target || details.statusCode < 200 || details.statusCode >= 300) return;
+  const hasContentRange = headers.some(({ name }) => name.toLowerCase() === "content-range");
+  if (isManifest(target, mime)) {
+    if (details.statusCode === 206 || hasContentRange) return;
+  } else {
+    const length = parseContentRangeTotal(headers) ?? mediaLength(headers);
+    if (details.statusCode === 206 || hasContentRange) {
+      if (length === undefined || length < 300_000) return;
+    }
+    if (!isMediaStream(details.url, mime, length)) return;
+  }
   void observedTab(details.tabId).then((tab) => {
     if (!tab?.url) return;
     if (network.recordStream(origin, tab.url, headers)) notifyStream(details.tabId, Math.max(0, details.frameId));
   }).catch(() => {});
   return undefined;
 }, webFilter, ["responseHeaders"]);
+
+async function collectCookiesForUrl(
+  target: URL,
+  storeId?: string,
+  incognito?: boolean,
+): Promise<string | undefined> {
+  if (!api.cookies?.getAll) return undefined;
+  if (incognito && !storeId) return undefined;
+  try {
+    const cookies = await api.cookies.getAll({
+      url: target.href,
+      ...(storeId ? { storeId } : {}),
+    });
+    if (!Array.isArray(cookies) || !cookies.length) return undefined;
+    const pairs: string[] = [];
+    let totalBytes = 0;
+    const encoder = new TextEncoder();
+    for (const cookie of cookies) {
+      if (!cookie || typeof cookie.name !== "string" || typeof cookie.value !== "string") continue;
+      if (!cookie.name || /[\u0000-\u001f\u007f;=\r\n]/.test(cookie.name) || /[\u0000-\u001f\u007f\r\n]/.test(cookie.value)) {
+        continue;
+      }
+      const pair = `${cookie.name}=${cookie.value}`;
+      const added = encoder.encode(pairs.length ? `; ${pair}` : pair).length;
+      if (totalBytes + added > 8192) break;
+      pairs.push(pair);
+      totalBytes += added;
+    }
+    return pairs.length ? pairs.join("; ") : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 function httpHandoffContext(url: URL, tab: chrome.tabs.Tab | undefined, fallback?: URL, allowCookie = true) {
   const canUsePageHeaders = canUseSiteStorage(api.extension?.inIncognitoContext, tab?.incognito);
@@ -238,6 +291,9 @@ function httpHandoffContext(url: URL, tab: chrome.tabs.Tab | undefined, fallback
   const userAgent = typeof navigator === "undefined" ? undefined : navigator.userAgent;
   if (!headers["User-Agent"] && userAgent?.trim() && !/[\u0000-\u001f\u007f]/.test(userAgent)) {
     headers["User-Agent"] = userAgent;
+  }
+  if (!headers["Accept-Language"]) {
+    headers["Accept-Language"] = "en-US,en;q=0.9";
   }
   let referrer = headers.Referer;
   if (!referrer && canUsePageHeaders && fallback && !(fallback.protocol === "https:" && url.protocol === "http:")) {
@@ -261,34 +317,101 @@ function handoffHttp(url: URL, context: ReturnType<typeof httpHandoffContext>, f
   });
 }
 
+const handledDownloads = new Set<number>();
+
+async function tryInterceptDownload(
+  current: chrome.downloads.DownloadItem,
+): Promise<boolean> {
+  if (!native.state.connected && !(await native.ensureConnected())) return false;
+  await settingsReady;
+  const [active] = await api.tabs.query({ active: true, lastFocusedWindow: true });
+  const target = httpUrl(current.finalUrl || current.url);
+  if (!target) return false;
+  const downloadContext = current as typeof current & { cookieStoreId?: string };
+  const tabContext = active as (typeof active & { cookieStoreId?: string }) | undefined;
+  const tab = canAttributeTab(downloadContext, tabContext) ? active : undefined;
+  if (!shouldIntercept(current, settings, {
+    connected: native.state.connected,
+    altHeld: tab?.id !== undefined && heldAlt.has(tab.id),
+    tabUrl: tab?.url,
+  })) return false;
+  const referrer = httpUrl(current.referrer);
+  const page = httpUrl(tab?.url);
+  const fallback = tab || (!active && !current.incognito)
+    ? referrer ?? (page?.origin === target.origin ? page : undefined)
+    : undefined;
+  const context = httpHandoffContext(target, tab, fallback, !!referrer && sameDownloadOrigin(current));
+  if (!context.headers.Cookie) {
+    const cookie = await collectCookiesForUrl(target, downloadContext.cookieStoreId, current.incognito);
+    if (cookie) context.headers.Cookie = cookie;
+  }
+  const response = await handoffHttp(target, context, safeFilename(current.filename));
+  return response.type === "transfer_created";
+}
+
+if (api.downloads.onDeterminingFilename) {
+  api.downloads.onDeterminingFilename.addListener((item, suggest) => {
+    let suggested = false;
+    const finishSuggest = () => {
+      if (suggested) return;
+      suggested = true;
+      clearTimeout(safetyTimer);
+      try {
+        suggest();
+      } catch {
+        // Ignore if Chromium already finalized the download.
+      }
+    };
+    const safetyTimer = setTimeout(finishSuggest, 3500);
+    if (handledDownloads.has(item.id)) {
+      finishSuggest();
+      return true;
+    }
+    handledDownloads.add(item.id);
+    void (async () => {
+      try {
+        const intercepted = await tryInterceptDownload(item);
+        finishSuggest();
+        if (intercepted) {
+          await api.downloads.cancel(item.id);
+          if (api.downloads.erase) {
+            await api.downloads.erase({ id: item.id }).catch(() => {});
+          }
+        }
+      } catch (error) {
+        report(error);
+        finishSuggest();
+      } finally {
+        handledDownloads.delete(item.id);
+      }
+    })();
+    return true;
+  });
+}
+
 api.downloads.onCreated.addListener((item) => {
+  if (api.downloads.onDeterminingFilename) return;
+  if (handledDownloads.has(item.id)) return;
+  handledDownloads.add(item.id);
   void (async () => {
-    if (!native.state.connected) return;
-    await settingsReady;
-    const [[active], [current]] = await Promise.all([
-      api.tabs.query({ active: true, lastFocusedWindow: true }),
-      api.downloads.search({ id: item.id }),
-    ]);
-    if (!current || current.state !== "in_progress" || current.paused) return;
-    const target = httpUrl(current.finalUrl || current.url);
-    if (!target) return;
-    const downloadContext = current as typeof current & { cookieStoreId?: string };
-    const tabContext = active as (typeof active & { cookieStoreId?: string }) | undefined;
-    const tab = canAttributeTab(downloadContext, tabContext) ? active : undefined;
-    if (!shouldIntercept(current, settings, {
-      connected: native.state.connected,
-      altHeld: tab?.id !== undefined && heldAlt.has(tab.id),
-      tabUrl: tab?.url,
-    })) return;
-    const referrer = httpUrl(current.referrer);
-    const page = httpUrl(tab?.url);
-    const fallback = tab || (!active && !current.incognito)
-      ? referrer ?? (page?.origin === target.origin ? page : undefined)
-      : undefined;
-    const context = httpHandoffContext(target, tab, fallback, !!referrer && sameDownloadOrigin(current));
-    const response = await handoffHttp(target, context, safeFilename(current.filename));
-    if (response.type === "transfer_created") await api.downloads.cancel(item.id);
-  })().catch(report);
+    try {
+      if (!native.state.connected && !(await native.ensureConnected())) return;
+      await settingsReady;
+      const [current] = await api.downloads.search({ id: item.id });
+      if (!current || current.state !== "in_progress" || current.paused) return;
+      const intercepted = await tryInterceptDownload(current);
+      if (intercepted) {
+        await api.downloads.cancel(item.id);
+        if (api.downloads.erase) {
+          await api.downloads.erase({ id: item.id }).catch(() => {});
+        }
+      }
+    } catch (error) {
+      report(error);
+    } finally {
+      handledDownloads.delete(item.id);
+    }
+  })();
 });
 
 function result(
@@ -372,9 +495,61 @@ function activeProbeCount(): number {
 function parseMediaTarget(frame: Frame, rawUrl: unknown, stream: Stream | undefined, embedded: boolean): URL | undefined {
   if (typeof rawUrl !== "string" || rawUrl.length > MAX_URL_LENGTH) return;
   const url = httpUrl(rawUrl);
-  if (!url || url.href.length > MAX_URL_LENGTH) return;
+  if (!url || url.href.length > MAX_URL_LENGTH || blockedSite(url, settings)) return;
   if (url.origin === frame.page.origin || stream?.url === url.href) return url;
-  if (isPublicHttpUrl(url.href) && (isKnownVideoPage(url.href) || (frame.frameId === 0 && embedded))) return url;
+  if (isPublicHttpUrl(url.href) && (isKnownVideoPage(url.href) || isDirectMediaUrl(url.href) || embedded)) return url;
+}
+
+function buildMediaHeaders(frame: Frame, target: URL): Record<string, string> {
+  if (frame.private) return {};
+  const headers = { ...network.mediaHeaders(frame.tabId, target.href, frame.tabUrl, frame.frameId, frame.page.href) };
+  const downgrade = frame.page.protocol === "https:" && target.protocol === "http:";
+  if (!headers.Referer && !downgrade) {
+    const clean = new URL(frame.page.href);
+    clean.hash = "";
+    headers.Referer = clean.href;
+  }
+  if (!headers.Origin && !downgrade) {
+    headers.Origin = frame.page.origin;
+  }
+  const userAgent = typeof navigator === "undefined" ? undefined : navigator.userAgent;
+  if (!headers["User-Agent"] && userAgent?.trim() && !/[\u0000-\u001f\u007f]/.test(userAgent)) {
+    headers["User-Agent"] = userAgent;
+  }
+  if (!headers["Accept-Language"]) {
+    headers["Accept-Language"] = "en-US,en;q=0.9";
+  }
+  return headers;
+}
+
+function directStreamChoice(url: string, mime = "", sizeBytes?: number): PillFormat {
+  const parsed = httpUrl(url);
+  const extMatch = parsed ? /\.([a-z0-9]+)$/i.exec(parsed.pathname)?.[1]?.toUpperCase() : undefined;
+  const mimeExt = mime.startsWith("video/") || mime.startsWith("audio/")
+    ? mime.split("/")[1]?.replace(/^x-/, "").replace("matroska", "mkv").replace("quicktime", "mov").toUpperCase()
+    : undefined;
+  const container = extMatch || mimeExt || "VIDEO";
+  const sub = sizeBytes && sizeBytes > 0 ? `${container} · ${formatBytes(sizeBytes)}` : container;
+  return { id: `direct:${url}`, label: "Download Video", sub };
+}
+
+async function handoffDirectVideo(frame: Frame, target: URL): Promise<ActionResult> {
+  const headers = buildMediaHeaders(frame, target);
+  if (!frame.private || frame.cookieStoreId) {
+    const cookie = await collectCookiesForUrl(target, frame.cookieStoreId, frame.private);
+    if (cookie) headers.Cookie = cookie;
+  }
+  const referrer = headers.Referer;
+  let filename: string | undefined;
+  try {
+    filename = safeFilename(decodeURIComponent(target.pathname));
+  } catch {
+    filename = safeFilename(target.pathname);
+  }
+  return result(
+    await handoffHttp(target, { headers, referrer }, filename),
+    ["transfer_created", "ack"],
+  );
 }
 
 function startOrReuseProbe(frame: Frame, url: string, playlist: boolean, timeoutMs: number): Probe | undefined {
@@ -388,8 +563,15 @@ function startOrReuseProbe(frame: Frame, url: string, playlist: boolean, timeout
     if (oldest) probes.delete(oldest[0]);
   }
   const controller = new AbortController();
+  const targetUrl = httpUrl(url);
+  const headers = targetUrl ? buildMediaHeaders(frame, targetUrl) : undefined;
   const response = native.probe(
-    { type: "probe_media", url, ...(playlist ? { playlist: true } : {}) },
+    {
+      type: "probe_media",
+      url,
+      ...(playlist ? { playlist: true } : {}),
+      ...(headers && Object.keys(headers).length ? { headers } : {}),
+    },
     AbortSignal.any([controller.signal, AbortSignal.timeout(timeoutMs)]),
   );
   const active: Probe = { frame, expires: Date.now() + 120_000, controller, response, settled: false };
@@ -418,15 +600,32 @@ function pillOpen(frame: Frame, message: Extract<BrowserMessage, { kind: "pill-o
     if (!stream.variants) readHls(stream);
     return { ok: true };
   }
+  const directTarget = stream?.kind === "direct" && (stream.url === url.href || !isKnownVideoPage(url.href))
+    ? { url: stream.url, mime: stream.mime, sizeBytes: stream.sizeBytes }
+    : isDirectMediaUrl(url.href)
+      ? { url: url.href, mime: "", sizeBytes: undefined }
+      : undefined;
+  if (directTarget) {
+    const immediate: PillFormatsMessage = {
+      kind: "pill-formats",
+      url: url.href,
+      requestId: message.requestId,
+      formats: [directStreamChoice(directTarget.url, directTarget.mime, directTarget.sizeBytes)],
+      isPlaylist: false,
+    };
+    postToFrame(frame.tabId, frame.frameId, immediate, frame.documentId);
+  }
   const playlist = message.isPlaylist === true && isPlaylistPage(url.href);
   const key = probeKey(frame, url.href, playlist);
   const active = startOrReuseProbe(frame, url.href, playlist, 12_000);
-  if (!active) return { ok: false };
+  if (!active) return { ok: Boolean(directTarget) };
   void active.response.then((response) => {
     if (probes.get(key) !== active || !response || response.type !== "media_probed") return;
+    const formats = probeFormats(response.probe);
+    if (!formats.length && directTarget) return;
     const update: PillFormatsMessage = {
       kind: "pill-formats", url: url.href, requestId: message.requestId,
-      formats: probeFormats(response.probe), isPlaylist: playlist || response.probe.is_playlist,
+      formats, isPlaylist: playlist || response.probe.is_playlist,
     };
     postToFrame(frame.tabId, frame.frameId, update, frame.documentId);
   }).catch(() => {});
@@ -455,6 +654,14 @@ async function mediaAction(action: MediaAction, source: string, links: unknown[]
   if (action === "picker" || action === "playlist") {
     return result(await native.send({ type: "open_desktop_window", open_picker_url: url }), ["ack"]);
   }
+  if (action.startsWith("direct:")) {
+    const directUrl = httpUrl(action.slice("direct:".length));
+    if (!directUrl || blockedSite(directUrl, settings)
+      || (directUrl.href !== url && observed?.url !== directUrl.href && !isPublicHttpUrl(directUrl.href))) {
+      return { ok: false, message: "That video stream is unavailable." };
+    }
+    return handoffDirectVideo(frame, directUrl);
+  }
 
   const audio = action === "mp3_320" || action === "flac" ? action : undefined;
   let formatId: string | undefined;
@@ -467,6 +674,17 @@ async function mediaAction(action: MediaAction, source: string, links: unknown[]
     if (observed?.separateAudio) height = variant.height ?? 0;
     else url = variant.url;
   } else if (action === "4k" || action === "1080p") {
+    if (frame.private) {
+      return { ok: false, message: "Automatic format probing is disabled in private windows." };
+    }
+    const directTarget = observed?.kind === "direct" && (observed.url === url || !isKnownVideoPage(url))
+      ? httpUrl(observed.url)
+      : isDirectMediaUrl(url)
+        ? httpUrl(url)
+        : undefined;
+    if (directTarget) {
+      return handoffDirectVideo(frame, directTarget);
+    }
     height = action === "4k" ? 2160 : 1080;
   }
 
@@ -503,7 +721,8 @@ const actions = new Set<MediaAction>(["4k", "1080p", "mp3_320", "flac", "picker"
 function isMediaAction(value: unknown): value is MediaAction {
   return typeof value === "string" && (actions.has(value as MediaAction)
     || (value.startsWith("format:") && validFormatId(value.slice(7)))
-    || (value.startsWith("hls:") && value.length <= 8196 && !!httpUrl(value.slice(4))));
+    || (value.startsWith("hls:") && value.length <= 8196 && !!httpUrl(value.slice(4)))
+    || (value.startsWith("direct:") && value.length <= 8199 && !!httpUrl(value.slice(7))));
 }
 
 api.runtime.onMessage.addListener((message: BrowserMessage, sender, reply) => {
@@ -523,9 +742,14 @@ api.runtime.onMessage.addListener((message: BrowserMessage, sender, reply) => {
   }
   if (message.kind === "stream" && frame) {
     const stream = observedStream(frame);
+    const formats: PillFormat[] | undefined = stream?.variants?.length
+      ? stream.variants.map(({ url, label }) => ({ id: ("hls:" + url) as MediaAction, label }))
+      : stream?.kind === "direct"
+        ? [directStreamChoice(stream.url, stream.mime, stream.sizeBytes)]
+        : undefined;
     reply({
       url: stream?.url,
-      formats: stream?.variants?.map(({ url, label }) => ({ id: "hls:" + url, label })),
+      formats,
       childActive: frame.frameId === 0 && childPlayers.has(frame.tabId),
     });
     return;

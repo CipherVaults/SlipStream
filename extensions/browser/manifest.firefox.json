@@ -3,7 +3,7 @@
   "name": "SlipStream",
   "version": "1.2.1",
   "description": "Send downloads and media to the SlipStream desktop app.",
-  "permissions": ["nativeMessaging", "downloads", "webRequest", "contextMenus", "storage", "tabs", "alarms"],
+  "permissions": ["nativeMessaging", "downloads", "webRequest", "contextMenus", "storage", "tabs", "alarms", "cookies"],
   "host_permissions": ["http://*/*", "https://*/*"],
   "background": { "scripts": ["background.js"] },
   "action": { "default_popup": "popup.html", "default_title": "SlipStream" },

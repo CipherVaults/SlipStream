@@ -1,5 +1,8 @@
 import { httpUrl, isPublicHttpUrl } from "./downloads";
-import { isHls, isManifest, isMediaStream, mediaLength, mediaMime, scopedHeaders, type Header, type HlsVariant } from "./streams";
+import {
+  isHls, isManifest, isMediaStream, mediaLength, mediaMime, parseContentRangeTotal,
+  scopedHeaders, streamKind, type Header, type HlsVariant,
+} from "./streams";
 
 export { isPublicHttpUrl };
 
@@ -15,7 +18,16 @@ type Request = {
 };
 type Scope = { tabId: number; frameId: number; origin: string; topOrigin: string; time: number };
 type RequestHeaders = Scope & { target: string; http: Record<string, string>; media: Record<string, string> };
-type Detection = Scope & { url: string; mime: string; variants?: HlsVariant[]; separateAudio?: boolean };
+export type StreamKind = "direct" | "hls" | "dash";
+type Detection = Scope & {
+  url: string;
+  kind: StreamKind;
+  mime: string;
+  sizeBytes?: number;
+  headers?: Record<string, string>;
+  variants?: HlsVariant[];
+  separateAudio?: boolean;
+};
 const TTL = 120_000;
 const frameKey = (tabId: number, frameId: number) => tabId + ":" + frameId;
 const requestPage = (details: Request) => httpUrl(details.documentUrl ?? details.initiator ?? details.originUrl);
@@ -67,14 +79,25 @@ export class ObservedNetwork {
     const scope = this.scope(details, tabUrl, now);
     const target = httpUrl(details.url);
     const mime = mediaMime(headers);
-    if (!scope || !target || !isMediaStream(target.href, mime, mediaLength(headers))) return false;
+    const sizeBytes = parseContentRangeTotal(headers) ?? mediaLength(headers);
+    if (!scope || !target || !isMediaStream(target.href, mime, sizeBytes)) return false;
     const key = frameKey(details.tabId, scope.frameId);
     const current = this.streams.get(key);
     const matchesScope = current?.origin === scope.origin && current.topOrigin === scope.topOrigin;
     if (current && matchesScope && isManifest(new URL(current.url), current.mime) && !isManifest(target, mime)) return false;
     if (current && matchesScope && current.variants?.some(({ url }) => url === target.href)) return false;
     const sameStream = matchesScope && current?.url === target.href;
-    this.keep(this.streams, key, { ...(sameStream ? current : undefined), ...scope, url: target.href, mime }, 150);
+    const kind = streamKind(target, mime);
+    const reqHeaders = this.requestHeaders(details.tabId, target.href, tabUrl, scope.frameId, scope.origin)?.media;
+    this.keep(this.streams, key, {
+      ...(sameStream ? current : undefined),
+      ...scope,
+      url: target.href,
+      kind,
+      mime,
+      sizeBytes: sizeBytes ?? (sameStream ? current?.sizeBytes : undefined),
+      headers: reqHeaders ?? (sameStream ? current?.headers : undefined),
+    }, 150);
     return !sameStream;
   }
 
