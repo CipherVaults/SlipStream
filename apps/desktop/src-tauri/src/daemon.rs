@@ -1,18 +1,22 @@
 use crate::{
-    media_jobs::{MediaJob, MediaJobRunOptions, PlaylistJobMeta, ScanRequest},
+    media_jobs::{MediaJob, MediaJobEvent, MediaJobRunOptions, PlaylistJobMeta, ScanRequest},
     paths::{
         build_defender_scan_args, decode_sha256, delete_files, ensure_playlist_subfolder,
         ensure_safe_directory, ensure_safe_tree, hash_file, local_drive_path, media_title_stem,
-        reveal_action, write_zone_identifier, RevealAction,
+        reveal_action, with_completed_file, write_zone_identifier, RevealAction,
     },
-    settings::{normalize, read_json, torrent_rate, write_json_atomically, SETTINGS_FILE},
+    pending_downloads::{PendingDownloads, PendingHttpEntry},
+    settings::{
+        category_id, match_category_for_filename, normalize, normalize_categories, read_json,
+        resolve_category_dir, torrent_rate, write_json_atomically, SETTINGS_FILE,
+    },
     tools::{
         defender_executable, discover_ytdlp_for_probe, explorer_executable, toolchain_status,
         ToolchainCache, ToolchainStatus,
     },
 };
 use serde::{Deserialize, Serialize};
-use slipstream_engine::{DownloadEngine, EngineConfig, EngineEvent};
+use slipstream_engine::{DownloadEngine, EngineConfig, EngineEvent, ExtendedHttpOptions};
 use slipstream_media::{
     args::{canonical_media_headers, validate_playlist_items},
     probe::{MAX_PLAYLIST_PREVIEW_ENTRIES, MAX_PLAYLIST_TITLE_CHARS},
@@ -24,10 +28,12 @@ use slipstream_native_host::{
     security::default_pipe_name,
 };
 use slipstream_protocol::{
-    is_private_or_loopback_ip, validate_http_url, validate_magnet_uri, AddHttpDownloadRequest,
-    AddMediaDownloadRequest, AddTorrentRequest, AppSettings, MediaProbeResult, NativeBridgeRequest,
-    NativeBridgeResponse, RefreshDownloadUrlRequest, SelectedPlaylistEntry, TelemetryBatch,
-    TorrentFileEntry, TransferSnapshot, TransferStatus, UpdateMode, MAX_NATIVE_MESSAGE_BYTES,
+    is_private_or_loopback_ip, sanitize_filename, validate_http_url, validate_magnet_uri,
+    AddHttpDownloadRequest, AddMediaDownloadRequest, AddTorrentRequest, AppSettings,
+    ConfirmPendingDownloadRequest, DownloadCategory, MediaProbeResult, NativeBridgeRequest,
+    NativeBridgeResponse, PendingDownloadPreview, RefreshDownloadUrlRequest, SelectedPlaylistEntry,
+    TelemetryBatch, TorrentFileEntry, TransferCompletionOptions, TransferSnapshot, TransferStatus,
+    UpdateMode, MAX_NATIVE_MESSAGE_BYTES,
 };
 use slipstream_torrent::{TorrentManager, TorrentManagerConfig};
 use std::{
@@ -78,6 +84,23 @@ pub trait UiBridge: Send + Sync + 'static {
     fn emit_telemetry(&self, batch: &TelemetryBatch) -> Result<()>;
     fn emit_open_picker(&self, event: &OpenPickerEvent) -> Result<()>;
     fn has_main_window(&self) -> bool;
+    fn has_telemetry_windows(&self) -> bool {
+        self.has_main_window()
+    }
+    fn supports_dialogs(&self) -> bool {
+        false
+    }
+    fn open_confirm_dialog(&self, _id: &str) -> Result<()> {
+        Ok(())
+    }
+    fn close_confirm_dialog(&self, _id: &str) {}
+    fn open_progress_dialog(&self, _id: &str) -> Result<()> {
+        Ok(())
+    }
+    fn close_progress_dialog(&self, _id: &str) {}
+    fn open_complete_dialog(&self, _id: &str) -> Result<()> {
+        Ok(())
+    }
     fn trigger_ready_check(&self) {}
     fn request_quit(&self);
 }
@@ -207,7 +230,10 @@ pub struct AppState {
     probe_permits: Arc<Semaphore>,
     media_queue: Mutex<VecDeque<PendingMediaJob>>,
     playlists: Mutex<HashMap<String, PlaylistCoordinator>>,
-    media_finished: mpsc::UnboundedSender<Option<String>>,
+    media_finished: mpsc::UnboundedSender<MediaJobEvent>,
+    pending_downloads: Mutex<PendingDownloads>,
+    pending_changed: Notify,
+    completion_options: Mutex<HashMap<String, TransferCompletionOptions>>,
     settings: RwLock<AppSettings>,
     dismissed_http: RwLock<HashSet<String>>,
     verified: RwLock<HashMap<String, bool>>,
@@ -310,6 +336,9 @@ impl AppState {
             media_queue: Mutex::default(),
             playlists: Mutex::default(),
             media_finished,
+            pending_downloads: Mutex::default(),
+            pending_changed: Notify::new(),
+            completion_options: Mutex::default(),
             settings: RwLock::new(settings),
             dismissed_http: RwLock::new(dismissed_http),
             verified: RwLock::default(),
@@ -340,6 +369,10 @@ impl AppState {
                 }
             }),
             tokio::spawn(emit_telemetry(state.clone(), state.stop.subscribe())),
+            tokio::spawn(expire_pending_downloads(
+                state.clone(),
+                state.stop.subscribe(),
+            )),
             tokio::spawn(watch_completions(
                 state.clone(),
                 state.stop.subscribe(),
@@ -442,7 +475,7 @@ impl AppState {
                 .map_err(message)?;
         }
         *self.settings.write().unwrap() = settings;
-        let _ = self.media_finished.send(None);
+        let _ = self.media_finished.send(MediaJobEvent::QueueChanged(None));
         Ok(())
     }
 
@@ -508,13 +541,15 @@ impl AppState {
 
     pub async fn add_http_download(&self, request: AddHttpDownloadRequest) -> Result<String> {
         let _operation = self.operation().await?;
-        self.enqueue_http(request, &self.settings()).await
+        self.enqueue_http(request, &self.settings(), ExtendedHttpOptions::default())
+            .await
     }
 
     async fn enqueue_http(
         &self,
         mut request: AddHttpDownloadRequest,
         settings: &AppSettings,
+        options: ExtendedHttpOptions,
     ) -> Result<String> {
         let directory = http_save_directory(request.save_dir.take(), settings).await?;
         request.save_dir = Some(
@@ -527,10 +562,312 @@ impl AppState {
         request
             .max_connections
             .get_or_insert(settings.default_connections);
+        let start_paused = request.start_paused || options.start_paused;
+        let id = self
+            .engine
+            .add_http_download_with_options(request, options)
+            .await
+            .map_err(message)?;
+        if !start_paused {
+            self.open_progress_if_enabled(&id, settings);
+        }
+        Ok(id)
+    }
+
+    fn stage_http_download(
+        &self,
+        request: AddHttpDownloadRequest,
+        filename: String,
+        settings: &AppSettings,
+    ) -> Result<()> {
+        let category = match_category_for_filename(settings, &filename);
+        let directory = resolve_category_dir(settings, &category.id);
+        let duplicate = self
+            .engine
+            .find_duplicate(&request.url, &directory, &filename)
+            .filter(|found| {
+                !self
+                    .dismissed_http
+                    .read()
+                    .unwrap()
+                    .contains(&found.transfer_id)
+            });
+        let id = Uuid::new_v4().to_string();
+        let preview = PendingDownloadPreview {
+            pending_id: id.clone(),
+            source_domain: validate_http_url(&request.url)
+                .map_err(message)?
+                .host_str()
+                .unwrap_or_default()
+                .to_owned(),
+            url: browser_source_url(&request.url),
+            filename,
+            suggested_category_id: category.id.clone(),
+            suggested_save_dir: directory.to_string_lossy().into_owned(),
+            expected_size_bytes: request.expected_size_bytes,
+            duplicate,
+        };
+        self.expire_pending_entries();
+        self.pending_downloads
+            .lock()
+            .unwrap()
+            .insert(PendingHttpEntry { request, preview })?;
+        self.pending_changed.notify_one();
+        if let Err(error) = self.ui.open_confirm_dialog(&id) {
+            self.discard_pending_download(&id);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn get_pending_download(&self, id: &str) -> Result<PendingDownloadPreview> {
+        self.pending_downloads
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|entry| entry.preview.clone())
+            .ok_or_else(|| "Pending download expired or was closed.".to_owned())
+    }
+
+    fn take_pending_download(&self, id: &str) -> Result<PendingHttpEntry> {
+        self.pending_downloads
+            .lock()
+            .unwrap()
+            .take(id)
+            .ok_or_else(|| "Pending download expired or was closed.".to_owned())
+    }
+
+    pub(crate) fn discard_pending_download(&self, id: &str) {
+        self.pending_downloads.lock().unwrap().discard(id);
+        self.pending_changed.notify_one();
+    }
+
+    pub fn cancel_pending_download(&self, id: &str) {
+        self.discard_pending_download(id);
+        self.ui.close_confirm_dialog(id);
+    }
+
+    fn expire_pending_entries(&self) {
+        let expired = self.pending_downloads.lock().unwrap().expire();
+        for id in expired {
+            self.ui.close_confirm_dialog(&id);
+        }
+    }
+
+    pub async fn confirm_pending_download(
+        &self,
+        confirmation: ConfirmPendingDownloadRequest,
+    ) -> Result<String> {
+        let _operation = self.operation().await?;
+        let mut settings = self.settings();
+        let filename = sanitize_filename(&confirmation.filename).map_err(message)?;
+        let category = settings
+            .categories
+            .iter()
+            .position(|category| category.id == confirmation.category_id)
+            .ok_or_else(|| "Download category not found.".to_owned())?;
+        self.get_pending_download(&confirmation.pending_id)?;
+        let directory = if confirmation.save_dir.trim().is_empty() {
+            resolve_category_dir(&settings, &confirmation.category_id)
+        } else {
+            PathBuf::from(confirmation.save_dir)
+        };
+        let directory = tokio::task::spawn_blocking(move || {
+            let directory = local_drive_path(&ensure_safe_directory(&directory)?)?;
+            directory
+                .into_os_string()
+                .into_string()
+                .map_err(|_| crate::paths::invalid("non-Unicode save directory"))
+        })
+        .await
+        .map_err(message)?
+        .map_err(message)?;
+        let pending = self.take_pending_download(&confirmation.pending_id)?;
+        self.pending_changed.notify_one();
+        self.ui.close_confirm_dialog(&confirmation.pending_id);
+        let mut request = pending.request.clone();
+        drop(pending);
+        request.filename = Some(filename);
+        request.save_dir = Some(directory.clone());
+        request.start_paused = !confirmation.start_immediately;
+        request.overwrite_existing = confirmation.overwrite_existing;
+        if confirmation.remember_category_path {
+            settings.categories[category].save_dir = Some(directory);
+            self.persist_categories(&settings)?;
+        }
+        self.enqueue_http(
+            request,
+            &settings,
+            ExtendedHttpOptions {
+                description: confirmation.description,
+                ..ExtendedHttpOptions::default()
+            },
+        )
+        .await
+    }
+
+    pub async fn resolve_duplicate_existing(&self, pending_id: &str) -> Result<String> {
+        let _operation = self.operation().await?;
+        let duplicate = self
+            .get_pending_download(pending_id)?
+            .duplicate
+            .ok_or_else(|| "No duplicate transfer was found.".to_owned())?;
+        let id = duplicate.transfer_id;
+        let snapshot = self
+            .http_snapshot(&id)
+            .filter(|snapshot| snapshot.status != TransferStatus::Canceled)
+            .ok_or_else(|| "The duplicate transfer is unavailable.".to_owned())?;
+        drop(self.take_pending_download(pending_id)?);
+        self.pending_changed.notify_one();
+        self.ui.close_confirm_dialog(pending_id);
+        if snapshot.status == TransferStatus::Completed {
+            self.ui.open_complete_dialog(&id)?;
+        } else {
+            if matches!(
+                snapshot.status,
+                TransferStatus::Paused | TransferStatus::Failed
+            ) {
+                self.engine.resume_transfer(&id).await.map_err(message)?;
+                self.verified.write().unwrap().remove(&id);
+            }
+            self.ui.open_progress_dialog(&id)?;
+        }
+        Ok(id)
+    }
+
+    fn persist_categories(&self, settings: &AppSettings) -> Result<()> {
+        write_json_atomically(&self.data_dir.join(SETTINGS_FILE), settings).map_err(message)?;
+        self.settings
+            .write()
+            .unwrap()
+            .categories
+            .clone_from(&settings.categories);
+        Ok(())
+    }
+
+    pub async fn add_download_category(
+        &self,
+        name: String,
+        extensions: Vec<String>,
+        save_dir: Option<String>,
+    ) -> Result<DownloadCategory> {
+        let _operation = self.operation().await?;
+        let mut settings = self.settings();
+        let name = sanitize_filename(&name).map_err(message)?;
+        let mut id = category_id(&name);
+        if id.is_empty() {
+            id = "category".into();
+        }
+        let base = id.clone();
+        let mut number = 2;
+        while settings.categories.iter().any(|category| category.id == id) {
+            id = format!("{base}-{number}");
+            number += 1;
+        }
+        settings.categories.push(DownloadCategory {
+            id,
+            name,
+            extensions,
+            save_dir,
+        });
+        normalize_categories(&mut settings.categories).map_err(message)?;
+        self.persist_categories(&settings)?;
+        Ok(settings.categories.pop().expect("new download category"))
+    }
+
+    pub async fn set_transfer_speed_limit(&self, id: &str, limit_bps: Option<u64>) -> Result<()> {
+        let _operation = self.operation().await?;
+        if self.http_snapshot(id).is_none() {
+            return Err("HTTP transfer not found".into());
+        }
         self.engine
-            .add_http_download(request)
+            .set_transfer_speed_limit(id, limit_bps)
             .await
             .map_err(message)
+    }
+
+    async fn transfer_snapshot(&self, id: &str) -> Result<TransferSnapshot> {
+        if let Some(snapshot) = self.http_snapshot(id) {
+            return Ok(snapshot);
+        }
+        if let Some(job) = self.media_job(id) {
+            return Ok(job.snapshot());
+        }
+        self.torrent
+            .read()
+            .await
+            .manager
+            .snapshot(id)
+            .map_err(message)
+    }
+
+    fn completion_options(&self, id: &str) -> TransferCompletionOptions {
+        self.completion_options
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| TransferCompletionOptions {
+                show_complete_dialog: self.settings.read().unwrap().show_complete_dialog,
+                auto_close_progress: false,
+                open_folder_on_complete: false,
+            })
+    }
+
+    pub async fn get_transfer_completion_options(
+        &self,
+        id: &str,
+    ) -> Result<TransferCompletionOptions> {
+        self.transfer_snapshot(id).await?;
+        Ok(self.completion_options(id))
+    }
+
+    pub async fn set_transfer_completion_options(
+        &self,
+        id: &str,
+        options: TransferCompletionOptions,
+    ) -> Result<()> {
+        let _operation = self.operation().await?;
+        self.transfer_snapshot(id).await?;
+        self.completion_options
+            .lock()
+            .unwrap()
+            .insert(id.into(), options);
+        Ok(())
+    }
+
+    pub async fn open_progress_dialog(&self, id: &str) -> Result<()> {
+        let _operation = self.operation().await?;
+        self.transfer_snapshot(id).await?;
+        self.ui.open_progress_dialog(id)
+    }
+
+    fn open_progress_if_enabled(&self, id: &str, settings: &AppSettings) {
+        if settings.show_progress_dialog && self.ui.supports_dialogs() {
+            if let Err(error) = self.ui.open_progress_dialog(id) {
+                tracing::warn!(transfer_id = id, %error, "could not open progress dialog");
+            }
+        }
+    }
+
+    async fn on_transfer_completed(&self, id: &str) {
+        if !self.ui.supports_dialogs() {
+            return;
+        }
+        let options = self.completion_options(id);
+        if options.auto_close_progress {
+            self.ui.close_progress_dialog(id);
+        }
+        if options.open_folder_on_complete {
+            if let Err(error) = self.reveal_in_explorer(id).await {
+                tracing::warn!(transfer_id = id, %error, "could not reveal completed transfer");
+            }
+        }
+        if options.show_complete_dialog {
+            if let Err(error) = self.ui.open_complete_dialog(id) {
+                tracing::warn!(transfer_id = id, %error, "could not open completion dialog");
+            }
+        }
     }
 
     pub async fn refresh_download_url(&self, request: RefreshDownloadUrlRequest) -> Result<()> {
@@ -664,7 +1001,9 @@ impl AppState {
             .map_err(message)?
             .map_err(message)?;
         if let Some(selection) = selection {
-            return self.enqueue_playlist(request, directory, selection).await;
+            let id = self.enqueue_playlist(request, directory, selection).await?;
+            self.open_progress_if_enabled(&id, &settings);
+            return Ok(id);
         }
         let job = Arc::new(MediaJob::new(request, directory, None)?);
         let id = job.snapshot().id;
@@ -673,6 +1012,7 @@ impl AppState {
             self.media.write().unwrap().remove(&id);
             return Err(error);
         }
+        self.open_progress_if_enabled(&id, &settings);
         Ok(id)
     }
 
@@ -918,7 +1258,7 @@ impl AppState {
             if !queue.is_empty() || !self.media_slot_available() {
                 job.queue_for_start()?;
                 queue.push_back((job.clone(), pre_probe));
-                let _ = self.media_finished.send(None);
+                let _ = self.media_finished.send(MediaJobEvent::QueueChanged(None));
                 return Ok(());
             }
         }
@@ -931,7 +1271,9 @@ impl AppState {
             let Some((job, pre_probe)) = next else { return };
             if let Err(error) = self.launch_media_job(&job, pre_probe).await {
                 job.fail_queued_start(error);
-                let _ = self.media_finished.send(job.snapshot().playlist_id);
+                let _ = self
+                    .media_finished
+                    .send(MediaJobEvent::QueueChanged(job.snapshot().playlist_id));
             }
         }
     }
@@ -1031,7 +1373,7 @@ impl AppState {
         } else if let Some(job) = self.media_job(id) {
             self.remove_queued_media_job(&job);
             job.stop(TransferStatus::Paused).await?;
-            let _ = self.media_finished.send(None);
+            let _ = self.media_finished.send(MediaJobEvent::QueueChanged(None));
             Ok(())
         } else {
             self.torrent
@@ -1163,7 +1505,7 @@ impl AppState {
                 }
             }
         }
-        let _ = self.media_finished.send(None);
+        let _ = self.media_finished.send(MediaJobEvent::QueueChanged(None));
         Ok(())
     }
 
@@ -1226,7 +1568,9 @@ impl AppState {
             self.remove_queued_media_job(&job);
             job.stop(TransferStatus::Canceled).await?;
             let snapshot = job.snapshot();
-            let _ = self.media_finished.send(snapshot.playlist_id.clone());
+            let _ = self
+                .media_finished
+                .send(MediaJobEvent::QueueChanged(snapshot.playlist_id.clone()));
             if remove_files {
                 remove_outputs(snapshot.save_dir.into(), job.outputs()).await?;
             }
@@ -1252,6 +1596,7 @@ impl AppState {
             self.torrent_completed_files.lock().unwrap().remove(id);
         }
         self.verified.write().unwrap().remove(id);
+        self.completion_options.lock().unwrap().remove(id);
         Ok(())
     }
 
@@ -1308,6 +1653,25 @@ impl AppState {
         open_reveal_action(
             reveal_action(&root, files.first().map(String::as_str)).map_err(message)?,
         )
+    }
+
+    pub async fn open_completed_file(&self, id: &str) -> Result<()> {
+        let _operation = self.operation().await?;
+        let snapshot = self.transfer_snapshot(id).await?;
+        if snapshot.status != TransferStatus::Completed {
+            return Err("Only completed files can be opened.".into());
+        }
+        let (root, paths) = self.transfer_paths(id).await?;
+        let [relative] = paths.as_slice() else {
+            return Err("Opening a file requires a single transfer output.".into());
+        };
+        let relative = relative.clone();
+        tokio::task::spawn_blocking(move || {
+            with_completed_file(snapshot.status, &root, &relative, crate::shell::open_file)
+        })
+        .await
+        .map_err(message)?
+        .map_err(message)
     }
 
     pub async fn get_toolchain_status(&self) -> ToolchainStatus {
@@ -1427,6 +1791,11 @@ impl AppState {
             tasks.pop();
         }
         let _operation = self.operations.lock().await;
+        let pending = self.pending_downloads.lock().unwrap().clear();
+        for id in pending {
+            self.ui.close_confirm_dialog(&id);
+        }
+        self.completion_options.lock().unwrap().clear();
         let jobs: Vec<_> = self.media.read().unwrap().values().cloned().collect();
         for job in jobs {
             if let Err(failure) = job.shutdown().await {
@@ -1469,6 +1838,7 @@ impl AppState {
                 for transfer in &mut batch.transfers {
                     transfer.source_url = browser_source_url(&transfer.source_url);
                     transfer.save_dir = String::new();
+                    transfer.description = None;
                 }
                 return bounded_native_status(NativeBridgeResponse::Status {
                     batch,
@@ -1480,8 +1850,21 @@ impl AppState {
                 if request.save_dir.is_some() {
                     return Err("browser requests cannot override save_dir".into());
                 }
-                request.save_dir = None;
-                return self.add_http_download(request).await.map(created);
+                let _operation = self.operation().await?;
+                let (url, filename) = self
+                    .engine
+                    .preview_http_request(&request)
+                    .map_err(message)?;
+                request.url = url;
+                let settings = self.settings();
+                if settings.show_download_dialog && self.ui.supports_dialogs() {
+                    self.stage_http_download(request, filename, &settings)?;
+                } else {
+                    return self
+                        .enqueue_http(request, &settings, ExtendedHttpOptions::default())
+                        .await
+                        .map(created);
+                }
             }
             ProbeMedia {
                 url,
@@ -1765,10 +2148,31 @@ async fn stopped_signal(mut stop: watch::Receiver<bool>) {
     let _ = stop.wait_for(|stopped| *stopped).await;
 }
 
+async fn expire_pending_downloads(state: Arc<AppState>, stop: watch::Receiver<bool>) {
+    let stopped = stopped_signal(stop);
+    tokio::pin!(stopped);
+    loop {
+        let next = state.pending_downloads.lock().unwrap().next_expiration();
+        let deadline = async {
+            if let Some(next) = next {
+                tokio::time::sleep_until(next).await;
+            } else {
+                pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = &mut stopped => return,
+            _ = state.pending_changed.notified() => {},
+            _ = deadline => state.expire_pending_entries(),
+        }
+    }
+}
+
 async fn watch_media_jobs(
     state: Weak<AppState>,
     stop: watch::Receiver<bool>,
-    mut finished: mpsc::UnboundedReceiver<Option<String>>,
+    mut finished: mpsc::UnboundedReceiver<MediaJobEvent>,
 ) {
     let stopped = stopped_signal(stop);
     tokio::pin!(stopped);
@@ -1776,9 +2180,18 @@ async fn watch_media_jobs(
         tokio::select! {
             biased;
             _ = &mut stopped => return,
-            Some(id) = finished.recv() => {
+            Some(event) = finished.recv() => {
                 let Some(state) = state.upgrade() else { return };
                 let Ok(_operation) = state.operation().await else { return };
+                let id = match event {
+                    MediaJobEvent::QueueChanged(id) => id,
+                    MediaJobEvent::Finished { transfer_id, playlist_id } => {
+                        if state.media_job(&transfer_id).is_some_and(|job| job.status() == TransferStatus::Completed) {
+                            state.on_transfer_completed(&transfer_id).await;
+                        }
+                        playlist_id
+                    }
+                };
                 state.drain_media_queue().await;
                 if let Some(id) = id.filter(|id| state.playlists.lock().unwrap().contains_key(id)) {
                     if let Err(error) = state.advance_playlist(&id, false).await {
@@ -1795,7 +2208,7 @@ async fn emit_telemetry(state: Arc<AppState>, stop: watch::Receiver<bool>) {
     tokio::pin!(stopped);
     let mut next = Instant::now();
     loop {
-        if !state.ui.has_main_window() {
+        if !state.ui.has_telemetry_windows() {
             tokio::select! {
                 _ = &mut stopped => return,
                 _ = state.window_changed.notified() => {}
@@ -1809,9 +2222,9 @@ async fn emit_telemetry(state: Arc<AppState>, stop: watch::Receiver<bool>) {
             _ = state.window_changed.notified() => continue,
             _ = tokio::time::sleep_until(next) => {}
         }
-        if state.ui.has_main_window() {
+        if state.ui.has_telemetry_windows() {
             let batch = state.snapshot().await;
-            if state.ui.has_main_window() {
+            if state.ui.has_telemetry_windows() {
                 if let Err(error) = state.ui.emit_telemetry(&batch) {
                     tracing::debug!(%error, "could not emit telemetry");
                 }
@@ -1833,6 +2246,7 @@ async fn watch_completions(
 ) {
     let stopped = stopped_signal(stop);
     tokio::pin!(stopped);
+    let mut announced_http = seen_http.clone();
     let mut pending_http = HashMap::new();
     let mut next_completion_check = Instant::now();
     loop {
@@ -1845,29 +2259,44 @@ async fn watch_completions(
                 pending::<()>().await;
             }
         };
-        tokio::select! {
+        let completed = tokio::select! {
             biased;
             _ = &mut stopped => return,
-            _ = state.torrent_changed.notified() => {}
+            _ = state.torrent_changed.notified() => continue,
             _ = timer => {
                 retry_http_completions(&state, &state.scans, &mut seen_http, &mut pending_http);
                 scan_torrent_completions(&state, &state.scans).await;
                 next_completion_check = Instant::now() + Duration::from_secs(1);
+                continue;
             }
             event = http.recv() => match event {
                 Ok(EngineEvent::StatusChanged { transfer_id, status: TransferStatus::Completed }) => {
-                    if let Some(snapshot) = state.http_snapshot(&transfer_id) {
-                        scan_http_completion(&state, &state.scans, &mut seen_http, &mut pending_http, snapshot);
-                    }
+                    state.http_snapshot(&transfer_id).into_iter().collect::<Vec<_>>()
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    for snapshot in state.engine.snapshots().into_iter().filter(|s| s.status == TransferStatus::Completed) {
-                        scan_http_completion(&state, &state.scans, &mut seen_http, &mut pending_http, snapshot);
-                    }
+                    state.engine.snapshots().into_iter().filter(|s| s.status == TransferStatus::Completed).collect()
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
-                _ => {}
+                _ => continue,
             },
+        };
+        for snapshot in completed {
+            let id = snapshot.id.clone();
+            scan_http_completion(
+                &state,
+                &state.scans,
+                &mut seen_http,
+                &mut pending_http,
+                snapshot,
+            );
+            if state.ui.supports_dialogs() && announced_http.insert(id.clone()) {
+                let Ok(_operation) = state.operation().await else {
+                    return;
+                };
+                if state.http_snapshot(&id).is_some() {
+                    state.on_transfer_completed(&id).await;
+                }
+            }
         }
     }
 }
@@ -2365,6 +2794,9 @@ mod tests {
                 headers: HashMap::new(),
                 referrer: None,
                 expected_sha256: None,
+                expected_size_bytes: None,
+                start_paused: false,
+                overwrite_existing: false,
             })
             .await
             .unwrap();
@@ -2709,6 +3141,9 @@ mod tests {
                 headers: HashMap::new(),
                 referrer: None,
                 expected_sha256: None,
+                expected_size_bytes: None,
+                start_paused: false,
+                overwrite_existing: false,
             })
             .await
             .unwrap();

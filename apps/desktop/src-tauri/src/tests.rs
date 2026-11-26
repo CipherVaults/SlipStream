@@ -4,7 +4,7 @@ use crate::{
     paths::{
         build_defender_scan_args, decode_sha256, delete_files, ensure_playlist_subfolder,
         ensure_safe_directory, ensure_safe_tree, hash_file, local_drive_path, reveal_action,
-        write_zone_identifier, RevealAction,
+        with_completed_file, write_zone_identifier, RevealAction,
     },
     settings::{normalize, read_json, torrent_rate, write_json_atomically, SETTINGS_FILE},
     tools::{
@@ -25,7 +25,7 @@ use slipstream_native_host::{
     },
     registry::install_host,
 };
-use slipstream_protocol::{AppSettings, BrowserKind, ToolSource, UpdateMode};
+use slipstream_protocol::{AppSettings, BrowserKind, ToolSource, TransferStatus, UpdateMode};
 use std::{
     env,
     ffi::OsString,
@@ -302,10 +302,46 @@ fn traversal_and_links_are_rejected_for_every_file_operation() {
         assert!(hash_file(&root, bad).is_err(), "{bad}");
         assert!(delete_files(&root, &[bad.into()]).is_err(), "{bad}");
         assert!(write_zone_identifier(&root, bad).is_err(), "{bad}");
+        assert!(
+            with_completed_file::<()>(TransferStatus::Completed, &root, bad, |_| panic!(
+                "unsafe file opened"
+            ))
+            .is_err(),
+            "{bad}"
+        );
     }
     assert!(reveal_action(&junction, Some("secret.bin")).is_err());
     assert_eq!(fs::read(&protected).unwrap(), b"private");
     assert!(!outside.join("secret.bin:Zone.Identifier").exists());
+}
+
+#[test]
+fn completed_file_open_requires_a_completed_regular_file() {
+    let temp = TempDir::new();
+    let path = temp.0.join("complete.bin");
+    fs::write(&path, b"complete").unwrap();
+    fs::create_dir(temp.0.join("directory")).unwrap();
+    for (status, name) in [
+        (TransferStatus::Paused, "complete.bin"),
+        (TransferStatus::Completed, "missing.bin"),
+        (TransferStatus::Completed, "directory"),
+    ] {
+        assert!(with_completed_file::<()>(status, &temp.0, name, |_| panic!(
+            "invalid file opened"
+        ))
+        .is_err());
+    }
+    with_completed_file(
+        TransferStatus::Completed,
+        &temp.0,
+        "complete.bin",
+        |opened| {
+            assert_eq!(opened, local_drive_path(&fs::canonicalize(&path)?).unwrap());
+            assert_eq!(fs::read(opened)?, b"complete");
+            Ok(())
+        },
+    )
+    .unwrap();
 }
 
 #[test]

@@ -159,11 +159,56 @@ fn same_file(_part: &Path, _final_path: &Path) -> std::io::Result<bool> {
 
 pub(crate) async fn commit(record: &Record) -> Result<()> {
     let (part, final_path) = record.paths()?;
-    tokio::task::spawn_blocking(move || move_file(&part, &final_path)).await??;
-    Ok(())
+    let overwrite = record.overwrite_existing;
+    let directory = record.save_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(windows)]
+        let _directory_handle = overwrite
+            .then(|| hold_commit_directory(&directory))
+            .transpose()?;
+        if overwrite {
+            if final_path.parent() != Some(directory.as_path())
+                || fs::canonicalize(&directory)? != directory
+            {
+                return Err(EngineError::InvalidState("download directory changed"));
+            }
+            for ancestor in directory.ancestors().filter(|path| path.is_absolute()) {
+                let metadata = fs::symlink_metadata(ancestor)?;
+                if !metadata.is_dir() || is_reparse_point(&metadata) {
+                    return Err(EngineError::InvalidState("unsafe download directory"));
+                }
+            }
+            if regular_file_length(&part)?.is_none() {
+                return Err(EngineError::InvalidState("missing download part file"));
+            }
+        }
+        move_file(&part, &final_path, overwrite)
+    })
+    .await?
 }
 
-pub(crate) fn numbered_filename(filename: &str, number: usize) -> String {
+#[cfg(windows)]
+fn hold_commit_directory(directory: &Path) -> Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    // Keep the destination directory open without write or delete sharing until the move.
+    let file = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(directory)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || is_reparse_point(&metadata) {
+        return Err(EngineError::InvalidState("unsafe download directory"));
+    }
+    Ok(file)
+}
+
+pub fn numbered_filename(filename: &str, number: usize) -> String {
     if number == 0 {
         return filename.to_owned();
     }
@@ -188,7 +233,7 @@ pub(crate) fn numbered_filename(filename: &str, number: usize) -> String {
 }
 
 #[cfg(windows)]
-fn move_file(part: &Path, final_path: &Path) -> std::io::Result<()> {
+fn move_file(part: &Path, final_path: &Path, overwrite: bool) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     #[link(name = "kernel32")]
@@ -196,6 +241,7 @@ fn move_file(part: &Path, final_path: &Path) -> std::io::Result<()> {
         fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
     }
     const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
     const ERROR_SHARING_VIOLATION: i32 = 32;
 
     let wide = |path: &Path| {
@@ -206,11 +252,18 @@ fn move_file(part: &Path, final_path: &Path) -> std::io::Result<()> {
     };
     let part = wide(part);
     let destination = wide(final_path);
+    let flags = if overwrite {
+        MOVEFILE_WRITE_THROUGH | MOVEFILE_REPLACE_EXISTING
+    } else {
+        MOVEFILE_WRITE_THROUGH
+    };
     // Both owned, NUL-terminated strings live across the call. The source and
-    // destination share a directory, and the flags forbid copy and replacement.
+    // destination share a directory and the flags forbid copy.
     for attempt in 0..5 {
-        if unsafe { MoveFileExW(part.as_ptr(), destination.as_ptr(), MOVEFILE_WRITE_THROUGH) } != 0
-        {
+        if overwrite {
+            regular_file_length(final_path)?;
+        }
+        if unsafe { MoveFileExW(part.as_ptr(), destination.as_ptr(), flags) } != 0 {
             return Ok(());
         }
         let error = std::io::Error::last_os_error();
@@ -218,21 +271,28 @@ fn move_file(part: &Path, final_path: &Path) -> std::io::Result<()> {
             std::thread::sleep(std::time::Duration::from_millis(20));
             continue;
         }
-        if error.kind() == std::io::ErrorKind::PermissionDenied
+        if !overwrite
+            && error.kind() == std::io::ErrorKind::PermissionDenied
             && fs::symlink_metadata(final_path).is_ok()
         {
-            return Err(std::io::ErrorKind::AlreadyExists.into());
+            return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into());
         }
-        return Err(error);
+        return Err(error.into());
     }
     unreachable!("move_file loop always returns on final attempt")
 }
 
 #[cfg(not(windows))]
-fn move_file(part: &Path, final_path: &Path) -> std::io::Result<()> {
-    fs::hard_link(part, final_path)?;
-    fs::remove_file(part)?;
-    File::open(final_path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()
+fn move_file(part: &Path, final_path: &Path, overwrite: bool) -> Result<()> {
+    if overwrite {
+        regular_file_length(final_path)?;
+        fs::rename(part, final_path)?;
+    } else {
+        fs::hard_link(part, final_path)?;
+        fs::remove_file(part)?;
+    }
+    File::open(final_path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()?;
+    Ok(())
 }
 
 #[cfg(windows)]

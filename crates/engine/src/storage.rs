@@ -13,6 +13,8 @@ pub(crate) struct Record {
     pub filename: String,
     pub use_server_filename: bool,
     pub source_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duplicate_url_digest: Option<String>,
     pub source_domain: String,
     pub save_dir: PathBuf,
     pub headers: HashMap<String, String>,
@@ -30,6 +32,10 @@ pub(crate) struct Record {
     pub sha256_verified: Option<bool>,
     pub commit_digest: Option<String>,
     pub speed_limit_bps: Option<u64>,
+    #[serde(default)]
+    pub overwrite_existing: bool,
+    #[serde(default)]
+    pub description: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

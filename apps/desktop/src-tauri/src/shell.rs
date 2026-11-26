@@ -1,10 +1,17 @@
-use crate::{commands, AppState, DaemonOptions, OpenPickerEvent, UiBridge};
+use crate::{
+    commands,
+    paths::{canonical_directory, local_drive_path, validate_existing_ancestors},
+    AppState, DaemonOptions, OpenPickerEvent, UiBridge,
+};
 use slipstream_protocol::TelemetryBatch;
 use std::{
     future::Future,
     io,
     mem::size_of,
+    os::windows::ffi::{OsStrExt, OsStringExt},
+    path::{Path, PathBuf},
     pin::Pin,
+    ptr::{null, null_mut},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -15,7 +22,8 @@ use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     webview::PageLoadEvent,
-    AppHandle, Emitter, Manager, RunEvent, WebviewWindow, WebviewWindowBuilder, WindowEvent,
+    AppHandle, Emitter, EventTarget, Manager, RunEvent, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder, WindowEvent,
 };
 use tokio::sync::{oneshot, watch};
 use windows_sys::Win32::Graphics::Dwm::{
@@ -25,6 +33,9 @@ use windows_sys::Win32::Graphics::Dwm::{
 pub(crate) const MAIN: &str = "main";
 const OPEN_PICKER_EVENT: &str = "slipstream://open-picker";
 const TELEMETRY_EVENT: &str = "slipstream://telemetry";
+const CONFIRM_PREFIX: &str = "dl-confirm-";
+const PROGRESS_PREFIX: &str = "dl-progress-";
+const COMPLETE_PREFIX: &str = "dl-complete-";
 type Result<T> = std::result::Result<T, String>;
 
 pub(crate) struct DesktopUi {
@@ -114,6 +125,93 @@ impl DesktopUi {
             .map_err(|error| error.to_string())?;
         rx.await.map_err(|error| error.to_string())?
     }
+
+    fn open_download_dialog(
+        &self,
+        prefix: &'static str,
+        id: &str,
+        size: (f64, f64),
+        resizable: bool,
+    ) -> Result<()> {
+        if id.is_empty()
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err("Invalid download ID.".into());
+        }
+        let app = self.app.clone();
+        let id = id.to_owned();
+        self.app
+            .run_on_main_thread(move || {
+                let Some(state) = app.try_state::<Arc<AppState>>() else {
+                    return;
+                };
+                if state.is_quitting()
+                    || (prefix == CONFIRM_PREFIX && state.get_pending_download(&id).is_err())
+                {
+                    return;
+                }
+                let label = format!("{prefix}{id}");
+                let result = (|| {
+                    let window = if let Some(window) = app.get_webview_window(&label) {
+                        window
+                    } else {
+                        let variant = prefix.trim_start_matches("dl-").trim_end_matches('-');
+                        let url = WebviewUrl::App(PathBuf::from(format!(
+                            "index.html?window={variant}&id={id}"
+                        )));
+                        let window = WebviewWindowBuilder::new(&app, &label, url)
+                            .title("SlipStream")
+                            .inner_size(size.0, size.1)
+                            .decorations(false)
+                            .resizable(resizable)
+                            .center()
+                            .visible(false)
+                            .build()
+                            .map_err(|error| error.to_string())?;
+                        if let Err(error) = configure_webview2(&window) {
+                            let _ = window.destroy();
+                            return Err(error);
+                        }
+                        round_corners(&window);
+                        window
+                    };
+                    window
+                        .show()
+                        .and_then(|()| window.unminimize())
+                        .and_then(|()| window.set_focus())
+                        .map_err(|error| error.to_string())
+                })();
+                if let Err(error) = result {
+                    tracing::warn!(%label, %error, "could not show download dialog");
+                    if prefix == CONFIRM_PREFIX {
+                        state.discard_pending_download(&id);
+                        if let Some(window) = app.get_webview_window(&label) {
+                            let _ = window.destroy();
+                        }
+                    }
+                }
+                state.window_shown();
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    fn close_download_dialog(&self, prefix: &str, id: &str) {
+        let app = self.app.clone();
+        let label = format!("{prefix}{id}");
+        let _ = self.app.run_on_main_thread(move || {
+            if let Some(window) = app.get_webview_window(&label) {
+                let _ = window.destroy();
+            }
+        });
+    }
+
+    fn is_telemetry_window(&self, label: &str) -> bool {
+        (label == MAIN && self.has_main_window())
+            || label.starts_with(PROGRESS_PREFIX)
+            || label.starts_with(COMPLETE_PREFIX)
+    }
 }
 
 impl UiBridge for DesktopUi {
@@ -142,14 +240,15 @@ impl UiBridge for DesktopUi {
     }
 
     fn emit_telemetry(&self, batch: &TelemetryBatch) -> Result<()> {
-        if !self.has_main_window() || *self.destroying.borrow() {
-            return Ok(());
-        }
-        let Some(window) = self.app.get_webview_window(MAIN) else {
-            return Ok(());
-        };
-        window
-            .emit(TELEMETRY_EVENT, batch)
+        // Emit once so listeners using Tauri's default Any target receive one batch.
+        self.app
+            .emit_filter(TELEMETRY_EVENT, batch, |target| match target {
+                EventTarget::Window { label }
+                | EventTarget::Webview { label }
+                | EventTarget::WebviewWindow { label }
+                | EventTarget::AnyLabel { label } => self.is_telemetry_window(label),
+                _ => false,
+            })
             .map_err(|error| error.to_string())
     }
 
@@ -167,6 +266,39 @@ impl UiBridge for DesktopUi {
 
     fn has_main_window(&self) -> bool {
         self.present.load(Ordering::Acquire) && !*self.destroying.borrow()
+    }
+
+    fn has_telemetry_windows(&self) -> bool {
+        self.has_main_window()
+            || self
+                .app
+                .webview_windows()
+                .keys()
+                .any(|label| self.is_telemetry_window(label))
+    }
+
+    fn supports_dialogs(&self) -> bool {
+        true
+    }
+
+    fn open_confirm_dialog(&self, id: &str) -> Result<()> {
+        self.open_download_dialog(CONFIRM_PREFIX, id, (540.0, 360.0), false)
+    }
+
+    fn close_confirm_dialog(&self, id: &str) {
+        self.close_download_dialog(CONFIRM_PREFIX, id);
+    }
+
+    fn open_progress_dialog(&self, id: &str) -> Result<()> {
+        self.open_download_dialog(PROGRESS_PREFIX, id, (540.0, 340.0), true)
+    }
+
+    fn close_progress_dialog(&self, id: &str) {
+        self.close_download_dialog(PROGRESS_PREFIX, id);
+    }
+
+    fn open_complete_dialog(&self, id: &str) -> Result<()> {
+        self.open_download_dialog(COMPLETE_PREFIX, id, (460.0, 220.0), false)
     }
 
     fn trigger_ready_check(&self) {
@@ -215,11 +347,11 @@ fn configure_webview2(window: &WebviewWindow) -> Result<()> {
             };
             let _ = applied.send(configure());
         })
-        .map_err(|error| format!("Could not access the main WebView2 controller: {error}"))?;
+        .map_err(|error| format!("Could not access the WebView2 controller: {error}"))?;
     result
         .try_recv()
-        .map_err(|_| "Could not apply the main WebView2 settings on the UI thread.".to_owned())?
-        .map_err(|error| format!("Could not configure the main WebView2 settings: {error}"))
+        .map_err(|_| "Could not apply the WebView2 settings on the UI thread.".to_owned())?
+        .map_err(|error| format!("Could not configure the WebView2 settings: {error}"))
 }
 
 fn round_corners(window: &WebviewWindow) {
@@ -233,6 +365,144 @@ fn round_corners(window: &WebviewWindow) {
                 (&raw const corner).cast(),
                 size_of::<i32>() as u32,
             );
+        }
+    }
+}
+
+pub(crate) fn open_file(path: &Path) -> io::Result<()> {
+    use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+    let file = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let verb = windows_sys::w!("open");
+    let result = unsafe {
+        ShellExecuteW(
+            null_mut(),
+            verb,
+            file.as_ptr(),
+            null(),
+            null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result as usize <= 32 {
+        return Err(io::Error::other(format!(
+            "Windows could not open the file (shell error {}).",
+            result as usize
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn pick_download_folder(
+    owner: isize,
+    initial_dir: Option<String>,
+) -> io::Result<Option<String>> {
+    use std::ffi::OsString;
+    use windows_sys::Win32::{
+        Foundation::HWND,
+        System::Com::{
+            CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
+            COINIT_DISABLE_OLE1DDE,
+        },
+        UI::{
+            Shell::{
+                SHBrowseForFolderW, SHGetPathFromIDListEx, BFFM_INITIALIZED, BFFM_SETSELECTIONW,
+                BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW, GPFIDL_DEFAULT,
+            },
+            WindowsAndMessaging::SendMessageW,
+        },
+    };
+
+    unsafe extern "system" fn select_initial_folder(
+        window: HWND,
+        message: u32,
+        _: isize,
+        initial: isize,
+    ) -> i32 {
+        if message == BFFM_INITIALIZED && initial != 0 {
+            // The caller owns the NUL-terminated path for the lifetime of the browse dialog.
+            unsafe { SendMessageW(window, BFFM_SETSELECTIONW, 1, initial) };
+        }
+        0
+    }
+
+    let initial = initial_dir
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| {
+            let directory = local_drive_path(Path::new(&path))?;
+            validate_existing_ancestors(&directory)?;
+            Ok::<_, io::Error>(
+                directory
+                    .ancestors()
+                    .find(|path| path.is_dir())
+                    .map(|path| {
+                        path.as_os_str()
+                            .encode_wide()
+                            .chain(Some(0))
+                            .collect::<Vec<_>>()
+                    }),
+            )
+        })
+        .transpose()?
+        .flatten();
+    let code = unsafe {
+        CoInitializeEx(
+            null(),
+            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+        )
+    };
+    if code < 0 {
+        return Err(io::Error::other(format!(
+            "Could not initialize the folder picker (0x{code:08x})."
+        )));
+    }
+    let mut display = [0_u16; 260];
+    let info = BROWSEINFOW {
+        hwndOwner: owner as HWND,
+        pidlRoot: null_mut(),
+        pszDisplayName: display.as_mut_ptr(),
+        lpszTitle: windows_sys::w!("Select a download folder"),
+        ulFlags: BIF_NEWDIALOGSTYLE | BIF_RETURNONLYFSDIRS,
+        lpfn: Some(select_initial_folder),
+        lParam: initial.as_ref().map_or(0, |path| path.as_ptr() as isize),
+        iImage: 0,
+    };
+    let mut selected = vec![0_u16; 32_768];
+    let resolved = unsafe {
+        let item = SHBrowseForFolderW(&info);
+        let result = if item.is_null() {
+            None
+        } else {
+            let found = SHGetPathFromIDListEx(
+                item,
+                selected.as_mut_ptr(),
+                selected.len() as u32,
+                GPFIDL_DEFAULT,
+            );
+            CoTaskMemFree(item.cast());
+            Some(found != 0)
+        };
+        CoUninitialize();
+        result
+    };
+    match resolved {
+        None => Ok(None),
+        Some(false) => Err(io::Error::other(
+            "Could not resolve the selected download folder.",
+        )),
+        Some(true) => {
+            let end = selected
+                .iter()
+                .position(|&unit| unit == 0)
+                .unwrap_or(selected.len());
+            let path = PathBuf::from(OsString::from_wide(&selected[..end]));
+            let path = local_drive_path(&canonical_directory(&path)?)?;
+            Ok(Some(path.into_os_string().into_string().map_err(|_| {
+                io::Error::other("Download folder is not Unicode.")
+            })?))
         }
     }
 }
@@ -342,6 +612,17 @@ pub(crate) fn run() {
             commands::mark_ui_ready,
             commands::get_snapshot,
             commands::add_http_download,
+            commands::get_pending_download,
+            commands::confirm_pending_download,
+            commands::cancel_pending_download,
+            commands::resolve_duplicate_existing,
+            commands::add_download_category,
+            commands::set_transfer_speed_limit,
+            commands::get_transfer_completion_options,
+            commands::set_transfer_completion_options,
+            commands::open_progress_dialog,
+            commands::open_completed_file,
+            commands::pick_download_folder,
             commands::expand_wildcard_urls,
             commands::probe_media,
             commands::add_media_download,
@@ -454,6 +735,17 @@ pub(crate) fn run() {
                 ui.present.store(false, Ordering::Release);
                 let _ = state.window_loading();
                 ui.destroying.send_replace(false);
+            }
+            RunEvent::WindowEvent {
+                label,
+                event: WindowEvent::Destroyed,
+                ..
+            } => {
+                if let Some(id) = label.strip_prefix(CONFIRM_PREFIX) {
+                    state.discard_pending_download(id);
+                } else if label.starts_with(PROGRESS_PREFIX) || label.starts_with(COMPLETE_PREFIX) {
+                    state.window_shown();
+                }
             }
             _ => {}
         }

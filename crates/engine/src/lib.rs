@@ -10,6 +10,7 @@ mod tests;
 mod wildcard;
 
 pub use http::validate_redirect_target;
+pub use output::numbered_filename;
 pub use slipstream_protocol::{
     AddHttpDownloadRequest, PostQueueAction, RefreshDownloadUrlRequest, SegmentSnapshot,
     SegmentState, TelemetryBatch, TransferSnapshot, TransferStatus,
@@ -20,10 +21,13 @@ use chrono::Utc;
 use http::{filename_from_url, sanitize_http_url_credentials, Http, Source};
 use limiter::Limiter;
 use serde::{Deserialize, Serialize};
-use slipstream_protocol::{sanitize_filename, validate_http_url, TransferKind, UI_SEGMENT_COUNT};
+use sha2::{Digest, Sha256};
+use slipstream_protocol::{
+    sanitize_filename, validate_http_url, DuplicateMatch, TransferKind, UI_SEGMENT_COUNT,
+};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use storage::{Database, Record, Segments};
@@ -152,6 +156,9 @@ impl Default for QueueConfig {
 pub struct ExtendedHttpOptions {
     pub expected_md5: Option<String>,
     pub speed_limit_bps: Option<u64>,
+    pub start_paused: bool,
+    pub overwrite_existing: bool,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -220,6 +227,7 @@ pub(crate) struct Job {
     record: Record,
     segments: Segments,
     limiter: Arc<Limiter>,
+    pub connect_rtt_ms: Option<u32>,
 }
 
 impl State {
@@ -296,6 +304,7 @@ impl DownloadEngine {
                         limiter: Arc::new(Limiter::new(record.speed_limit_bps)),
                         segments,
                         record,
+                        connect_rtt_ms: None,
                     },
                 );
             }
@@ -359,9 +368,38 @@ impl DownloadEngine {
         let mut state = self.inner.lock();
         state.open()?;
         state.db()?.save_record(&record)?;
+        let starts_queued = record.status == TransferStatus::Queued;
         let id = self.register_http_job(&mut state, record);
-        self.inner.wake.notify_one();
+        if starts_queued {
+            self.inner.wake.notify_one();
+        }
         Ok(id)
+    }
+
+    /// Validate an HTTP request without registering a transfer or touching disk.
+    pub fn preview_http_request(
+        &self,
+        request: &AddHttpDownloadRequest,
+    ) -> Result<(String, String)> {
+        let (source, filename) = self.http_source_and_filename(request)?;
+        Ok((source.url.into(), filename))
+    }
+
+    fn http_source_and_filename(
+        &self,
+        request: &AddHttpDownloadRequest,
+    ) -> Result<(Source, String)> {
+        let source = Source::new(
+            &request.url,
+            &request.headers,
+            request.referrer.as_deref(),
+            self.inner.config.allow_loopback,
+        )?;
+        let filename = match request.filename.as_deref() {
+            Some(filename) => sanitize_filename(filename)?,
+            None => filename_from_url(&source.url),
+        };
+        Ok((source, filename))
     }
 
     /// Enqueue a batch in one transaction using a canonical download directory
@@ -386,6 +424,9 @@ impl DownloadEngine {
                         headers: HashMap::new(),
                         referrer: referrer.clone(),
                         expected_sha256: None,
+                        expected_size_bytes: None,
+                        start_paused: false,
+                        overwrite_existing: false,
                     },
                     ExtendedHttpOptions::default(),
                 )
@@ -419,16 +460,7 @@ impl DownloadEngine {
         request: AddHttpDownloadRequest,
         options: ExtendedHttpOptions,
     ) -> Result<Record> {
-        let source = Source::new(
-            &request.url,
-            &request.headers,
-            request.referrer.as_deref(),
-            self.inner.config.allow_loopback,
-        )?;
-        let filename = match request.filename.as_deref() {
-            Some(filename) => sanitize_filename(filename)?,
-            None => filename_from_url(&source.url),
-        };
+        let (source, filename) = self.http_source_and_filename(&request)?;
         let expected_sha256 = checksum(request.expected_sha256, 64, "SHA-256")?;
         let expected_md5 = checksum(options.expected_md5, 32, "MD5")?;
         let queue_id = request.queue_id.unwrap_or_else(|| DEFAULT_QUEUE.into());
@@ -443,6 +475,7 @@ impl DownloadEngine {
             use_server_filename: request.filename.is_none(),
             source_domain: source.url.host_str().unwrap_or_default().to_owned(),
             source_url: source.url.to_string(),
+            duplicate_url_digest: None,
             save_dir,
             headers: request.headers,
             referrer: request
@@ -451,8 +484,12 @@ impl DownloadEngine {
                 .and_then(sanitize_http_url_credentials),
             expected_sha256,
             expected_md5,
-            status: TransferStatus::Queued,
-            total: None,
+            status: if request.start_paused || options.start_paused {
+                TransferStatus::Paused
+            } else {
+                TransferStatus::Queued
+            },
+            total: request.expected_size_bytes,
             ranges: false,
             validators: Default::default(),
             max_connections: request
@@ -465,6 +502,8 @@ impl DownloadEngine {
             sha256_verified: None,
             commit_digest: None,
             speed_limit_bps: options.speed_limit_bps.filter(|rate| *rate > 0),
+            overwrite_existing: request.overwrite_existing || options.overwrite_existing,
+            description: options.description,
             created_at: now,
             updated_at: now,
         })
@@ -472,17 +511,63 @@ impl DownloadEngine {
 
     fn register_http_job(&self, state: &mut State, record: Record) -> String {
         let id = record.id.clone();
-        state.armed_queues.insert(record.queue_id.clone());
+        let status = record.status;
+        if status == TransferStatus::Queued {
+            state.armed_queues.insert(record.queue_id.clone());
+        }
         state.jobs.insert(
             id.clone(),
             Job {
                 limiter: Arc::new(Limiter::new(record.speed_limit_bps)),
                 record,
                 segments: Segments::new(),
+                connect_rtt_ms: None,
             },
         );
-        self.inner.status(&id, TransferStatus::Queued);
+        self.inner.status(&id, status);
         id
+    }
+
+    pub fn find_duplicate(
+        &self,
+        raw_url: &str,
+        save_dir: &Path,
+        filename: &str,
+    ) -> Option<DuplicateMatch> {
+        let url = duplicate_url(raw_url);
+        let url_digest = url.as_ref().map(duplicate_url_digest);
+        let directory = save_dir.canonicalize().ok();
+        let state = self.inner.lock();
+        let job = state
+            .jobs
+            .values()
+            .filter(|job| job.record.status != TransferStatus::Canceled)
+            .filter_map(|job| {
+                let url_match = if let Some(digest) = &job.record.duplicate_url_digest {
+                    url_digest.as_ref() == Some(digest)
+                } else {
+                    url.is_some() && url == duplicate_url(&job.record.source_url)
+                };
+                let path_match = directory.as_ref().is_some_and(|directory| {
+                    same_download_path(directory, &job.record.save_dir)
+                        && same_download_path(Path::new(filename), Path::new(&job.record.filename))
+                });
+                (url_match || path_match).then_some((url_match, job))
+            })
+            .max_by_key(|(url_match, job)| (*url_match, job.record.created_at, &job.record.id))?
+            .1;
+        Some(DuplicateMatch {
+            transfer_id: job.record.id.clone(),
+            filename: job.record.filename.clone(),
+            status: job.record.status,
+            save_dir: job.record.save_dir.to_string_lossy().into_owned(),
+            total_bytes: job.record.total,
+            downloaded_bytes: job
+                .segments
+                .values()
+                .map(|segment| segment.cursor - segment.start)
+                .sum(),
+        })
     }
 
     pub fn snapshot(&self, id: &str) -> Result<TransferSnapshot> {
@@ -727,6 +812,47 @@ impl DownloadEngine {
     }
 }
 
+fn duplicate_url(raw: &str) -> Option<url::Url> {
+    let mut url = validate_http_url(raw).ok()?;
+    url.set_fragment(None);
+    Some(url)
+}
+
+fn duplicate_url_digest(url: &url::Url) -> String {
+    hex::encode(Sha256::digest(url.as_str()))
+}
+
+#[cfg(windows)]
+fn same_download_path(left: &Path, right: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CompareStringOrdinal(
+            left: *const u16,
+            left_len: i32,
+            right: *const u16,
+            right_len: i32,
+            ignore_case: i32,
+        ) -> i32;
+    }
+    let left = left.as_os_str().encode_wide().collect::<Vec<_>>();
+    let right = right.as_os_str().encode_wide().collect::<Vec<_>>();
+    let (Ok(left_len), Ok(right_len)) = (i32::try_from(left.len()), i32::try_from(right.len()))
+    else {
+        return false;
+    };
+    const CSTR_EQUAL: i32 = 2;
+    unsafe {
+        CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) == CSTR_EQUAL
+    }
+}
+
+#[cfg(not(windows))]
+fn same_download_path(left: &Path, right: &Path) -> bool {
+    left == right
+}
+
 fn checksum(value: Option<String>, len: usize, label: &str) -> Result<Option<String>> {
     value
         .map(|value| {
@@ -785,6 +911,13 @@ fn save_status(
 fn scrub_record_credentials(record: &mut Record) {
     record.headers.clear();
     record.referrer = None;
+    if record.duplicate_url_digest.is_none() {
+        // Retain exact duplicate matching after redacting a signed query string.
+        record.duplicate_url_digest = duplicate_url(&record.source_url)
+            .filter(|url| url.query().is_some())
+            .as_ref()
+            .map(duplicate_url_digest);
+    }
     record.source_url = validate_http_url(&record.source_url).map_or_else(
         |_| String::new(),
         |mut url| {
@@ -1073,6 +1206,9 @@ impl Job {
             playlist_paused: None,
             playlist_index: None,
             playlist_total: None,
+            speed_limit_bps: record.speed_limit_bps,
+            connect_rtt_ms: self.connect_rtt_ms,
+            description: record.description.clone(),
             created_at: record.created_at,
             updated_at: record.updated_at,
         }
