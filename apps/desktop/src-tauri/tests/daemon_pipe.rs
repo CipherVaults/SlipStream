@@ -55,7 +55,13 @@ impl TempDir {
     fn new() -> Self {
         let path = env::temp_dir().join(format!("slipstream-desktop-{}", Uuid::new_v4()));
         fs::create_dir(&path).unwrap();
-        Self(path)
+        let canonical = fs::canonicalize(&path).unwrap();
+        let clean = canonical
+            .to_str()
+            .and_then(|value| value.strip_prefix(r"\\?\"))
+            .map(PathBuf::from)
+            .unwrap_or(canonical);
+        Self(clean)
     }
 }
 
