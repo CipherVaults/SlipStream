@@ -1,17 +1,24 @@
 use crate::{EngineError, Result};
+use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder};
+use chrono::{DateTime, NaiveDateTime, Utc};
+use futures_util::TryStreamExt;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{
-    HeaderMap, HeaderName, HeaderValue, ACCEPT, ACCEPT_ENCODING, CONTENT_DISPOSITION,
-    CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE, LAST_MODIFIED, LOCATION,
-    RANGE, REFERER, USER_AGENT,
+    HeaderMap, HeaderName, HeaderValue, ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE,
+    CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, COOKIE, ETAG, IF_RANGE,
+    LAST_MODIFIED, LOCATION, ORIGIN, RANGE, REFERER, RETRY_AFTER, SET_COOKIE, USER_AGENT,
 };
 use reqwest::{Client, Method, Response, StatusCode, Version};
 use serde::{Deserialize, Serialize};
 use slipstream_protocol::{is_private_or_loopback_ip, sanitize_filename, validate_http_url};
 use std::collections::HashMap;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncRead;
+use tokio_util::io::StreamReader;
 use url::{Host, Url};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -66,7 +73,7 @@ impl Validators {
         }
         self.last_modified
             .as_deref()
-            .filter(|value| is_valid_http_date(value))
+            .filter(|value| parse_http_date(value).is_some())
     }
 
     pub(crate) fn changed(&self, response: &Response, conditional: bool) -> bool {
@@ -97,13 +104,19 @@ impl Validators {
     }
 }
 
-fn is_valid_http_date(value: &str) -> bool {
-    let valid_imf = value.ends_with(" GMT") && chrono::DateTime::parse_from_rfc2822(value).is_ok();
-    let valid_rfc850 = value.ends_with(" GMT")
-        && chrono::NaiveDateTime::parse_from_str(value, "%A, %d-%b-%y %H:%M:%S GMT").is_ok();
-    let valid_asctime =
-        chrono::NaiveDateTime::parse_from_str(value, "%a %b %e %H:%M:%S %Y").is_ok();
-    valid_imf || valid_rfc850 || valid_asctime
+fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
+    if value.ends_with(" GMT") {
+        return DateTime::parse_from_rfc2822(value)
+            .map(|date| date.to_utc())
+            .or_else(|_| {
+                NaiveDateTime::parse_from_str(value, "%A, %d-%b-%y %H:%M:%S GMT")
+                    .map(|date| date.and_utc())
+            })
+            .ok();
+    }
+    NaiveDateTime::parse_from_str(value, "%a %b %e %H:%M:%S %Y")
+        .ok()
+        .map(|date| date.and_utc())
 }
 
 pub(crate) struct Metadata {
@@ -112,6 +125,7 @@ pub(crate) struct Metadata {
     pub validators: Validators,
     pub filename: Option<String>,
     pub protocol: &'static str,
+    pub response: Option<Response>,
 }
 
 #[derive(Clone)]
@@ -122,24 +136,72 @@ pub(crate) struct Source {
 
 pub(crate) struct Http {
     client: Client,
+    ipv4_client: Client,
     allow_loopback: bool,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FetchProfile {
+    ipv4_only: bool,
+    strip_cookies: bool,
+    strip_referer: bool,
+}
+
+impl FetchProfile {
+    pub(crate) fn fallback(mut self, source: &Source, sent_cookie: bool) -> Option<Self> {
+        if !self.ipv4_only {
+            self.ipv4_only = true;
+        } else if !self.strip_cookies && (sent_cookie || source.headers.contains_key(COOKIE)) {
+            self.strip_cookies = true;
+        } else if !self.strip_referer
+            && [REFERER, ORIGIN]
+                .iter()
+                .any(|name| source.headers.contains_key(name))
+        {
+            self.strip_cookies = true;
+            self.strip_referer = true;
+        } else {
+            return None;
+        }
+        Some(self)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeMode {
+    HeadThenRange,
+    Range,
+    Full,
 }
 
 struct CheckedDns {
     allow_loopback: bool,
+    ipv4_only: bool,
 }
+
+#[derive(Clone)]
+struct SentCookie;
 
 impl Resolve for CheckedDns {
     fn resolve(&self, name: Name) -> Resolving {
         let allow_loopback = self.allow_loopback;
+        let ipv4_only = self.ipv4_only;
         Box::pin(async move {
-            let addrs: Vec<SocketAddr> =
+            let mut addrs: Vec<SocketAddr> =
                 tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
-            if addrs.is_empty() {
-                return Err(std::io::Error::other("DNS returned no addresses").into());
-            }
             for addr in &addrs {
                 check_ip(addr.ip(), allow_loopback)?;
+            }
+            if ipv4_only {
+                addrs.retain(SocketAddr::is_ipv4);
+            }
+            if addrs.is_empty() {
+                let message = if ipv4_only {
+                    "DNS returned no IPv4 addresses"
+                } else {
+                    "DNS returned no addresses"
+                };
+                return Err(io::Error::other(message).into());
             }
             // Reqwest dials these exact addresses. No second DNS lookup occurs.
             Ok(Box::new(addrs.into_iter()) as Addrs)
@@ -244,6 +306,9 @@ impl Source {
         request_headers
             .entry(ACCEPT)
             .or_insert(HeaderValue::from_static("*/*"));
+        request_headers
+            .entry(ACCEPT_LANGUAGE)
+            .or_insert(HeaderValue::from_static("en-US,en;q=0.9"));
         request_headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
         Ok(Self {
             url,
@@ -254,22 +319,29 @@ impl Source {
 
 impl Http {
     pub(crate) fn new(allow_loopback: bool, timeout: Duration) -> Result<Self> {
-        let client = Client::builder()
-            .use_rustls_tls()
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .no_gzip()
-            .no_deflate()
-            .no_brotli()
-            .no_zstd()
-            .referer(false)
-            .connect_timeout(timeout)
-            .read_timeout(timeout)
-            .dns_resolver(Arc::new(CheckedDns { allow_loopback }))
-            .build()
-            .map_err(EngineError::Http)?;
+        let build = |ipv4_only| {
+            Client::builder()
+                .use_rustls_tls()
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
+                .http1_title_case_headers()
+                .no_gzip()
+                .no_deflate()
+                .no_brotli()
+                .no_zstd()
+                .referer(false)
+                .connect_timeout(timeout)
+                .read_timeout(timeout)
+                .dns_resolver(Arc::new(CheckedDns {
+                    allow_loopback,
+                    ipv4_only,
+                }))
+                .build()
+                .map_err(EngineError::Http)
+        };
         Ok(Self {
-            client,
+            client: build(false)?,
+            ipv4_client: build(true)?,
             allow_loopback,
         })
     }
@@ -277,12 +349,29 @@ impl Http {
     async fn request(
         &self,
         source: &Source,
+        profile: FetchProfile,
         method: Method,
         range: Option<(u64, u64)>,
         if_range: Option<&str>,
     ) -> Result<Response> {
         let mut url = source.url.clone();
-        let mut headers = source.headers.clone();
+        let client = if profile.ipv4_only {
+            &self.ipv4_client
+        } else {
+            &self.client
+        };
+        let mut headers = if profile.strip_referer {
+            [USER_AGENT, ACCEPT, ACCEPT_LANGUAGE, ACCEPT_ENCODING]
+                .into_iter()
+                .filter_map(|name| source.headers.get(&name).map(|value| (name, value.clone())))
+                .collect()
+        } else {
+            source.headers.clone()
+        };
+        if profile.strip_cookies {
+            headers.remove(COOKIE);
+            headers.remove("cookie2");
+        }
         if let Some((start, last)) = range {
             headers.insert(
                 RANGE,
@@ -298,8 +387,12 @@ impl Http {
             );
         }
         for hop in 0..=10 {
-            let response = self
-                .client
+            if profile.ipv4_only && matches!(url.host(), Some(Host::Ipv6(_))) {
+                return Err(EngineError::InvalidRequest(
+                    "IPv4-only requests require an IPv4 destination".into(),
+                ));
+            }
+            let mut response = client
                 .request(method.clone(), url.clone())
                 .headers(headers.clone())
                 .send()
@@ -313,6 +406,9 @@ impl Http {
                     | StatusCode::TEMPORARY_REDIRECT
                     | StatusCode::PERMANENT_REDIRECT
             ) {
+                if response.status() == StatusCode::FORBIDDEN && headers.contains_key(COOKIE) {
+                    response.extensions_mut().insert(SentCookie);
+                }
                 return Ok(response);
             }
             if hop == 10 {
@@ -326,22 +422,34 @@ impl Http {
                     "missing or invalid redirect location",
                 ))?;
             let next = validate_redirect_target(&url, location, self.allow_loopback)?;
+            if !profile.strip_cookies && url.origin() == next.origin() {
+                merge_redirect_cookies(&mut headers, response.headers());
+            }
             apply_redirect_header_policy(&mut headers, &url, &next);
             url = next;
         }
         unreachable!("request loop returns after its final hop")
     }
 
-    pub(crate) async fn probe(&self, source: &Source, force_get: bool) -> Result<Metadata> {
+    pub(crate) async fn probe(
+        &self,
+        source: &Source,
+        profile: FetchProfile,
+        mode: ProbeMode,
+    ) -> Result<Metadata> {
         let mut head_name = None;
-        if !force_get {
-            let head = match self.request(source, Method::HEAD, None, None).await {
+        if mode == ProbeMode::HeadThenRange {
+            let head = match self
+                .request(source, profile, Method::HEAD, None, None)
+                .await
+            {
                 Ok(response) => Some(response),
                 Err(error) if error.is_transient() => None,
                 Err(error) => return Err(error),
             };
-            if let Some(response) = head.filter(|response| response.status() == StatusCode::OK) {
-                ensure_identity(&response)?;
+            if let Some(response) = head.filter(|response| {
+                response.status() == StatusCode::OK && ensure_identity(response).is_ok()
+            }) {
                 head_name = filename(&response)?;
                 let total = length(&response)?;
                 let range_hint = response
@@ -362,53 +470,59 @@ impl Http {
                         validators: Validators::from_response(&response),
                         filename: head_name,
                         protocol: protocol(&response),
+                        response: None,
                     });
                 }
             }
         }
 
-        let mut response = self
-            .request(source, Method::GET, Some((0, 0)), None)
-            .await?;
-        let (total, ranges) = match response.status() {
-            StatusCode::PARTIAL_CONTENT => {
-                let total = content_range(&response, 0, 0)?;
-                (total, total.is_some())
-            }
-            StatusCode::OK => (length(&response)?, false),
-            StatusCode::RANGE_NOT_SATISFIABLE
-                if response
+        if mode != ProbeMode::Full {
+            let response = self
+                .request(source, profile, Method::GET, Some((0, 0)), None)
+                .await?;
+            let total = match response.status() {
+                StatusCode::PARTIAL_CONTENT => {
+                    ensure_identity(&response)?;
+                    content_range(&response, 0, 0)?
+                }
+                StatusCode::OK if !response.headers().contains_key(CONTENT_RANGE) => {
+                    return full_metadata(response, head_name);
+                }
+                StatusCode::OK
+                | StatusCode::FORBIDDEN
+                | StatusCode::BAD_REQUEST
+                | StatusCode::METHOD_NOT_ALLOWED
+                | StatusCode::PRECONDITION_FAILED
+                | StatusCode::NOT_IMPLEMENTED
+                | StatusCode::SERVICE_UNAVAILABLE => None,
+                StatusCode::RANGE_NOT_SATISFIABLE => response
                     .headers()
                     .get(CONTENT_RANGE)
-                    .is_some_and(|range| range == "bytes */0") =>
-            {
-                (Some(0), true)
+                    .is_some_and(|range| range == "bytes */0")
+                    .then_some(0),
+                _ => return Err(status_error(&response)),
+            };
+            if total.is_some() {
+                return Ok(Metadata {
+                    total,
+                    ranges: true,
+                    validators: Validators::from_response(&response),
+                    filename: filename(&response)?.or(head_name),
+                    protocol: protocol(&response),
+                    response: None,
+                });
             }
-            StatusCode::FORBIDDEN
-            | StatusCode::BAD_REQUEST
-            | StatusCode::METHOD_NOT_ALLOWED
-            | StatusCode::RANGE_NOT_SATISFIABLE => {
-                drop(response);
-                response = self.request(source, Method::GET, None, None).await?;
-                (full_length(&response)?, false)
-            }
-            status => return Err(EngineError::Status(status)),
-        };
-        if response.status().is_success() {
-            ensure_identity(&response)?;
         }
-        Ok(Metadata {
-            total,
-            ranges,
-            validators: Validators::from_response(&response),
-            filename: filename(&response)?.or(head_name),
-            protocol: protocol(&response),
-        })
+        let response = self
+            .request(source, profile, Method::GET, None, None)
+            .await?;
+        full_metadata(response, head_name)
     }
 
     pub(crate) async fn get_or_restart(
         &self,
         source: &Source,
+        profile: FetchProfile,
         range: Option<(u64, u64)>,
         total: Option<u64>,
         validators: &Validators,
@@ -422,16 +536,19 @@ impl Http {
         } else {
             None
         };
-        let response = self.request(source, Method::GET, range, if_range).await?;
+        let response = self
+            .request(source, profile, Method::GET, range, if_range)
+            .await?;
         if let Some((start, last)) = range {
             match response.status() {
                 StatusCode::OK | StatusCode::RANGE_NOT_SATISFIABLE => {
-                    let unchanged = if_range.is_none()
-                        && !validators.changed(&response, false)
+                    let unchanged = !validators.changed(&response, false)
                         && (response.status() == StatusCode::RANGE_NOT_SATISFIABLE
-                            || !total
-                                .zip(length(&response)?)
-                                .is_some_and(|(old, new)| old != new));
+                            || (if_range.is_none()
+                                && (response.headers().contains_key(CONTENT_RANGE)
+                                    || !total
+                                        .zip(full_length(&response)?)
+                                        .is_some_and(|(old, new)| old != new))));
                     let reason = if unchanged {
                         RestartReason::RangeUnsupported
                     } else {
@@ -443,7 +560,7 @@ impl Http {
                     return Ok(GetOutcome::Restart(RestartReason::RepresentationChanged));
                 }
                 StatusCode::PARTIAL_CONTENT => {}
-                status => return Err(EngineError::Status(status)),
+                _ => return Err(status_error(&response)),
             }
             ensure_identity(&response)?;
             if validators.changed(&response, if_range.is_some())
@@ -453,7 +570,6 @@ impl Http {
             }
         } else {
             let length = full_length(&response)?;
-            ensure_identity(&response)?;
             if validators.changed(&response, false)
                 || total.zip(length).is_some_and(|(old, new)| old != new)
             {
@@ -515,6 +631,37 @@ fn apply_redirect_header_policy(headers: &mut HeaderMap, previous: &Url, next: &
     *headers = safe;
 }
 
+fn merge_redirect_cookies(headers: &mut HeaderMap, response: &HeaderMap) {
+    let mut incoming = response
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| {
+            let pair = value.to_str().ok()?.split(';').next()?.trim();
+            let (name, _) = pair.split_once('=')?;
+            HeaderName::from_bytes(name.as_bytes()).ok()?;
+            Some((name, pair))
+        })
+        .peekable();
+    if incoming.peek().is_none() {
+        return;
+    }
+    let mut pairs: Vec<_> = headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';').map(str::trim))
+        .filter(|pair| !pair.is_empty())
+        .collect();
+    for (name, pair) in incoming {
+        pairs.retain(|existing| !existing.split_once('=').is_some_and(|(key, _)| key == name));
+        pairs.push(pair);
+    }
+    if let Ok(mut value) = HeaderValue::from_str(&pairs.join("; ")) {
+        value.set_sensitive(true);
+        headers.insert(COOKIE, value);
+    }
+}
+
 pub(crate) fn request_error(error: reqwest::Error) -> EngineError {
     let mut source = std::error::Error::source(&error);
     while let Some(cause) = source {
@@ -551,9 +698,17 @@ fn length(response: &Response) -> Result<Option<u64>> {
 
 fn full_length(response: &Response) -> Result<Option<u64>> {
     match response.status() {
-        StatusCode::OK => length(response),
+        StatusCode::OK if !response.headers().contains_key(CONTENT_RANGE) => {
+            if ContentCoding::from_response(response)? == ContentCoding::Identity {
+                length(response)
+            } else {
+                Ok(None)
+            }
+        }
+        StatusCode::OK => Err(EngineError::InvalidResponse("unexpected Content-Range")),
         StatusCode::PARTIAL_CONTENT => {
             // A plain GET can only use a 206 response that covers the complete representation.
+            ensure_identity(response)?;
             let incomplete = || EngineError::InvalidResponse("incomplete response to plain GET");
             let total = length(response)?
                 .filter(|&total| total > 0)
@@ -563,7 +718,98 @@ fn full_length(response: &Response) -> Result<Option<u64>> {
             }
             Ok(Some(total))
         }
-        status => Err(EngineError::Status(status)),
+        _ => Err(status_error(response)),
+    }
+}
+
+fn full_metadata(response: Response, head_name: Option<String>) -> Result<Metadata> {
+    Ok(Metadata {
+        total: full_length(&response)?,
+        ranges: false,
+        validators: Validators::from_response(&response),
+        filename: filename(&response)?.or(head_name),
+        protocol: protocol(&response),
+        response: Some(response),
+    })
+}
+
+fn status_error(response: &Response) -> EngineError {
+    let status = response.status();
+    let retry_after = if matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+    ) {
+        response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| parse_retry_after(value, Utc::now()))
+    } else {
+        None
+    };
+    EngineError::Status {
+        status,
+        retry_after,
+        sent_cookie: response.extensions().get::<SentCookie>().is_some(),
+    }
+}
+
+fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<Duration> {
+    let value = value.trim();
+    let delay = if let Ok(seconds) = value.parse::<u64>() {
+        Duration::from_secs(seconds)
+    } else {
+        parse_http_date(value)?
+            .signed_duration_since(now)
+            .to_std()
+            .unwrap_or_default()
+    };
+    Some(delay.clamp(Duration::from_millis(250), Duration::from_secs(10)))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContentCoding {
+    Identity,
+    Gzip,
+    Deflate,
+    Brotli,
+}
+
+impl ContentCoding {
+    pub(crate) fn from_response(response: &Response) -> Result<Self> {
+        if ensure_identity(response).is_ok() {
+            return Ok(Self::Identity);
+        }
+        let mut codings = response.headers().get_all(CONTENT_ENCODING).iter();
+        if let Some(value) = codings.next().filter(|_| codings.next().is_none()) {
+            for (name, coding) in [
+                (&b"gzip"[..], Self::Gzip),
+                (&b"deflate"[..], Self::Deflate),
+                (&b"br"[..], Self::Brotli),
+            ] {
+                if value.as_bytes().eq_ignore_ascii_case(name) {
+                    return Ok(coding);
+                }
+            }
+        }
+        Err(EngineError::InvalidResponse("unsupported Content-Encoding"))
+    }
+
+    pub(crate) fn reader(self, response: Response) -> Pin<Box<dyn AsyncRead + Send>> {
+        let reader =
+            StreamReader::new(response.bytes_stream().map_err(|error| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, error.without_url())
+            }));
+        match self {
+            Self::Identity => Box::pin(reader),
+            Self::Gzip => {
+                let mut decoder = GzipDecoder::new(reader);
+                decoder.multiple_members(true);
+                Box::pin(decoder)
+            }
+            Self::Deflate => Box::pin(ZlibDecoder::new(reader)),
+            Self::Brotli => Box::pin(BrotliDecoder::new(reader)),
+        }
     }
 }
 
@@ -691,6 +937,48 @@ pub(crate) fn filename_from_url(url: &Url) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn checked_ipv4_dns_returns_only_ipv4_destinations() {
+        let resolver = CheckedDns {
+            allow_loopback: true,
+            ipv4_only: true,
+        };
+        let addresses: Vec<_> = resolver
+            .resolve("localhost".parse().unwrap())
+            .await
+            .unwrap()
+            .collect();
+        assert!(!addresses.is_empty());
+        assert!(addresses.iter().all(SocketAddr::is_ipv4));
+        assert!(CheckedDns {
+            allow_loopback: false,
+            ..resolver
+        }
+        .resolve("localhost".parse().unwrap())
+        .await
+        .is_err());
+    }
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates_with_bounded_delays() {
+        let now = parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT").unwrap();
+        assert_eq!(parse_retry_after("2", now), Some(Duration::from_secs(2)));
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2015 07:28:04 GMT", now),
+            Some(Duration::from_secs(4))
+        );
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2015 07:27:59 GMT", now),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            parse_retry_after("0", now),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(parse_retry_after("100", now), Some(Duration::from_secs(10)));
+        assert_eq!(parse_retry_after("later", now), None);
+    }
 
     #[test]
     fn disposition_filenames_are_sanitized() {
