@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { canAttributeTab, defaults, sameDownloadOrigin, shouldIntercept } from "./downloads";
 import { isPublicHttpUrl, ObservedNetwork } from "./network";
 import { isRefreshableHttpTransfer } from "./state";
-import { isMediaStream, mediaMime, parseHlsMaster, probeFormats, scopedHeaders, selectPillFormatId, StreamNavigationState } from "./streams";
+import { isMediaStream, mediaMime, parseContentRangeTotal, parseHlsMaster, probeFormats, scopedHeaders, selectPillFormatId, StreamNavigationState } from "./streams";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -25,14 +25,19 @@ describe("media streams", () => {
   });
 
   it("filters segment paths, transport streams, range parameters and payloads below 300 KB", () => {
-    for (const path of ["seg.ts", "seg.M4S", "file.mp4?range=0-500", "file.mp4?ByteStart=0", "file.mp4?byteend=500"]) {
+    for (const path of ["seg.ts", "seg.M4S", "chunk.m4f", "hls/seg-12.mp4", "file.mp4?range=0-500", "file.mp4?ByteStart=0", "file.mp4?byteend=500"]) {
       expect(isMediaStream("https://media.example/" + path, "video/mp4", 500_000)).toBe(false);
     }
     expect(isMediaStream("https://media.example/chunk", "video/MP2T", 500_000)).toBe(false);
     expect(isMediaStream("https://media.example/file.mp4", "", 299_999)).toBe(false);
     expect(isMediaStream("https://media.example/file.mp4", "", 300_000)).toBe(true);
+    expect(isMediaStream("https://media.example/movie.mkv", "", 500_000)).toBe(true);
+    expect(isMediaStream("https://media.example/clip.mov", "", 500_000)).toBe(true);
     expect(isMediaStream("https://media.example/master.m3u8", "", 100)).toBe(true);
     expect(isMediaStream("https://media.example/manifest", "application/dash+xml", 100)).toBe(true);
+    expect(parseContentRangeTotal([{ name: "Content-Range", value: "bytes 0-65535/1500000000" }])).toBe(1_500_000_000);
+    expect(parseContentRangeTotal([{ name: "Content-Range", value: "bytes 0-65535/*" }])).toBeUndefined();
+    expect(parseContentRangeTotal([{ name: "Content-Range", value: "invalid" }])).toBeUndefined();
   });
 
   it("parses, resolves, sorts and deduplicates HLS variants by quality", () => {
@@ -227,6 +232,39 @@ describe("download interception", () => {
     expect(shouldIntercept(item, { ...settings, excludedSites: ["dn.example"] }, context)).toBe(true);
   });
 
+  it("intercepts extensionless URLs by downloadable MIME or clean filename with non-webpage MIME", () => {
+    expect(shouldIntercept(
+      { url: "https://github.com/org/repo/releases/download/v1/app-linux", filename: "", fileSize: 5_000_000, mime: "application/octet-stream" },
+      defaults,
+      context,
+    )).toBe(true);
+    expect(shouldIntercept(
+      { url: "https://sourceforge.net/projects/demo/files/latest/download", filename: "demo-setup.exe", fileSize: 2_000_000 },
+      defaults,
+      context,
+    )).toBe(true);
+    expect(shouldIntercept(
+      { url: "https://cdn.example/download?id=123", filename: "package.custom", fileSize: 100_000, mime: "application/x-custom-package" },
+      defaults,
+      context,
+    )).toBe(true);
+    expect(shouldIntercept(
+      { url: "https://cdn.example/page", filename: "index.html", fileSize: 50_000, mime: "text/html" },
+      defaults,
+      context,
+    )).toBe(false);
+    expect(shouldIntercept(
+      { url: "https://cdn.example/photo", filename: "photo.png", fileSize: 50_000, mime: "image/png" },
+      defaults,
+      context,
+    )).toBe(false);
+    expect(shouldIntercept(
+      { url: "http://127.0.0.1/file.zip", filename: "file.zip", fileSize: 50_000, mime: "application/zip" },
+      defaults,
+      context,
+    )).toBe(false);
+  });
+
   it("checks browser contexts and compares the redirect's endpoint origins", () => {
     expect(canAttributeTab({ referrer: "https://source.example/p", incognito: true }, { url: "https://source.example/p", incognito: false })).toBe(false);
     expect(canAttributeTab({ referrer: "https://source.example/p", incognito: true }, { url: "https://source.example/p" })).toBe(false);
@@ -284,6 +322,26 @@ describe("adaptive pill format selection and TTL cache eviction", () => {
     expect(selectPillFormatId(boundaryProbe, 2160)).toBe(`${shortId}+bestaudio`);
     expect(selectPillFormatId({ ...boundaryProbe, formats: [{ ...baseProbe.formats[0], format_id: longId }, baseProbe.formats[3]] }, 2160)).toBe(longId);
     expect(selectPillFormatId({ ...baseProbe, formats: [] }, 2160)).toBeUndefined();
+  });
+
+  it("falls back to highest format <= expectedHeight when exact resolution is absent", () => {
+    const hd720Probe: MediaProbeResult = {
+      ...baseProbe,
+      formats: [
+        { format_id: "136", label: "720p H264", container: "mp4", video_codec: "avc1", audio_codec: null, height: 720, fps: 30, filesize_bytes: 1200, is_audio_only: false, has_video: true, has_audio: false },
+        { format_id: "135", label: "480p H264", container: "mp4", video_codec: "avc1", audio_codec: null, height: 480, fps: 30, filesize_bytes: 800, is_audio_only: false, has_video: true, has_audio: false },
+        baseProbe.formats[3],
+      ],
+    };
+    expect(selectPillFormatId(hd720Probe, 1080)).toBe("136+bestaudio");
+    expect(selectPillFormatId(hd720Probe, 2160)).toBe("136+bestaudio");
+    const noHeightProbe: MediaProbeResult = {
+      ...baseProbe,
+      formats: [
+        { format_id: "mp4-default", label: "MP4", container: "mp4", video_codec: "avc1", audio_codec: "mp4a", height: null, fps: null, filesize_bytes: 1000, is_audio_only: false, has_video: true, has_audio: true },
+      ],
+    };
+    expect(selectPillFormatId(noHeightProbe, 1080)).toBe("mp4-default");
   });
 
   it("purges expired Cookie headers and streams after TTL", () => {

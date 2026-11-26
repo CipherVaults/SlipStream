@@ -5,7 +5,7 @@
   "version": "1.2.1",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApJVhasWV6fKMP7HpQipJzGgn0u1XnhkS1Z/Q8qjKs2RuLXPCfqRbKuxdIz5hHAhZoJ2FGA6mG5sPrYwhUunKpfkNPipSYeQ1hQDnuI59/POfG49UgVBhU+XIxJ8oGTexC1ivp/kTK+Y0MEEZ4j5jJ3G9jePDZa0QHzz2MLp13XkumAxeDQaIieUQtzAPBbw3+9vswbErNyGNsAe8b6do3g/2dE6FacnN0GwC9GvomjOwX5hp3DFf9JYe6oU5matHVKfyeGsHmHG0sm+7ts3U1mh0NQkr6z98SWzNleFdDKhSJFzBh3wjI36JMYFxfKC86Ze6xrZTURprxMXp8VndbwIDAQAB",
   "description": "Send downloads and media to the SlipStream desktop app.",
-  "permissions": ["nativeMessaging", "downloads", "webRequest", "contextMenus", "storage", "tabs", "alarms"],
+  "permissions": ["nativeMessaging", "downloads", "webRequest", "contextMenus", "storage", "tabs", "alarms", "cookies"],
   "host_permissions": ["http://*/*", "https://*/*"],
   "background": { "service_worker": "background.js" },
   "action": { "default_popup": "popup.html", "default_title": "SlipStream" },

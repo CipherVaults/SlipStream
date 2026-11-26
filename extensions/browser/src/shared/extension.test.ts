@@ -561,7 +561,7 @@ describe("direct HTTP handoff", () => {
     await observe(cdn);
     expect(await intercept()).toEqual({ type: "add_http_download", request: {
       url: cdn, filename: "file.mp4", referrer: page,
-      headers: { Referer: page, Origin: "https://vidtube.example", "User-Agent": "Captured Browser/2.0" },
+      headers: { Referer: page, Origin: "https://vidtube.example", "User-Agent": "Captured Browser/2.0", "Accept-Language": "en-US,en;q=0.9" },
     } });
   });
 
@@ -570,7 +570,7 @@ describe("direct HTTP handoff", () => {
     await observe(start);
     await observe(cdn + "-different");
     expect(await intercept({ referrer: page + "#private" })).toEqual({ type: "add_http_download", request: {
-      url: cdn, filename: "file.mp4", referrer: page, headers: { "User-Agent": browserAgent },
+      url: cdn, filename: "file.mp4", referrer: page, headers: { "User-Agent": browserAgent, "Accept-Language": "en-US,en;q=0.9" },
     } });
   });
 
@@ -579,7 +579,7 @@ describe("direct HTTP handoff", () => {
     const insecure = cdn.replace("https:", "http:");
     await observe(insecure);
     expect(await intercept({ finalUrl: insecure })).toEqual({ type: "add_http_download", request: {
-      url: insecure, filename: "file.mp4", referrer: undefined, headers: { "User-Agent": "Captured Browser/2.0" },
+      url: insecure, filename: "file.mp4", referrer: undefined, headers: { "User-Agent": "Captured Browser/2.0", "Accept-Language": "en-US,en;q=0.9" },
     } });
   });
 
@@ -588,20 +588,20 @@ describe("direct HTTP handoff", () => {
     await observe(cdn);
     for (const overrides of [{ incognito: true }, { cookieStoreId: "firefox-container-1" }]) {
       expect(await intercept(overrides)).toEqual({ type: "add_http_download", request: {
-        url: cdn, filename: "file.mp4", referrer: undefined, headers: { "User-Agent": browserAgent },
+        url: cdn, filename: "file.mp4", referrer: undefined, headers: { "User-Agent": browserAgent, "Accept-Language": "en-US,en;q=0.9" },
       } });
     }
     const unrelated = cdn + "-unrelated";
     await observe(unrelated, { initiator: "https://unrelated.example" });
     expect(await intercept({ finalUrl: unrelated, referrer: "" })).toEqual({ type: "add_http_download", request: {
-      url: unrelated, filename: "file.mp4", referrer: undefined, headers: { "User-Agent": browserAgent },
+      url: unrelated, filename: "file.mp4", referrer: undefined, headers: { "User-Agent": browserAgent, "Accept-Language": "en-US,en;q=0.9" },
     } });
   });
 
   it("keeps same-origin cookies limited to attributed downloads without cross-origin redirects", async () => {
     const { observe, intercept } = await setup();
     await observe(start);
-    const publicHeaders = { Referer: page, Origin: "https://vidtube.example", "User-Agent": "Captured Browser/2.0" };
+    const publicHeaders = { Referer: page, Origin: "https://vidtube.example", "User-Agent": "Captured Browser/2.0", "Accept-Language": "en-US,en;q=0.9" };
     const requestHeaders = async (overrides: Parameters<typeof intercept>[0]) => {
       const response = await intercept(overrides);
       return response?.type === "add_http_download" ? response.request.headers : undefined;
@@ -616,7 +616,7 @@ describe("direct HTTP handoff", () => {
     onMenu.addListener.mock.calls[0][0]({ menuItemId: "download", linkUrl: cdn, pageUrl: page }, tab);
     const originReferrer = "https://vidtube.example/";
     await vi.waitFor(() => expect(port.posted.at(-1)).toEqual({ type: "add_http_download", request: {
-      url: cdn, filename: undefined, referrer: originReferrer, headers: { "User-Agent": browserAgent },
+      url: cdn, filename: undefined, referrer: originReferrer, headers: { "User-Agent": browserAgent, "Accept-Language": "en-US,en;q=0.9" },
     } }));
     port.emitMessage({ type: "transfer_created", transfer_id: "http-id" });
 
@@ -626,7 +626,7 @@ describe("direct HTTP handoff", () => {
       { id: "ext-test-id", url: "chrome-extension://ext-test-id/popup.html" }, resolve,
     ));
     await vi.waitFor(() => expect(port.posted.at(-1)).toEqual({ type: "refresh_download_url", request: {
-      transfer_id: "tr-1", new_url: cdn, referrer: originReferrer, headers: { "User-Agent": browserAgent },
+      transfer_id: "tr-1", new_url: cdn, referrer: originReferrer, headers: { "User-Agent": browserAgent, "Accept-Language": "en-US,en;q=0.9" },
     } }));
     port.emitMessage({ type: "ack", ok: true, message: null });
     expect(await result).toEqual({ ok: true });
@@ -734,7 +734,15 @@ describe("frame-scoped media handoff", () => {
     expect(await request({ kind: "pill-open", url, requestId: 1 })).toEqual({ ok: true });
     expect(await request({ kind: "pill-open", url, requestId: 2 })).toEqual({ ok: true });
     expect(probePorts).toHaveLength(1);
-    expect(probePorts[0].posted).toEqual([{ type: "probe_media", url }]);
+    expect(probePorts[0].posted).toEqual([{
+      type: "probe_media",
+      url,
+      headers: expect.objectContaining({
+        Referer: page,
+        Origin: "https://media.example",
+        "Accept-Language": "en-US,en;q=0.9",
+      }),
+    }]);
     const playlist = request({ kind: "media", action: "playlist", url: page });
     await Promise.resolve();
     expect(port.posted.at(-1)).toEqual({ type: "open_desktop_window", open_picker_url: page });
@@ -797,5 +805,268 @@ describe("frame-scoped media handoff", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(badProbePort.disconnect).toHaveBeenCalledOnce();
+  });
+
+  it("auto-connects NativeClient.send() when service worker wakes disconnected", async () => {
+    vi.resetModules();
+    vi.useFakeTimers();
+    const ports: Array<ReturnType<typeof makeFakePort>> = [];
+    (globalThis as Record<string, unknown>).chrome = {
+      runtime: {
+        lastError: undefined,
+        connectNative: vi.fn(() => {
+          const port = makeFakePort();
+          ports.push(port);
+          return port;
+        }),
+      },
+    };
+    const { NativeClient } = await import("./native");
+    const client = new NativeClient(() => {});
+    const sendPromise = client.send({ type: "open_desktop_window" });
+    expect(ports).toHaveLength(1);
+    expect(ports[0].posted[0]).toEqual({ type: "get_status" });
+
+    ports[0].emitMessage({
+      type: "status",
+      theme: "dark",
+      accent: "blue",
+      batch: {
+        aggregate_down_bps: 0,
+        aggregate_up_bps: 0,
+        active_count: 0,
+        active_threads: 0,
+        speed_limit_bps: null,
+        transfers: [],
+        timestamp: "2026-11-26T00:00:00Z",
+      },
+    });
+    await vi.waitFor(() => expect(ports[0].posted[1]).toEqual({ type: "open_desktop_window" }));
+    ports[0].emitMessage({ type: "ack", ok: true, message: null });
+    expect(await sendPromise).toEqual({ type: "ack", ok: true, message: null });
+  });
+
+  it("intercepts via onDeterminingFilename with cookies isolation, erase, and 3500ms timeout guard", async () => {
+    vi.resetModules();
+    vi.useFakeTimers();
+    vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Fixture Browser/1.0");
+    const onDeterminingFilename = listener<(item: object, suggest: () => void) => boolean | undefined>();
+    const onCreated = listener<(item: object) => void>();
+    const port = makeFakePort();
+    const cancel = vi.fn(async (_id: number) => {});
+    const erase = vi.fn(async (_query: object) => []);
+    const getAllCookies = vi.fn(async ({ url, storeId }: { url: string; storeId?: string }) => {
+      if (storeId === "firefox-container-1") return [{ name: "box", value: "container1" }];
+      if (url.startsWith("https://releases.example/")) {
+        return [
+          { name: "auth", value: "tok123" },
+          { name: "bad\r\n", value: "evil" },
+        ];
+      }
+      return [];
+    });
+    const tab = { id: 9, url: "https://releases.example/project", incognito: false };
+    (globalThis as Record<string, unknown>).chrome = {
+      runtime: {
+        id: "ext-test-id",
+        getURL: (file: string) => "chrome-extension://ext-test-id/" + file,
+        getManifest: () => ({ background: { service_worker: "background.js" } }),
+        onMessage: listener(),
+        onConnect: listener(),
+        onInstalled: listener(),
+        connectNative: vi.fn(() => port),
+      },
+      downloads: { onDeterminingFilename, onCreated, cancel, erase, search: vi.fn(async () => []) },
+      cookies: { getAll: getAllCookies },
+      contextMenus: { onClicked: listener() },
+      alarms: { onAlarm: listener(), create: vi.fn() },
+      tabs: { get: vi.fn(async () => tab), query: vi.fn(async () => [tab]), onUpdated: listener(), onRemoved: listener() },
+      webRequest: { onSendHeaders: listener(), onHeadersReceived: listener() },
+      storage: {
+        onChanged: listener(),
+        local: { get: vi.fn(async () => ({})), set: vi.fn(async () => {}) },
+        session: { get: vi.fn(async () => ({})), set: vi.fn(async () => {}), remove: vi.fn(async () => {}) },
+      },
+    };
+    await import("../background");
+    port.emitMessage({
+      type: "status", theme: "dark", accent: "blue",
+      batch: { aggregate_down_bps: 0, aggregate_up_bps: 0, active_count: 0, active_threads: 0, speed_limit_bps: null, transfers: [], timestamp: "2026-11-26T00:00:00Z" },
+    });
+    await Promise.resolve();
+
+    // 1. Extensionless URL with application/octet-stream intercepts with sanitized cookies, calls suggest(), cancel(), erase().
+    const suggest1 = vi.fn();
+    const ret = onDeterminingFilename.addListener.mock.calls[0][0]({
+      id: 101,
+      url: "https://releases.example/download?id=99",
+      finalUrl: "https://releases.example/download?id=99",
+      filename: "C:\\Downloads\\installer-v2.bin",
+      mime: "application/octet-stream",
+      fileSize: 4_000_000,
+      referrer: "https://releases.example/project",
+      incognito: false,
+    }, suggest1);
+    expect(ret).toBe(true);
+    await vi.waitFor(() => expect(port.posted.at(-1)).toEqual({
+      type: "add_http_download",
+      request: {
+        url: "https://releases.example/download?id=99",
+        filename: "installer-v2.bin",
+        referrer: "https://releases.example/project",
+        headers: {
+          "User-Agent": "Fixture Browser/1.0",
+          "Accept-Language": "en-US,en;q=0.9",
+          Cookie: "auth=tok123",
+        },
+      },
+    }));
+    port.emitMessage({ type: "transfer_created", transfer_id: "tr-101" });
+    await vi.waitFor(() => {
+      expect(suggest1).toHaveBeenCalledOnce();
+      expect(cancel).toHaveBeenCalledWith(101);
+      expect(erase).toHaveBeenCalledWith({ id: 101 });
+    });
+
+    // 2. Incognito download without storeId never queries default cookies.
+    getAllCookies.mockClear();
+    const suggest2 = vi.fn();
+    onDeterminingFilename.addListener.mock.calls[0][0]({
+      id: 102,
+      url: "https://releases.example/download?id=100",
+      filename: "secret.zip",
+      mime: "application/zip",
+      fileSize: 1_000_000,
+      referrer: "https://releases.example/project",
+      incognito: true,
+    }, suggest2);
+    await vi.waitFor(() => expect(port.posted.at(-1)).toMatchObject({
+      type: "add_http_download",
+      request: { url: "https://releases.example/download?id=100", filename: "secret.zip" },
+    }));
+    const incognitoReq = port.posted.at(-1);
+    expect(incognitoReq?.type === "add_http_download" ? incognitoReq.request.headers : {}).not.toHaveProperty("Cookie");
+    expect(getAllCookies).not.toHaveBeenCalled();
+    port.emitMessage({ type: "transfer_created", transfer_id: "tr-102" });
+    await vi.waitFor(() => expect(suggest2).toHaveBeenCalledOnce());
+
+    // 3. Safety timeout calls suggest() once after 3500ms if desktop hangs, never hanging Chromium.
+    const suggest3 = vi.fn();
+    onDeterminingFilename.addListener.mock.calls[0][0]({
+      id: 103,
+      url: "https://releases.example/slow.zip",
+      filename: "slow.zip",
+      mime: "application/zip",
+      fileSize: 1_000_000,
+      referrer: "https://releases.example/project",
+      incognito: false,
+    }, suggest3);
+    await vi.waitFor(() => expect(port.posted.at(-1)).toMatchObject({
+      type: "add_http_download",
+      request: { url: "https://releases.example/slow.zip" },
+    }));
+    expect(suggest3).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(3500);
+    expect(suggest3).toHaveBeenCalledOnce();
+    port.emitMessage({ type: "error", code: "pipe_unavailable", message: "disconnected" });
+    await Promise.resolve();
+    expect(suggest3).toHaveBeenCalledOnce();
+  });
+
+  it("sniffs 206 Partial Content direct MP4 via Content-Range (>= 300KB) and downloads cross-origin video with cookies and Referer", async () => {
+    vi.resetModules();
+    vi.useFakeTimers();
+    vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Fixture Browser/1.0");
+    const onMessage = listener<(message: object, sender: chrome.runtime.MessageSender, reply: (value: unknown) => void) => true | undefined>();
+    const onResponse = listener<(details: object) => void>();
+    const port = makeFakePort();
+    const push = vi.fn(async (_id: number, _message: object, _options: object) => {});
+    const page = "https://vidtube.example/watch/123";
+    const cdnVideo = "https://cdn-video.xyz/streams/movie.mp4?token=abc";
+    const smallVideo = "https://cdn-video.xyz/streams/preview.mp4";
+    const tab = { id: 12, url: page, incognito: false } as chrome.tabs.Tab;
+    const getAllCookies = vi.fn(async ({ url }: { url: string }) =>
+      url.startsWith("https://cdn-video.xyz/") ? [{ name: "cdn_sid", value: "xyz789" }] : [],
+    );
+    (globalThis as Record<string, unknown>).chrome = {
+      runtime: {
+        id: "ext-test-id",
+        getURL: (file: string) => "chrome-extension://ext-test-id/" + file,
+        getManifest: () => ({ background: { service_worker: "background.js" } }),
+        onMessage,
+        onConnect: listener(),
+        onInstalled: listener(),
+        connectNative: vi.fn(() => port),
+      },
+      downloads: { onCreated: listener() },
+      cookies: { getAll: getAllCookies },
+      contextMenus: { onClicked: listener() },
+      alarms: { onAlarm: listener(), create: vi.fn() },
+      tabs: { get: vi.fn(async () => tab), query: vi.fn(async () => [tab]), onUpdated: listener(), onRemoved: listener(), sendMessage: push },
+      webRequest: { onSendHeaders: listener(), onHeadersReceived: onResponse },
+      storage: {
+        onChanged: listener(),
+        local: { get: vi.fn(async () => ({})), set: vi.fn(async () => {}) },
+        session: { get: vi.fn(async () => ({})), set: vi.fn(async () => {}) },
+      },
+    };
+    await import("../background");
+    port.emitMessage({
+      type: "status", theme: "dark", accent: "blue",
+      batch: { aggregate_down_bps: 0, aggregate_up_bps: 0, active_count: 0, active_threads: 0, speed_limit_bps: null, transfers: [], timestamp: "2026-11-26T00:00:00Z" },
+    });
+    await Promise.resolve();
+
+    const sender = { id: "ext-test-id", url: page, origin: new URL(page).origin, frameId: 0, tab };
+    const receive = onMessage.addListener.mock.calls[0][0];
+    const request = (msg: object, from: chrome.runtime.MessageSender = sender) => new Promise((resolve) => {
+      if (receive(msg, from, resolve) !== true) resolve(undefined);
+    });
+
+    const detect = onResponse.addListener.mock.calls[0][0];
+    // 206 Partial Content < 300KB is rejected
+    detect({
+      tabId: 12, frameId: 0, initiator: page, url: smallVideo, statusCode: 206, requestId: "small-206",
+      responseHeaders: [
+        { name: "Content-Type", value: "video/mp4" },
+        { name: "Content-Range", value: "bytes 0-65535/250000" },
+      ],
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(await request({ kind: "stream" })).toMatchObject({ url: undefined });
+
+    // 206 Partial Content >= 300KB is accepted and exposes direct Download Video choice
+    detect({
+      tabId: 12, frameId: 0, initiator: page, url: cdnVideo, statusCode: 206, requestId: "big-206",
+      responseHeaders: [
+        { name: "Content-Type", value: "video/mp4" },
+        { name: "Content-Range", value: "bytes 0-65535/1500000000" },
+      ],
+    });
+    await vi.waitFor(async () => expect(await request({ kind: "stream" })).toMatchObject({
+      url: cdnVideo,
+      formats: [{ id: `direct:${cdnVideo}`, label: "Download Video", sub: "MP4 · 1.4 GB" }],
+    }));
+
+    // Clicking direct: or 1080p on cross-origin <video src> sends add_http_download with Referer, Origin, UA, Accept-Language, and target Cookie
+    const downloadPromise = request({ kind: "media", action: `direct:${cdnVideo}`, url: cdnVideo, embedded: true });
+    await vi.waitFor(() => expect(port.posted.at(-1)).toEqual({
+      type: "add_http_download",
+      request: {
+        url: cdnVideo,
+        filename: "movie.mp4",
+        referrer: page,
+        headers: {
+          Referer: page,
+          Origin: "https://vidtube.example",
+          "User-Agent": "Fixture Browser/1.0",
+          "Accept-Language": "en-US,en;q=0.9",
+          Cookie: "cdn_sid=xyz789",
+        },
+      },
+    }));
+    port.emitMessage({ type: "transfer_created", transfer_id: "vid-1" });
+    expect(await downloadPromise).toEqual({ ok: true });
   });
 });

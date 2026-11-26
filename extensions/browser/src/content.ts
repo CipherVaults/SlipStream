@@ -257,8 +257,18 @@ function* coveredPlayers(): Generator<[HTMLIFrameElement, DOMRect]> {
   }
 }
 
+function videoSourceUrl(video: HTMLVideoElement): string {
+  for (const candidate of [video.currentSrc, video.src]) {
+    if (httpUrl(candidate)) return candidate;
+  }
+  for (const source of video.querySelectorAll<HTMLSourceElement>("source[src]")) {
+    if (httpUrl(source.src)) return source.src;
+  }
+  return video.currentSrc || video.src;
+}
+
 function sourceIdentity(player: Player): string {
-  return player instanceof HTMLVideoElement ? player.currentSrc || player.src : player.src;
+  return player instanceof HTMLVideoElement ? videoSourceUrl(player) : player.src;
 }
 
 function resolveTarget(player: Player): string {
@@ -314,10 +324,11 @@ function showPlayer(player: Player, bounds: DOMRect, fullscreen: Element | null)
         return { ok: true };
       }
       const url = pills.get(player)?.url ?? resolveTarget(player);
+      const embedded = player instanceof HTMLIFrameElement || Boolean(httpUrl(sourceIdentity(player)));
       return send<ActionResult>({
         kind: "media", action, url,
         links: action === "links" ? collectLinks() : undefined,
-        ...(player instanceof HTMLIFrameElement && { embedded: true }),
+        ...(embedded && { embedded: true }),
       });
     }, {
       onOpen() {
@@ -326,9 +337,10 @@ function showPlayer(player: Player, bounds: DOMRect, fullscreen: Element | null)
         if (!siteStorage || !current || !url) return;
         const requestId = ++nextRequestId;
         current.requestId = requestId;
+        const embedded = player instanceof HTMLIFrameElement || Boolean(httpUrl(sourceIdentity(player)));
         void send({
           kind: "pill-open", url, isPlaylist: isPlaylistPage(url), requestId,
-          ...(player instanceof HTMLIFrameElement && { embedded: true }),
+          ...(embedded && { embedded: true }),
         }).catch(() => {});
       },
       onDismiss() {

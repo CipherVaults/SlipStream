@@ -25,6 +25,15 @@ export function mediaLength(headers: Header[]): number | undefined {
   return Number.isSafeInteger(bytes) ? bytes : undefined;
 }
 
+export function parseContentRangeTotal(headers: Header[]): number | undefined {
+  const value = header(headers, "content-range")?.trim();
+  if (!value) return undefined;
+  const match = /^bytes\s+\d+-\d+\/(\d+)$/i.exec(value);
+  if (!match) return undefined;
+  const total = Number(match[1]);
+  return Number.isSafeInteger(total) && total > 0 ? total : undefined;
+}
+
 export function isHls(url: URL, mime: string): boolean {
   return /\.m3u8$/i.test(url.pathname) || hlsTypes.has(mime);
 }
@@ -33,15 +42,29 @@ export function isManifest(url: URL, mime: string): boolean {
   return isHls(url, mime) || /\.mpd$/i.test(url.pathname) || mime === "application/dash+xml";
 }
 
+export function streamKind(url: URL, mime: string): "hls" | "dash" | "direct" {
+  if (isHls(url, mime)) return "hls";
+  if (/\.mpd$/i.test(url.pathname) || mime === "application/dash+xml") return "dash";
+  return "direct";
+}
+
 export function isMediaStream(value: string, mime = "", contentLengthBytes?: number): boolean {
   const url = httpUrl(value);
   if (!url) return false;
   const type = mime.split(";")[0].trim().toLowerCase();
-  if (type === "video/mp2t" || /\.(ts|m4s)$/i.test(url.pathname)
+  if (type === "video/mp2t" || /\.(ts|m4s|m4f)$/i.test(url.pathname) || /\/seg-/i.test(url.pathname)
     || [...url.searchParams.keys()].some((param) => /^(range|bytestart|byteend)$/i.test(param))) return false;
   if (isManifest(url, type)) return true;
   if (contentLengthBytes !== undefined && contentLengthBytes < 300_000) return false;
-  return /\.(mp4|webm)$/i.test(url.pathname) || /^(video|audio)\/[\w.+-]+$/.test(type);
+  return /\.(mp4|webm|mkv|mov|m4v)$/i.test(url.pathname) || /^(video|audio)\/[\w.+-]+$/.test(type);
+}
+
+export function isDirectMediaUrl(value: string, mime = ""): boolean {
+  const url = httpUrl(value);
+  if (!url) return false;
+  const type = mime.split(";")[0].trim().toLowerCase();
+  if (isManifest(url, type)) return false;
+  return isMediaStream(value, mime);
 }
 
 export function parseHlsMaster(manifestText: string, baseUrl: string): HlsVariant[] {
@@ -196,16 +219,35 @@ const MAX_FORMAT_ID_LEN = 256;
 const BEST_AUDIO_SUFFIX = "+bestaudio";
 
 export function selectPillFormatId(probe: MediaProbeResult, expectedHeight: number): string | undefined {
-  const formats = probe.formats.filter(
-    (format) => format.has_video && format.height === expectedHeight && validFormatId(format.format_id),
+  const videoFormats = probe.formats.filter(
+    (format) => format.has_video && validFormatId(format.format_id),
   );
-  const muxed = formats.find((format) => format.has_audio);
+  if (!videoFormats.length) return undefined;
+
+  const exact = videoFormats.filter((format) => format.height === expectedHeight);
+  let candidates: typeof videoFormats;
+  if (exact.length) {
+    candidates = exact;
+  } else {
+    const withinCap = videoFormats
+      .filter((format) => format.height !== null && format.height <= expectedHeight)
+      .sort((a, b) => (b.height ?? 0) - (a.height ?? 0) || (b.fps ?? 0) - (a.fps ?? 0));
+    if (withinCap.length) {
+      const bestHeight = withinCap[0].height;
+      candidates = withinCap.filter((format) => format.height === bestHeight);
+    } else {
+      const withoutHeight = videoFormats.filter((format) => format.height === null);
+      candidates = withoutHeight.length ? withoutHeight : videoFormats;
+    }
+  }
+
+  const muxed = candidates.find((format) => format.has_audio);
   if (muxed) return muxed.format_id;
   if (probe.formats.some((format) => format.has_audio)) {
-    const combinable = formats.find((format) => (format.format_id + BEST_AUDIO_SUFFIX).length <= MAX_FORMAT_ID_LEN);
+    const combinable = candidates.find((format) => (format.format_id + BEST_AUDIO_SUFFIX).length <= MAX_FORMAT_ID_LEN);
     if (combinable) return combinable.format_id + BEST_AUDIO_SUFFIX;
   }
-  return formats[0]?.format_id;
+  return candidates[0]?.format_id;
 }
 
 export class StreamNavigationState {

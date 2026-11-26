@@ -233,7 +233,7 @@ export type NativeBridgeRequest =
   | { type: "ping" }
   | { type: "get_status" }
   | { type: "add_http_download"; request: AddHttpDownloadRequest }
-  | { type: "probe_media"; url: string; playlist?: boolean | null }
+  | { type: "probe_media"; url: string; playlist?: boolean | null; headers?: Record<string, string> }
   | { type: "add_media_download"; request: AddMediaDownloadRequest }
   | { type: "add_torrent"; request: AddTorrentRequest }
   | {

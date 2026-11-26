@@ -50,7 +50,7 @@ export function readState(value: unknown): BridgeState {
   return { ...readAppearance(saved), connected: !!batch && saved?.connected === true, batch };
 }
 export type MediaAction = "4k" | "1080p" | "mp3_320" | "flac" | "picker" | "playlist" | "mute" | "links"
-  | `format:${string}` | `hls:${string}`;
+  | `format:${string}` | `hls:${string}` | `direct:${string}`;
 export interface PillFormat {
   id: MediaAction;
   label: string;
