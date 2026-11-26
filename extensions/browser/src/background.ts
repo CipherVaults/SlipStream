@@ -330,10 +330,22 @@ function tabReferrer(url: URL, tab: chrome.tabs.Tab | undefined): URL | undefine
   return page && (page.origin === url.origin ? page : new URL(page.origin));
 }
 
-function handoffHttp(url: URL, context: ReturnType<typeof httpHandoffContext>, filename?: string): Promise<NativeBridgeResponse> {
+function handoffHttp(
+  url: URL,
+  context: ReturnType<typeof httpHandoffContext>,
+  filename?: string,
+  expectedSizeBytes?: number,
+): Promise<NativeBridgeResponse> {
   return native.send({
     type: "add_http_download",
-    request: { url: url.href, filename, ...context },
+    request: {
+      url: url.href,
+      filename,
+      ...context,
+      ...(typeof expectedSizeBytes === "number" && Number.isFinite(expectedSizeBytes) && expectedSizeBytes > 0
+        ? { expected_size_bytes: Math.floor(expectedSizeBytes) }
+        : {}),
+    },
   });
 }
 
@@ -372,8 +384,9 @@ async function tryInterceptDownload(
     if (cookie) context.headers.Cookie = cookie;
   }
   if (isExpired?.()) return false;
-  const response = await handoffHttp(target, context, safeFilename(current.filename));
-  return !isExpired?.() && response.type === "transfer_created";
+  const expectedSize = typeof current.fileSize === "number" && current.fileSize > 0 ? current.fileSize : undefined;
+  const response = await handoffHttp(target, context, safeFilename(current.filename), expectedSize);
+  return !isExpired?.() && (response.type === "transfer_created" || (response.type === "ack" && response.ok));
 }
 
 if (api.downloads.onDeterminingFilename) {
@@ -574,7 +587,7 @@ function directStreamChoice(url: string, mime = "", sizeBytes?: number): PillFor
   return { id: `direct:${url}`, label: "Download Video", sub };
 }
 
-async function handoffDirectVideo(frame: Frame, target: URL): Promise<ActionResult> {
+async function handoffDirectVideo(frame: Frame, target: URL, sizeBytes?: number): Promise<ActionResult> {
   if (blockedSite(target, settings)) {
     return { ok: false, message: "SlipStream is disabled for this site." };
   }
@@ -594,8 +607,9 @@ async function handoffDirectVideo(frame: Frame, target: URL): Promise<ActionResu
   } catch {
     filename = safeFilename(target.pathname);
   }
+  const expectedSize = typeof sizeBytes === "number" && sizeBytes > 0 ? sizeBytes : undefined;
   return result(
-    await handoffHttp(target, { headers, referrer }, filename),
+    await handoffHttp(target, { headers, referrer }, filename, expectedSize),
     ["transfer_created", "ack"],
   );
 }
@@ -712,7 +726,8 @@ async function mediaAction(action: MediaAction, source: string, links: unknown[]
       || (directUrl.href !== url && observed?.url !== directUrl.href && !isPublicHttpUrl(directUrl.href))) {
       return { ok: false, message: "That video stream is unavailable." };
     }
-    return handoffDirectVideo(frame, directUrl);
+    const sizeBytes = observed?.url === directUrl.href ? observed.sizeBytes : undefined;
+    return handoffDirectVideo(frame, directUrl, sizeBytes);
   }
 
   const audio = action === "mp3_320" || action === "flac" ? action : undefined;
@@ -737,7 +752,8 @@ async function mediaAction(action: MediaAction, source: string, links: unknown[]
         ? httpUrl(url)
         : undefined;
     if (directTarget && !blockedSite(directTarget, settings)) {
-      return handoffDirectVideo(frame, directTarget);
+      const sizeBytes = useObservedDirect ? observed!.sizeBytes : undefined;
+      return handoffDirectVideo(frame, directTarget, sizeBytes);
     }
     height = action === "4k" ? 2160 : 1080;
   }

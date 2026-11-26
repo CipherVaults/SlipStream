@@ -630,6 +630,9 @@ export default function App() {
           await desktop.revealInExplorer(transfer.id);
           if (preview) notify("Save folder: " + transfer.save_dir);
           return;
+        case "progress":
+          await desktop.openProgressDialog(transfer.id);
+          return;
         case "cancel": await desktop.cancelTransfer(transfer.id, false); break;
         case "remove":
           await desktop.cancelTransfer(transfer.id, false);

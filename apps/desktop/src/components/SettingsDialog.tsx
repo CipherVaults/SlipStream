@@ -1,4 +1,4 @@
-import { Download, Info, Plug, Save, Settings, Timer } from "lucide-react";
+import { AppWindow, Download, Info, Plug, Save, Settings, Timer } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { version } from "../../package.json";
 import { desktop } from "../lib/tauri";
@@ -271,6 +271,26 @@ export function SettingsDialog({
           <Switch label="Monitor clipboard" checked={draft.monitor_clipboard} onChange={value => update("monitor_clipboard", value)} />
           <button className="btn-ghost form-button" type="button" onClick={() => void run("hibernate", onHibernate)}><Timer size={14} />Hibernate Now</button>
         </div>
+        <section className="settings-group" aria-label="Floating Download Boxes">
+          <h3 className="settings-heading"><AppWindow size={14} />Floating Download Boxes</h3>
+          <div className="settings-switches">
+            <Switch
+              label="Show Download File Info box before starting"
+              checked={draft.show_download_dialog ?? true}
+              onChange={value => update("show_download_dialog", value)}
+            />
+            <Switch
+              label="Show floating Download Progress box"
+              checked={draft.show_progress_dialog ?? true}
+              onChange={value => update("show_progress_dialog", value)}
+            />
+            <Switch
+              label="Show Download Complete box when finished"
+              checked={draft.show_complete_dialog ?? true}
+              onChange={value => update("show_complete_dialog", value)}
+            />
+          </div>
+        </section>
         <section className="settings-group" aria-label="Toolchain">
           <div className="settings-section-header">
             <h3 className="settings-heading"><Download size={14} />Toolchain</h3>
