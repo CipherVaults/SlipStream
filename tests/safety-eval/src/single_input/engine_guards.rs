@@ -314,6 +314,9 @@ fn base_req(url: String) -> AddHttpDownloadRequest {
         headers: HashMap::new(),
         referrer: None,
         expected_sha256: None,
+        expected_size_bytes: None,
+        start_paused: false,
+        overwrite_existing: false,
     }
 }
 

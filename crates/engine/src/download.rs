@@ -1,6 +1,6 @@
 use crate::http::{
-    protocol, ContentCoding, FetchProfile, GetOutcome, Metadata, ProbeMode, RestartReason, Source,
-    Validators,
+    connect_rtt_ms, protocol, ContentCoding, FetchProfile, GetOutcome, Metadata, ProbeMode,
+    RestartReason, Source, Validators,
 };
 use crate::limiter::Limiter;
 use crate::output;
@@ -331,6 +331,7 @@ impl Run<'_> {
             };
             job.record = record;
             job.segments = segments;
+            job.connect_rtt_ms = job.connect_rtt_ms.or(meta.connect_rtt_ms);
             if destroys_progress {
                 db.checkpoint(false)?;
             }
@@ -618,6 +619,7 @@ impl Run<'_> {
     fn note_response(&self, response: &Response, conditional: bool) -> Result<()> {
         let mut state = self.engine.lock();
         let (db, job) = state.job_mut(self.id)?;
+        job.connect_rtt_ms = job.connect_rtt_ms.or_else(|| connect_rtt_ms(response));
         let mut record = job.record.clone();
         let known = &mut record.validators;
         if known.changed(response, conditional) {
@@ -970,10 +972,12 @@ impl Run<'_> {
             stop.check()?;
             let candidate = output::numbered_filename(&filename, number);
             let target = slipstream_protocol::safe_join_under(&record.save_dir, &candidate)?;
-            match tokio::fs::symlink_metadata(&target).await {
-                Ok(_) => continue,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+            if !record.overwrite_existing {
+                match tokio::fs::symlink_metadata(&target).await {
+                    Ok(_) => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
             }
             let record = {
                 let mut state = self.engine.lock();
@@ -989,7 +993,8 @@ impl Run<'_> {
             };
             match output::commit(&record).await {
                 Err(EngineError::Io(error))
-                    if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    if !record.overwrite_existing
+                        && error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 result => return result,
             }
         }

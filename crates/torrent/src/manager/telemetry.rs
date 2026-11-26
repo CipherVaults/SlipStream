@@ -173,6 +173,9 @@ impl Entry {
             playlist_paused: None,
             playlist_index: None,
             playlist_total: None,
+            speed_limit_bps: None,
+            connect_rtt_ms: None,
+            description: None,
             created_at: self.created_at,
             updated_at: state.updated_at,
         };

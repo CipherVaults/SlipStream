@@ -4,8 +4,9 @@ use slipstream_desktop_lib::{AppState, DaemonOptions, OpenPickerEvent, UiBridge}
 use slipstream_native_host::{pipe::PipeClient, token::SessionToken};
 use slipstream_protocol::{
     AccentMode, AddHttpDownloadRequest, AddMediaDownloadRequest, AddTorrentRequest, AppSettings,
-    NativeBridgeRequest as Request, NativeBridgeResponse as Response, RefreshDownloadUrlRequest,
-    SelectedPlaylistEntry, TelemetryBatch, ThemeMode, TransferKind, TransferSnapshot,
+    ConfirmPendingDownloadRequest, NativeBridgeRequest as Request,
+    NativeBridgeResponse as Response, RefreshDownloadUrlRequest, SelectedPlaylistEntry,
+    TelemetryBatch, ThemeMode, TransferCompletionOptions, TransferKind, TransferSnapshot,
     TransferStatus,
 };
 use slipstream_torrent::TorrentManagerConfig;
@@ -98,6 +99,91 @@ impl UiBridge for FakeUi {
     }
 }
 
+#[derive(Default)]
+struct DialogUi {
+    main: FakeUi,
+    calls: Mutex<Vec<(&'static str, String)>>,
+}
+
+impl DialogUi {
+    fn record(&self, action: &'static str, id: &str) {
+        self.calls.lock().unwrap().push((action, id.into()));
+    }
+
+    fn last_confirmation(&self) -> String {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(action, _)| *action == "confirm")
+            .unwrap()
+            .1
+            .clone()
+    }
+
+    async fn wait_for(&self, action: &str, id: &str) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if self
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(called, transfer)| *called == action && transfer == id)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("missing dialog event {action} for {id}"));
+    }
+}
+
+impl UiBridge for DialogUi {
+    fn show_main_window(&self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        self.main.show_main_window()
+    }
+    fn emit_telemetry(&self, batch: &TelemetryBatch) -> Result<(), String> {
+        self.main.emit_telemetry(batch)
+    }
+    fn emit_open_picker(&self, event: &OpenPickerEvent) -> Result<(), String> {
+        self.main.emit_open_picker(event)
+    }
+    fn has_main_window(&self) -> bool {
+        self.main.has_main_window()
+    }
+    fn has_telemetry_windows(&self) -> bool {
+        true
+    }
+    fn request_quit(&self) {
+        self.main.request_quit();
+    }
+    fn supports_dialogs(&self) -> bool {
+        true
+    }
+    fn open_confirm_dialog(&self, id: &str) -> Result<(), String> {
+        self.record("confirm", id);
+        Ok(())
+    }
+    fn close_confirm_dialog(&self, id: &str) {
+        self.record("close-confirm", id);
+    }
+    fn open_progress_dialog(&self, id: &str) -> Result<(), String> {
+        self.record("progress", id);
+        Ok(())
+    }
+    fn close_progress_dialog(&self, id: &str) {
+        self.record("close-progress", id);
+    }
+    fn open_complete_dialog(&self, id: &str) -> Result<(), String> {
+        self.record("complete", id);
+        Ok(())
+    }
+}
+
 struct HttpServer {
     base_url: String,
     task: JoinHandle<()>,
@@ -185,6 +271,9 @@ fn http_request(server: &HttpServer, path: &str, filename: &str) -> AddHttpDownl
         headers: Default::default(),
         referrer: None,
         expected_sha256: None,
+        expected_size_bytes: None,
+        start_paused: false,
+        overwrite_existing: false,
     }
 }
 
@@ -256,6 +345,256 @@ fn installed_settings(data: &Path, downloads: &Path) -> AppSettings {
     )
     .unwrap();
     settings
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_http_dialog_flow_stages_redacts_resumes_and_completes() {
+    let temp = TempDir::new();
+    let downloads = temp.0.join("downloads");
+    installed_settings(&temp.0, &downloads);
+    let registry_key = RegistryKey::isolated();
+    let pipe = format!(r"\\.\pipe\slipstream-dialog-test-{}", Uuid::new_v4());
+    let ui = Arc::new(DialogUi::default());
+    let state = AppState::start(temp.0.clone(), ui.clone(), options(&pipe, &registry_key.0))
+        .await
+        .unwrap();
+    let token = SessionToken::read(&temp.0.join("session.token")).unwrap();
+    let mut bridge = Bridge(Some(
+        PipeClient::connect(&pipe, &token, "dialogs").await.unwrap(),
+    ));
+    let server = HttpServer::start().await;
+    let mut request = http_request(&server, "download?signature=private#old", "report.PDF");
+    request
+        .headers
+        .insert("Cookie".into(), "session=pending-private".into());
+    request.expected_size_bytes = Some(4);
+    let mut invalid = request.clone();
+    invalid
+        .headers
+        .insert("X-Invalid".into(), "bad\r\nheader".into());
+    assert!(matches!(
+        bridge
+            .request(Request::AddHttpDownload { request: invalid })
+            .await,
+        Response::Error { .. }
+    ));
+    assert!(ui.calls.lock().unwrap().is_empty());
+    bridge
+        .ack(Request::AddHttpDownload {
+            request: request.clone(),
+        })
+        .await;
+    let pending_id = ui.last_confirmation();
+    let preview = state.get_pending_download(&pending_id).unwrap();
+    assert_eq!(preview.filename, "report.PDF");
+    assert_eq!(preview.source_domain, "127.0.0.1");
+    assert_eq!(preview.suggested_category_id, "documents");
+    assert_eq!(
+        Path::new(&preview.suggested_save_dir),
+        downloads.join("Documents")
+    );
+    assert_eq!(preview.expected_size_bytes, Some(4));
+    assert!(preview.duplicate.is_none());
+    let wire = serde_json::to_string(&preview).unwrap();
+    for secret in ["Cookie", "headers", "private", "signature"] {
+        assert!(!wire.contains(secret));
+    }
+    assert!(state.snapshot().await.transfers.is_empty());
+    let category = state
+        .add_download_category(
+            "  Reports  ".into(),
+            vec![" .PDF ".into(), "pdf".into()],
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(category.extensions, ["pdf"]);
+    let destination = downloads.join("Reports");
+    let id = state
+        .confirm_pending_download(ConfirmPendingDownloadRequest {
+            pending_id: pending_id.clone(),
+            filename: "finished.pdf".into(),
+            save_dir: destination.to_string_lossy().into_owned(),
+            category_id: category.id.clone(),
+            remember_category_path: true,
+            start_immediately: false,
+            overwrite_existing: false,
+            description: Some("Saved for later".into()),
+        })
+        .await
+        .unwrap();
+    assert!(state.get_pending_download(&pending_id).is_err());
+    ui.wait_for("close-confirm", &pending_id).await;
+    assert!(!ui
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(event, _)| *event == "progress"));
+    let persisted: AppSettings =
+        serde_json::from_slice(&fs::read(temp.0.join("settings.json")).unwrap()).unwrap();
+    let category = persisted
+        .categories
+        .iter()
+        .find(|item| item.id == category.id)
+        .unwrap();
+    assert_eq!(
+        Path::new(category.save_dir.as_deref().unwrap()),
+        destination
+    );
+    let paused = wait_for(&state, &id, TransferStatus::Paused).await;
+    assert_eq!(paused.description.as_deref(), Some("Saved for later"));
+    assert!(state.open_completed_file(&id).await.is_err());
+    assert_eq!(
+        state.get_transfer_completion_options(&id).await.unwrap(),
+        TransferCompletionOptions {
+            show_complete_dialog: true,
+            auto_close_progress: false,
+            open_folder_on_complete: false,
+        }
+    );
+    let completion = TransferCompletionOptions {
+        show_complete_dialog: true,
+        auto_close_progress: true,
+        open_folder_on_complete: false,
+    };
+    state
+        .set_transfer_completion_options(&id, completion.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        state.get_transfer_completion_options(&id).await.unwrap(),
+        completion
+    );
+    state
+        .set_transfer_speed_limit(&id, Some(128_000))
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_for(&state, &id, TransferStatus::Paused)
+            .await
+            .speed_limit_bps,
+        Some(128_000)
+    );
+
+    request.url = server.url("download?signature=private#new");
+    bridge
+        .ack(Request::AddHttpDownload {
+            request: request.clone(),
+        })
+        .await;
+    let duplicate_id = ui.last_confirmation();
+    let duplicate = state
+        .get_pending_download(&duplicate_id)
+        .unwrap()
+        .duplicate
+        .unwrap();
+    assert_eq!(duplicate.transfer_id, id);
+    assert_eq!(duplicate.status, TransferStatus::Paused);
+    assert_eq!(
+        state
+            .resolve_duplicate_existing(&duplicate_id)
+            .await
+            .unwrap(),
+        id
+    );
+    assert!(state.get_pending_download(&duplicate_id).is_err());
+    ui.wait_for("progress", &id).await;
+    let finished = wait_for(&state, &id, TransferStatus::Completed).await;
+    assert!(finished.connect_rtt_ms.is_some());
+    ui.wait_for("close-progress", &id).await;
+    ui.wait_for("complete", &id).await;
+    assert_eq!(fs::read(destination.join("finished.pdf")).unwrap(), b"test");
+    assert!(!ui.has_main_window());
+    timeout(Duration::from_secs(3), async {
+        while !ui.main.snapshots.lock().unwrap().iter().any(|batch| {
+            batch
+                .transfers
+                .iter()
+                .any(|item| item.id == id && item.status == TransferStatus::Completed)
+        }) {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    bridge
+        .ack(Request::AddHttpDownload {
+            request: request.clone(),
+        })
+        .await;
+    let completed_id = ui.last_confirmation();
+    assert_eq!(
+        state
+            .get_pending_download(&completed_id)
+            .unwrap()
+            .duplicate
+            .unwrap()
+            .status,
+        TransferStatus::Completed
+    );
+    assert_eq!(
+        state
+            .resolve_duplicate_existing(&completed_id)
+            .await
+            .unwrap(),
+        id
+    );
+    assert_eq!(
+        ui.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(action, transfer)| *action == "complete" && transfer == &id)
+            .count(),
+        2
+    );
+
+    bridge
+        .ack(Request::AddHttpDownload {
+            request: request.clone(),
+        })
+        .await;
+    let canceled = ui.last_confirmation();
+    state.cancel_pending_download(&canceled);
+    assert!(state.get_pending_download(&canceled).is_err());
+    ui.wait_for("close-confirm", &canceled).await;
+
+    bridge.ack(Request::AddHttpDownload { request }).await;
+    let open_at_shutdown = ui.last_confirmation();
+    state.shutdown().await.unwrap();
+    assert!(state.get_pending_download(&open_at_shutdown).is_err());
+    ui.wait_for("close-confirm", &open_at_shutdown).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn media_download_opens_progress_and_completion_dialogs() {
+    let temp = TempDir::new();
+    let downloads = temp.0.join("downloads");
+    let mut settings = installed_settings(&temp.0, &downloads);
+    let registry = RegistryKey::isolated();
+    let pipe = format!(r"\\.\pipe\slipstream-media-dialog-test-{}", Uuid::new_v4());
+    let ui = Arc::new(DialogUi::default());
+    let state = AppState::start(temp.0.clone(), ui.clone(), options(&pipe, &registry.0))
+        .await
+        .unwrap();
+    let executable = media_tool_fixture(&temp.0)
+        .await
+        .to_string_lossy()
+        .into_owned();
+    settings.ytdlp_path = Some(executable.clone());
+    settings.ffmpeg_path = Some(executable);
+    state.save_settings(settings).await.unwrap();
+    let server = HttpServer::start().await;
+    let id = state
+        .add_media_download(media_request(&server.url("video")))
+        .await
+        .unwrap();
+    ui.wait_for("progress", &id).await;
+    wait_for(&state, &id, TransferStatus::Completed).await;
+    ui.wait_for("complete", &id).await;
+    state.shutdown().await.unwrap();
 }
 
 async fn media_tool_fixture(directory: &Path) -> PathBuf {

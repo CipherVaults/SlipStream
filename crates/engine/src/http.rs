@@ -17,7 +17,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
 use tokio_util::io::StreamReader;
 use url::{Host, Url};
@@ -127,6 +127,14 @@ pub(crate) struct Metadata {
     pub filename: Option<String>,
     pub protocol: &'static str,
     pub response: Option<Response>,
+    pub connect_rtt_ms: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
+struct ConnectRtt(u32);
+
+pub(crate) fn connect_rtt_ms(response: &Response) -> Option<u32> {
+    response.extensions().get::<ConnectRtt>().map(|rtt| rtt.0)
 }
 
 #[derive(Clone)]
@@ -403,18 +411,23 @@ impl Http {
                 })?,
             );
         }
+        let mut first_rtt = None;
         for hop in 0..=10 {
             if profile.ipv4_only && matches!(url.host(), Some(Host::Ipv6(_))) {
                 return Err(EngineError::InvalidRequest(
                     FetchProfile::IPV4_REQUIRED.into(),
                 ));
             }
+            let started = Instant::now();
             let mut response = client
                 .request(method.clone(), url.clone())
                 .headers(headers.clone())
                 .send()
                 .await
                 .map_err(request_error)?;
+            let rtt = *first_rtt.get_or_insert_with(|| {
+                u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX)
+            });
             if !matches!(
                 response.status(),
                 StatusCode::MOVED_PERMANENTLY
@@ -423,6 +436,7 @@ impl Http {
                     | StatusCode::TEMPORARY_REDIRECT
                     | StatusCode::PERMANENT_REDIRECT
             ) {
+                response.extensions_mut().insert(ConnectRtt(rtt));
                 if response.status() == StatusCode::FORBIDDEN && headers.contains_key(COOKIE) {
                     response.extensions_mut().insert(SentCookie);
                 }
@@ -455,6 +469,7 @@ impl Http {
         mode: ProbeMode,
     ) -> Result<Metadata> {
         let mut head_name = None;
+        let mut initial_rtt = None;
         if mode == ProbeMode::HeadThenRange {
             let head = match self
                 .request(source, profile, Method::HEAD, None, None)
@@ -464,6 +479,7 @@ impl Http {
                 Err(error) if error.is_transient() && !profile.ipv4_unavailable(&error) => None,
                 Err(error) => return Err(error),
             };
+            initial_rtt = head.as_ref().and_then(connect_rtt_ms);
             if let Some(response) = head.filter(|response| {
                 response.status() == StatusCode::OK && ensure_identity(response).is_ok()
             }) {
@@ -488,6 +504,7 @@ impl Http {
                         filename: head_name,
                         protocol: protocol(&response),
                         response: None,
+                        connect_rtt_ms: initial_rtt,
                     });
                 }
             }
@@ -497,13 +514,14 @@ impl Http {
             let response = self
                 .request(source, profile, Method::GET, Some((0, 0)), None)
                 .await?;
+            initial_rtt = initial_rtt.or_else(|| connect_rtt_ms(&response));
             let total = match response.status() {
                 StatusCode::PARTIAL_CONTENT => {
                     ensure_identity(&response)?;
                     content_range(&response, 0, 0)?
                 }
                 StatusCode::OK if !response.headers().contains_key(CONTENT_RANGE) => {
-                    return full_metadata(response, head_name);
+                    return full_metadata(response, head_name, initial_rtt);
                 }
                 StatusCode::OK
                 | StatusCode::FORBIDDEN
@@ -526,13 +544,14 @@ impl Http {
                     filename: filename(&response)?.or(head_name),
                     protocol: protocol(&response),
                     response: None,
+                    connect_rtt_ms: initial_rtt,
                 });
             }
         }
         let response = self
             .request(source, profile, Method::GET, None, None)
             .await?;
-        full_metadata(response, head_name)
+        full_metadata(response, head_name, initial_rtt)
     }
 
     pub(crate) async fn get_or_restart(
@@ -795,13 +814,18 @@ fn full_length(response: &Response) -> Result<Option<u64>> {
     }
 }
 
-fn full_metadata(response: Response, head_name: Option<String>) -> Result<Metadata> {
+fn full_metadata(
+    response: Response,
+    head_name: Option<String>,
+    initial_rtt: Option<u32>,
+) -> Result<Metadata> {
     Ok(Metadata {
         total: full_length(&response)?,
         ranges: false,
         validators: Validators::from_response(&response),
         filename: filename(&response)?.or(head_name),
         protocol: protocol(&response),
+        connect_rtt_ms: initial_rtt.or_else(|| connect_rtt_ms(&response)),
         response: Some(response),
     })
 }

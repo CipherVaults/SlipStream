@@ -87,6 +87,12 @@ pub struct TransferSnapshot {
     pub playlist_index: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub playlist_total: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_limit_bps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_rtt_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -112,6 +118,54 @@ pub struct AddHttpDownloadRequest {
     pub headers: HashMap<String, String>,
     pub referrer: Option<String>,
     pub expected_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub start_paused: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub overwrite_existing: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DuplicateMatch {
+    pub transfer_id: String,
+    pub filename: String,
+    pub status: TransferStatus,
+    pub save_dir: String,
+    pub total_bytes: Option<u64>,
+    pub downloaded_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingDownloadPreview {
+    pub pending_id: String,
+    pub url: String,
+    pub source_domain: String,
+    pub filename: String,
+    pub suggested_category_id: String,
+    pub suggested_save_dir: String,
+    pub expected_size_bytes: Option<u64>,
+    pub duplicate: Option<DuplicateMatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmPendingDownloadRequest {
+    pub pending_id: String,
+    pub filename: String,
+    pub save_dir: String,
+    pub category_id: String,
+    pub remember_category_path: bool,
+    pub start_immediately: bool,
+    pub overwrite_existing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferCompletionOptions {
+    pub show_complete_dialog: bool,
+    pub auto_close_progress: bool,
+    pub open_folder_on_complete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -365,6 +419,71 @@ pub struct UpdateStatus {
     pub pub_date: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DownloadCategory {
+    pub id: String,
+    pub name: String,
+    pub extensions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_dir: Option<String>,
+}
+
+pub fn default_download_categories() -> Vec<DownloadCategory> {
+    let categories: [(&str, &str, &[&str]); 6] = [
+        ("general", "General", &[]),
+        (
+            "programs",
+            "Programs",
+            &[
+                "exe", "msi", "msix", "appx", "dmg", "pkg", "deb", "rpm", "apk", "bin", "bat",
+                "cmd",
+            ],
+        ),
+        (
+            "compressed",
+            "Compressed",
+            &[
+                "zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "zst", "cab", "iso", "img",
+            ],
+        ),
+        (
+            "video",
+            "Video",
+            &[
+                "mp4", "mkv", "webm", "avi", "mov", "m4v", "flv", "wmv", "ts",
+            ],
+        ),
+        (
+            "music",
+            "Music",
+            &["mp3", "flac", "wav", "m4a", "ogg", "opus", "aac", "wma"],
+        ),
+        (
+            "documents",
+            "Documents",
+            &[
+                "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "epub", "csv",
+            ],
+        ),
+    ];
+    categories
+        .into_iter()
+        .map(|(id, name, extensions)| DownloadCategory {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            extensions: extensions
+                .iter()
+                .map(|extension| (*extension).to_owned())
+                .collect(),
+            save_dir: None,
+        })
+        .collect()
+}
+
+fn default_show_dialog() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub theme: ThemeMode,
@@ -380,6 +499,14 @@ pub struct AppSettings {
     pub ffmpeg_path: Option<String>,
     #[serde(default)]
     pub update_mode: UpdateMode,
+    #[serde(default = "default_show_dialog")]
+    pub show_download_dialog: bool,
+    #[serde(default = "default_show_dialog")]
+    pub show_progress_dialog: bool,
+    #[serde(default = "default_show_dialog")]
+    pub show_complete_dialog: bool,
+    #[serde(default = "default_download_categories")]
+    pub categories: Vec<DownloadCategory>,
 }
 
 impl Default for AppSettings {
@@ -397,6 +524,10 @@ impl Default for AppSettings {
             ytdlp_path: None,
             ffmpeg_path: None,
             update_mode: UpdateMode::Auto,
+            show_download_dialog: default_show_dialog(),
+            show_progress_dialog: default_show_dialog(),
+            show_complete_dialog: default_show_dialog(),
+            categories: default_download_categories(),
         }
     }
 }
@@ -473,6 +604,38 @@ pub enum NativeBridgeResponse {
 mod media_wire_tests {
     use super::*;
     use serde_json::{json, to_value};
+
+    #[test]
+    fn legacy_http_requests_and_settings_supply_dialog_defaults() {
+        let wire = json!({
+            "url": "https://example.com/file", "filename": null, "save_dir": null,
+            "max_connections": null, "queue_id": null, "headers": {}, "referrer": null,
+            "expected_sha256": null
+        });
+        let request: AddHttpDownloadRequest = serde_json::from_value(wire.clone()).unwrap();
+        assert!(!request.start_paused && !request.overwrite_existing);
+        assert_eq!(request.expected_size_bytes, None);
+        assert_eq!(to_value(request).unwrap(), wire);
+
+        let defaults = to_value(AppSettings::default()).unwrap();
+        let mut legacy = defaults.clone();
+        for key in [
+            "show_download_dialog",
+            "show_progress_dialog",
+            "show_complete_dialog",
+            "categories",
+        ] {
+            legacy.as_object_mut().unwrap().remove(key);
+        }
+        let settings: AppSettings = serde_json::from_value(legacy).unwrap();
+        assert!(
+            settings.show_download_dialog
+                && settings.show_progress_dialog
+                && settings.show_complete_dialog
+        );
+        assert_eq!(settings.categories, default_download_categories());
+        assert_eq!(to_value(settings).unwrap(), defaults);
+    }
 
     #[test]
     fn media_download_playlist_fields_default_and_round_trip() {

@@ -375,6 +375,9 @@ async fn initial_stage(
                 headers: Default::default(),
                 referrer: None,
                 expected_sha256: Some(digest.into()),
+                expected_size_bytes: None,
+                start_paused: false,
+                overwrite_existing: false,
             })
             .await,
     )?;

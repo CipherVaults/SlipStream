@@ -1,7 +1,7 @@
 use slipstream_media::{args::validate_local_path, MediaError};
 use slipstream_protocol::{
     safe_join_under, sanitize_title_to_filename, validate_safe_filename_component,
-    PathSecurityError,
+    PathSecurityError, TransferStatus,
 };
 use std::{
     ffi::{OsStr, OsString},
@@ -341,6 +341,21 @@ fn existing_file(root: &Path, relative: &str) -> io::Result<PathBuf> {
         return Err(invalid("expected a regular transfer file"));
     }
     Ok(path)
+}
+
+pub(crate) fn with_completed_file<T>(
+    status: TransferStatus,
+    root: &Path,
+    relative: &str,
+    open: impl FnOnce(&Path) -> io::Result<T>,
+) -> io::Result<T> {
+    if status != TransferStatus::Completed {
+        return Err(invalid("only completed files can be opened"));
+    }
+    let path = existing_file(root, relative)?;
+    // Hold the checked file without write or delete sharing until the shell receives the path.
+    let _file = file_for_operation(&path, false)?;
+    open(&local_drive_path(&path)?)
 }
 
 fn file_for_operation(path: &Path, delete: bool) -> io::Result<File> {

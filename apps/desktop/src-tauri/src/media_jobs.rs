@@ -25,6 +25,14 @@ use uuid::Uuid;
 
 pub(crate) type ScanRequest = (PathBuf, Vec<String>);
 
+pub(crate) enum MediaJobEvent {
+    QueueChanged(Option<String>),
+    Finished {
+        transfer_id: String,
+        playlist_id: Option<String>,
+    },
+}
+
 pub(crate) struct PlaylistJobMeta {
     pub id: String,
     pub title: String,
@@ -38,7 +46,7 @@ pub(crate) struct MediaJobRunOptions {
     pub toolchain_cache: Arc<ToolchainCache>,
     pub download: DownloadOptions,
     pub scans: mpsc::Sender<ScanRequest>,
-    pub media_finished: mpsc::UnboundedSender<Option<String>>,
+    pub media_finished: mpsc::UnboundedSender<MediaJobEvent>,
 }
 
 pub(crate) struct MediaJob {
@@ -181,6 +189,9 @@ impl MediaJob {
             playlist_paused: None,
             playlist_index: playlist.as_ref().and_then(|meta| meta.index),
             playlist_total: playlist.and_then(|meta| meta.total),
+            speed_limit_bps: None,
+            connect_rtt_ms: None,
+            description: None,
             created_at: now,
             updated_at: now,
         };
@@ -382,7 +393,10 @@ impl MediaJob {
                 snapshot.error_message = Some(error.to_string());
             }
         }
-        let _ = media_finished.send(snapshot.playlist_id.clone());
+        let _ = media_finished.send(MediaJobEvent::Finished {
+            transfer_id: snapshot.id.clone(),
+            playlist_id: snapshot.playlist_id.clone(),
+        });
     }
 
     async fn stage_download(

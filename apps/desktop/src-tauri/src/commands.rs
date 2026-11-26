@@ -1,8 +1,9 @@
 use crate::{shell::DesktopUi, tools, AppState, ToolchainStatus};
 use slipstream_protocol::{
     AddHttpDownloadRequest, AddMediaDownloadRequest, AddTorrentRequest, AppSettings, BrowserKind,
-    BrowserSetupResult, BrowserStatus, MediaProbeResult, RefreshDownloadUrlRequest, TelemetryBatch,
-    TorrentFileEntry, UpdateProgress, UpdateProgressStage, UpdateStatus,
+    BrowserSetupResult, BrowserStatus, ConfirmPendingDownloadRequest, DownloadCategory,
+    MediaProbeResult, PendingDownloadPreview, RefreshDownloadUrlRequest, TelemetryBatch,
+    TorrentFileEntry, TransferCompletionOptions, UpdateProgress, UpdateProgressStage, UpdateStatus,
 };
 use std::{
     fmt::Display,
@@ -34,6 +35,99 @@ pub(crate) async fn add_http_download(
     request: AddHttpDownloadRequest,
 ) -> Result<String> {
     state.add_http_download(request).await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub(crate) fn get_pending_download(
+    state: Daemon<'_>,
+    pending_id: String,
+) -> Result<PendingDownloadPreview> {
+    state.get_pending_download(&pending_id)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub(crate) async fn confirm_pending_download(
+    state: Daemon<'_>,
+    request: ConfirmPendingDownloadRequest,
+) -> Result<String> {
+    state.confirm_pending_download(request).await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub(crate) fn cancel_pending_download(state: Daemon<'_>, pending_id: String) {
+    state.cancel_pending_download(&pending_id);
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub(crate) async fn resolve_duplicate_existing(
+    state: Daemon<'_>,
+    pending_id: String,
+) -> Result<String> {
+    state.resolve_duplicate_existing(&pending_id).await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub(crate) async fn add_download_category(
+    state: Daemon<'_>,
+    name: String,
+    extensions: Vec<String>,
+    save_dir: Option<String>,
+) -> Result<DownloadCategory> {
+    state
+        .add_download_category(name, extensions, save_dir)
+        .await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub(crate) async fn set_transfer_speed_limit(
+    state: Daemon<'_>,
+    transfer_id: String,
+    limit_bps: Option<u64>,
+) -> Result<()> {
+    state
+        .set_transfer_speed_limit(&transfer_id, limit_bps)
+        .await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub(crate) async fn get_transfer_completion_options(
+    state: Daemon<'_>,
+    transfer_id: String,
+) -> Result<TransferCompletionOptions> {
+    state.get_transfer_completion_options(&transfer_id).await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub(crate) async fn set_transfer_completion_options(
+    state: Daemon<'_>,
+    transfer_id: String,
+    options: TransferCompletionOptions,
+) -> Result<()> {
+    state
+        .set_transfer_completion_options(&transfer_id, options)
+        .await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub(crate) async fn open_progress_dialog(state: Daemon<'_>, transfer_id: String) -> Result<()> {
+    state.open_progress_dialog(&transfer_id).await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub(crate) async fn open_completed_file(state: Daemon<'_>, transfer_id: String) -> Result<()> {
+    state.open_completed_file(&transfer_id).await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub(crate) async fn pick_download_folder(
+    window: WebviewWindow,
+    initial_dir: Option<String>,
+) -> Result<Option<String>> {
+    let owner = window.hwnd().map_err(|error| error.to_string())?.0 as isize;
+    tokio::task::spawn_blocking(move || crate::shell::pick_download_folder(owner, initial_dir))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command(rename_all = "snake_case")]

@@ -309,6 +309,9 @@ fn request(url: String, filename: Option<&str>, connections: u8) -> AddHttpDownl
         headers: HashMap::new(),
         referrer: None,
         expected_sha256: None,
+        expected_size_bytes: None,
+        start_paused: false,
+        overwrite_existing: false,
     }
 }
 
@@ -733,6 +736,157 @@ fn numbered_output_names_handle_extensionless_and_long_unicode_names() {
     let deduplicated = output::numbered_filename(&filename, 1);
     assert!(deduplicated.ends_with(" (1).bin"));
     assert!(slipstream_protocol::validate_safe_filename_component(&deduplicated).is_ok());
+}
+
+#[tokio::test]
+async fn paused_additions_persist_without_connecting_until_resumed() {
+    let data = payload(KIB, 1);
+    let contents = data.clone();
+    let server = Server::new(move |req| Reply::resource(req, &contents, "\"paused\"")).await;
+    let dir = TestDir::new().await;
+    let config = dir.config();
+    let engine = DownloadEngine::new(config.clone()).await.unwrap();
+    let mut ids = Vec::new();
+    for request_paused in [true, false] {
+        let mut download = request(server.url("/paused.bin"), None, 1);
+        download.start_paused = request_paused;
+        download.expected_size_bytes = Some(data.len() as u64);
+        let id = engine
+            .add_http_download_with_options(
+                download,
+                ExtendedHttpOptions {
+                    start_paused: !request_paused,
+                    description: Some("Save for later".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(engine.snapshot(&id).unwrap().status, TransferStatus::Paused);
+        ids.push(id);
+    }
+    sleep(Duration::from_millis(100)).await;
+    assert!(server.requests().is_empty());
+    engine.shutdown().await.unwrap();
+    let engine = DownloadEngine::new(config).await.unwrap();
+    for id in &ids {
+        let snapshot = engine.snapshot(id).unwrap();
+        assert_eq!(snapshot.status, TransferStatus::Paused);
+        assert_eq!(snapshot.total_bytes, Some(data.len() as u64));
+        assert_eq!(snapshot.description.as_deref(), Some("Save for later"));
+        assert_eq!(snapshot.connect_rtt_ms, None);
+    }
+    engine.resume_transfer(&ids[0]).await.unwrap();
+    let snapshot = completed(&engine, &ids[0]).await;
+    assert!(snapshot.connect_rtt_ms.is_some());
+    assert_eq!(
+        engine.snapshot(&ids[1]).unwrap().status,
+        TransferStatus::Paused
+    );
+    dir.assert_output("paused.bin", &data).await;
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn duplicate_matching_uses_url_or_canonical_path_and_ignores_canceled() {
+    let data = payload(KIB, 1);
+    let server = Server::new(move |req| Reply::resource(req, &data, "\"duplicate\"")).await;
+    let dir = TestDir::new().await;
+    let config = dir.config();
+    let engine = DownloadEngine::new(config.clone()).await.unwrap();
+    let mut download = request(server.url("/download?token=test#old"), Some("File.bin"), 1);
+    download.start_paused = true;
+    let id = engine.add_http_download(download.clone()).await.unwrap();
+    let root = &config.default_download_dir;
+    let same_url = server.url("/download?token=test#new");
+    assert_eq!(
+        engine
+            .find_duplicate(&same_url, root, "other.bin")
+            .unwrap()
+            .transfer_id,
+        id
+    );
+    let filename = if cfg!(windows) {
+        "file.BIN"
+    } else {
+        "File.bin"
+    };
+    assert_eq!(
+        engine
+            .find_duplicate(&server.url("/another"), &root.join("."), filename)
+            .unwrap()
+            .transfer_id,
+        id
+    );
+    assert!(engine
+        .find_duplicate(&server.url("/download?token=another"), root, "other.bin")
+        .is_none());
+    engine.cancel_transfer(&id).await.unwrap();
+    assert!(engine.find_duplicate(&same_url, root, "File.bin").is_none());
+    download.start_paused = false;
+    let id = engine.add_http_download(download).await.unwrap();
+    let finished = completed(&engine, &id).await;
+    assert_eq!(finished.source_url, server.url("/download"));
+    engine.shutdown().await.unwrap();
+    let engine = DownloadEngine::new(config.clone()).await.unwrap();
+    let duplicate = engine.find_duplicate(&same_url, root, "other.bin").unwrap();
+    assert_eq!(duplicate.transfer_id, id);
+    assert_eq!(duplicate.status, TransferStatus::Completed);
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn overwrite_atomically_replaces_files_and_rejects_unsafe_targets() {
+    let data = payload(KIB, 1);
+    let contents = data.clone();
+    let server = Server::new(move |req| Reply::resource(req, &contents, "\"overwrite\"")).await;
+    let dir = TestDir::new().await;
+    let config = dir.config();
+    let root = &config.default_download_dir;
+    std::fs::create_dir(root).unwrap();
+    std::fs::write(root.join("existing.bin"), b"old contents").unwrap();
+    std::fs::create_dir(root.join("directory.bin")).unwrap();
+    let outside = dir.path.join("protected.bin");
+    std::fs::write(&outside, b"protected contents").unwrap();
+    let link = root.join("link.bin");
+    #[cfg(unix)]
+    let symlink = std::os::unix::fs::symlink(&outside, &link);
+    #[cfg(windows)]
+    let symlink = std::os::windows::fs::symlink_file(&outside, &link);
+    let mut unsafe_targets = vec!["directory.bin"];
+    match symlink {
+        Ok(()) => unsafe_targets.push("link.bin"),
+        Err(error) if cfg!(windows) && error.raw_os_error() == Some(1314) => {}
+        Err(error) => panic!("could not create a test symlink: {error}"),
+    }
+    let engine = DownloadEngine::new(config.clone()).await.unwrap();
+    let id = engine
+        .add_http_download_with_options(
+            request(server.url("/replace"), Some("existing.bin"), 1),
+            ExtendedHttpOptions {
+                overwrite_existing: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed(&engine, &id).await.filename, "existing.bin");
+    dir.assert_output("existing.bin", &data).await;
+    assert!(!root.join("existing (1).bin").exists());
+
+    for filename in unsafe_targets {
+        let mut download = request(server.url("/replace"), Some(filename), 1);
+        download.overwrite_existing = true;
+        let id = engine.add_http_download(download).await.unwrap();
+        assert!(failed(&engine, &id)
+            .await
+            .error_message
+            .unwrap()
+            .contains("regular download file"));
+    }
+    assert!(root.join("directory.bin").is_dir());
+    assert_eq!(std::fs::read(&outside).unwrap(), b"protected contents");
+    engine.shutdown().await.unwrap();
 }
 
 #[tokio::test]
