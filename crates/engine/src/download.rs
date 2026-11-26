@@ -1,5 +1,6 @@
 use crate::http::{
-    protocol, request_error, GetOutcome, Metadata, RestartReason, Source, Validators,
+    protocol, ContentCoding, FetchProfile, GetOutcome, Metadata, ProbeMode, RestartReason, Source,
+    Validators,
 };
 use crate::limiter::Limiter;
 use crate::output;
@@ -7,15 +8,17 @@ use crate::storage::{Record, Segment, Segments};
 use crate::{EngineError, EngineEvent, Inner, Result, SegmentState, TransferStatus};
 use chrono::Utc;
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use reqwest::Response;
+use reqwest::{Response, StatusCode};
 use std::future::Future;
 use std::io::{self, SeekFrom};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
+use tokio::time::Instant;
 
 const SPLIT_THRESHOLD: u64 = 512 * 1024;
 const WRITE_SIZE: usize = 16 * 1024;
@@ -28,6 +31,16 @@ struct Run<'a> {
     id: &'a str,
     source: Source,
     limiter: Arc<Limiter>,
+    profile: Mutex<FetchProfile>,
+    concurrency: Mutex<ConcurrencyState>,
+    concurrency_changed: watch::Sender<()>,
+    has_written: AtomicBool,
+}
+
+struct ConcurrencyState {
+    effective_max_workers: usize,
+    active_workers: usize,
+    retry_at: Option<Instant>,
 }
 
 struct Plan {
@@ -36,6 +49,13 @@ struct Plan {
     ranges: bool,
     conditional: bool,
     indices: Vec<u8>,
+    response: Option<Response>,
+}
+
+enum SegmentOutcome {
+    Complete,
+    Retired,
+    Rebalance,
 }
 
 #[derive(Clone)]
@@ -61,9 +81,9 @@ impl Stop {
         }
     }
 
-    async fn backoff(&mut self, retry: u32) -> Result<()> {
+    async fn wait(&mut self, delay: Duration) -> Result<()> {
         self.during(async {
-            tokio::time::sleep(Duration::from_millis(100 * 2_u64.pow(retry))).await;
+            tokio::time::sleep(delay).await;
             Ok(())
         })
         .await
@@ -98,17 +118,29 @@ impl Inner {
             id,
             source,
             limiter,
+            profile: Mutex::new(FetchProfile::default()),
+            concurrency: Mutex::new(ConcurrencyState {
+                effective_max_workers: usize::from(record.max_connections),
+                active_workers: 0,
+                retry_at: None,
+            }),
+            concurrency_changed: watch::channel(()).0,
+            has_written: AtomicBool::new(false),
         };
         let mut plan = match run.resume_plan(&record, &segments).await? {
             Some(plan) => plan,
-            None => run.fresh_plan(&mut stop, false, true).await?,
+            None => run.fresh_plan(&mut stop, ProbeMode::HeadThenRange).await?,
         };
         for restarts in 0..=RESTARTS {
-            match run.execute_plan(&plan, &mut stop).await {
+            match run.execute_plan(&mut plan, &mut stop).await {
                 Ok(None) => return run.finalize(&stop).await,
                 Ok(Some(reason)) if restarts < RESTARTS => {
-                    let allow_ranges = reason != RestartReason::RangeUnsupported;
-                    plan = run.fresh_plan(&mut stop, true, allow_ranges).await?;
+                    let mode = if reason == RestartReason::RangeUnsupported || !plan.ranges {
+                        ProbeMode::Full
+                    } else {
+                        ProbeMode::Range
+                    };
+                    plan = run.fresh_plan(&mut stop, mode).await?;
                 }
                 Ok(Some(_)) => return Err(EngineError::RestartRequired),
                 Err(error) => {
@@ -152,17 +184,71 @@ impl Run<'_> {
                 .filter(|segment| segment.end != Some(segment.cursor))
                 .map(|segment| segment.index)
                 .collect(),
+            response: None,
         }))
     }
 
-    async fn probe(&self, stop: &mut Stop, force_get: bool) -> Result<Metadata> {
+    async fn fetch<T, F: Future<Output = Result<T>>>(
+        &self,
+        probing: bool,
+        mut request: impl FnMut(FetchProfile) -> F,
+    ) -> Result<T> {
+        let initial = *self.profile.lock().unwrap();
+        let mut profile = initial;
+        loop {
+            let result = request(profile).await;
+            if result.is_ok() && profile != initial {
+                let mut winning = self.profile.lock().unwrap();
+                if *winning == initial {
+                    *winning = profile;
+                }
+            }
+            let Err(EngineError::Status {
+                status: StatusCode::FORBIDDEN,
+                sent_cookie,
+                ..
+            }) = &result
+            else {
+                return result;
+            };
+            // A parallel rejection first reduces concurrency. Only a single worker
+            // opening the representation can change its request profile.
+            if !probing && (self.has_written.load(Ordering::Relaxed) || self.active_workers() > 1) {
+                return result;
+            }
+            let Some(next) = profile.fallback(&self.source, *sent_cookie) else {
+                return result;
+            };
+            profile = next;
+        }
+    }
+
+    fn active_workers(&self) -> usize {
+        self.concurrency.lock().unwrap().active_workers
+    }
+
+    async fn wait_for_server(&self, stop: &mut Stop) -> Result<()> {
+        loop {
+            let deadline = self.concurrency.lock().unwrap().retry_at;
+            let Some(delay) = deadline.and_then(|time| time.checked_duration_since(Instant::now()))
+            else {
+                return Ok(());
+            };
+            stop.wait(delay).await?;
+        }
+    }
+
+    async fn probe(&self, stop: &mut Stop, mode: ProbeMode) -> Result<Metadata> {
+        self.wait_for_server(stop).await?;
         for retry in 0..=RETRIES {
             let response = stop
-                .during(self.engine.http.probe(&self.source, force_get))
+                .during(self.fetch(true, |profile| {
+                    self.engine.http.probe(&self.source, profile, mode)
+                }))
                 .await;
             match response {
                 Err(error) if error.is_transient() && retry < RETRIES => {
-                    stop.backoff(retry).await?
+                    stop.wait(retry_delay(retry, true, &error)).await?
                 }
                 response => return response,
             }
@@ -170,14 +256,10 @@ impl Run<'_> {
         unreachable!("probe loop returns after its final attempt")
     }
 
-    async fn fresh_plan(
-        &self,
-        stop: &mut Stop,
-        force_get: bool,
-        allow_ranges: bool,
-    ) -> Result<Plan> {
-        let meta = self.probe(stop, force_get).await?;
+    async fn fresh_plan(&self, stop: &mut Stop, mode: ProbeMode) -> Result<Plan> {
+        let meta = self.probe(stop, mode).await?;
         stop.check()?;
+        self.has_written.store(false, Ordering::Relaxed);
         let plan = {
             let mut state = self.engine.lock();
             let (db, job) = state.job_mut(self.id)?;
@@ -189,7 +271,7 @@ impl Run<'_> {
             let reprobe = record.status != TransferStatus::Probing;
             record.set_status(TransferStatus::Probing);
             record.total = meta.total;
-            record.ranges = allow_ranges && meta.ranges && meta.total.is_some();
+            record.ranges = meta.ranges && meta.total.is_some();
             record.validators = meta.validators;
             record.protocol = meta.protocol.into();
             record.sha256_verified = None;
@@ -213,6 +295,7 @@ impl Run<'_> {
                 ranges: record.ranges,
                 conditional: false,
                 indices,
+                response: meta.response,
             };
             job.record = record;
             job.segments = segments;
@@ -230,9 +313,20 @@ impl Run<'_> {
         Ok(plan)
     }
 
-    async fn execute_plan(&self, plan: &Plan, stop: &mut Stop) -> Result<Option<RestartReason>> {
+    async fn execute_plan(
+        &self,
+        plan: &mut Plan,
+        stop: &mut Stop,
+    ) -> Result<Option<RestartReason>> {
         stop.check()?;
-        self.activate(plan)?;
+        let worker_count = {
+            let mut concurrency = self.concurrency.lock().unwrap();
+            let worker_count = plan.indices.len().min(concurrency.effective_max_workers);
+            concurrency.active_workers = worker_count;
+            worker_count
+        };
+        let indices = &plan.indices[..worker_count];
+        self.activate(indices)?;
         if plan.indices.is_empty() {
             if plan.conditional && plan.total.is_some_and(|total| total > 0) {
                 // A paused transfer can already have all its bytes on disk.
@@ -240,17 +334,20 @@ impl Run<'_> {
                 let validators = self.validators()?;
                 for retry in 0..=RETRIES {
                     match stop
-                        .during(self.engine.http.get_or_restart(
-                            &self.source,
-                            Some((0, 0)),
-                            plan.total,
-                            &validators,
-                            true,
-                        ))
+                        .during(self.fetch(false, |profile| {
+                            self.engine.http.get_or_restart(
+                                &self.source,
+                                profile,
+                                Some((0, 0)),
+                                plan.total,
+                                &validators,
+                                true,
+                            )
+                        }))
                         .await
                     {
                         Err(error) if error.is_transient() && retry < RETRIES => {
-                            stop.backoff(retry).await?;
+                            stop.wait(retry_delay(retry, true, &error)).await?;
                         }
                         Ok(GetOutcome::Response(_)) => break,
                         Ok(GetOutcome::Restart(reason)) => return Ok(Some(reason)),
@@ -260,10 +357,16 @@ impl Run<'_> {
             }
             return Ok(None);
         }
-        let restart = std::sync::Mutex::new(None);
+        let mut response = plan.response.take();
+        let restart = Mutex::new(None);
         let (group_stop, group) = watch::channel(false);
         let mut workers = FuturesUnordered::new();
-        for &index in &plan.indices {
+        for (worker_index, &index) in indices.iter().enumerate() {
+            let stagger = if self.engine.config.allow_loopback {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(25 * worker_index as u64)
+            };
             workers.push(self.worker(
                 plan,
                 index,
@@ -272,10 +375,13 @@ impl Run<'_> {
                     transfer: stop.transfer.clone(),
                     group: group.clone(),
                 },
+                response.take(),
+                stagger,
             ));
         }
         let mut failure = None;
         while let Some(result) = workers.next().await {
+            self.concurrency.lock().unwrap().active_workers -= 1;
             if let Err(error) = result {
                 if failure.is_none()
                     || (matches!(failure, Some(EngineError::Interrupted))
@@ -293,18 +399,21 @@ impl Run<'_> {
         failure.map_or(Ok(None), Err)
     }
 
-    fn activate(&self, plan: &Plan) -> Result<()> {
+    fn activate(&self, indices: &[u8]) -> Result<()> {
         let mut state = self.engine.lock();
         let (db, job) = state.job_mut(self.id)?;
         let mut record = job.record.clone();
         let mut segments = job.segments.clone();
         record.set_status(TransferStatus::Active);
         for segment in segments.values_mut() {
-            if segment.end == Some(segment.cursor) {
-                segment.state = SegmentState::Completed;
-            }
+            segment.state = if segment.end == Some(segment.cursor) {
+                SegmentState::Completed
+            } else {
+                SegmentState::Pending
+            };
+            segment.speed = 0;
         }
-        for index in &plan.indices {
+        for index in indices {
             let segment = segments.get_mut(index).unwrap();
             segment.state = SegmentState::Active;
         }
@@ -319,16 +428,27 @@ impl Run<'_> {
         &self,
         plan: &Plan,
         mut index: u8,
-        restart: &std::sync::Mutex<Option<RestartReason>>,
+        restart: &Mutex<Option<RestartReason>>,
         mut stop: Stop,
+        mut response: Option<Response>,
+        stagger: Duration,
     ) -> Result<()> {
+        if !stagger.is_zero() {
+            stop.wait(stagger).await?;
+        }
         let mut file = OpenOptions::new().write(true).open(&plan.part).await?;
         loop {
             stop.check()?;
-            self.download_segment(plan, index, &mut file, restart, &mut stop)
+            let outcome = self
+                .download_segment(plan, index, &mut file, restart, &mut stop, response.take())
                 .await?;
             stop.check()?;
-            let Some(next_index) = self.finish_segment(index, plan.ranges)? else {
+            let next_index = match outcome {
+                SegmentOutcome::Complete => self.finish_segment(index, plan.ranges)?,
+                SegmentOutcome::Rebalance => self.reassign_segment(index)?,
+                SegmentOutcome::Retired => None,
+            };
+            let Some(next_index) = next_index else {
                 return Ok(());
             };
             index = next_index;
@@ -340,38 +460,56 @@ impl Run<'_> {
         plan: &Plan,
         index: u8,
         file: &mut File,
-        restart: &std::sync::Mutex<Option<RestartReason>>,
+        restart: &Mutex<Option<RestartReason>>,
         stop: &mut Stop,
-    ) -> Result<()> {
+        mut probe_response: Option<Response>,
+    ) -> Result<SegmentOutcome> {
         for retry in 0..=RETRIES {
             stop.check()?;
-            let (range, validators, conditional) = {
+            let (range, total, validators, conditional, untouched) = {
                 let state = self.engine.lock();
                 let job = state.job(self.id)?;
                 let segment = &job.segments[&index];
                 if plan.ranges && segment.end == Some(segment.cursor) {
-                    return Ok(());
+                    return Ok(SegmentOutcome::Complete);
                 }
                 let range = plan
                     .ranges
                     .then(|| (segment.cursor, segment.end.unwrap() - 1));
                 (
                     range,
+                    job.record.total,
                     job.record.validators.clone(),
-                    plan.conditional || (retry != 0 && segment.cursor > segment.start),
+                    plan.conditional || segment.cursor > segment.start,
+                    segment.cursor == segment.start,
                 )
             };
             let result = async {
-                let response = match stop
-                    .during(self.engine.http.get_or_restart(
-                        &self.source,
-                        range,
-                        plan.total,
-                        &validators,
-                        conditional,
-                    ))
-                    .await?
+                let outcome = if let Some(response) = probe_response
+                    .take()
+                    .filter(|_| index == 0 && range.is_none() && untouched)
                 {
+                    GetOutcome::Response(response)
+                } else {
+                    self.wait_for_server(stop).await?;
+                    let mut concurrency_changed = self.concurrency_changed.subscribe();
+                    let outcome = stop.during(async {
+                        tokio::select! {
+                            biased;
+                            result = self.fetch(false, |profile| {
+                                self.engine.http.get_or_restart(
+                                    &self.source, profile, range, total, &validators, conditional,
+                                )
+                            }) => result.map(Some),
+                            _ = concurrency_changed.changed() => Ok(None),
+                        }
+                    }).await?;
+                    let Some(outcome) = outcome else {
+                        return Ok(SegmentOutcome::Rebalance);
+                    };
+                    outcome
+                };
+                let response = match outcome {
                     GetOutcome::Response(response) => response,
                     GetOutcome::Restart(reason) => {
                         record_restart(restart, reason);
@@ -384,21 +522,50 @@ impl Run<'_> {
                     }
                     return Err(error);
                 }
+                let coding = if plan.ranges {
+                    ContentCoding::Identity
+                } else {
+                    ContentCoding::from_response(&response)?
+                };
+                if coding != ContentCoding::Identity && total.is_some() {
+                    self.clear_stream_length(index, file).await?;
+                }
                 file.seek(SeekFrom::Start(range.map_or(0, |(start, _)| start)))
                     .await?;
-                self.write_response(response, index, plan.ranges, file, stop)
-                    .await
+                self.write_response(coding.reader(response), index, plan.ranges, file, stop)
+                    .await?;
+                Ok(SegmentOutcome::Complete)
             }
             .await;
-            match result {
-                Err(error) if error.is_transient() && retry < RETRIES => {
-                    if !plan.ranges {
-                        self.reset_stream(index, file, plan.total).await?;
-                    }
-                    stop.backoff(retry).await?;
-                }
-                result => return result,
+            let Err(error) = result else {
+                return result;
+            };
+            if self.retire_on_congestion(index, &error)? {
+                return Ok(SegmentOutcome::Retired);
             }
+            let single_worker = self.active_workers() == 1;
+            if single_worker
+                && plan.ranges
+                && untouched
+                && matches!(
+                    error,
+                    EngineError::Status {
+                        status: StatusCode::FORBIDDEN | StatusCode::SERVICE_UNAVAILABLE,
+                        ..
+                    }
+                )
+            {
+                stop.wait(retry_delay(retry, true, &error)).await?;
+                record_restart(restart, RestartReason::RangeUnsupported);
+                return Err(EngineError::RestartRequired);
+            }
+            if !error.is_transient() || retry == RETRIES {
+                return Err(error);
+            }
+            if !plan.ranges {
+                self.reset_stream(index, file).await?;
+            }
+            stop.wait(retry_delay(retry, single_worker, &error)).await?;
         }
         unreachable!("segment loop returns after its final attempt")
     }
@@ -448,8 +615,70 @@ impl Run<'_> {
         Ok(())
     }
 
-    async fn reset_stream(&self, index: u8, file: &File, total: Option<u64>) -> Result<()> {
-        {
+    fn retire_on_congestion(&self, index: u8, error: &EngineError) -> Result<bool> {
+        if !matches!(
+            error,
+            EngineError::Status {
+                status: StatusCode::FORBIDDEN
+                    | StatusCode::TOO_MANY_REQUESTS
+                    | StatusCode::SERVICE_UNAVAILABLE,
+                ..
+            }
+        ) {
+            return Ok(false);
+        }
+        let mut concurrency = self.concurrency.lock().unwrap();
+        if concurrency.active_workers <= 1 {
+            return Ok(false);
+        }
+        let mut state = self.engine.lock();
+        let (db, job) = state.job_mut(self.id)?;
+        let segment = pending_segment(&job.segments[&index]);
+        let has_progress = segment.cursor > segment.start;
+        db.edit_segments(self.id, &[&segment], None)?;
+        job.segments.insert(index, segment);
+        concurrency.effective_max_workers = (concurrency.effective_max_workers / 2).max(1);
+        let delay = error.retry_after();
+        if !delay.is_zero() {
+            concurrency.retry_at = concurrency.retry_at.max(Some(Instant::now() + delay));
+        }
+        if has_progress {
+            // An interrupted range may need its original validator or refreshed URL.
+            // Let workers waiting for response headers pick it up without dropping live bodies.
+            self.concurrency_changed.send_replace(());
+        }
+        Ok(true)
+    }
+
+    fn reassign_segment(&self, index: u8) -> Result<Option<u8>> {
+        let can_continue = {
+            let concurrency = self.concurrency.lock().unwrap();
+            concurrency.active_workers <= concurrency.effective_max_workers
+        };
+        let mut state = self.engine.lock();
+        let (db, job) = state.job_mut(self.id)?;
+        let current = pending_segment(&job.segments[&index]);
+        if !can_continue {
+            db.edit_segments(self.id, &[&current], None)?;
+            job.segments.insert(index, current);
+            return Ok(None);
+        }
+        let Some(pending) = job.segments.values().find(|segment| {
+            segment.state == SegmentState::Pending && segment.cursor > segment.start
+        }) else {
+            return Ok(Some(index));
+        };
+        let mut next = pending.clone();
+        next.state = SegmentState::Active;
+        let next_index = next.index;
+        db.edit_segments(self.id, &[&current, &next], None)?;
+        job.segments.insert(index, current);
+        job.segments.insert(next_index, next);
+        Ok(Some(next_index))
+    }
+
+    async fn reset_stream(&self, index: u8, file: &File) -> Result<()> {
+        let total = {
             let mut state = self.engine.lock();
             let (db, job) = state.job_mut(self.id)?;
             let segment = job.segments.get_mut(&index).unwrap();
@@ -458,28 +687,46 @@ impl Run<'_> {
             segment.reserved_end = 0;
             segment.sample_cursor = 0;
             segment.speed = 0;
-        }
+            job.record.total
+        };
         file.set_len(0).await?;
         file.set_len(total.unwrap_or(0)).await?;
         Ok(())
     }
 
+    async fn clear_stream_length(&self, index: u8, file: &File) -> Result<()> {
+        {
+            let mut state = self.engine.lock();
+            let (db, job) = state.job_mut(self.id)?;
+            let mut record = job.record.clone();
+            record.total = None;
+            let mut segments = job.segments.clone();
+            segments.get_mut(&index).unwrap().end = None;
+            db.replace_segments(&record, &segments)?;
+            job.record = record;
+            job.segments = segments;
+        }
+        file.set_len(0).await?;
+        Ok(())
+    }
+
     async fn write_response(
         &self,
-        mut response: Response,
+        mut reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>,
         index: u8,
         ranges: bool,
         file: &mut File,
         stop: &mut Stop,
     ) -> Result<()> {
+        let mut buffer = [0; WRITE_SIZE];
         loop {
             if ranges && self.remaining(index, 1)? == 0 {
                 return Ok(());
             }
-            let chunk = stop
-                .during(async { response.chunk().await.map_err(request_error) })
+            let count = stop
+                .during(async { Ok(reader.read(&mut buffer).await?) })
                 .await?;
-            let Some(chunk) = chunk else {
+            if count == 0 {
                 let state = self.engine.lock();
                 let segment = &state.job(self.id)?.segments[&index];
                 if segment.end.is_some_and(|end| segment.cursor < end) {
@@ -490,7 +737,8 @@ impl Run<'_> {
                     .into());
                 }
                 return Ok(());
-            };
+            }
+            let chunk = &buffer[..count];
             let mut offset = 0;
             while offset < chunk.len() {
                 let available = self.remaining(index, (chunk.len() - offset).min(WRITE_SIZE))?;
@@ -556,10 +804,15 @@ impl Run<'_> {
         db.save_cursor(self.id, index, cursor)?;
         segment.cursor = cursor;
         job.record.updated_at = Utc::now();
+        self.has_written.store(true, Ordering::Relaxed);
         Ok(())
     }
 
     fn finish_segment(&self, index: u8, ranges: bool) -> Result<Option<u8>> {
+        let can_continue = {
+            let concurrency = self.concurrency.lock().unwrap();
+            concurrency.active_workers <= concurrency.effective_max_workers
+        };
         let mut state = self.engine.lock();
         let (db, job) = state.job_mut(self.id)?;
         let mut complete = job.segments[&index].clone();
@@ -577,7 +830,21 @@ impl Run<'_> {
             return Ok(None);
         }
 
-        let donor = ranges
+        if let Some(pending) = job
+            .segments
+            .values()
+            .find(|segment| can_continue && segment.state == SegmentState::Pending)
+        {
+            let mut pending = pending.clone();
+            pending.state = SegmentState::Active;
+            let next_index = pending.index;
+            db.edit_segments(self.id, &[&complete, &pending], None)?;
+            job.segments.insert(index, complete);
+            job.segments.insert(next_index, pending);
+            return Ok(Some(next_index));
+        }
+
+        let donor = (ranges && can_continue)
             .then(|| {
                 job.segments
                     .values()
@@ -688,7 +955,27 @@ impl Run<'_> {
     }
 }
 
-fn record_restart(slot: &std::sync::Mutex<Option<RestartReason>>, reason: RestartReason) {
+fn retry_delay(retry: u32, single_worker: bool, error: &EngineError) -> Duration {
+    let millis = if single_worker {
+        match retry {
+            0 => 500,
+            1 => 1500,
+            _ => 3000,
+        }
+    } else {
+        100 * 2_u64.pow(retry)
+    };
+    Duration::from_millis(millis).max(error.retry_after())
+}
+
+fn pending_segment(segment: &Segment) -> Segment {
+    let mut pending = segment.clone();
+    pending.state = SegmentState::Pending;
+    pending.speed = 0;
+    pending
+}
+
+fn record_restart(slot: &Mutex<Option<RestartReason>>, reason: RestartReason) {
     let mut guard = slot.lock().unwrap();
     if *guard != Some(RestartReason::RepresentationChanged) {
         *guard = Some(reason);

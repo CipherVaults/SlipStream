@@ -22,7 +22,9 @@ struct Request {
 
 impl Request {
     fn header(&self, name: &str) -> Option<&str> {
-        self.headers.get(name).map(String::as_str)
+        self.headers
+            .iter()
+            .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value.as_str()))
     }
 
     fn range(&self) -> Option<Range<usize>> {
@@ -43,6 +45,7 @@ struct Reply {
     chunk_delay: Duration,
     cutoff: Option<usize>,
     chunked: bool,
+    connection_slot: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl Reply {
@@ -56,6 +59,7 @@ impl Reply {
             chunk_delay: Duration::ZERO,
             cutoff: None,
             chunked: false,
+            connection_slot: None,
         }
     }
 
@@ -105,6 +109,7 @@ impl Reply {
     }
 
     async fn send(self, request: &Request, stream: &mut TcpStream) -> io::Result<()> {
+        let _connection_slot = self.connection_slot;
         let mut header = format!("HTTP/1.1 {}\r\nConnection: close\r\n", self.status);
         for (name, value) in self.headers {
             header.push_str(&format!("{name}: {value}\r\n"));
@@ -216,7 +221,7 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Request> {
             break;
         }
         let (key, value) = line.split_once(':').ok_or_else(invalid)?;
-        headers.insert(key.to_ascii_lowercase(), value.trim().into());
+        headers.insert(key.to_owned(), value.trim().into());
     }
     Ok(Request {
         method,
@@ -789,7 +794,11 @@ async fn cross_origin_redirect_strips_credentials_permanently() {
     let destination = target.url("/other");
     let origin = Server::new(move |req| {
         if req.path == "/initial" {
-            Reply::redirect(&destination)
+            let mut reply = Reply::redirect(&destination);
+            reply
+                .headers
+                .push(("Set-Cookie", "session=origin-only".into()));
+            reply
         } else {
             Reply::resource(req, &source, "\"cross\"")
         }
@@ -1106,18 +1115,23 @@ async fn sends_default_http_headers_and_preserves_caller_values() {
         .headers
         .insert("uSeR-aGeNt".into(), "Fixture Player/1.0".into());
     custom.headers.insert("Accept".into(), "video/mp4".into());
+    custom
+        .headers
+        .insert("accept-language".into(), "ar-EG".into());
     let custom_id = engine.add_http_download(custom).await.unwrap();
     completed(&engine, &custom_id).await;
 
     let requests = server.requests();
-    for (path, accept, user_agent_prefix) in [
-        ("/default", "*/*", "Mozilla/5.0 "),
-        ("/custom", "video/mp4", "Fixture Player/1.0"),
+    for (path, accept, user_agent_prefix, language) in [
+        ("/default", "*/*", "Mozilla/5.0 ", "en-US,en;q=0.9"),
+        ("/custom", "video/mp4", "Fixture Player/1.0", "ar-EG"),
     ] {
         let matching: Vec<_> = requests.iter().filter(|req| req.path == path).collect();
         assert!(matching.iter().any(|req| req.method == "GET"));
         for req in matching {
+            assert!(req.headers.contains_key("Accept-Language"));
             assert_eq!(req.header("accept"), Some(accept));
+            assert_eq!(req.header("accept-language"), Some(language));
             assert_eq!(req.header("accept-encoding"), Some("identity"));
             let user_agent = req.header("user-agent").unwrap();
             if path == "/custom" {
@@ -1135,15 +1149,15 @@ async fn retries_rejected_range_probes_with_one_plain_get() {
     let data = payload(4 * KIB, 13);
     let source = Arc::clone(&data);
     let server = Server::new(move |req| {
-        if req.method == "HEAD" {
-            return Reply::empty("403 Forbidden");
-        }
-        if req.header("range").is_some() {
+        if req.method == "HEAD" || req.header("range").is_some() {
             let status = match req.path.as_str() {
                 "/400" => "400 Bad Request",
                 "/403" | "/206" | "/partial" => "403 Forbidden",
                 "/405" => "405 Method Not Allowed",
+                "/412" => "412 Precondition Failed",
                 "/416" => "416 Range Not Satisfiable",
+                "/501" => "501 Not Implemented",
+                "/503" => "503 Service Unavailable",
                 _ => unreachable!(),
             };
             let mut reply = Reply::empty(status);
@@ -1172,7 +1186,9 @@ async fn retries_rejected_range_probes_with_one_plain_get() {
     .await;
     let dir = TestDir::new().await;
     let engine = DownloadEngine::new(dir.config()).await.unwrap();
-    for path in ["/400", "/403", "/405", "/416", "/206"] {
+    for path in [
+        "/400", "/403", "/405", "/412", "/416", "/501", "/503", "/206",
+    ] {
         let id = engine
             .add_http_download(request(server.url(path), None, 4))
             .await
@@ -1190,12 +1206,7 @@ async fn retries_rejected_range_probes_with_one_plain_get() {
             .collect();
         assert_eq!(
             methods_and_ranges,
-            [
-                ("HEAD", None),
-                ("GET", Some("bytes=0-0")),
-                ("GET", None),
-                ("GET", None),
-            ]
+            [("HEAD", None), ("GET", Some("bytes=0-0")), ("GET", None),]
         );
     }
     let partial = engine
@@ -1208,6 +1219,342 @@ async fn retries_rejected_range_probes_with_one_plain_get() {
         .unwrap()
         .contains("incomplete response to plain GET"));
     assert!(!dir.config().default_download_dir.join("partial").exists());
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn backs_down_when_more_than_two_connections_are_rejected() {
+    let data = payload(1024 * KIB, 23);
+    let source = Arc::clone(&data);
+    let slots = Arc::new(tokio::sync::Semaphore::new(2));
+    let rejected = Arc::new(AtomicUsize::new(0));
+    let rejections = Arc::clone(&rejected);
+    let server = Server::new(move |req| {
+        if req.method == "HEAD" {
+            return Reply::resource(req, &source, "\"backdown\"");
+        }
+        let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+            rejections.fetch_add(1, Ordering::SeqCst);
+            return Reply::empty("503 Service Unavailable");
+        };
+        let mut reply = Reply::resource(req, &source, "\"backdown\"");
+        reply.connection_slot = Some(slot);
+        reply.initial_delay = Duration::from_millis(75);
+        reply
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    let id = engine
+        .add_http_download(request(server.url("/backdown.bin"), None, 16))
+        .await
+        .unwrap();
+    let done = completed(&engine, &id).await;
+    assert!(rejected.load(Ordering::SeqCst) > 0);
+    assert_eq!(done.segments.len(), 16);
+    assert!(done
+        .segments
+        .iter()
+        .all(|segment| segment.state == SegmentState::Completed));
+    assert!(server
+        .requests()
+        .iter()
+        .filter(|req| req.method == "GET")
+        .all(|req| req.range().is_some()));
+    dir.assert_output("backdown.bin", &data).await;
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn restarts_rejected_single_worker_ranges_with_one_full_get() {
+    let data = payload(64 * KIB, 28);
+    let source = Arc::clone(&data);
+    let server = Server::new(move |req| {
+        if req.range().is_some() {
+            return Reply::empty(match req.path.as_str() {
+                "/403" => "403 Forbidden",
+                "/503" => "503 Service Unavailable",
+                "/416" => "416 Range Not Satisfiable",
+                _ => unreachable!(),
+            });
+        }
+        Reply::resource(req, &source, "\"full-only\"")
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    for (path, range_attempts) in [("/403", 2), ("/503", 1), ("/416", 1)] {
+        let id = engine
+            .add_http_download(request(server.url(path), None, 1))
+            .await
+            .unwrap();
+        let done = completed(&engine, &id).await;
+        assert!(!done.resumable);
+        let requests = server.requests();
+        let gets: Vec<_> = requests
+            .iter()
+            .filter(|req| req.path == path && req.method == "GET")
+            .collect();
+        assert_eq!(gets.len(), range_attempts + 1);
+        assert!(gets[..range_attempts]
+            .iter()
+            .all(|req| req.range().is_some()));
+        assert!(gets[range_attempts].range().is_none());
+        dir.assert_output(&done.filename, &data).await;
+    }
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn streams_the_only_get_allowed_by_a_single_use_url() {
+    let data = payload(64 * KIB, 24);
+    let source = Arc::clone(&data);
+    let gets = AtomicUsize::new(0);
+    let server = Server::new(move |req| {
+        if req.method == "HEAD" {
+            return Reply::empty("403 Forbidden");
+        }
+        if gets.fetch_add(1, Ordering::SeqCst) != 0 {
+            return Reply::empty("410 Gone");
+        }
+        let mut reply = Reply::resource(req, &source, "\"one-use\"");
+        reply.status = "200 OK";
+        reply
+            .headers
+            .retain(|(name, _)| !matches!(*name, "Content-Range" | "Content-Length"));
+        reply
+            .headers
+            .push(("Content-Length", source.len().to_string()));
+        reply.content = Some((Arc::clone(&source), 0..source.len()));
+        reply
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    let id = engine
+        .add_http_download(request(server.url("/one-use.bin"), None, 16))
+        .await
+        .unwrap();
+    completed(&engine, &id).await;
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|req| req.method == "GET")
+            .count(),
+        1
+    );
+    dir.assert_output("one-use.bin", &data).await;
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn forbidden_cookie_and_hotlink_headers_fall_back_to_winning_profiles() {
+    let data = payload(128 * KIB, 25);
+    let source = Arc::clone(&data);
+    let server = Server::new(move |req| {
+        let cookie = req.header("cookie").is_some();
+        let hotlink = req.header("referer").is_some() || req.header("origin").is_some();
+        if (req.path == "/cookie" && cookie)
+            || (req.path == "/hotlink" && req.method == "GET" && (cookie || hotlink))
+        {
+            return Reply::empty("403 Forbidden");
+        }
+        Reply::resource(req, &source, "\"headers\"")
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    for (path, workers) in [("/cookie", 4), ("/hotlink", 1)] {
+        let mut download = request(server.url(path), None, workers);
+        download.headers = [
+            ("Cookie".into(), "session=stale".into()),
+            ("Referer".into(), "https://example.com/watch".into()),
+            ("Origin".into(), "https://example.com".into()),
+            ("User-Agent".into(), "Fixture Player".into()),
+            ("X-Custom".into(), "browser".into()),
+        ]
+        .into();
+        let id = engine.add_http_download(download).await.unwrap();
+        let done = completed(&engine, &id).await;
+        dir.assert_output(&done.filename, &data).await;
+    }
+    let requests = server.requests();
+    let cookie: Vec<_> = requests
+        .iter()
+        .filter(|req| req.path == "/cookie")
+        .collect();
+    assert_eq!(
+        cookie
+            .iter()
+            .filter(|req| req.method == "HEAD" && req.header("cookie").is_some())
+            .count(),
+        2
+    );
+    let winning_head = cookie
+        .iter()
+        .position(|req| req.method == "HEAD" && req.header("cookie").is_none())
+        .unwrap();
+    assert!(cookie[winning_head..].iter().all(|req| {
+        req.header("cookie").is_none()
+            && req.header("referer") == Some("https://example.com/watch")
+            && req.header("user-agent") == Some("Fixture Player")
+    }));
+
+    let hotlink: Vec<_> = requests
+        .iter()
+        .filter(|req| req.path == "/hotlink" && req.method == "GET")
+        .collect();
+    let [default, ipv4, no_cookie, bare] = hotlink.as_slice() else {
+        panic!("expected four GET profiles: {hotlink:?}");
+    };
+    assert_eq!(default.header("cookie"), Some("session=stale"));
+    assert_eq!(ipv4.header("cookie"), Some("session=stale"));
+    assert!(ipv4.headers.contains_key("User-Agent"));
+    assert_eq!(no_cookie.header("cookie"), None);
+    assert_eq!(
+        no_cookie.header("referer"),
+        Some("https://example.com/watch")
+    );
+    for name in ["cookie", "referer", "origin", "x-custom"] {
+        assert_eq!(bare.header(name), None);
+    }
+    assert_eq!(bare.header("user-agent"), Some("Fixture Player"));
+    assert_eq!(bare.header("accept"), Some("*/*"));
+    assert_eq!(bare.header("accept-language"), Some("en-US,en;q=0.9"));
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn retries_429_after_the_server_delay() {
+    let data = payload(64 * KIB, 26);
+    let source = Arc::clone(&data);
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let times = Arc::clone(&attempts);
+    let server = Server::new(move |req| {
+        if req.method == "GET" {
+            let mut times = times.lock().unwrap();
+            times.push(Instant::now());
+            if times.len() == 1 {
+                let mut reply = Reply::empty("429 Too Many Requests");
+                reply.headers.push(("Retry-After", "1".into()));
+                return reply;
+            }
+        }
+        Reply::resource(req, &source, "\"retry-after\"")
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    let id = engine
+        .add_http_download(request(server.url("/throttled.bin"), None, 1))
+        .await
+        .unwrap();
+    completed(&engine, &id).await;
+    {
+        let times = attempts.lock().unwrap();
+        assert_eq!(times.len(), 2);
+        assert!(times[1] - times[0] >= Duration::from_secs(1));
+    }
+    dir.assert_output("throttled.bin", &data).await;
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn keeps_redirect_cookies_on_the_same_origin_and_in_the_same_chain() {
+    let data = payload(8 * KIB, 27);
+    let source = Arc::clone(&data);
+    let server = Server::new(move |req| {
+        if req.path == "/start" {
+            let mut reply = Reply::redirect("/final");
+            reply.headers.extend([
+                ("Set-Cookie", "session=new; HttpOnly".into()),
+                ("Set-Cookie", "challenge=passed; Path=/".into()),
+            ]);
+            return reply;
+        }
+        Reply::resource(req, &source, "\"redirect-cookie\"")
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    let mut download = request(server.url("/start"), Some("cookie.bin"), 1);
+    download
+        .headers
+        .insert("Cookie".into(), "pref=dark; session=old".into());
+    let id = engine.add_http_download(download).await.unwrap();
+    completed(&engine, &id).await;
+    for req in server.requests() {
+        let expected = if req.path == "/start" {
+            "pref=dark; session=old"
+        } else {
+            "pref=dark; session=new; challenge=passed"
+        };
+        assert_eq!(req.header("cookie"), Some(expected));
+    }
+    dir.assert_output("cookie.bin", &data).await;
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn compressed_full_responses_use_decoded_lengths_and_keep_206_strict() {
+    use async_compression::tokio::write::{BrotliEncoder, GzipEncoder, ZlibEncoder};
+    use tokio::io::AsyncWrite;
+
+    async fn encode(mut encoder: impl AsyncWrite + Unpin, data: &[u8]) {
+        encoder.write_all(data).await.unwrap();
+        encoder.shutdown().await.unwrap();
+    }
+
+    let data = b"compressed body\n".repeat(4096);
+    let (mut gzip, mut deflate, mut brotli) = (Vec::new(), Vec::new(), Vec::new());
+    encode(GzipEncoder::new(&mut gzip), &data).await;
+    encode(ZlibEncoder::new(&mut deflate), &data).await;
+    encode(BrotliEncoder::new(&mut brotli), &data).await;
+    let server = Server::new(move |req| {
+        let (coding, source) = match req.path.as_str() {
+            "/gzip" | "/partial-gzip" => ("gzip", &gzip),
+            "/deflate" => ("deflate", &deflate),
+            "/br" => ("br", &brotli),
+            _ => unreachable!(),
+        };
+        let source = Arc::new(source.clone());
+        let mut plain = req.clone();
+        if req.path != "/partial-gzip" {
+            plain
+                .headers
+                .retain(|name, _| !name.eq_ignore_ascii_case("range"));
+        }
+        let mut reply = Reply::resource(&plain, &source, "\"encoded\"");
+        reply.headers.push(("Content-Encoding", coding.into()));
+        reply
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    for coding in ["gzip", "deflate", "br"] {
+        let id = engine
+            .add_http_download(request(server.url(&format!("/{coding}")), None, 4))
+            .await
+            .unwrap();
+        let done = completed(&engine, &id).await;
+        assert_eq!(done.total_bytes, Some(data.len() as u64));
+        assert!(!done.resumable);
+        dir.assert_output(coding, &data).await;
+    }
+    let id = engine
+        .add_http_download(request(server.url("/partial-gzip"), None, 1))
+        .await
+        .unwrap();
+    assert!(failed(&engine, &id)
+        .await
+        .error_message
+        .unwrap()
+        .contains("unsupported Content-Encoding"));
+    assert!(server
+        .requests()
+        .iter()
+        .all(|req| req.header("accept-encoding") == Some("identity")));
     engine.shutdown().await.unwrap();
 }
 

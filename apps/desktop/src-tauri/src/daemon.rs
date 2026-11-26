@@ -118,6 +118,33 @@ impl ProbeKey {
             headers: canonical_media_headers(headers).map_err(message)?,
         })
     }
+
+    fn from_probe_headers(url: &str, playlist: bool, headers: &HashMap<String, String>) -> Self {
+        let mut canonical: Vec<_> = headers
+            .iter()
+            .filter_map(|(name, value)| {
+                canonical_media_headers(&HashMap::from([(name.clone(), value.clone())]))
+                    .ok()?
+                    .pop()
+            })
+            .collect();
+        canonical.sort_unstable();
+        canonical.dedup();
+        Self {
+            url: url.to_owned(),
+            playlist,
+            headers: canonical
+                .chunk_by(|a, b| a.0 == b.0)
+                .filter_map(|group| {
+                    if let [header] = group {
+                        Some(header.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        }
+    }
 }
 type ProbeResult = Result<Arc<MediaProbeResult>>;
 
@@ -518,9 +545,19 @@ impl AppState {
     }
 
     pub async fn probe_media(&self, url: &str, playlist: Option<bool>) -> Result<MediaProbeResult> {
+        self.probe_media_with_headers(url, playlist, &HashMap::new())
+            .await
+    }
+
+    async fn probe_media_with_headers(
+        &self,
+        url: &str,
+        playlist: Option<bool>,
+        headers: &HashMap<String, String>,
+    ) -> Result<MediaProbeResult> {
         let url = validate_media_url(url, self.allow_loopback)?;
         let playlist = playlist.unwrap_or_else(|| is_pure_playlist_url(&url));
-        let key = ProbeKey::new(url.as_str(), playlist, &HashMap::new())?;
+        let key = ProbeKey::from_probe_headers(url.as_str(), playlist, headers);
         Ok((*self.probe_media_shared(key).await?).clone())
     }
 
@@ -1443,9 +1480,13 @@ impl AppState {
                 request.save_dir = None;
                 return self.add_http_download(request).await.map(created);
             }
-            ProbeMedia { url, playlist } => {
+            ProbeMedia {
+                url,
+                playlist,
+                headers,
+            } => {
                 return self
-                    .probe_media(&url, playlist)
+                    .probe_media_with_headers(&url, playlist, &headers)
                     .await
                     .map(|probe| NativeBridgeResponse::MediaProbed { probe })
             }
@@ -2440,6 +2481,26 @@ mod tests {
         assert!(a != key(false, "User-Agent", "other"));
         assert!(a != key(true, "User-Agent", "fixture"));
         assert!(a != ProbeKey::new(url, false, &HashMap::new()).unwrap());
+    }
+
+    #[test]
+    fn native_probe_headers_keep_valid_values_and_drop_conflicts() {
+        let url = "https://example.com/video";
+        let headers = [
+            ("referer", "https://example.com/watch"),
+            ("Origin", "https://example.com/invalid-path"),
+            ("Accept-Language", "en-US\r\nX-Invalid: true"),
+            ("User-Agent", "first"),
+            ("user-agent", "conflicting"),
+            ("Cookie", "session=private"),
+        ]
+        .map(|(name, value)| (name.into(), value.into()))
+        .into();
+        let filtered = ProbeKey::from_probe_headers(url, false, &headers);
+        assert_eq!(
+            filtered.headers,
+            vec![("Referer".into(), "https://example.com/watch".into())]
+        );
     }
 
     #[test]

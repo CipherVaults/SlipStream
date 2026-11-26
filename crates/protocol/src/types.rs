@@ -418,6 +418,8 @@ pub enum NativeBridgeRequest {
         url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         playlist: Option<bool>,
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        headers: HashMap<String, String>,
     },
     AddMediaDownload {
         request: AddMediaDownloadRequest,
@@ -611,12 +613,12 @@ mod media_wire_tests {
     }
 
     #[test]
-    fn native_probe_media_playlist_defaults_and_round_trips() {
+    fn native_probe_media_fields_default_and_round_trip() {
         let mut wire = json!({"type": "probe_media", "url": "https://example.com/video"});
         let legacy: NativeBridgeRequest = serde_json::from_value(wire.clone()).unwrap();
         assert!(matches!(
             legacy,
-            NativeBridgeRequest::ProbeMedia { playlist: None, .. }
+            NativeBridgeRequest::ProbeMedia { playlist: None, ref headers, .. } if headers.is_empty()
         ));
         assert_eq!(to_value(legacy).unwrap(), wire);
 
@@ -628,5 +630,14 @@ mod media_wire_tests {
             );
             assert_eq!(to_value(decoded).unwrap(), wire);
         }
+
+        wire["headers"] = json!({"Referer": "https://example.com/", "Accept-Language": "en-US"});
+        let decoded: NativeBridgeRequest = serde_json::from_value(wire.clone()).unwrap();
+        assert!(matches!(
+            decoded,
+            NativeBridgeRequest::ProbeMedia { ref headers, .. }
+                if headers.get("Referer").is_some_and(|value| value == "https://example.com/")
+        ));
+        assert_eq!(to_value(decoded).unwrap(), wire);
     }
 }

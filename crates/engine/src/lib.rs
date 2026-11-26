@@ -53,8 +53,12 @@ pub enum EngineError {
     Task(#[from] tokio::task::JoinError),
     #[error(transparent)]
     Http(reqwest::Error),
-    #[error("HTTP {0}")]
-    Status(reqwest::StatusCode),
+    #[error("HTTP {status}")]
+    Status {
+        status: reqwest::StatusCode,
+        retry_after: Option<Duration>,
+        sent_cookie: bool,
+    },
     #[error("invalid HTTP response: {0}")]
     InvalidResponse(&'static str),
     #[error("blocked connection to {0}")]
@@ -85,9 +89,18 @@ impl EngineError {
                     || error.is_decode()
                     || error.is_request()
             }
-            Self::Status(status) => status.is_server_error() || status.as_u16() == 408,
+            Self::Status { status, .. } => {
+                status.is_server_error() || matches!(status.as_u16(), 408 | 429)
+            }
             Self::Io(error) => error.kind() == std::io::ErrorKind::UnexpectedEof,
             _ => false,
+        }
+    }
+
+    fn retry_after(&self) -> Duration {
+        match self {
+            Self::Status { retry_after, .. } => retry_after.unwrap_or_default(),
+            _ => Duration::ZERO,
         }
     }
 }

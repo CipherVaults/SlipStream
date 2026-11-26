@@ -500,7 +500,7 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
 
     let media_url = "https://example.com/video";
     assert!(matches!(
-        bridge.request(Request::ProbeMedia { url: media_url.into(), playlist: None }).await,
+        bridge.request(Request::ProbeMedia { url: media_url.into(), playlist: None, headers: Default::default() }).await,
         Response::MediaProbed { probe } if probe.title == "Fixture video"
     ));
     let media = bridge
@@ -1011,16 +1011,17 @@ async fn media_playlist_publishes_successful_items_with_original_indices_and_mot
     );
     let pure = "https://example.com/playlist?list=PL1";
     assert!(matches!(
-        bridge.request(Request::ProbeMedia { url: pure.into(), playlist: None }).await,
+        bridge.request(Request::ProbeMedia { url: pure.into(), playlist: None, headers: Default::default() }).await,
         Response::MediaProbed { probe } if probe.is_playlist
     ));
     assert!(matches!(
-        bridge.request(Request::ProbeMedia { url: mixed.into(), playlist: Some(true) }).await,
+        bridge.request(Request::ProbeMedia { url: mixed.into(), playlist: Some(true), headers: Default::default() }).await,
         Response::MediaProbed { probe } if probe.is_playlist
     ));
     let large = Request::ProbeMedia {
         url: "https://example.com/playlist?list=PL6000".into(),
         playlist: None,
+        headers: Default::default(),
     };
     let large = bridge.request(large).await;
     assert!(matches!(&large, Response::MediaProbed { probe }
@@ -1117,7 +1118,8 @@ async fn media_probes_coalesce_across_the_pipe_and_reuse_toolchain_and_download_
     let (native, normalized, desktop) = tokio::join!(
         bridge.request(Request::ProbeMedia {
             url: url.into(),
-            playlist: None
+            playlist: None,
+            headers: Default::default(),
         }),
         state.probe_media("HTTPS://EXAMPLE.COM:443/coalesced", Some(false)),
         state.probe_media(url, None),
@@ -1146,6 +1148,18 @@ async fn media_probes_coalesce_across_the_pipe_and_reuse_toolchain_and_download_
         media_tool_log(&temp.0),
         format!("yt-dlp version\nprobe false {url}\nffmpeg version\n")
     );
+    assert!(matches!(
+        bridge.request(Request::ProbeMedia {
+            url: url.into(),
+            playlist: None,
+            headers: [
+                ("user-agent".into(), "Probe Fixture".into()),
+                ("Cookie".into(), "session=ignored".into()),
+                ("Origin".into(), "https://example.com/invalid-path".into()),
+            ].into(),
+        }).await,
+        Response::MediaProbed { probe } if probe.title == "Header-specific video"
+    ));
     let mut request = media_request(url);
     request
         .headers
