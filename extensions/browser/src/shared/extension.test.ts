@@ -560,7 +560,7 @@ describe("direct HTTP handoff", () => {
     await observe(start);
     await observe(cdn);
     expect(await intercept()).toEqual({ type: "add_http_download", request: {
-      url: cdn, filename: "file.mp4", referrer: page,
+      url: cdn, filename: "file.mp4", referrer: page, expected_size_bytes: 500_000,
       headers: { Referer: page, Origin: "https://vidtube.example", "User-Agent": "Captured Browser/2.0", "Accept-Language": "en-US,en;q=0.9" },
     } });
   });
@@ -570,7 +570,7 @@ describe("direct HTTP handoff", () => {
     await observe(start);
     await observe(cdn + "-different");
     expect(await intercept({ referrer: page + "#private" })).toEqual({ type: "add_http_download", request: {
-      url: cdn, filename: "file.mp4", referrer: page, headers: { "User-Agent": browserAgent, "Accept-Language": "en-US,en;q=0.9" },
+      url: cdn, filename: "file.mp4", referrer: page, expected_size_bytes: 500_000, headers: { "User-Agent": browserAgent, "Accept-Language": "en-US,en;q=0.9" },
     } });
   });
 
@@ -579,7 +579,7 @@ describe("direct HTTP handoff", () => {
     const insecure = cdn.replace("https:", "http:");
     await observe(insecure);
     expect(await intercept({ finalUrl: insecure })).toEqual({ type: "add_http_download", request: {
-      url: insecure, filename: "file.mp4", referrer: undefined, headers: { "User-Agent": "Captured Browser/2.0", "Accept-Language": "en-US,en;q=0.9" },
+      url: insecure, filename: "file.mp4", referrer: undefined, expected_size_bytes: 500_000, headers: { "User-Agent": "Captured Browser/2.0", "Accept-Language": "en-US,en;q=0.9" },
     } });
   });
 
@@ -588,13 +588,13 @@ describe("direct HTTP handoff", () => {
     await observe(cdn);
     for (const overrides of [{ incognito: true }, { cookieStoreId: "firefox-container-1" }]) {
       expect(await intercept(overrides)).toEqual({ type: "add_http_download", request: {
-        url: cdn, filename: "file.mp4", referrer: undefined, headers: { "User-Agent": browserAgent, "Accept-Language": "en-US,en;q=0.9" },
+        url: cdn, filename: "file.mp4", referrer: undefined, expected_size_bytes: 500_000, headers: { "User-Agent": browserAgent, "Accept-Language": "en-US,en;q=0.9" },
       } });
     }
     const unrelated = cdn + "-unrelated";
     await observe(unrelated, { initiator: "https://unrelated.example" });
     expect(await intercept({ finalUrl: unrelated, referrer: "" })).toEqual({ type: "add_http_download", request: {
-      url: unrelated, filename: "file.mp4", referrer: undefined, headers: { "User-Agent": browserAgent, "Accept-Language": "en-US,en;q=0.9" },
+      url: unrelated, filename: "file.mp4", referrer: undefined, expected_size_bytes: 500_000, headers: { "User-Agent": browserAgent, "Accept-Language": "en-US,en;q=0.9" },
     } });
   });
 
@@ -919,6 +919,7 @@ describe("frame-scoped media handoff", () => {
         url: "https://releases.example/download?id=99",
         filename: "installer-v2.bin",
         referrer: "https://releases.example/project",
+        expected_size_bytes: 4_000_000,
         headers: {
           "User-Agent": "Fixture Browser/1.0",
           "Accept-Language": "en-US,en;q=0.9",
@@ -932,6 +933,53 @@ describe("frame-scoped media handoff", () => {
       expect(cancel).toHaveBeenCalledWith(101);
       expect(erase).toHaveBeenCalledWith({ id: 101 });
     });
+
+    // 1b. Desktop confirmation dialog reply (ack { ok: true }) cancels and erases browser download cleanly, while ack { ok: false } does not.
+    cancel.mockClear();
+    erase.mockClear();
+    const suggestAckOk = vi.fn();
+    onDeterminingFilename.addListener.mock.calls[0][0]({
+      id: 105,
+      url: "https://releases.example/dialog-confirm.iso",
+      filename: "dialog-confirm.iso",
+      mime: "application/octet-stream",
+      fileSize: 8_500_000,
+      referrer: "https://releases.example/project",
+      incognito: false,
+    }, suggestAckOk);
+    await vi.waitFor(() => expect(port.posted.at(-1)).toMatchObject({
+      type: "add_http_download",
+      request: { url: "https://releases.example/dialog-confirm.iso", expected_size_bytes: 8_500_000 },
+    }));
+    port.emitMessage({ type: "ack", ok: true, message: null });
+    await vi.waitFor(() => {
+      expect(suggestAckOk).toHaveBeenCalledOnce();
+      expect(cancel).toHaveBeenCalledWith(105);
+      expect(erase).toHaveBeenCalledWith({ id: 105 });
+    });
+
+    cancel.mockClear();
+    erase.mockClear();
+    const suggestAckFail = vi.fn();
+    onDeterminingFilename.addListener.mock.calls[0][0]({
+      id: 106,
+      url: "https://releases.example/dialog-reject.iso",
+      filename: "dialog-reject.iso",
+      mime: "application/octet-stream",
+      fileSize: 0,
+      referrer: "https://releases.example/project",
+      incognito: false,
+    }, suggestAckFail);
+    await vi.waitFor(() => expect(port.posted.at(-1)).toMatchObject({
+      type: "add_http_download",
+      request: { url: "https://releases.example/dialog-reject.iso" },
+    }));
+    const zeroSizeReq = port.posted.at(-1);
+    expect(zeroSizeReq?.type === "add_http_download" ? zeroSizeReq.request : {}).not.toHaveProperty("expected_size_bytes");
+    port.emitMessage({ type: "ack", ok: false, message: "Rejected" });
+    await vi.waitFor(() => expect(suggestAckFail).toHaveBeenCalledOnce());
+    expect(cancel).not.toHaveBeenCalled();
+    expect(erase).not.toHaveBeenCalled();
 
     // 2. Incognito download without storeId never queries default cookies.
     getAllCookies.mockClear();
@@ -1109,7 +1157,7 @@ describe("frame-scoped media handoff", () => {
       formats: [{ id: `direct:${cdnVideo}`, label: "Download Video", sub: "MP4 · 1.4 GB" }],
     }));
 
-    // Clicking direct: on cross-origin <video src> sends add_http_download with origin-only Referer, Origin, UA, Accept-Language, and cross-site Cookie (filtering out SameSite=Strict).
+    // Clicking direct: on cross-origin <video src> sends add_http_download with origin-only Referer, Origin, UA, Accept-Language, expected_size_bytes, and cross-site Cookie (filtering out SameSite=Strict).
     const downloadPromise = request({ kind: "media", action: `direct:${cdnVideo}`, url: cdnVideo, embedded: true });
     await vi.waitFor(() => expect(port.posted.at(-1)).toEqual({
       type: "add_http_download",
@@ -1117,6 +1165,7 @@ describe("frame-scoped media handoff", () => {
         url: cdnVideo,
         filename: "movie.mp4",
         referrer: "https://vidtube.example/",
+        expected_size_bytes: 1_500_000_000,
         headers: {
           Referer: "https://vidtube.example/",
           Origin: "https://vidtube.example",

@@ -1,11 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
+import { LogicalSize } from "@tauri-apps/api/dpi";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview, type DragDropEvent } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type {
   AddHttpDownloadRequest, AddMediaDownloadRequest, AddTorrentRequest, AppSettings, BrowserKind,
-  BrowserSetupResult, BrowserStatus, MediaProbeResult, RefreshDownloadUrlRequest, TelemetryBatch,
-  ToolchainStatus, TorrentFileEntry, UpdateProgress, UpdateStatus,
+  BrowserSetupResult, BrowserStatus, ConfirmPendingDownloadRequest, DownloadCategory, MediaProbeResult,
+  PendingDownloadPreview, RefreshDownloadUrlRequest, TelemetryBatch, ToolchainStatus, TorrentFileEntry,
+  TransferCompletionOptions, UpdateProgress, UpdateStatus,
 } from "../types/ipc";
 import { demo } from "./demo";
 
@@ -53,6 +55,33 @@ export const desktop = {
   verifyTransferChecksum: (transfer_id: string, expected_sha256: string) =>
     command<boolean>("verify_transfer_checksum", { transfer_id, expected_sha256 }, () => demo.verify(transfer_id, expected_sha256)),
   revealInExplorer: (transfer_id: string) => command<void>("reveal_in_explorer", { transfer_id }, () => undefined),
+  getPendingDownload: (pendingId: string) =>
+    command<PendingDownloadPreview>("get_pending_download", { pending_id: pendingId }, () => demo.getPendingDownload(pendingId)),
+  confirmPendingDownload: (request: ConfirmPendingDownloadRequest) =>
+    command<string>("confirm_pending_download", { request }, () => demo.confirmPendingDownload(request)),
+  cancelPendingDownload: (pendingId: string) =>
+    command<void>("cancel_pending_download", { pending_id: pendingId }, () => demo.cancelPendingDownload(pendingId)),
+  resolveDuplicateExisting: (pendingId: string) =>
+    command<string>("resolve_duplicate_existing", { pending_id: pendingId }, () => demo.resolveDuplicateExisting(pendingId)),
+  addDownloadCategory: (name: string, extensions: string[], saveDir?: string | null) =>
+    command<DownloadCategory>("add_download_category", { name, extensions, save_dir: saveDir ?? null },
+      () => demo.addDownloadCategory(name, extensions, saveDir ?? null)),
+  setTransferSpeedLimit: (transferId: string, limitBps: number | null) =>
+    command<void>("set_transfer_speed_limit", { transfer_id: transferId, limit_bps: limitBps },
+      () => demo.setTransferSpeedLimit(transferId, limitBps)),
+  getTransferCompletionOptions: (transferId: string) =>
+    command<TransferCompletionOptions>("get_transfer_completion_options", { transfer_id: transferId },
+      () => demo.getTransferCompletionOptions(transferId)),
+  setTransferCompletionOptions: (transferId: string, options: TransferCompletionOptions) =>
+    command<void>("set_transfer_completion_options", { transfer_id: transferId, options },
+      () => demo.setTransferCompletionOptions(transferId, options)),
+  openProgressDialog: (transferId: string) =>
+    command<void>("open_progress_dialog", { transfer_id: transferId }, () => demo.openProgressDialog(transferId)),
+  openCompletedFile: (transferId: string) =>
+    command<void>("open_completed_file", { transfer_id: transferId }, () => demo.openCompletedFile(transferId)),
+  pickDownloadFolder: (initialDir?: string | null) =>
+    command<string | null>("pick_download_folder", { initial_dir: initialDir ?? null },
+      () => demo.pickDownloadFolder(initialDir ?? null)),
   getSettings: () => command<AppSettings>("get_settings", undefined, demo.getSettings),
   saveSettings: (settings: AppSettings) => command<void>("save_settings", { settings }, () => demo.saveSettings(settings)),
   getToolchainStatus: () => command<ToolchainStatus>("get_toolchain_status", undefined, demo.toolchain),
@@ -105,4 +134,21 @@ export const desktop = {
   async minimize() { if (isTauri()) await getCurrentWindow().minimize(); },
   async toggleMaximize() { if (isTauri()) await getCurrentWindow().toggleMaximize(); },
   async close() { if (isTauri()) await getCurrentWindow().close(); },
+  async setWindowSize(width: number, height: number) {
+    if (!isTauri()) return;
+    try {
+      await getCurrentWindow().setSize(new LogicalSize(width, height));
+    } catch {
+      // Ignore in non-resizable or test environments.
+    }
+  },
+  async setWindowTitle(title: string) {
+    if (typeof document !== "undefined") document.title = title;
+    if (!isTauri()) return;
+    try {
+      await getCurrentWindow().setTitle(title);
+    } catch {
+      // Ignore in test environments where native title updates are unavailable.
+    }
+  },
 };

@@ -1,5 +1,5 @@
 import {
-  Archive, Check, ChevronDown, ChevronRight, Disc, Ellipsis, File, FileCheck2, Film, Folder, ListVideo, Magnet, Music,
+  Archive, Check, ChevronDown, ChevronRight, Disc, Ellipsis, ExternalLink, File, FileCheck2, Film, Folder, ListVideo, Magnet, Music,
   Pause, Play, RefreshCw, Trash2, X,
 } from "lucide-react";
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
@@ -11,7 +11,7 @@ import {
 import type { View } from "./Shell";
 import { IconButton } from "./ui";
 
-export type TransferAction = "pause" | "resume" | "refresh" | "reveal" | "cancel" | "remove" | "verify";
+export type TransferAction = "pause" | "resume" | "refresh" | "reveal" | "cancel" | "remove" | "verify" | "progress";
 export type OnTransferAction = (action: TransferAction, transfer: TransferSnapshot) => void;
 export type OnPlaylistAction = (action: "pause_playlist" | "resume_playlist" | "reveal_playlist", playlistId: string) => void;
 
@@ -62,6 +62,7 @@ function TransferMenu({ transfer, onAction }: { transfer: TransferSnapshot; onAc
     <IconButton label={"More actions for " + transfer.filename} className="folder-ghost more-trigger"
       aria-expanded={open} onClick={() => setOpen(!open)}><Ellipsis size={15} /></IconButton>
     {open && <div className="transfer-popover">
+      {!isDone(transfer) && action("progress", "Open Progress Window", <ExternalLink size={13} />)}
       {!isDone(transfer) && transfer.kind === "http" && action("refresh", "Refresh Link", <RefreshCw size={13} />)}
       {!isDone(transfer) && action("reveal", "Reveal", <Folder size={14} />)}
       {isDone(transfer) && action("verify", "Verify SHA-256", <FileCheck2 size={14} />)}
@@ -86,7 +87,7 @@ function TransferRow({ transfer, selected, select, onAction, preview }: {
   if (paused) source = transfer.resumable ? "Resumable Range" : transfer.protocol_label;
 
   return <article aria-label={transfer.filename} className={"transfer-row" + (selected ? " selected" : "")}>
-    <button className="transfer-select" type="button" onClick={select} aria-pressed={selected} aria-label={"Inspect " + transfer.filename}>
+    <button className="transfer-select" type="button" onClick={select} onDoubleClick={() => onAction("progress", transfer)} aria-pressed={selected} aria-label={"Inspect " + transfer.filename}>
       <span className={"thumb-tile" + (torrent ? " torrent-tile" : "")}>
         {preview && transfer.id === "alpine" ? <img src={tile} alt="" /> : <TransferIcon transfer={transfer} />}
       </span>

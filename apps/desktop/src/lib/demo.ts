@@ -2,19 +2,30 @@ import { version } from "../../package.json";
 import { DEFAULT_CHROMIUM_EXTENSION_ID, DEFAULT_FIREFOX_EXTENSION_ID } from "../types/ipc";
 import type {
   AddHttpDownloadRequest, AddMediaDownloadRequest, AddTorrentRequest, AppSettings, BrowserKind,
-  BrowserSetupResult, BrowserStatus, MediaFormatOption, MediaProbeResult, PlaylistEntry,
-  RefreshDownloadUrlRequest, SegmentSnapshot, TelemetryBatch, ToolchainStatus, TorrentFileEntry, TransferSnapshot, UpdateStatus,
+  BrowserSetupResult, BrowserStatus, ConfirmPendingDownloadRequest, DownloadCategory, MediaFormatOption,
+  MediaProbeResult, PendingDownloadPreview, PlaylistEntry, RefreshDownloadUrlRequest, SegmentSnapshot,
+  TelemetryBatch, ToolchainStatus, TorrentFileEntry, TransferCompletionOptions, TransferSnapshot, UpdateStatus,
 } from "../types/ipc";
 import {
   MB, SEGMENT_COUNT, folderSeparator, isHttpUrl, isPurePlaylistUrl, isRunning, parsePlaylistRanges, ratio,
   sanitizeMediaStem, sourceName,
 } from "./transfers";
 
+export const DEFAULT_CATEGORIES: DownloadCategory[] = [
+  { id: "general", name: "General", extensions: [], save_dir: null },
+  { id: "programs", name: "Programs", extensions: ["exe", "msi", "msix", "appx", "dmg", "pkg", "deb", "rpm", "apk", "bin", "bat", "cmd"], save_dir: null },
+  { id: "compressed", name: "Compressed", extensions: ["zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "zst", "cab", "iso", "img"], save_dir: null },
+  { id: "video", name: "Video", extensions: ["mp4", "mkv", "webm", "avi", "mov", "m4v", "flv", "wmv", "ts"], save_dir: null },
+  { id: "music", name: "Music", extensions: ["mp3", "flac", "wav", "m4a", "ogg", "opus", "aac", "wma"], save_dir: null },
+  { id: "documents", name: "Documents", extensions: ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "epub", "csv"], save_dir: null },
+];
+
 export const DEFAULT_SETTINGS: AppSettings = {
   theme: "dark", accent: "blue", default_download_dir: "", default_connections: 16,
   global_speed_limit_bps: null, max_concurrent_downloads: 4, auto_defender_scan: true,
   close_to_tray_hibernate: true, monitor_clipboard: false, ytdlp_path: null, ffmpeg_path: null,
-  update_mode: "auto",
+  update_mode: "auto", show_download_dialog: true, show_progress_dialog: true, show_complete_dialog: true,
+  categories: DEFAULT_CATEGORIES.map(category => ({ ...category, extensions: [...category.extensions] })),
 };
 
 const demoFolder = "D:\\Downloads";
@@ -31,6 +42,8 @@ const demoPlaylistItems: (PlaylistEntry & { url: string })[] = demoPlaylistTitle
   index: position + 1, id, title, url: "https://www.youtube.com/watch?v=" + id, duration_seconds,
 }));
 const pausedPlaylists = new Set<string>();
+const pendingDownloads = new Map<string, PendingDownloadPreview>();
+const completionOptionsMap = new Map<string, TransferCompletionOptions>();
 const timestamp = new Date().toISOString();
 const telemetryListeners = new Set<(batch: TelemetryBatch) => void>();
 const pickerListeners = new Set<(url: string | null) => void>();
@@ -467,7 +480,98 @@ export const demo = {
     settings = { ...settings, global_speed_limit_bps: limit };
     refreshRates();
   },
-  getSettings() { return { ...settings }; },
+  getPendingDownload(pendingId: string): PendingDownloadPreview {
+    const existing = pendingDownloads.get(pendingId);
+    if (existing) return existing;
+    const preview: PendingDownloadPreview = {
+      pending_id: pendingId,
+      url: "https://releases.example.com/app/SlipStream-Setup.exe",
+      source_domain: "releases.example.com",
+      filename: "SlipStream-Setup.exe",
+      suggested_category_id: "programs",
+      suggested_save_dir: (settings.default_download_dir || demoFolder) + "\\Programs",
+      expected_size_bytes: 85_960_000,
+      duplicate: null,
+    };
+    pendingDownloads.set(pendingId, preview);
+    return preview;
+  },
+  confirmPendingDownload(request: ConfirmPendingDownloadRequest): string {
+    const pending = pendingDownloads.get(request.pending_id);
+    pendingDownloads.delete(request.pending_id);
+    if (request.remember_category_path && settings.categories) {
+      settings = {
+        ...settings,
+        categories: settings.categories.map(cat =>
+          cat.id === request.category_id ? { ...cat, save_dir: request.save_dir } : cat),
+      };
+    }
+    const url = pending?.url ?? "https://releases.example.com/" + request.filename;
+    return add(baseTransfer("demo-" + ++sequence, request.filename, url), {
+      save_dir: request.save_dir || settings.default_download_dir || demoFolder,
+      total_bytes: pending?.expected_size_bytes ?? 85_960_000,
+      status: request.start_immediately ? "active" : "paused",
+      download_speed_bps: request.start_immediately ? 24 * MB : 0,
+      active_connections: request.start_immediately ? settings.default_connections : 0,
+      description: request.description ?? null,
+    });
+  },
+  cancelPendingDownload(pendingId: string) {
+    pendingDownloads.delete(pendingId);
+  },
+  resolveDuplicateExisting(pendingId: string): string {
+    const pending = pendingDownloads.get(pendingId);
+    pendingDownloads.delete(pendingId);
+    const dup = pending?.duplicate;
+    if (!dup) return transfers[0]?.id ?? "";
+    if (dup.status !== "completed") {
+      try {
+        demo.resume(dup.transfer_id);
+      } catch {
+        // Ignore if transfer is not present in demo store.
+      }
+    }
+    return dup.transfer_id;
+  },
+  addDownloadCategory(name: string, extensions: string[], saveDir: string | null): DownloadCategory {
+    const trimmed = name.trim();
+    const id = trimmed.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || ("cat-" + ++sequence);
+    const category: DownloadCategory = {
+      id,
+      name: trimmed,
+      extensions: extensions.map(ext => ext.trim().replace(/^\./, "").toLowerCase()).filter(Boolean),
+      save_dir: saveDir?.trim() || null,
+    };
+    const current = settings.categories ?? DEFAULT_CATEGORIES;
+    settings = {
+      ...settings,
+      categories: [...current.filter(cat => cat.id !== id), category],
+    };
+    return category;
+  },
+  setTransferSpeedLimit(transferId: string, limitBps: number | null) {
+    update(transferId, () => ({ speed_limit_bps: limitBps }));
+  },
+  getTransferCompletionOptions(transferId: string): TransferCompletionOptions {
+    return completionOptionsMap.get(transferId) ?? {
+      show_complete_dialog: settings.show_complete_dialog ?? true,
+      auto_close_progress: false,
+      open_folder_on_complete: false,
+    };
+  },
+  setTransferCompletionOptions(transferId: string, options: TransferCompletionOptions) {
+    completionOptionsMap.set(transferId, { ...options });
+  },
+  openProgressDialog(_transferId: string) {
+    // No-op in browser preview mode.
+  },
+  openCompletedFile(_transferId: string) {
+    // No-op in browser preview mode.
+  },
+  pickDownloadFolder(initialDir: string | null): string | null {
+    return initialDir || settings.default_download_dir || demoFolder;
+  },
+  getSettings() { return { ...settings, categories: settings.categories?.map(cat => ({ ...cat, extensions: [...cat.extensions] })) }; },
   saveSettings(next: AppSettings) {
     settings = { ...next };
     refreshRates();

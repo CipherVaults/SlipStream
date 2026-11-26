@@ -56,6 +56,9 @@ export interface TransferSnapshot {
   playlist_paused?: boolean | null;
   playlist_index?: number | null;
   playlist_total?: number | null;
+  speed_limit_bps?: number | null;
+  connect_rtt_ms?: number | null;
+  description?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -79,6 +82,9 @@ export interface AddHttpDownloadRequest {
   headers: Record<string, string>;
   referrer?: string | null;
   expected_sha256?: string | null;
+  expected_size_bytes?: number | null;
+  start_paused?: boolean;
+  overwrite_existing?: boolean;
 }
 
 export type AudioPreset = "mp3_320" | "m4a_aac" | "opus" | "flac" | "wav";
@@ -213,6 +219,50 @@ export interface UpdateStatus {
   pub_date?: string | null;
 }
 
+export interface DownloadCategory {
+  id: string;
+  name: string;
+  extensions: string[];
+  save_dir?: string | null;
+}
+
+export interface DuplicateMatch {
+  transfer_id: string;
+  filename: string;
+  status: TransferStatus;
+  save_dir: string;
+  total_bytes: number | null;
+  downloaded_bytes: number;
+}
+
+export interface PendingDownloadPreview {
+  pending_id: string;
+  url: string;
+  source_domain: string;
+  filename: string;
+  suggested_category_id: string;
+  suggested_save_dir: string;
+  expected_size_bytes: number | null;
+  duplicate: DuplicateMatch | null;
+}
+
+export interface ConfirmPendingDownloadRequest {
+  pending_id: string;
+  filename: string;
+  save_dir: string;
+  category_id: string;
+  remember_category_path: boolean;
+  start_immediately: boolean;
+  overwrite_existing: boolean;
+  description?: string | null;
+}
+
+export interface TransferCompletionOptions {
+  show_complete_dialog: boolean;
+  auto_close_progress: boolean;
+  open_folder_on_complete: boolean;
+}
+
 export interface AppSettings {
   theme: ThemeMode;
   accent: AccentMode;
@@ -226,6 +276,10 @@ export interface AppSettings {
   ytdlp_path: string | null;
   ffmpeg_path: string | null;
   update_mode?: UpdateMode;
+  show_download_dialog?: boolean;
+  show_progress_dialog?: boolean;
+  show_complete_dialog?: boolean;
+  categories?: DownloadCategory[];
 }
 
 export type NativeBridgeRequest =
