@@ -11,6 +11,7 @@ use slipstream_protocol::{
 };
 use slipstream_torrent::TorrentManagerConfig;
 use std::{
+    collections::HashMap,
     env, fs,
     future::Future,
     os::windows::{
@@ -345,6 +346,69 @@ fn installed_settings(data: &Path, downloads: &Path) -> AppSettings {
     )
     .unwrap();
     settings
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_http_cannot_overwrite_and_superseded_rows_cannot_delete_the_output() {
+    let temp = TempDir::new();
+    let downloads = temp.0.join("downloads");
+    installed_settings(&temp.0, &downloads);
+    let registry_key = RegistryKey::isolated();
+    let pipe = format!(r"\\.\pipe\slipstream-overwrite-test-{}", Uuid::new_v4());
+    let state = AppState::start(
+        temp.0.clone(),
+        Arc::new(FakeUi::default()),
+        options(&pipe, &registry_key.0),
+    )
+    .await
+    .unwrap();
+    let server = HttpServer::start().await;
+    let token = SessionToken::read(&temp.0.join("session.token")).unwrap();
+    let mut bridge = Bridge(Some(
+        PipeClient::connect(&pipe, &token, "overwrite-test")
+            .await
+            .unwrap(),
+    ));
+
+    let request = http_request(&server, "download", "shared.bin");
+    let old = state.add_http_download(request.clone()).await.unwrap();
+    wait_for(&state, &old, TransferStatus::Completed).await;
+    assert!(state
+        .verify_transfer_checksum(&old, TEST_HASH)
+        .await
+        .unwrap());
+
+    let mut overwrite = request;
+    overwrite.overwrite_existing = true;
+    let response = bridge
+        .request(Request::AddHttpDownload {
+            request: overwrite.clone(),
+        })
+        .await;
+    let Response::TransferCreated { transfer_id } = response else {
+        panic!("expected a browser download to be queued, got {response:?}");
+    };
+    let browser = wait_for(&state, &transfer_id, TransferStatus::Completed).await;
+    assert_eq!(browser.filename, "shared (1).bin");
+    assert!(
+        !wait_for(&state, &old, TransferStatus::Completed)
+            .await
+            .output_superseded
+    );
+
+    let replacement = state.add_http_download(overwrite).await.unwrap();
+    wait_for(&state, &replacement, TransferStatus::Completed).await;
+    let superseded = wait_for(&state, &old, TransferStatus::Completed).await;
+    assert!(superseded.output_superseded);
+    assert_eq!(superseded.sha256_verified, None);
+    assert!(state.open_completed_file(&old).await.is_err());
+    assert!(state
+        .verify_transfer_checksum(&old, TEST_HASH)
+        .await
+        .is_err());
+    state.cancel_transfer(&old, true).await.unwrap();
+    assert_eq!(fs::read(downloads.join("shared.bin")).unwrap(), b"test");
+    state.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -999,7 +1063,8 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
     assert!(matches!(
         bridge
             .request(Request::OpenDesktopWindow {
-                open_picker_url: Some("file:///C:/private".into())
+                open_picker_url: Some("file:///C:/private".into()),
+                headers: HashMap::new(),
             })
             .await,
         Response::Error { .. }
@@ -1008,6 +1073,13 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
     bridge
         .ack(Request::OpenDesktopWindow {
             open_picker_url: Some(media_url.into()),
+            headers: HashMap::from([
+                ("referer".into(), "https://example.com/watch".into()),
+                ("Origin".into(), "https://example.com/invalid-path".into()),
+                ("User-Agent".into(), "first".into()),
+                ("user-agent".into(), "conflicting".into()),
+                ("Cookie".into(), "session=private".into()),
+            ]),
         })
         .await;
     assert!(ui.events.lock().unwrap().is_empty());
@@ -1018,15 +1090,23 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
     assert_eq!(
         *ui.events.lock().unwrap(),
         vec![OpenPickerEvent {
-            url: Some(media_url.into())
+            url: Some(media_url.into()),
+            headers: HashMap::from([("Referer".into(), "https://example.com/watch".into())]),
         }]
     );
     bridge
         .ack(Request::OpenDesktopWindow {
             open_picker_url: None,
+            headers: HashMap::from([("Accept-Language".into(), "en-US".into())]),
         })
         .await;
-    assert_eq!(ui.events.lock().unwrap().last().unwrap().url, None);
+    assert_eq!(
+        ui.events.lock().unwrap().last().unwrap(),
+        &OpenPickerEvent {
+            url: None,
+            headers: HashMap::new(),
+        }
+    );
     timeout(Duration::from_secs(1), async {
         while ui.snapshots.lock().unwrap().len() < 2 {
             sleep(Duration::from_millis(10)).await;
@@ -1047,6 +1127,7 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
     bridge
         .ack(Request::OpenDesktopWindow {
             open_picker_url: Some(magnet.clone()),
+            headers: HashMap::new(),
         })
         .await;
     assert_eq!(ui.events.lock().unwrap().len(), 2);

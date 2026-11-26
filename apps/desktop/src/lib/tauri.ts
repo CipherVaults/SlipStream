@@ -20,14 +20,25 @@ async function command<T>(name: string, args: Record<string, unknown> | undefine
   return args ? invoke<T>(name, args) : invoke<T>(name);
 }
 
+const ALLOWED_PICKER_HEADERS = new Map<string, string>([
+  ["referer", "Referer"],
+  ["origin", "Origin"],
+  ["user-agent", "User-Agent"],
+  ["accept-language", "Accept-Language"],
+]);
+
 export const desktop = {
   getSnapshot: () => command<TelemetryBatch>("get_snapshot", undefined, demo.snapshot),
   addHttpDownload: (request: AddHttpDownloadRequest) =>
     command<string>("add_http_download", { request }, () => demo.addHttp(request)),
   expandWildcardUrls: (pattern: string) =>
     command<string[]>("expand_wildcard_urls", { pattern }, () => demo.expandWildcard(pattern)),
-  probeMedia: (url: string, playlist?: boolean) =>
-    command<MediaProbeResult>("probe_media", playlist === undefined ? { url } : { url, playlist }, () => demo.probe(url, playlist)),
+  probeMedia: (url: string, playlist?: boolean, headers?: Record<string, string>) => {
+    const args: Record<string, unknown> = { url };
+    if (playlist !== undefined) args.playlist = playlist;
+    if (headers && Object.keys(headers).length > 0) args.headers = headers;
+    return command<MediaProbeResult>("probe_media", args, () => demo.probe(url, playlist));
+  },
   addMediaDownload: (request: AddMediaDownloadRequest) =>
     command<string>("add_media_download", { request }, () => demo.addMedia(request)),
   addTorrent: (request: AddTorrentRequest) =>
@@ -122,9 +133,24 @@ export const desktop = {
       // Older backends or tests without mark_ui_ready remain usable.
     }
   },
-  async onOpenPicker(handler: (url: string | null) => void) {
-    return isTauri() ? listen<{ url: string | null }>("slipstream://open-picker", ({ payload }) => {
-      handler(typeof payload?.url === "string" ? payload.url : null);
+  async onSettingsUpdated(handler: () => void) {
+    return isTauri() ? listen("slipstream://settings-updated", () => handler()) : () => {};
+  },
+  async onOpenPicker(handler: (url: string | null, headers?: Record<string, string>) => void) {
+    return isTauri() ? listen<{ url: string | null; headers?: Record<string, string> }>("slipstream://open-picker", ({ payload }) => {
+      const nextUrl = typeof payload?.url === "string" ? payload.url : null;
+      const rawHeaders = payload?.headers;
+      const filtered: Record<string, string> = {};
+      if (rawHeaders && typeof rawHeaders === "object" && !Array.isArray(rawHeaders)) {
+        for (const [name, value] of Object.entries(rawHeaders)) {
+          const canonical = ALLOWED_PICKER_HEADERS.get(name.toLowerCase());
+          if (canonical && typeof value === "string" && value.length > 0 && !(canonical in filtered)) {
+            filtered[canonical] = value;
+          }
+        }
+      }
+      if (Object.keys(filtered).length > 0) handler(nextUrl, filtered);
+      else handler(nextUrl);
     }) : demo.listenPicker(handler);
   },
   async onFileDrop(handler: (event: DragDropEvent) => void) {

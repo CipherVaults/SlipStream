@@ -301,7 +301,7 @@ export type NativeBridgeRequest =
     }
   | { type: "pause_transfer"; transfer_id: string }
   | { type: "resume_transfer"; transfer_id: string }
-  | { type: "open_desktop_window"; open_picker_url?: string | null }
+  | { type: "open_desktop_window"; open_picker_url?: string | null; headers?: Record<string, string> }
   | { type: "grab_batch_urls"; urls: string[]; referrer?: string | null };
 
 export type NativeBridgeResponse =

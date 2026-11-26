@@ -21,7 +21,7 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 
 - **Target OS:** Windows 10 / Windows 11 (`x86_64`)
 - **Public repository** [CipherVaults/SlipStream](https://github.com/CipherVaults/SlipStream)
-- **Latest release** [v1.2.2](https://github.com/CipherVaults/SlipStream/releases/tag/v1.2.2)
+- **Latest release** [v1.3.0](https://github.com/CipherVaults/SlipStream/releases/tag/v1.3.0)
 
 ---
 
@@ -51,7 +51,12 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 - **Floating media pill.** Open the closed Shadow DOM pill for direct HTTP video downloads (`HTTP 200`/`206`), HLS master variants, probed `yt-dlp` qualities, audio presets, or **Download Playlist…** across embedded players and third-party CDNs. Drag the pill to snap it to a player edge, dismiss it in one click, or enable it in fullscreen from the extension popup. Capture-phase protection helps keep page click handlers from interfering with the pill.
 - **Privacy & Context Isolation:** Uses Chromium `downloads.onDeterminingFilename` (plus `downloads.onCreated` fallback) with `Alt`-key bypass, broadened extension and inferred-MIME matching, non-private `"cookies"` retrieval, `Alt`-key bypass protection, muted/excluded sites, and **Incognito / Firefox private `cookieStoreId` isolation**. Browser `GetStatus` responses redact desktop query tokens and filesystem paths before leaving the daemon.
 
-### 5. Dual-Theme Windows Desktop App & Auto-Updater (`apps/desktop`)
+### 5. Dual-Theme Windows Desktop App, Floating Dialogs & Auto-Updater (`apps/desktop`)
+- **Standalone Floating Download Windows:** Even when the main window is hibernated to the system tray, intercepted HTTP downloads and transfer controls can open dedicated lightweight windows outside the main workspace (each independently toggleable in **Settings → Floating Download Windows**):
+  - **Duplicate Download Link:** Prompts with three choices—auto-numbered filename, overwrite existing file cleanly via atomic replacement, or resume/show existing completion dialog.
+  - **Download File Info:** Auto-matches the file extension to pre-seeded IDM-style category subfolders (`General`, `Programs`, `Compressed`, `Video`, `Music`, `Documents`, plus `+` custom categories), offers **Save As** with a native Win32 folder picker (`Browse`), optional **Remember this path**, file size, **Description**, **Download Later**, and **Start Download**.
+  - **Download Progress:** Shows live `{pct}% {filename}` titlebar updates, speed/ETA/resume stats, `host · protocol · connect_rtt_ms` server info, an expandable `Show details >>` connection map (`N. | Downloaded | Info`), a **Speed Limiter** tab, and **Options on completion**.
+  - **Download Complete:** Displays filename, size, SHA-256 verification status, and **Open**, **Open folder**, or **Close** actions.
 - **Soft Graphite Dark ↔ Porcelain Light:** Live instant theme switching (plus `Follow System` and `Blue` / `Monochrome` accents), 16-segment progress visualizer, `T01–T16` active thread map, throughput sparkline, and `Ctrl+K` / `Ctrl+N` command shortcuts.
 - **Tray-Hibernate Mode & OS Security:** Closes the WebView2 surface cleanly to the Windows system tray while active downloads continue at minimal RAM, reveals completed files via `explorer.exe /select`, and optionally queues Windows Defender (`MpCmdRun.exe`) scans.
 - **Signed NSIS updates** In **Settings → About & Updates**, choose **Automatic on startup** or **Manual only**. An automatic check runs once per app process, including across tray restores. **Check for Updates** is available in either mode. **Install Update & Restart** shows live progress for the signed update. If installation is interrupted after downloads are stopped, quit and reopen SlipStream to resume them.
@@ -68,8 +73,8 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 
 ## Download, Installation & Browser Setup
 
-1. **Installer** Download `SlipStream_1.2.2_x64-setup.exe` and run the per-user installer. It includes the native messaging host, media tools, and both browser extension builds. [v1.2.2 release assets](https://github.com/CipherVaults/SlipStream/releases/tag/v1.2.2)
-2. **Portable ZIP** Extract `SlipStream-1.2.2-windows-x64-portable.zip` and run `SlipStream.exe`. Keep the extracted `bin/` and `extensions/` directories beside it.
+1. **Installer** Download `SlipStream_1.3.0_x64-setup.exe` and run the per-user installer. It includes the native messaging host, media tools, and both browser extension builds. [v1.3.0 release assets](https://github.com/CipherVaults/SlipStream/releases/tag/v1.3.0)
+2. **Portable ZIP** Extract `SlipStream-1.3.0-windows-x64-portable.zip` and run `SlipStream.exe`. Keep the extracted `bin/` and `extensions/` directories beside it.
 3. **Browser extension** In **Settings → Browser Integration**, select your browser. For Chrome, Edge, or Brave, enable **Developer mode**, select **Load unpacked**, and choose the revealed folder. In Firefox, choose **Load Temporary Add-on** and select the revealed `manifest.json`. Separate browser extension ZIPs are also available on the release page.
 
 **Upgrading from v1.0.0** SlipStream keeps the valid native messaging IDs already registered for each browser and adds the bundled extension ID. If an older unpacked copy’s ID is missing from the registration, copy the ID from the browser’s extensions page and enter it in **Settings → Browser Integration** for that browser.

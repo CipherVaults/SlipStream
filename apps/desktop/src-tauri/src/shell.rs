@@ -33,10 +33,25 @@ use windows_sys::Win32::Graphics::Dwm::{
 pub(crate) const MAIN: &str = "main";
 const OPEN_PICKER_EVENT: &str = "slipstream://open-picker";
 const TELEMETRY_EVENT: &str = "slipstream://telemetry";
-const CONFIRM_PREFIX: &str = "dl-confirm-";
-const PROGRESS_PREFIX: &str = "dl-progress-";
-const COMPLETE_PREFIX: &str = "dl-complete-";
+pub(crate) const CONFIRM_PREFIX: &str = "dl-confirm-";
+pub(crate) const PROGRESS_PREFIX: &str = "dl-progress-";
+pub(crate) const COMPLETE_PREFIX: &str = "dl-complete-";
 type Result<T> = std::result::Result<T, String>;
+
+fn is_allowed_app_url(url: &url::Url) -> bool {
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    let origin = (url.scheme(), url.host_str(), url.port());
+    #[cfg(debug_assertions)]
+    if origin == ("http", Some("localhost"), Some(1420)) {
+        return true;
+    }
+    matches!(
+        origin,
+        ("tauri", Some("localhost"), None) | ("http", Some("tauri.localhost"), None)
+    )
+}
 
 pub(crate) struct DesktopUi {
     app: AppHandle,
@@ -68,7 +83,12 @@ impl DesktopUi {
                 .find(|config| config.label == MAIN)
                 .ok_or_else(|| "missing main window configuration".to_owned())?;
             let window = WebviewWindowBuilder::from_config(&self.app, config)
-                .map(|builder| builder.visible(false))
+                .map(|builder| {
+                    builder
+                        .on_navigation(is_allowed_app_url)
+                        .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
+                        .visible(false)
+                })
                 .and_then(WebviewWindowBuilder::build)
                 .map_err(|error| error.to_string())?;
             if let Err(error) = configure_webview2(&window) {
@@ -162,6 +182,8 @@ impl DesktopUi {
                             "index.html?window={variant}&id={id}"
                         )));
                         let window = WebviewWindowBuilder::new(&app, &label, url)
+                            .on_navigation(is_allowed_app_url)
+                            .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
                             .title("SlipStream")
                             .inner_size(size.0, size.1)
                             .decorations(false)
@@ -262,6 +284,10 @@ impl UiBridge for DesktopUi {
         window
             .emit(OPEN_PICKER_EVENT, event)
             .map_err(|error| error.to_string())
+    }
+
+    fn emit_settings_changed(&self) {
+        let _ = self.app.emit_to(MAIN, "slipstream://settings-updated", ());
     }
 
     fn has_main_window(&self) -> bool {
@@ -459,6 +485,13 @@ pub(crate) fn pick_download_folder(
             "Could not initialize the folder picker (0x{code:08x})."
         )));
     }
+    struct ComApartment;
+    impl Drop for ComApartment {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+    let _apartment = ComApartment;
     let mut display = [0_u16; 260];
     let info = BROWSEINFOW {
         hwndOwner: owner as HWND,
@@ -473,7 +506,7 @@ pub(crate) fn pick_download_folder(
     let mut selected = vec![0_u16; 32_768];
     let resolved = unsafe {
         let item = SHBrowseForFolderW(&info);
-        let result = if item.is_null() {
+        if item.is_null() {
             None
         } else {
             let found = SHGetPathFromIDListEx(
@@ -484,9 +517,7 @@ pub(crate) fn pick_download_folder(
             );
             CoTaskMemFree(item.cast());
             Some(found != 0)
-        };
-        CoUninitialize();
-        result
+        }
     };
     match resolved {
         None => Ok(None),

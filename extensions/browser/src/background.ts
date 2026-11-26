@@ -718,7 +718,13 @@ async function mediaAction(action: MediaAction, source: string, links: unknown[]
   if (url.length > MAX_URL_LENGTH) return { ok: false, message: "Media URL is too long." };
   if (blockedSite(httpUrl(url), settings)) return { ok: false, message: "SlipStream is disabled for this site." };
   if (action === "picker" || action === "playlist") {
-    return result(await native.send({ type: "open_desktop_window", open_picker_url: url }), ["ack"]);
+    const targetUrl = httpUrl(url);
+    const headers = !frame.private && targetUrl ? buildMediaHeaders(frame, targetUrl) : undefined;
+    return result(await native.send({
+      type: "open_desktop_window",
+      open_picker_url: url,
+      ...(headers && Object.keys(headers).length ? { headers } : {}),
+    }), ["ack"]);
   }
   if (action.startsWith("direct:")) {
     const directUrl = httpUrl(action.slice("direct:".length));
@@ -777,12 +783,18 @@ async function mediaAction(action: MediaAction, source: string, links: unknown[]
     if (!formatId) return { ok: false, message: "That quality is unavailable. Open the format picker for more options." };
   }
   if (formatId !== undefined && !validFormatId(formatId)) return { ok: false, message: "Invalid media format." };
+  const mediaTarget = httpUrl(url);
+  const mediaHeaders = frame.private
+    ? {}
+    : mediaTarget
+      ? buildMediaHeaders(frame, mediaTarget)
+      : network.mediaHeaders(tabId, url, tabUrl, frameId, page.href);
   return result(await native.send({
     type: "add_media_download",
     request: {
       url, format_id: formatId, audio_only_preset: audio,
       embed_subtitles_langs: [], lossless_remux: !audio, normalize_audio: false,
-      headers: frame.private ? {} : network.mediaHeaders(tabId, url, tabUrl, frameId, page.href),
+      headers: mediaHeaders,
     },
   }), ["transfer_created", "ack"]);
 }

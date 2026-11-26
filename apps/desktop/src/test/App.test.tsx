@@ -23,7 +23,7 @@ const availableUpdate: UpdateStatus = {
 };
 
 let pushTelemetry: (batch: TelemetryBatch) => void;
-let openPicker: (url: string | null) => void;
+let openPicker: (url: string | null, headers?: Record<string, string>) => void;
 
 beforeEach(() => {
   vi.spyOn(desktop, "onTelemetry").mockImplementation(async handler => {
@@ -1675,5 +1675,47 @@ describe("appearance, settings and transfer dialogs", () => {
       Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
       Reflect.deleteProperty(window, "__TAURI_EVENT_PLUGIN_INTERNALS__");
     }
+  });
+
+  it("forwards open-picker media headers for same origin and clears them when edited to another origin", async () => {
+    const cdnUrl = "https://cdn.example.org/hls/index-v1-a1.m3u8?token=abc";
+    const headers = {
+      Referer: "https://video-host.example.org/embed/123",
+      Origin: "https://video-host.example.org",
+      "User-Agent": "TestBrowser/1.0",
+    };
+    const probeSpy = vi.spyOn(desktop, "probeMedia").mockResolvedValue({
+      title: "CDN Stream", source_url: cdnUrl, extractor: "generic", duration_seconds: 90,
+      thumbnail_url: null, is_playlist: false, playlist_count: null, playlist_entries: [],
+      formats: [{
+        format_id: "hls-720", label: "720p · MP4", container: "mp4", video_codec: "h264", audio_codec: "aac",
+        height: 720, fps: 30, filesize_bytes: 50_000_000, is_audio_only: false, has_audio: true, has_video: true,
+      }],
+      subtitles: [],
+    });
+    const addHttpSpy = vi.spyOn(desktop, "addHttpDownload").mockResolvedValue("http-hdr-1");
+    const addMediaSpy = vi.spyOn(desktop, "addMediaDownload").mockResolvedValue("media-hdr-1");
+    const user = await start();
+
+    await act(async () => openPicker(cdnUrl, headers));
+    await waitFor(() => expect(probeSpy).toHaveBeenCalledWith(cdnUrl, undefined, headers));
+    const addDlg = dialog("Add Download");
+    await user.click(addDlg.getByRole("button", { name: "Download" }));
+    await waitFor(() => expect(addMediaSpy).toHaveBeenCalledWith(expect.objectContaining({
+      url: cdnUrl,
+      headers,
+    })));
+
+    // Changing the URL to a different origin must drop seed headers instead of leaking them.
+    await act(async () => openPicker(cdnUrl, headers));
+    const nextDlg = dialog("Add Download");
+    const input = nextDlg.getByLabelText("URL, magnet link, .torrent path, or wildcard pattern");
+    await user.clear(input);
+    await user.type(input, "https://other-site.example.net/installer.exe");
+    await user.click(nextDlg.getByRole("button", { name: "Download" }));
+    await waitFor(() => expect(addHttpSpy).toHaveBeenCalledWith(expect.objectContaining({
+      url: "https://other-site.example.net/installer.exe",
+      headers: {},
+    })));
   });
 });

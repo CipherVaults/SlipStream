@@ -180,6 +180,7 @@ impl MediaJob {
             ui_segments: [0.0; UI_SEGMENT_COUNT],
             segments: Vec::new(),
             sha256_verified: None,
+            output_superseded: false,
             resumable: false,
             queue_id: "default".into(),
             error_message: None,

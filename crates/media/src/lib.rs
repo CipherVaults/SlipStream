@@ -5,6 +5,9 @@ pub mod pipeline;
 pub mod probe;
 pub mod toolchain;
 
+#[cfg(test)]
+mod test_support;
+
 pub use args::{BuildFfmpegArgs, BuildYtDlpArgs};
 pub use error::MediaError;
 pub use pipeline::{

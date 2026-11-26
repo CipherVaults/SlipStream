@@ -35,6 +35,8 @@ pub(crate) struct Record {
     #[serde(default)]
     pub overwrite_existing: bool,
     #[serde(default)]
+    pub output_superseded: bool,
+    #[serde(default)]
     pub description: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -195,8 +197,20 @@ impl Database {
     }
 
     pub(crate) fn replace_segments(&mut self, record: &Record, segments: &Segments) -> Result<()> {
+        self.replace_segments_with_records(record, segments, &[])
+    }
+
+    pub(crate) fn replace_segments_with_records(
+        &mut self,
+        record: &Record,
+        segments: &Segments,
+        other_records: &[Record],
+    ) -> Result<()> {
         let transaction = self.0.transaction()?;
         save_record(&transaction, record)?;
+        for record in other_records {
+            save_record(&transaction, record)?;
+        }
         transaction.execute("DELETE FROM segments WHERE transfer_id = ?1", [&record.id])?;
         for segment in segments.values() {
             save_segment(&transaction, &record.id, segment)?;

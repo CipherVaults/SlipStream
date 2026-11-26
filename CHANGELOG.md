@@ -2,6 +2,29 @@
 
 All notable changes to **SlipStream** are documented in this file following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - 2026-11-26
+
+### Added
+
+- **Standalone Floating Download Windows (`apps/desktop`):** Added IDM-style lightweight windows outside the main SlipStream window (working even while hibernated to tray), each toggleable in **Settings → Floating Download Windows** (`show_download_dialog`, `show_progress_dialog`, `show_complete_dialog`, all enabled by default):
+  - **Duplicate Download Link dialog:** Detects matching URL/path downloads and lets you choose numbered naming, atomic **overwrite existing**, or resume / open completion for the existing transfer.
+  - **Download File Info dialog:** Stages browser-intercepted downloads in volatile-scrubbed RAM (`pending_downloads`, bounded to `32` entries / `15 min` TTL) and shows URL, auto-matched category, **Save As** with native Win32 folder picker (`Browse`), **Remember this path for category**, **Description**, file size, **Download Later** (`start_paused`), and **Start Download**.
+  - **Download Progress dialog (`{pct}% {filename}`):** Live telemetry bar, server line (`host · protocol · connect_rtt_ms`), expandable **Show details >>** per-connection chunk map & `N. | Downloaded | Info` table, live **Speed Limiter** (`KB/s` / `MB/s`), and **Options on completion** (`Show complete dialog`, `Auto close progress`, `Open containing folder`).
+  - **Download Complete dialog:** Displays filename, verified SHA-256 badge, saved path, and **Open**, **Open folder**, and **Close** controls.
+- **Download Categories & Custom Subfolders (`crates/protocol`, `apps/desktop`):** Added pre-seeded categories (`General`, `Programs`, `Compressed`, `Video`, `Music`, `Documents`) defaulting to subfolders under `default_download_dir` (`General` uses the root folder), plus a **+** modal in Download File Info to create custom categories with extension lists.
+
+### Fixed
+
+- **HLS `.m3u8` & `Add Download` `HTTP 403 Forbidden` compatibility (`crates/protocol`, `crates/media`, `apps/desktop`, `extensions/browser`):**
+  - Forwarded validated `Referer`, `Origin`, `User-Agent`, and `Accept-Language` headers from browser `open_desktop_window` (`picker`/`playlist`) and `add_media_download` actions into `OpenPickerEvent` -> `AddDialog` (`probeMedia`, `addHttpDownload`, and `addMediaDownload`), clearing seeded headers automatically if the user changes the URL to a different origin.
+  - Added a default Chrome `User-Agent` header when missing in `yt-dlp` probes and downloads, allowlisted `--force-ipv4` in `BuildYtDlpArgs`, and added a single automatic `--force-ipv4` retry on recognized HTTP 403 failures during `yt-dlp` probe and clean-stage single-video downloads.
+
+### Security & Hardening
+
+- **Audit hardening (`run-3`, Codex CLI cross-model audit on `v1.3.0`):**
+  - Enforced per-window label/ID command authorization across all 39 Tauri commands (`commands.rs`), replaced `"core:default"` in `capabilities/dialogs.json` with exact minimal permissions (no `core:event:allow-emit`), and restricted WebView navigation & popups cleanly in `shell.rs`.
+  - Cleared `overwrite_existing` at native bridge ingress, added durable overwrite record ownership invalidation in `crates/engine` (`output_superseded` clearing old SHA-256 verification badges and file actions), added a COM `Drop` unwind guard in Win32 `pick_download_folder`, made `confirm_pending_download` single-flight with volatile credential scrubbing on failure, preserved Windows drive-root paths (`C:\`) in `splitPath`, and added live `slipstream://settings-updated` synchronization so main window saves never revert remembered category paths.
+
 ## [1.2.2] - 2026-11-26
 
 ### Fixed

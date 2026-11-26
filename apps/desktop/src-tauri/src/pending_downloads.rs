@@ -1,9 +1,14 @@
 use slipstream_protocol::{AddHttpDownloadRequest, PendingDownloadPreview};
-use std::{collections::HashMap, time::Duration};
-use tokio::time::Instant;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+    time::Duration,
+};
+use tokio::{sync::Notify, time::Instant};
 
 const CAPACITY: usize = 32;
 const TTL: Duration = Duration::from_secs(15 * 60);
+pub(crate) const PENDING_UNAVAILABLE: &str = "Pending download expired or was closed.";
 
 pub(crate) struct PendingHttpEntry {
     pub request: AddHttpDownloadRequest,
@@ -12,27 +17,74 @@ pub(crate) struct PendingHttpEntry {
 
 impl Drop for PendingHttpEntry {
     fn drop(&mut self) {
-        fn scrub(value: String) {
-            let mut bytes = value.into_bytes();
-            for byte in &mut bytes {
-                // The original string allocation may contain credentials.
-                unsafe { std::ptr::write_volatile(byte, 0) };
-            }
-        }
-        for (name, value) in self.request.headers.drain() {
-            scrub(name);
-            scrub(value);
-        }
-        if let Some(referrer) = self.request.referrer.take() {
-            scrub(referrer);
-        }
-        scrub(std::mem::take(&mut self.request.url));
+        scrub_http_request(&mut self.request);
     }
+}
+
+pub(crate) struct ScrubbedRequest(pub Option<AddHttpDownloadRequest>);
+
+impl Drop for ScrubbedRequest {
+    fn drop(&mut self) {
+        if let Some(request) = &mut self.0 {
+            scrub_http_request(request);
+        }
+    }
+}
+
+fn scrub_http_request(request: &mut AddHttpDownloadRequest) {
+    fn scrub(value: String) {
+        let mut bytes = value.into_bytes();
+        for byte in &mut bytes {
+            // The original string allocation may contain credentials.
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+    }
+    for (name, value) in request.headers.drain() {
+        scrub(name);
+        scrub(value);
+    }
+    if let Some(referrer) = request.referrer.take() {
+        scrub(referrer);
+    }
+    scrub(std::mem::take(&mut request.url));
 }
 
 #[derive(Default)]
 pub(crate) struct PendingDownloads {
     entries: HashMap<String, (Instant, PendingHttpEntry)>,
+    confirming: HashSet<String>,
+}
+
+pub(crate) struct PendingConfirmation<'a> {
+    pending: &'a Mutex<PendingDownloads>,
+    changed: &'a Notify,
+    id: &'a str,
+}
+
+impl<'a> PendingConfirmation<'a> {
+    pub fn begin(
+        pending: &'a Mutex<PendingDownloads>,
+        changed: &'a Notify,
+        id: &'a str,
+    ) -> Result<Self, String> {
+        let mut downloads = pending.lock().unwrap();
+        downloads.get(id).ok_or(PENDING_UNAVAILABLE)?;
+        if !downloads.confirming.insert(id.to_owned()) {
+            return Err("This download is already being confirmed.".into());
+        }
+        Ok(Self {
+            pending,
+            changed,
+            id,
+        })
+    }
+}
+
+impl Drop for PendingConfirmation<'_> {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().confirming.remove(self.id);
+        self.changed.notify_one();
+    }
 }
 
 impl PendingDownloads {
@@ -50,7 +102,7 @@ impl PendingDownloads {
     pub fn get(&self, id: &str) -> Option<&PendingHttpEntry> {
         self.entries
             .get(id)
-            .filter(|(deadline, _)| Instant::now() < *deadline)
+            .filter(|(deadline, _)| Instant::now() < *deadline || self.confirming.contains(id))
             .map(|(_, entry)| entry)
     }
 
@@ -59,18 +111,26 @@ impl PendingDownloads {
         self.entries.remove(id).map(|(_, entry)| entry)
     }
 
-    pub fn discard(&mut self, id: &str) {
+    pub fn discard(&mut self, id: &str) -> bool {
+        if self.confirming.contains(id) {
+            return false;
+        }
         self.entries.remove(id);
+        true
     }
 
     pub fn next_expiration(&self) -> Option<Instant> {
-        self.entries.values().map(|(deadline, _)| *deadline).min()
+        self.entries
+            .iter()
+            .filter(|(id, _)| !self.confirming.contains(*id))
+            .map(|(_, (deadline, _))| *deadline)
+            .min()
     }
 
     pub fn expire(&mut self) -> Vec<String> {
         let now = Instant::now();
         self.entries
-            .extract_if(|_, (deadline, _)| *deadline <= now)
+            .extract_if(|id, (deadline, _)| *deadline <= now && !self.confirming.contains(id))
             .map(|(id, _)| id)
             .collect()
     }
@@ -132,5 +192,21 @@ mod tests {
         assert_eq!(pending.expire(), ["1"]);
         assert_eq!(pending.clear().len(), CAPACITY - 1);
         assert_eq!(pending.next_expiration(), None);
+    }
+
+    #[test]
+    fn in_flight_confirmation_keeps_the_pending_entry_and_rejects_another() {
+        let pending = Mutex::new(PendingDownloads::default());
+        let changed = Notify::new();
+        pending.lock().unwrap().insert(entry("confirm")).unwrap();
+        let confirming = PendingConfirmation::begin(&pending, &changed, "confirm").unwrap();
+        assert!(PendingConfirmation::begin(&pending, &changed, "confirm").is_err());
+        assert!(!pending.lock().unwrap().discard("confirm"));
+        assert!(pending.lock().unwrap().get("confirm").is_some());
+        drop(confirming);
+        let retry = PendingConfirmation::begin(&pending, &changed, "confirm").unwrap();
+        assert!(pending.lock().unwrap().take("confirm").is_some());
+        drop(retry);
+        assert!(PendingConfirmation::begin(&pending, &changed, "confirm").is_err());
     }
 }

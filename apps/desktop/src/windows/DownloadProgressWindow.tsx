@@ -1,5 +1,5 @@
 import { ChevronDown, ChevronUp, Download, Pause, Play, X } from "lucide-react";
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { desktop } from "../lib/tauri";
 import { bytes, clock, errorMessage, isDone, isRunning, percentage, ratio } from "../lib/transfers";
 import type { SegmentSnapshot, TelemetryBatch, TransferCompletionOptions, TransferSnapshot } from "../types/ipc";
@@ -65,7 +65,7 @@ export function DownloadProgressWindow({ transferId }: { transferId: string }) {
   const [limiterEnabled, setLimiterEnabled] = useState(false);
   const [limiterValue, setLimiterValue] = useState("500");
   const [limiterUnit, setLimiterUnit] = useState<SpeedUnit>("KB/s");
-  const [limiterInitialized, setLimiterInitialized] = useState(false);
+  const [limiterDirty, setLimiterDirty] = useState(false);
 
   // Completion options state
   const [completionOptions, setCompletionOptions] = useState<TransferCompletionOptions>({
@@ -73,6 +73,8 @@ export function DownloadProgressWindow({ transferId }: { transferId: string }) {
     auto_close_progress: false,
     open_folder_on_complete: false,
   });
+  const completionOptionsRef = useRef(completionOptions);
+  const [completionLoaded, setCompletionLoaded] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -93,8 +95,14 @@ export function DownloadProgressWindow({ transferId }: { transferId: string }) {
     });
 
     void desktop.getTransferCompletionOptions(transferId).then(opts => {
-      if (active) setCompletionOptions(opts);
-    }).catch(() => {});
+      if (active) {
+        completionOptionsRef.current = opts;
+        setCompletionOptions(opts);
+        setCompletionLoaded(true);
+      }
+    }).catch(() => {
+      if (active) setCompletionLoaded(true);
+    });
 
     return () => {
       active = false;
@@ -103,19 +111,21 @@ export function DownloadProgressWindow({ transferId }: { transferId: string }) {
   }, [transferId]);
 
   useEffect(() => {
-    if (!transfer || limiterInitialized) return;
-    if (transfer.speed_limit_bps && transfer.speed_limit_bps > 0) {
+    if (!transfer || limiterDirty) return;
+    const bps = transfer.speed_limit_bps ?? null;
+    if (bps && bps > 0) {
       setLimiterEnabled(true);
-      if (transfer.speed_limit_bps >= 1_000_000 && transfer.speed_limit_bps % 100_000 === 0) {
+      if (bps >= 1_000_000 && bps % 100_000 === 0) {
         setLimiterUnit("MB/s");
-        setLimiterValue(String(transfer.speed_limit_bps / 1_000_000));
+        setLimiterValue(String(bps / 1_000_000));
       } else {
         setLimiterUnit("KB/s");
-        setLimiterValue(String(Math.round(transfer.speed_limit_bps / 1_000)));
+        setLimiterValue(String(bps / 1_000));
       }
+    } else {
+      setLimiterEnabled(false);
     }
-    setLimiterInitialized(true);
-  }, [transfer, limiterInitialized]);
+  }, [transfer, limiterDirty]);
 
   const pct = transfer ? percentage(transfer) : 0;
   const titleText = transfer ? `${pct}% ${transfer.filename}` : "Download Progress";
@@ -165,7 +175,7 @@ export function DownloadProgressWindow({ transferId }: { transferId: string }) {
   }
 
   async function handleApplySpeedLimit() {
-    if (busy) return;
+    if (busy || !transfer) return;
     setBusy(true);
     setError("");
     setNotice("");
@@ -181,6 +191,7 @@ export function DownloadProgressWindow({ transferId }: { transferId: string }) {
         limitBps = Math.round(numeric * (limiterUnit === "MB/s" ? 1_000_000 : 1_000));
       }
       await desktop.setTransferSpeedLimit(transferId, limitBps);
+      setLimiterDirty(false);
       setNotice(limitBps === null ? "Speed limit removed." : `Speed limit set to ${limiterValue} ${limiterUnit}.`);
     } catch (err) {
       setError(errorMessage(err));
@@ -193,7 +204,9 @@ export function DownloadProgressWindow({ transferId }: { transferId: string }) {
     key: K,
     value: TransferCompletionOptions[K],
   ) {
-    const next = { ...completionOptions, [key]: value };
+    if (!completionLoaded) return;
+    const next = { ...completionOptionsRef.current, [key]: value };
+    completionOptionsRef.current = next;
     setCompletionOptions(next);
     setError("");
     try {
@@ -359,7 +372,10 @@ export function DownloadProgressWindow({ transferId }: { transferId: string }) {
                     type="checkbox"
                     checked={limiterEnabled}
                     disabled={busy}
-                    onChange={event => setLimiterEnabled(event.target.checked)}
+                    onChange={event => {
+                      setLimiterDirty(true);
+                      setLimiterEnabled(event.target.checked);
+                    }}
                   />
                   <span>Use speed limiter</span>
                 </label>
@@ -375,13 +391,19 @@ export function DownloadProgressWindow({ transferId }: { transferId: string }) {
                         aria-label="Speed limit value"
                         disabled={!limiterEnabled || busy}
                         value={limiterValue}
-                        onChange={event => setLimiterValue(event.target.value)}
+                        onChange={event => {
+                          setLimiterDirty(true);
+                          setLimiterValue(event.target.value);
+                        }}
                       />
                       <select
                         aria-label="Speed limit unit"
                         disabled={!limiterEnabled || busy}
                         value={limiterUnit}
-                        onChange={event => setLimiterUnit(event.target.value as SpeedUnit)}
+                        onChange={event => {
+                          setLimiterDirty(true);
+                          setLimiterUnit(event.target.value as SpeedUnit);
+                        }}
                       >
                         <option value="KB/s">KB/s</option>
                         <option value="MB/s">MB/s</option>
@@ -389,7 +411,7 @@ export function DownloadProgressWindow({ transferId }: { transferId: string }) {
                       <button
                         type="button"
                         className="btn-primary form-button"
-                        disabled={busy}
+                        disabled={busy || !transfer}
                         onClick={() => void handleApplySpeedLimit()}
                       >
                         Apply
@@ -408,6 +430,7 @@ export function DownloadProgressWindow({ transferId }: { transferId: string }) {
                   <input
                     type="checkbox"
                     checked={completionOptions.show_complete_dialog}
+                    disabled={!completionLoaded}
                     onChange={event => void updateCompletionOption("show_complete_dialog", event.target.checked)}
                   />
                   <span>Show &ldquo;Download complete&rdquo; dialog when finished</span>
@@ -416,6 +439,7 @@ export function DownloadProgressWindow({ transferId }: { transferId: string }) {
                   <input
                     type="checkbox"
                     checked={completionOptions.auto_close_progress}
+                    disabled={!completionLoaded}
                     onChange={event => void updateCompletionOption("auto_close_progress", event.target.checked)}
                   />
                   <span>Close this progress window when finished</span>
@@ -424,6 +448,7 @@ export function DownloadProgressWindow({ transferId }: { transferId: string }) {
                   <input
                     type="checkbox"
                     checked={completionOptions.open_folder_on_complete}
+                    disabled={!completionLoaded}
                     onChange={event => void updateCompletionOption("open_folder_on_complete", event.target.checked)}
                   />
                   <span>Open containing folder when finished</span>

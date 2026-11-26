@@ -19,8 +19,9 @@ use uuid::Uuid;
 
 use crate::{
     args::{
-        container_extension, extension, local_demuxer, sidecar_path, validate_filename,
-        validate_local_path, validate_subtitle_language, DOWNLOAD_PROGRESS_PREFIX,
+        container_extension, ensure_default_user_agent, extension, is_http_403_error,
+        local_demuxer, sidecar_path, validate_filename, validate_local_path,
+        validate_subtitle_language, DOWNLOAD_PROGRESS_PREFIX,
     },
     motw::{is_regular_file, is_reparse_point, write_mark_of_the_web},
     toolchain::{command, spawn_sidecar, ResolvedBinary},
@@ -370,7 +371,7 @@ impl MediaPipeline {
         let mut builder = BuildYtDlpArgs::download(playlist)
             .ffmpeg_location(&self.tools.ffmpeg().path)?
             .merge_output_format(request.target_container)
-            .headers(&request.headers)?;
+            .headers(&ensure_default_user_agent(&request.headers))?;
         if let Some(dir) = &options.cache_dir {
             builder = builder.cache_dir(dir)?;
         }
@@ -390,7 +391,7 @@ impl MediaPipeline {
         if options.embed_cover_art {
             builder = builder.write_thumbnail().convert_thumbnail_to_png();
         }
-        let args = builder.build(&request.url)?;
+        let args = builder.clone().build(&request.url)?;
 
         let save_dir = request
             .save_dir
@@ -435,7 +436,20 @@ impl MediaPipeline {
             MediaProgressEvent::Downloading(DownloadProgress::default()),
         )
         .await;
-        let download = run_streaming(binary, "yt-dlp", &args, Some(&stage.path), progress).await;
+        let download =
+            match run_streaming(binary, "yt-dlp", &args, Some(&stage.path), progress).await {
+                Err(err)
+                    if !playlist
+                        && is_http_403_error(&err)
+                        && std::fs::read_dir(&stage.path)
+                            .map(|mut entries| entries.next().is_none())
+                            .unwrap_or(false) =>
+                {
+                    let args = builder.force_ipv4().build(&request.url)?;
+                    run_streaming(binary, "yt-dlp", &args, Some(&stage.path), progress).await
+                }
+                result => result,
+            };
         let download = match download {
             Err(MediaError::ToolFailed { status, .. })
                 if playlist && matches!(status.code(), Some(1 | 101)) =>
@@ -1809,6 +1823,73 @@ impl Drop for Stage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{parse_ytdlp_probe_json, test_support::RetryTool, ToolchainConfig};
+
+    #[tokio::test]
+    async fn download_retries_only_single_video_http_403_before_staging_output() {
+        let tool = RetryTool::build().await;
+        let tools = MediaToolchain::discover(ToolchainConfig {
+            ytdlp_path: Some(tool.executable()),
+            ffmpeg_path: Some(tool.executable()),
+            ffprobe_path: Some(tool.executable()),
+            ..ToolchainConfig::default()
+        })
+        .await
+        .unwrap();
+        let pipeline = MediaPipeline::new(tools, tool.root.join("downloads"));
+        for (case, expected_stderr) in [
+            ("download-retry", None),
+            ("download-playlist", Some("403: Forbidden")),
+            ("download-partial", Some("403: Forbidden")),
+            ("download-non-403", Some("HTTP Error 404")),
+        ] {
+            let url = format!("https://example.com/{case}");
+            let playlist = case == "download-playlist";
+            let probe_json = if playlist {
+                r#"{"title":"Fixture playlist","entries":[{"title":"Fixture video"}]}"#
+            } else {
+                r#"{"title":"Fixture video"}"#
+            };
+            let mut request: AddMediaDownloadRequest = serde_json::from_value(serde_json::json!({
+                "url": url,
+                "download_playlist": playlist,
+                "embed_subtitles_langs": [],
+                "lossless_remux": false,
+                "normalize_audio": false,
+                "headers": {"referer": "https://example.com/watch"},
+            }))
+            .unwrap();
+            if case == "download-non-403" {
+                request
+                    .headers
+                    .insert("user-agent".into(), "Fixture browser".into());
+            }
+            let options = DownloadOptions {
+                pre_probe: Some(parse_ytdlp_probe_json(probe_json, &request.url).unwrap()),
+                ..DownloadOptions::default()
+            };
+            let result = pipeline.download(&request, &options, None).await;
+            if let Some(expected_stderr) = expected_stderr {
+                assert!(
+                    matches!(
+                        result.unwrap_err(),
+                        MediaError::ToolFailed { tool: "yt-dlp", stderr, .. }
+                            if stderr.contains(expected_stderr)
+                    ),
+                    "{case}"
+                );
+                assert_eq!(tool.attempts(case), "default\n", "{case}");
+            } else {
+                let paths = result.unwrap();
+                assert_eq!(paths.len(), 1);
+                assert_eq!(
+                    fs::read_to_string(&paths[0]).await.unwrap(),
+                    "fixture output"
+                );
+                assert_eq!(tool.attempts(case), "default\nipv4\n", "{case}");
+            }
+        }
+    }
 
     #[tokio::test]
     async fn nested_playlist_indices_keep_separate_media_and_sidecars() {

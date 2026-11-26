@@ -183,6 +183,18 @@ describe("DownloadConfirmWindow", () => {
     });
     unmount();
 
+    // Drive-root Save As path preserves trailing backslash on submit
+    const rootView = render(<DownloadConfirmWindow pendingId="pend-1" />);
+    const rootSaveAs = await screen.findByLabelText<HTMLInputElement>("Save As");
+    await user.clear(rootSaveAs);
+    await user.type(rootSaveAs, "C:\\RootFile.exe");
+    await user.click(screen.getByRole("button", { name: /Start Download/i }));
+    expect(confirmSpy).toHaveBeenLastCalledWith(expect.objectContaining({
+      save_dir: "C:\\",
+      filename: "RootFile.exe",
+    }));
+    rootView.unmount();
+
     // Cancel via Escape calls cancelPendingDownload + close
     render(<DownloadConfirmWindow pendingId="pend-1" />);
     await screen.findByLabelText("Save As");

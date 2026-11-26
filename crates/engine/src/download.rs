@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::watch;
+use tokio::sync::{watch, OwnedMutexGuard};
 use tokio::time::Instant;
 
 const SPLIT_THRESHOLD: u64 = 512 * 1024;
@@ -93,7 +93,11 @@ impl Stop {
 }
 
 impl Inner {
-    pub(crate) async fn download(&self, id: &str, signal: watch::Receiver<bool>) -> Result<()> {
+    pub(crate) async fn download(
+        &self,
+        id: &str,
+        signal: watch::Receiver<bool>,
+    ) -> Result<OwnedMutexGuard<()>> {
         let (_probe_stop, probe_signal) = watch::channel(false);
         let mut stop = Stop {
             transfer: signal,
@@ -941,7 +945,7 @@ impl Run<'_> {
         Ok(Some(next_index))
     }
 
-    async fn finalize(&self, stop: &Stop) -> Result<()> {
+    async fn finalize(&self, stop: &Stop) -> Result<OwnedMutexGuard<()>> {
         stop.check()?;
         let record = self.engine.lock().job(self.id)?.record.clone();
         let for_check = record.clone();
@@ -967,6 +971,7 @@ impl Run<'_> {
             job.record = record.clone();
             stop.check()?;
         }
+        let output_guard = Arc::clone(&self.engine.outputs).lock_owned().await;
         let filename = record.filename;
         for number in 0.. {
             stop.check()?;
@@ -992,10 +997,12 @@ impl Run<'_> {
                 record
             };
             match output::commit(&record).await {
+                // The supervisor releases the guard after it publishes ownership in SQLite.
+                Ok(()) => return Ok(output_guard),
                 Err(EngineError::Io(error))
                     if !record.overwrite_existing
                         && error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                result => return result,
+                Err(error) => return Err(error),
             }
         }
         unreachable!("filename suffixes are unbounded")

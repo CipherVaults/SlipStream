@@ -42,6 +42,7 @@ describe("Tauri v2 adapter", () => {
     await desktop.probeMedia(url);
     await desktop.probeMedia(url, true);
     await desktop.probeMedia(url, false);
+    await desktop.probeMedia(url, false, { Referer: "https://example.org/watch" });
     await desktop.addMediaDownload(media);
     await desktop.addTorrent(torrent);
     await desktop.listTorrentFiles(id);
@@ -71,6 +72,7 @@ describe("Tauri v2 adapter", () => {
       ["get_snapshot", {}], ["add_http_download", { request: http }],
       ["expand_wildcard_urls", { pattern: "https://example.org/[1-3].zip" }],
       ["probe_media", { url }], ["probe_media", { url, playlist: true }], ["probe_media", { url, playlist: false }],
+      ["probe_media", { url, playlist: false, headers: { Referer: "https://example.org/watch" } }],
       ["add_media_download", { request: media }], ["add_torrent", { request: torrent }],
       ["list_torrent_files", { transfer_id: id }], ["set_torrent_files", { transfer_id: id, selected_indices: [1, 3] }],
       ["pause_transfer", { transfer_id: id }], ["resume_transfer", { transfer_id: id }],
@@ -146,14 +148,23 @@ describe("Tauri v2 adapter", () => {
     await emit("slipstream://open-picker", { url: "magnet:?xt=example" });
     await emit("slipstream://open-picker", { url: null });
     await emit("slipstream://open-picker", { url: 123 });
+    await emit("slipstream://open-picker", {
+      url: "https://cdn.example.org/video.m3u8",
+      headers: { referer: "https://example.org/watch", Cookie: "secret=1", "X-Custom": "no", empty: "", bad: 42 },
+    });
     expect(telemetry).toHaveBeenCalledWith(batch);
-    expect(picker.mock.calls).toEqual([["magnet:?xt=example"], [null], [null]]);
+    expect(picker.mock.calls).toEqual([
+      ["magnet:?xt=example"],
+      [null],
+      [null],
+      ["https://cdn.example.org/video.m3u8", { Referer: "https://example.org/watch" }],
+    ]);
     await offTelemetry();
     await offPicker();
     await emit("slipstream://telemetry", batch);
     await emit("slipstream://open-picker", { url: "https://unused.example.org" });
     expect(telemetry).toHaveBeenCalledOnce();
-    expect(picker).toHaveBeenCalledTimes(3);
+    expect(picker).toHaveBeenCalledTimes(4);
   });
 
   it("guards native window controls and passes native drop paths through", async () => {

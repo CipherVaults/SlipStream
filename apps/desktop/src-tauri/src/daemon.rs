@@ -5,7 +5,10 @@ use crate::{
         ensure_safe_directory, ensure_safe_tree, hash_file, local_drive_path, media_title_stem,
         reveal_action, with_completed_file, write_zone_identifier, RevealAction,
     },
-    pending_downloads::{PendingDownloads, PendingHttpEntry},
+    pending_downloads::{
+        PendingConfirmation, PendingDownloads, PendingHttpEntry, ScrubbedRequest,
+        PENDING_UNAVAILABLE,
+    },
     settings::{
         category_id, match_category_for_filename, normalize, normalize_categories, read_json,
         resolve_category_dir, torrent_rate, write_json_atomically, SETTINGS_FILE,
@@ -77,12 +80,15 @@ const MAX_CONCURRENT_PROBES: usize = 4;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpenPickerEvent {
     pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub headers: HashMap<String, String>,
 }
 
 pub trait UiBridge: Send + Sync + 'static {
     fn show_main_window(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
     fn emit_telemetry(&self, batch: &TelemetryBatch) -> Result<()>;
     fn emit_open_picker(&self, event: &OpenPickerEvent) -> Result<()>;
+    fn emit_settings_changed(&self) {}
     fn has_main_window(&self) -> bool;
     fn has_telemetry_windows(&self) -> bool {
         self.has_main_window()
@@ -143,32 +149,36 @@ impl ProbeKey {
     }
 
     fn from_probe_headers(url: &str, playlist: bool, headers: &HashMap<String, String>) -> Self {
-        let mut canonical: Vec<_> = headers
-            .iter()
-            .filter_map(|(name, value)| {
-                canonical_media_headers(&HashMap::from([(name.clone(), value.clone())]))
-                    .ok()?
-                    .pop()
-            })
-            .collect();
-        canonical.sort_unstable();
-        canonical.dedup();
+        let mut headers: Vec<_> = filter_media_headers(headers).into_iter().collect();
+        headers.sort_unstable();
         Self {
             url: url.to_owned(),
             playlist,
-            headers: canonical
-                .chunk_by(|a, b| a.0 == b.0)
-                .filter_map(|group| {
-                    if let [header] = group {
-                        Some(header.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
+            headers,
         }
     }
 }
+
+pub(crate) fn filter_media_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut canonical: Vec<_> = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            canonical_media_headers(&HashMap::from([(name.clone(), value.clone())]))
+                .ok()?
+                .pop()
+        })
+        .collect();
+    canonical.sort_unstable();
+    canonical.dedup();
+    canonical
+        .chunk_by(|a, b| a.0 == b.0)
+        .filter_map(|group| match group {
+            [header] => Some(header.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 type ProbeResult = Result<Arc<MediaProbeResult>>;
 
 #[derive(Default)]
@@ -480,8 +490,11 @@ impl AppState {
     }
 
     pub async fn snapshot(&self) -> TelemetryBatch {
+        let mut batch = {
+            let _outputs = self.engine.lock_outputs().await;
+            self.engine.telemetry_batch()
+        };
         let torrent = self.torrent.read().await;
-        let mut batch = self.engine.telemetry_batch();
         {
             let dismissed = self.dismissed_http.read().unwrap();
             batch
@@ -511,7 +524,10 @@ impl AppState {
                 .as_ref()
                 .and_then(|id| playlists.get(id))
                 .map(|playlist| playlist.paused);
-            if let Some(result) = verified.get(&transfer.id) {
+            if let Some(result) = verified
+                .get(&transfer.id)
+                .filter(|_| !transfer.output_superseded)
+            {
                 transfer.sha256_verified = Some(*result);
             }
             batch.aggregate_down_bps = batch
@@ -541,16 +557,21 @@ impl AppState {
 
     pub async fn add_http_download(&self, request: AddHttpDownloadRequest) -> Result<String> {
         let _operation = self.operation().await?;
-        self.enqueue_http(request, &self.settings(), ExtendedHttpOptions::default())
-            .await
+        self.enqueue_http(
+            ScrubbedRequest(Some(request)),
+            &self.settings(),
+            ExtendedHttpOptions::default(),
+        )
+        .await
     }
 
     async fn enqueue_http(
         &self,
-        mut request: AddHttpDownloadRequest,
+        mut scrubbed: ScrubbedRequest,
         settings: &AppSettings,
         options: ExtendedHttpOptions,
     ) -> Result<String> {
+        let request = scrubbed.0.as_mut().expect("HTTP request to enqueue");
         let directory = http_save_directory(request.save_dir.take(), settings).await?;
         request.save_dir = Some(
             local_drive_path(&directory)
@@ -565,7 +586,10 @@ impl AppState {
         let start_paused = request.start_paused || options.start_paused;
         let id = self
             .engine
-            .add_http_download_with_options(request, options)
+            .add_http_download_with_options(
+                scrubbed.0.take().expect("HTTP request to enqueue"),
+                options,
+            )
             .await
             .map_err(message)?;
         if !start_paused {
@@ -626,7 +650,7 @@ impl AppState {
             .unwrap()
             .get(id)
             .map(|entry| entry.preview.clone())
-            .ok_or_else(|| "Pending download expired or was closed.".to_owned())
+            .ok_or_else(|| PENDING_UNAVAILABLE.to_owned())
     }
 
     fn take_pending_download(&self, id: &str) -> Result<PendingHttpEntry> {
@@ -634,17 +658,21 @@ impl AppState {
             .lock()
             .unwrap()
             .take(id)
-            .ok_or_else(|| "Pending download expired or was closed.".to_owned())
+            .ok_or_else(|| PENDING_UNAVAILABLE.to_owned())
     }
 
-    pub(crate) fn discard_pending_download(&self, id: &str) {
-        self.pending_downloads.lock().unwrap().discard(id);
-        self.pending_changed.notify_one();
+    pub(crate) fn discard_pending_download(&self, id: &str) -> bool {
+        let discarded = self.pending_downloads.lock().unwrap().discard(id);
+        if discarded {
+            self.pending_changed.notify_one();
+        }
+        discarded
     }
 
     pub fn cancel_pending_download(&self, id: &str) {
-        self.discard_pending_download(id);
-        self.ui.close_confirm_dialog(id);
+        if self.discard_pending_download(id) {
+            self.ui.close_confirm_dialog(id);
+        }
     }
 
     fn expire_pending_entries(&self) {
@@ -658,6 +686,9 @@ impl AppState {
         &self,
         confirmation: ConfirmPendingDownloadRequest,
     ) -> Result<String> {
+        let pending_id = &confirmation.pending_id;
+        let _confirmation =
+            PendingConfirmation::begin(&self.pending_downloads, &self.pending_changed, pending_id)?;
         let _operation = self.operation().await?;
         let mut settings = self.settings();
         let filename = sanitize_filename(&confirmation.filename).map_err(message)?;
@@ -666,7 +697,6 @@ impl AppState {
             .iter()
             .position(|category| category.id == confirmation.category_id)
             .ok_or_else(|| "Download category not found.".to_owned())?;
-        self.get_pending_download(&confirmation.pending_id)?;
         let directory = if confirmation.save_dir.trim().is_empty() {
             resolve_category_dir(&settings, &confirmation.category_id)
         } else {
@@ -682,31 +712,44 @@ impl AppState {
         .await
         .map_err(message)?
         .map_err(message)?;
-        let pending = self.take_pending_download(&confirmation.pending_id)?;
-        self.pending_changed.notify_one();
-        self.ui.close_confirm_dialog(&confirmation.pending_id);
-        let mut request = pending.request.clone();
-        drop(pending);
+        let mut scrubbed = ScrubbedRequest(Some(
+            self.pending_downloads
+                .lock()
+                .unwrap()
+                .get(pending_id)
+                .ok_or(PENDING_UNAVAILABLE)?
+                .request
+                .clone(),
+        ));
+        let request = scrubbed.0.as_mut().expect("pending HTTP request");
         request.filename = Some(filename);
         request.save_dir = Some(directory.clone());
         request.start_paused = !confirmation.start_immediately;
         request.overwrite_existing = confirmation.overwrite_existing;
+        let id = self
+            .enqueue_http(
+                scrubbed,
+                &settings,
+                ExtendedHttpOptions {
+                    description: confirmation.description,
+                    ..ExtendedHttpOptions::default()
+                },
+            )
+            .await?;
+        drop(self.take_pending_download(pending_id)?);
+        self.ui.close_confirm_dialog(pending_id);
         if confirmation.remember_category_path {
             settings.categories[category].save_dir = Some(directory);
-            self.persist_categories(&settings)?;
+            if let Err(error) = self.persist_categories(&settings) {
+                tracing::warn!(%error, "could not remember the download category path");
+            }
         }
-        self.enqueue_http(
-            request,
-            &settings,
-            ExtendedHttpOptions {
-                description: confirmation.description,
-                ..ExtendedHttpOptions::default()
-            },
-        )
-        .await
+        Ok(id)
     }
 
     pub async fn resolve_duplicate_existing(&self, pending_id: &str) -> Result<String> {
+        let _confirmation =
+            PendingConfirmation::begin(&self.pending_downloads, &self.pending_changed, pending_id)?;
         let _operation = self.operation().await?;
         let duplicate = self
             .get_pending_download(pending_id)?
@@ -715,7 +758,9 @@ impl AppState {
         let id = duplicate.transfer_id;
         let snapshot = self
             .http_snapshot(&id)
-            .filter(|snapshot| snapshot.status != TransferStatus::Canceled)
+            .filter(|snapshot| {
+                snapshot.status != TransferStatus::Canceled && !snapshot.output_superseded
+            })
             .ok_or_else(|| "The duplicate transfer is unavailable.".to_owned())?;
         drop(self.take_pending_download(pending_id)?);
         self.pending_changed.notify_one();
@@ -742,6 +787,7 @@ impl AppState {
             .unwrap()
             .categories
             .clone_from(&settings.categories);
+        self.ui.emit_settings_changed();
         Ok(())
     }
 
@@ -886,7 +932,7 @@ impl AppState {
             .await
     }
 
-    async fn probe_media_with_headers(
+    pub async fn probe_media_with_headers(
         &self,
         url: &str,
         playlist: Option<bool>,
@@ -1552,12 +1598,20 @@ impl AppState {
                 .scrub_transfer_credentials(id)
                 .map_err(message)?;
             if remove_files {
+                let outputs = self.engine.lock_outputs().await;
+                let snapshot = self.engine.snapshot(id).map_err(message)?;
                 let mut paths = vec![format!(".{id}.slipstream-part")];
-                // A failed download can have collided with someone else's file.
-                if snapshot.status == TransferStatus::Completed {
+                // Only delete the final file while this transfer still owns it.
+                if snapshot.status == TransferStatus::Completed && !snapshot.output_superseded {
                     paths.push(snapshot.filename);
                 }
-                remove_outputs(snapshot.save_dir.into(), paths).await?;
+                tokio::task::spawn_blocking(move || {
+                    let _outputs = outputs;
+                    delete_files(Path::new(&snapshot.save_dir), &paths)
+                })
+                .await
+                .map_err(message)?
+                .map_err(message)?;
             }
             let mut dismissed = self.dismissed_http.read().unwrap().clone();
             dismissed.insert(id.into());
@@ -1603,7 +1657,7 @@ impl AppState {
     async fn transfer_paths(&self, id: &str) -> Result<(PathBuf, Vec<String>)> {
         if let Some(snapshot) = self.http_snapshot(id) {
             let mut paths = Vec::new();
-            if snapshot.status == TransferStatus::Completed {
+            if snapshot.status == TransferStatus::Completed && !snapshot.output_superseded {
                 paths.push(snapshot.filename);
             }
             return Ok((snapshot.save_dir.into(), paths));
@@ -1640,6 +1694,7 @@ impl AppState {
             .map_err(message)?
             .map_err(message)?;
         let _operation = self.operation().await?;
+        let _outputs = self.engine.lock_outputs().await;
         if self.transfer_paths(id).await? != target {
             return Err("transfer files changed during checksum verification".into());
         }
@@ -1649,6 +1704,7 @@ impl AppState {
     }
 
     pub async fn reveal_in_explorer(&self, id: &str) -> Result<()> {
+        let _outputs = self.engine.lock_outputs().await;
         let (root, files) = self.transfer_paths(id).await?;
         open_reveal_action(
             reveal_action(&root, files.first().map(String::as_str)).map_err(message)?,
@@ -1657,6 +1713,7 @@ impl AppState {
 
     pub async fn open_completed_file(&self, id: &str) -> Result<()> {
         let _operation = self.operation().await?;
+        let outputs = self.engine.lock_outputs().await;
         let snapshot = self.transfer_snapshot(id).await?;
         if snapshot.status != TransferStatus::Completed {
             return Err("Only completed files can be opened.".into());
@@ -1667,6 +1724,7 @@ impl AppState {
         };
         let relative = relative.clone();
         tokio::task::spawn_blocking(move || {
+            let _outputs = outputs;
             with_completed_file(snapshot.status, &root, &relative, crate::shell::open_file)
         })
         .await
@@ -1697,6 +1755,14 @@ impl AppState {
     }
 
     pub async fn open_picker(&self, url: Option<String>) -> Result<()> {
+        self.open_picker_with_headers(url, HashMap::new()).await
+    }
+
+    pub async fn open_picker_with_headers(
+        &self,
+        url: Option<String>,
+        headers: HashMap<String, String>,
+    ) -> Result<()> {
         if let Some(url) = url.as_deref() {
             if url
                 .trim()
@@ -1709,9 +1775,17 @@ impl AppState {
             }
         }
         self.show_main_window().await?;
+        let event = OpenPickerEvent {
+            headers: if url.is_some() {
+                filter_media_headers(&headers)
+            } else {
+                HashMap::new()
+            },
+            url,
+        };
         let needs_ready_check = {
             let mut picker = self.picker.lock().unwrap();
-            picker.pending.push_back(OpenPickerEvent { url });
+            picker.pending.push_back(event);
             !picker.ready
         };
         if needs_ready_check {
@@ -1847,6 +1921,7 @@ impl AppState {
                 });
             }
             AddHttpDownload { mut request } => {
+                request.overwrite_existing = false;
                 if request.save_dir.is_some() {
                     return Err("browser requests cannot override save_dir".into());
                 }
@@ -1861,7 +1936,11 @@ impl AppState {
                     self.stage_http_download(request, filename, &settings)?;
                 } else {
                     return self
-                        .enqueue_http(request, &settings, ExtendedHttpOptions::default())
+                        .enqueue_http(
+                            ScrubbedRequest(Some(request)),
+                            &settings,
+                            ExtendedHttpOptions::default(),
+                        )
                         .await
                         .map(created);
                 }
@@ -1894,7 +1973,13 @@ impl AppState {
             RefreshDownloadUrl { request } => self.refresh_download_url(request).await?,
             PauseTransfer { transfer_id } => self.pause_transfer(&transfer_id).await?,
             ResumeTransfer { transfer_id } => self.resume_transfer(&transfer_id).await?,
-            OpenDesktopWindow { open_picker_url } => self.open_picker(open_picker_url).await?,
+            OpenDesktopWindow {
+                open_picker_url,
+                headers,
+            } => {
+                self.open_picker_with_headers(open_picker_url, headers)
+                    .await?
+            }
             GrabBatchUrls { urls, referrer } => self.grab_batch(urls, referrer).await?,
         }
         Ok(NativeBridgeResponse::Ack {
@@ -2293,7 +2378,10 @@ async fn watch_completions(
                 let Ok(_operation) = state.operation().await else {
                     return;
                 };
-                if state.http_snapshot(&id).is_some() {
+                if state
+                    .http_snapshot(&id)
+                    .is_some_and(|snapshot| !snapshot.output_superseded)
+                {
                     state.on_transfer_completed(&id).await;
                 }
             }
@@ -2307,7 +2395,10 @@ fn try_enqueue_http_scan(
     seen: &mut HashSet<String>,
     snapshot: &TransferSnapshot,
 ) -> bool {
-    if seen.contains(&snapshot.id) || state.dismissed_http.read().unwrap().contains(&snapshot.id) {
+    if snapshot.output_superseded
+        || seen.contains(&snapshot.id)
+        || state.dismissed_http.read().unwrap().contains(&snapshot.id)
+    {
         return true;
     }
     if !state.settings.read().unwrap().auto_defender_scan {
@@ -2351,10 +2442,12 @@ fn retry_http_completions(
     pending: &mut HashMap<String, TransferSnapshot>,
 ) {
     pending.retain(|id, snapshot| {
-        if state.http_snapshot(id).is_none() {
-            return false;
+        if let Some(current) = state.http_snapshot(id) {
+            *snapshot = current;
+            !try_enqueue_http_scan(state, scans, seen, snapshot)
+        } else {
+            false
         }
-        !try_enqueue_http_scan(state, scans, seen, snapshot)
     });
 }
 
@@ -2946,6 +3039,7 @@ mod tests {
         let url = "https://example.com/video";
         let headers = [
             ("referer", "https://example.com/watch"),
+            ("Referer", "https://example.com/watch"),
             ("Origin", "https://example.com/invalid-path"),
             ("Accept-Language", "en-US\r\nX-Invalid: true"),
             ("User-Agent", "first"),
@@ -2959,6 +3053,9 @@ mod tests {
             filtered.headers,
             vec![("Referer".into(), "https://example.com/watch".into())]
         );
+        let picker_headers = filter_media_headers(&headers);
+        let download_key = ProbeKey::new(url, false, &picker_headers).unwrap();
+        assert!(filtered == download_key);
     }
 
     #[test]

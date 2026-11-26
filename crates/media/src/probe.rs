@@ -13,7 +13,10 @@ use slipstream_protocol::{
 };
 
 use crate::{
-    args::{validate_format_id, validate_subtitle_language},
+    args::{
+        ensure_default_user_agent, is_http_403_error, validate_format_id,
+        validate_subtitle_language,
+    },
     toolchain::{capture, command},
     BuildYtDlpArgs, MediaError, MediaToolchain, ResolvedBinary,
 };
@@ -50,21 +53,26 @@ pub async fn probe_url_with_binary(
     url: &str,
     options: ProbeOptions,
 ) -> Result<MediaProbeResult, MediaError> {
-    let mut builder = BuildYtDlpArgs::probe(options.playlist).headers(&options.headers)?;
+    let effective_headers = ensure_default_user_agent(&options.headers);
+    let mut builder = BuildYtDlpArgs::probe(options.playlist).headers(&effective_headers)?;
     if let Some(dir) = &options.cache_dir {
         builder = builder.cache_dir(dir)?;
     }
-    let args = builder.build(url)?;
-    let mut cmd = command(&binary.path, "yt-dlp");
-    cmd.args(args);
-    let output = capture(
-        cmd,
-        &binary.path,
-        "yt-dlp",
-        Duration::from_secs(90),
-        32 * 1024 * 1024,
-    )
-    .await?;
+    let run_probe = |args| {
+        let mut cmd = command(&binary.path, "yt-dlp");
+        cmd.args(args);
+        capture(
+            cmd,
+            &binary.path,
+            "yt-dlp",
+            Duration::from_secs(90),
+            32 * 1024 * 1024,
+        )
+    };
+    let output = match run_probe(builder.clone().build(url)?).await {
+        Err(err) if is_http_403_error(&err) => run_probe(builder.force_ipv4().build(url)?).await?,
+        result => result?,
+    };
     let json = std::str::from_utf8(&output).map_err(|_| MediaError::InvalidToolOutput {
         tool: "yt-dlp",
         kind: "UTF-8 JSON",
@@ -734,8 +742,45 @@ pub fn audio_preset_recommendations(probe: &MediaProbeResult) -> Vec<AudioPreset
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{test_support::RetryTool, ToolchainConfig};
 
     const URL: &str = "https://example.com/watch?v=[123]&t=%32";
+
+    #[tokio::test]
+    async fn probe_sets_user_agent_and_retries_http_403_once_over_ipv4() {
+        let tool = RetryTool::build().await;
+        let binary = crate::discover_ytdlp_only(ToolchainConfig {
+            ytdlp_path: Some(tool.executable()),
+            ..ToolchainConfig::default()
+        })
+        .await
+        .unwrap();
+        let mut options = ProbeOptions {
+            headers: HashMap::from([("referer".into(), "https://example.com/watch".into())]),
+            ..ProbeOptions::default()
+        };
+
+        for (case, attempts) in [
+            ("probe-default", "default\n"),
+            ("probe-retry", "default\nipv4\n"),
+            ("probe-always-forbidden", "default\nipv4\n"),
+            ("probe-custom", "default\n"),
+        ] {
+            if case == "probe-custom" {
+                options
+                    .headers
+                    .insert("uSeR-aGeNt".into(), "Fixture browser".into());
+            }
+            let url = format!("https://example.com/{case}");
+            let result = probe_url_with_binary(&binary, &url, options.clone()).await;
+            if case == "probe-always-forbidden" {
+                assert!(is_http_403_error(&result.unwrap_err()));
+            } else {
+                assert_eq!(result.unwrap().title, "Fixture video");
+            }
+            assert_eq!(tool.attempts(case), attempts, "{case}");
+        }
+    }
 
     #[test]
     fn ranks_direct_youtube_formats_and_drops_equivalent_hls_video() {

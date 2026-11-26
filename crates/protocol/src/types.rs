@@ -72,6 +72,8 @@ pub struct TransferSnapshot {
     pub ui_segments: [f32; UI_SEGMENT_COUNT],
     pub segments: Vec<SegmentSnapshot>,
     pub sha256_verified: Option<bool>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub output_superseded: bool,
     pub resumable: bool,
     pub queue_id: String,
     pub error_message: Option<String>,
@@ -569,6 +571,8 @@ pub enum NativeBridgeRequest {
     },
     OpenDesktopWindow {
         open_picker_url: Option<String>,
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        headers: HashMap<String, String>,
     },
     GrabBatchUrls {
         urls: Vec<String>,

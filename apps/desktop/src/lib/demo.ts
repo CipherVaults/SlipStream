@@ -46,7 +46,7 @@ const pendingDownloads = new Map<string, PendingDownloadPreview>();
 const completionOptionsMap = new Map<string, TransferCompletionOptions>();
 const timestamp = new Date().toISOString();
 const telemetryListeners = new Set<(batch: TelemetryBatch) => void>();
-const pickerListeners = new Set<(url: string | null) => void>();
+const pickerListeners = new Set<(url: string | null, headers?: Record<string, string>) => void>();
 let timer: number | undefined;
 let tick = 0;
 let sequence = 0;
@@ -337,12 +337,15 @@ export const demo = {
       }
     };
   },
-  listenPicker(listener: (url: string | null) => void) {
+  listenPicker(listener: (url: string | null, headers?: Record<string, string>) => void) {
     pickerListeners.add(listener);
     return () => { pickerListeners.delete(listener); };
   },
-  openPicker(url: string | null) {
-    for (const listener of pickerListeners) listener(url);
+  openPicker(url: string | null, headers?: Record<string, string>) {
+    for (const listener of pickerListeners) {
+      if (headers && Object.keys(headers).length > 0) listener(url, headers);
+      else listener(url);
+    }
   },
   probe(url: string, playlist = isPurePlaylistUrl(url)): MediaProbeResult {
     if (!isHttpUrl(url)) throw new Error("Enter an HTTP or HTTPS media URL.");

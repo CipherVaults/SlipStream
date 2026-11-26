@@ -164,6 +164,7 @@ impl Entry {
             ui_segments: bitmap.project_to_ui_segments(),
             segments: bitmap.to_segment_snapshots(status, download_speed_bps),
             sha256_verified: None,
+            output_superseded: false,
             resumable: true,
             queue_id: "default".into(),
             error_message,

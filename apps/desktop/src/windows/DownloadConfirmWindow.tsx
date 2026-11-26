@@ -23,7 +23,8 @@ function splitPath(fullPath: string, fallbackDir: string, fallbackName: string):
   if (lastSep <= 0) {
     return { saveDir: fallbackDir, filename: trimmed || fallbackName };
   }
-  const saveDir = trimmed.slice(0, lastSep);
+  const dirPart = trimmed.slice(0, lastSep);
+  const saveDir = /^[A-Za-z]:$/.test(dirPart) ? `${dirPart}\\` : dirPart;
   const filename = trimmed.slice(lastSep + 1).trim() || fallbackName;
   return { saveDir, filename };
 }
@@ -162,7 +163,10 @@ export function DownloadConfirmWindow({ pendingId }: { pendingId: string }) {
     try {
       const picked = await desktop.pickDownloadFolder(currentDir || null);
       if (picked?.trim()) {
-        setSaveAsPath(joinPath(picked.trim(), currentFilename));
+        const dir = picked.trim();
+        const fallbackDir = preview?.suggested_save_dir ?? baseDownloadDir;
+        const fallbackName = preview?.filename ?? "download";
+        setSaveAsPath(current => joinPath(dir, splitPath(current, fallbackDir, fallbackName).filename));
       }
     } catch (err) {
       setError(errorMessage(err));

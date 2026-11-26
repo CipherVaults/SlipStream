@@ -54,9 +54,26 @@ function pairVideoWithAudio(video: MediaFormatOption, formats: MediaFormatOption
 
 export interface AddSeed {
   url?: string;
+  headers?: Record<string, string>;
   probe?: MediaProbeResult;
   format?: MediaFormatOption;
   autoProbe?: boolean;
+}
+
+function sourceOrigin(raw: string | undefined) {
+  const trimmed = raw?.trim();
+  if (!trimmed) return "";
+  try {
+    return new URL(trimmed).origin;
+  } catch {
+    return "";
+  }
+}
+
+function cleanSeedHeaders(headers: Record<string, string> | undefined) {
+  if (!headers) return undefined;
+  const entries = Object.entries(headers).filter(([, value]) => value.length > 0);
+  return entries.length ? Object.fromEntries(entries) : undefined;
 }
 
 const pendingAutoProbes = new WeakMap<AddSeed, Promise<MediaProbeResult>>();
@@ -98,6 +115,8 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
   const [thumbFailed, setThumbFailed] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [message, setMessage] = useState("");
+  const [seedHeaders, setSeedHeaders] = useState<Record<string, string> | undefined>(() => cleanSeedHeaders(seed.headers));
+  const seedOrigin = useRef(sourceOrigin(seed.url));
   const probeRequest = useRef(0);
   const activeProbe = useRef<{ id: number; source: string; playlist?: boolean } | null>(null);
   const submitLock = useRef(false);
@@ -105,6 +124,9 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
   const appliedDropSeq = useRef(0);
 
   const source = url.trim();
+  const activeHeaders = seedHeaders && (!source || (seedOrigin.current && sourceOrigin(source) === seedOrigin.current))
+    ? seedHeaders
+    : undefined;
   const isPlaylistActive = playlistMode;
   const canTogglePlaylist = hasListParam(source) && !isPurePlaylistUrl(source);
   const wildcard = !isPlaylistActive && isWildcard(source);
@@ -159,6 +181,10 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
 
   function changeSource(value: string) {
     setUrl(value);
+    if (sourceOrigin(value) !== seedOrigin.current) {
+      seedOrigin.current = "";
+      setSeedHeaders(undefined);
+    }
     setMessage("");
     setProbe(undefined);
     setVideoFormat(null);
@@ -181,7 +207,12 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
     else if (isHttpUrl(next) && tab === "torrent") setTab("video");
   }
 
-  async function probeSource(value: string, playlist: boolean | undefined = playlistMode || undefined, coalesceSeed = false) {
+  async function probeSource(
+    value: string,
+    playlist: boolean | undefined = playlistMode || undefined,
+    coalesceSeed = false,
+    explicitHeaders?: Record<string, string>,
+  ) {
     if (activeProbe.current?.source === value && activeProbe.current.playlist === playlist) return;
     const request = ++probeRequest.current;
     activeProbe.current = { id: request, source: value, playlist };
@@ -195,7 +226,10 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
         setTab("torrent");
       } else {
         if (!isHttpUrl(value)) throw new Error("Enter an HTTP or HTTPS media URL to probe.");
-        const runProbe = () => playlist === undefined ? desktop.probeMedia(value) : desktop.probeMedia(value, playlist);
+        const probeHeaders = explicitHeaders ?? (sourceOrigin(value) === seedOrigin.current ? activeHeaders : undefined);
+        const runProbe = () => probeHeaders
+          ? desktop.probeMedia(value, playlist, probeHeaders)
+          : playlist === undefined ? desktop.probeMedia(value) : desktop.probeMedia(value, playlist);
         let probePromise: Promise<MediaProbeResult>;
         if (coalesceSeed) {
           let cached = pendingAutoProbes.get(seed);
@@ -255,8 +289,11 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
 
   useEffect(() => {
     const initial = seed.url?.trim();
+    const initialHeaders = cleanSeedHeaders(seed.headers);
+    seedOrigin.current = sourceOrigin(seed.url);
+    setSeedHeaders(initialHeaders);
     if (seed.autoProbe && initial && !isTorrentSource(initial) && !isRemoteTorrentUrl(initial)) {
-      void probeSource(initial, isPurePlaylistUrl(initial) || undefined, true);
+      void probeSource(initial, isPurePlaylistUrl(initial) || undefined, true, initialHeaders);
     }
     return () => {
       probeRequest.current++;
@@ -349,8 +386,12 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
       if (torrent) {
         id = await desktop.addTorrent({ source, save_dir: saveDir, sequential });
       } else if (direct) {
-        id = await desktop.addHttpDownload({ url: source, save_dir: saveDir, max_connections: threads,
-          filename: outputName, expected_sha256: checksum.trim() || null, headers: {} });
+        id = await desktop.addHttpDownload({
+          url: source, save_dir: saveDir, max_connections: threads,
+          filename: outputName, expected_sha256: checksum.trim() || null,
+          headers: activeHeaders ?? {},
+          ...(activeHeaders?.Referer ? { referrer: activeHeaders.Referer } : {}),
+        });
       } else {
         let format = isPlaylistActive ? null : tab === "audio" ? ("format" in audio ? audio.format : null) : videoFormat;
         if (tab !== "audio" && format && probe) {
@@ -365,6 +406,7 @@ export function AddDialog({ seed, droppedSource, settings, onClose, onAdded, onB
           embed_subtitles_langs: tab === "audio" ? [] : tab === "subs" || embed ? languages : [],
           lossless_remux: remux, normalize_audio: normalize, save_dir: saveDir,
           filename: isPlaylistActive ? null : outputName,
+          ...(activeHeaders && { headers: activeHeaders }),
           ...(isPlaylistActive && {
             download_playlist: true, max_height: tab === "audio" ? null : maxHeight,
             playlist_items: items || null,

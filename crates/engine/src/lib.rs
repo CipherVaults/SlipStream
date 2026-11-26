@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use storage::{Database, Record, Segments};
-use tokio::sync::{broadcast, watch, Notify};
+use tokio::sync::{broadcast, watch, Mutex as AsyncMutex, Notify, OwnedMutexGuard};
 use tokio::task::{Id, JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior};
 use uuid::Uuid;
@@ -203,6 +203,7 @@ pub(crate) struct Inner {
     events: broadcast::Sender<EngineEvent>,
     telemetry: broadcast::Sender<TelemetryBatch>,
     wake: Notify,
+    outputs: Arc<AsyncMutex<()>>,
     state: Mutex<State>,
 }
 
@@ -270,22 +271,22 @@ impl DownloadEngine {
                 queues.insert(queue.id.clone(), queue);
             }
             let mut jobs = HashMap::new();
+            let mut recovered = Vec::new();
             for (mut record, mut segments) in db.transfers()? {
                 if matches!(
                     record.status,
                     TransferStatus::Active | TransferStatus::Probing
                 ) {
                     if output::recovered_commit(&record)? {
-                        record.set_status(TransferStatus::Completed);
-                        scrub_record_credentials(&mut record);
+                        recovered.push((record.updated_at, record.id.clone()));
                     } else {
                         record.set_status(TransferStatus::Paused);
                         for segment in segments.values_mut() {
                             segment.settled(SegmentState::Paused);
                         }
+                        record.commit_digest = None;
+                        db.replace_segments(&record, &segments)?;
                     }
-                    record.commit_digest = None;
-                    db.replace_segments(&record, &segments)?;
                 } else if matches!(
                     record.status,
                     TransferStatus::Completed | TransferStatus::Canceled
@@ -308,6 +309,10 @@ impl DownloadEngine {
                     },
                 );
             }
+            recovered.sort_unstable();
+            for (_, id) in recovered {
+                save_completed(&mut db, &mut jobs, &id)?;
+            }
             Ok::<_, EngineError>((db, queues, jobs))
         })
         .await??;
@@ -323,6 +328,7 @@ impl DownloadEngine {
             events: broadcast::channel(256).0,
             telemetry: broadcast::channel(32).0,
             wake: Notify::new(),
+            outputs: Arc::new(AsyncMutex::new(())),
             state: Mutex::new(State {
                 database: Some(database),
                 jobs,
@@ -503,6 +509,7 @@ impl DownloadEngine {
             commit_digest: None,
             speed_limit_bps: options.speed_limit_bps.filter(|rate| *rate > 0),
             overwrite_existing: request.overwrite_existing || options.overwrite_existing,
+            output_superseded: false,
             description: options.description,
             created_at: now,
             updated_at: now,
@@ -541,7 +548,9 @@ impl DownloadEngine {
         let job = state
             .jobs
             .values()
-            .filter(|job| job.record.status != TransferStatus::Canceled)
+            .filter(|job| {
+                job.record.status != TransferStatus::Canceled && !job.record.output_superseded
+            })
             .filter_map(|job| {
                 let url_match = if let Some(digest) = &job.record.duplicate_url_digest {
                     url_digest.as_ref() == Some(digest)
@@ -576,6 +585,11 @@ impl DownloadEngine {
 
     pub fn snapshots(&self) -> Vec<TransferSnapshot> {
         self.inner.lock().snapshots()
+    }
+
+    /// Hold while acting on HTTP output paths so a commit cannot replace them mid-operation.
+    pub async fn lock_outputs(&self) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.inner.outputs).lock_owned().await
     }
 
     pub fn telemetry_batch(&self) -> TelemetryBatch {
@@ -887,11 +901,7 @@ fn save_status(
     let mut segments = job.segments.clone();
     record.set_status(status);
     record.error = error;
-    // Keep the intent in SQLite if publishing Completed fails after a move.
-    if status == TransferStatus::Completed {
-        record.commit_digest = None;
-    }
-    if matches!(status, TransferStatus::Completed | TransferStatus::Canceled) {
+    if status == TransferStatus::Canceled {
         scrub_record_credentials(&mut record);
     }
     let segment_state = if status == TransferStatus::Failed {
@@ -903,6 +913,40 @@ fn save_status(
         segment.settled(segment_state);
     }
     db.replace_segments(&record, &segments)?;
+    job.record = record;
+    job.segments = segments;
+    Ok(())
+}
+
+fn save_completed(db: &mut Database, jobs: &mut HashMap<String, Job>, id: &str) -> Result<()> {
+    let mut record = jobs[id].record.clone();
+    let mut segments = jobs[id].segments.clone();
+    record.set_status(TransferStatus::Completed);
+    record.commit_digest = None;
+    scrub_record_credentials(&mut record);
+    for segment in segments.values_mut() {
+        segment.settled(SegmentState::Paused);
+    }
+
+    let mut superseded = Vec::new();
+    if record.overwrite_existing {
+        for job in jobs.values_mut() {
+            let old = &mut job.record;
+            if old.id != id
+                && old.status == TransferStatus::Completed
+                && !old.output_superseded
+                && same_download_path(&old.save_dir, &record.save_dir)
+                && same_download_path(Path::new(&old.filename), Path::new(&record.filename))
+            {
+                // Keep the old output inaccessible in memory even if saving fails after the move.
+                old.output_superseded = true;
+                old.sha256_verified = None;
+                superseded.push(old.clone());
+            }
+        }
+    }
+    db.replace_segments_with_records(&record, &segments, &superseded)?;
+    let job = jobs.get_mut(id).expect("completed transfer exists");
     job.record = record;
     job.segments = segments;
     Ok(())
@@ -990,7 +1034,7 @@ impl Inner {
         failure.map_or(Ok(()), Err)
     }
 
-    fn schedule(self: &Arc<Self>, runs: &mut JoinSet<Result<()>>) -> Result<()> {
+    fn schedule(self: &Arc<Self>, runs: &mut JoinSet<Result<OwnedMutexGuard<()>>>) -> Result<()> {
         let mut state = self.lock();
         if state.closing {
             return Ok(());
@@ -1058,7 +1102,7 @@ impl Inner {
 
     fn finish_run(
         &self,
-        outcome: std::result::Result<(Id, Result<()>), tokio::task::JoinError>,
+        outcome: std::result::Result<(Id, Result<OwnedMutexGuard<()>>), tokio::task::JoinError>,
     ) -> Result<()> {
         let (task, result) = match outcome {
             Ok(outcome) => outcome,
@@ -1074,14 +1118,23 @@ impl Inner {
                 "finished transfer has no run control",
             ))?;
         let run = state.running.remove(&id).unwrap();
-        let (status, error) = match result {
-            Ok(()) => (TransferStatus::Completed, None),
-            Err(_) if run.desired.is_some() => (run.desired.unwrap(), None),
-            Err(EngineError::Interrupted) => (TransferStatus::Paused, None),
-            Err(error) => (TransferStatus::Failed, Some(error.to_string())),
+        let (status, saved) = match result {
+            Ok(_output_guard) => {
+                let State { database, jobs, .. } = &mut *state;
+                let db = database.as_mut().ok_or(EngineError::Closed)?;
+                (TransferStatus::Completed, save_completed(db, jobs, &id))
+            }
+            Err(error) => {
+                let (status, error) = match (run.desired, error) {
+                    (Some(desired), _) => (desired, None),
+                    (_, EngineError::Interrupted) => (TransferStatus::Paused, None),
+                    (_, error) => (TransferStatus::Failed, Some(error.to_string())),
+                };
+                let (db, job) = state.job_mut(&id)?;
+                (status, save_status(db, job, status, error))
+            }
         };
-        let (db, job) = state.job_mut(&id)?;
-        if let Err(err) = save_status(db, job, status, error) {
+        if let Err(err) = saved {
             let _ = run.done.send_replace(Some(Err(err.to_string())));
             return Err(err);
         }
@@ -1195,6 +1248,7 @@ impl Job {
             ui_segments: project(&self.segments, record.total, record.status),
             segments,
             sha256_verified: record.sha256_verified,
+            output_superseded: record.output_superseded,
             resumable: record.ranges
                 && record.total.is_some()
                 && record.validators.if_range().is_some(),

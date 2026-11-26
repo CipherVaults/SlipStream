@@ -458,6 +458,7 @@ async fn run_pipe_trust_boundaries(suite: &mut Suite) {
             "pipe_auth_open_picker",
             NativeBridgeRequest::OpenDesktopWindow {
                 open_picker_url: Some("https://cdn.example.test/video.mp4".into()),
+                headers: Default::default(),
             },
         ),
     ] {
@@ -471,33 +472,43 @@ async fn run_pipe_trust_boundaries(suite: &mut Suite) {
         let pipe_name = pipe_name.clone();
         let token_clone = SessionToken::read(&token_path).expect("token");
         let seen_ref = Arc::clone(&seen);
-        let task = tokio::spawn(async move {
-            let client = accepted(
-                PipeClient::connect(&pipe_name, &token_clone, "eval-client").await,
-                "PipeClient::connect",
-            )?;
-            let (_client, response) =
-                accepted(client.request(&request).await, "PipeClient::request")?;
-            match (&request, &response) {
-                (NativeBridgeRequest::Ping, NativeBridgeResponse::Ack { ok: true, .. }) => {}
-                (NativeBridgeRequest::GetStatus, NativeBridgeResponse::Status { .. }) => {}
-                (
-                    NativeBridgeRequest::OpenDesktopWindow { open_picker_url },
-                    NativeBridgeResponse::Ack {
-                        ok: true,
-                        message: Some(msg),
-                    },
-                ) if msg == "picker_opened" => {
-                    let recorded = seen_ref.lock().unwrap();
-                    require(
-                        recorded.iter().any(|item| matches!(item, NativeBridgeRequest::OpenDesktopWindow { open_picker_url: u } if u == open_picker_url)),
+        let task =
+            tokio::spawn(async move {
+                let client = accepted(
+                    PipeClient::connect(&pipe_name, &token_clone, "eval-client").await,
+                    "PipeClient::connect",
+                )?;
+                let (_client, response) =
+                    accepted(client.request(&request).await, "PipeClient::request")?;
+                match (&request, &response) {
+                    (NativeBridgeRequest::Ping, NativeBridgeResponse::Ack { ok: true, .. }) => {}
+                    (NativeBridgeRequest::GetStatus, NativeBridgeResponse::Status { .. }) => {}
+                    (
+                        NativeBridgeRequest::OpenDesktopWindow {
+                            open_picker_url,
+                            headers,
+                        },
+                        NativeBridgeResponse::Ack {
+                            ok: true,
+                            message: Some(msg),
+                        },
+                    ) if msg == "picker_opened" => {
+                        let recorded = seen_ref.lock().unwrap();
+                        require(
+                        recorded.iter().any(|item| matches!(
+                            item,
+                            NativeBridgeRequest::OpenDesktopWindow {
+                                open_picker_url: received_url,
+                                headers: received_headers,
+                            } if received_url == open_picker_url && received_headers == headers
+                        )),
                         "handler did not receive exact authenticated OpenDesktopWindow request",
                     )?;
+                    }
+                    _ => return Err(format!("unexpected pipe response: {response:?}")),
                 }
-                _ => return Err(format!("unexpected pipe response: {response:?}")),
-            }
-            Ok("Authenticated Windows Named Pipe round-tripped the typed request cleanly.")
-        });
+                Ok("Authenticated Windows Named Pipe round-tripped the typed request cleanly.")
+            });
         suite.records.push(item.record(join(task).await, 1, None));
     }
 

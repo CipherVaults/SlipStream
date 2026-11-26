@@ -745,7 +745,15 @@ describe("frame-scoped media handoff", () => {
     }]);
     const playlist = request({ kind: "media", action: "playlist", url: page });
     await Promise.resolve();
-    expect(port.posted.at(-1)).toEqual({ type: "open_desktop_window", open_picker_url: page });
+    expect(port.posted.at(-1)).toEqual({
+      type: "open_desktop_window",
+      open_picker_url: page,
+      headers: expect.objectContaining({
+        Referer: page,
+        Origin: "https://media.example",
+        "Accept-Language": "en-US,en;q=0.9",
+      }),
+    });
     port.emitMessage({ type: "ack", ok: true, message: null });
     expect(await playlist).toMatchObject({ ok: true });
     probePorts[0].emitMessage({ type: "media_probed", probe: {
@@ -776,7 +784,11 @@ describe("frame-scoped media handoff", () => {
       request: {
         url, format_id: "137", lossless_remux: true, normalize_audio: false,
         audio_only_preset: undefined, embed_subtitles_langs: [],
-        headers: { Referer: page, "Accept-Language": "en" },
+        headers: expect.objectContaining({
+          Referer: page,
+          Origin: "https://media.example",
+          "Accept-Language": "en",
+        }),
       },
     });
     port.emitMessage({ type: "ack", ok: true, message: null });

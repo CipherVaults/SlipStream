@@ -890,6 +890,73 @@ async fn overwrite_atomically_replaces_files_and_rejects_unsafe_targets() {
 }
 
 #[tokio::test]
+async fn overwrites_leave_only_the_latest_completed_transfer_owning_the_output() {
+    let original = payload(KIB, 7);
+    let replacement = payload(KIB, 8);
+    let first = original.clone();
+    let next = replacement.clone();
+    let server = Server::new(move |req| {
+        let contents = if req.path == "/first" { &first } else { &next };
+        Reply::resource(req, contents, "\"ownership\"")
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let config = dir.config();
+    let engine = DownloadEngine::new(config.clone()).await.unwrap();
+    let mut download = request(server.url("/first"), Some("shared.bin"), 1);
+    download.expected_sha256 = Some(hex::encode(Sha256::digest(&*original)));
+    let old_id = engine.add_http_download(download).await.unwrap();
+    let old = completed(&engine, &old_id).await;
+    assert_eq!(old.sha256_verified, Some(true));
+    assert!(!old.output_superseded);
+
+    let filename = if cfg!(windows) {
+        "SHARED.bin"
+    } else {
+        "shared.bin"
+    };
+    let mut download = request(server.url("/replacement"), Some(filename), 1);
+    download.save_dir = Some(
+        config
+            .default_download_dir
+            .join(".")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    download.overwrite_existing = true;
+    download.expected_sha256 = Some(hex::encode(Sha256::digest(&*replacement)));
+    let (left, right) = tokio::join!(
+        engine.add_http_download(download.clone()),
+        engine.add_http_download(download),
+    );
+    let left = left.unwrap();
+    let right = right.unwrap();
+    completed(&engine, &left).await;
+    completed(&engine, &right).await;
+    dir.assert_output(filename, &replacement).await;
+    let assert_ownership = |engine: &DownloadEngine| {
+        let old = engine.snapshot(&old_id).unwrap();
+        assert_eq!(old.status, TransferStatus::Completed);
+        assert_eq!(old.sha256_verified, None);
+        assert!(old.output_superseded);
+        let left = engine.snapshot(&left).unwrap();
+        let right = engine.snapshot(&right).unwrap();
+        assert_ne!(left.output_superseded, right.output_superseded);
+        for record in [left, right] {
+            assert_eq!(
+                record.sha256_verified,
+                (!record.output_superseded).then_some(true)
+            );
+        }
+    };
+    assert_ownership(&engine);
+    engine.shutdown().await.unwrap();
+    let engine = DownloadEngine::new(config).await.unwrap();
+    assert_ownership(&engine);
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn refresh_failed_url_preserves_bytes_and_sends_new_credentials() {
     let data = payload(512 * KIB, 6);
     let source = Arc::clone(&data);

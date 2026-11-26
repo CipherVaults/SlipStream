@@ -447,8 +447,8 @@ export default function App() {
     })).then(() => {
       if (!cancelled) void pullSnapshot().catch(report);
     });
-    void connect(desktop.onOpenPicker(url => {
-      if (!cancelled) openAdd({ url: url ?? undefined, autoProbe: Boolean(url) }, true);
+    void connect(desktop.onOpenPicker((url, headers) => {
+      if (!cancelled) openAdd({ url: url ?? undefined, headers, autoProbe: Boolean(url) }, true);
     }).then(stop => {
       if (!cancelled) void desktop.markUiReady();
       return stop;
@@ -466,6 +466,12 @@ export default function App() {
       }
     }));
     void loadSettings().catch(report);
+    void connect(desktop.onSettingsUpdated(() => {
+      if (cancelled) return;
+      settingsLoadedRef.current = false;
+      settingsLoadRef.current = null;
+      void loadSettings().catch(() => {});
+    }));
     return () => {
       cancelled = true;
       cleanup.forEach(stopSafely);
@@ -526,7 +532,8 @@ export default function App() {
 
   function saveAppearance(change: Partial<AppSettings>) {
     void enqueueSettings(async () => {
-      const next = { ...settingsRef.current, ...change };
+      const base = isTauri() ? await desktop.getSettings().catch(() => settingsRef.current) : settingsRef.current;
+      const next = { ...base, ...change };
       await persistAndSyncSettings(next);
     }).catch(showError);
   }

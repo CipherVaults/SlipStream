@@ -14,6 +14,7 @@ const YTDLP_FLAGS: &[&str] = &[
     "--no-cache-dir",
     "--cache-dir",
     "--add-header",
+    "--force-ipv4",
     "--no-exec",
     "--no-warnings",
     "--dump-single-json",
@@ -256,6 +257,39 @@ pub struct BuildYtDlpArgs {
     args: Vec<OsString>,
 }
 
+pub fn ensure_default_user_agent(headers: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut headers = headers.clone();
+    if !headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("user-agent"))
+    {
+        headers.insert(
+            "User-Agent".into(),
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36".into(),
+        );
+    }
+    headers
+}
+
+pub(crate) fn is_http_403_error(error: &MediaError) -> bool {
+    fn boundary(character: char) -> bool {
+        !character.is_alphanumeric() && character != '_'
+    }
+
+    matches!(
+        error,
+        MediaError::ToolFailed { tool: "yt-dlp", stderr, .. }
+            if stderr.lines().any(|line| {
+                ["HTTP Error 403", "403: Forbidden"].into_iter().any(|marker| {
+                    line.match_indices(marker).any(|(start, _)| {
+                        line[..start].chars().next_back().is_none_or(boundary)
+                            && line[start + marker.len()..].chars().next().is_none_or(boundary)
+                    })
+                })
+            })
+    )
+}
+
 fn media_header<'a>(name: &str, value: &'a str) -> Result<(&'static str, &'a str), MediaError> {
     let name = ["Referer", "Origin", "User-Agent", "Accept-Language"]
         .into_iter()
@@ -335,6 +369,11 @@ impl BuildYtDlpArgs {
             builder.option("-o", DOWNLOAD_TEMPLATE);
         }
         builder
+    }
+
+    pub fn force_ipv4(mut self) -> Self {
+        self.flag("--force-ipv4");
+        self
     }
 
     pub fn format(mut self, format: &str) -> Result<Self, MediaError> {
@@ -657,6 +696,30 @@ fn container_muxer(container: MediaContainer) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_403_retry_classifier_requires_a_distinct_status() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+
+        for (stderr, expected) in [
+            ("ERROR: HTTP Error 403: Forbidden", true),
+            ("first line\nERROR: 403: Forbidden.", true),
+            ("ERROR: HTTP Error 4031", false),
+            ("ERROR: HTTP Error 4030", false),
+            ("ERROR: video 1403: Forbidden", false),
+            ("ERROR: 403: ForbiddenWords", false),
+        ] {
+            let error = MediaError::ToolFailed {
+                tool: "yt-dlp",
+                stderr: stderr.into(),
+                status: std::process::ExitStatus::from_raw(1),
+            };
+            assert_eq!(is_http_403_error(&error), expected, "{stderr}");
+        }
+    }
 
     #[test]
     fn cache_directory_is_explicit_and_validated() {
