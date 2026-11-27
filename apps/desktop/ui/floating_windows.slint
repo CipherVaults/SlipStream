@@ -1,0 +1,1051 @@
+import { ScrollView } from "std-widgets.slint";
+import { Theme } from "./tokens.slint";
+import {
+    PrimaryButton,
+    GhostButton,
+    CircleIconButton,
+    PillSwitch,
+    CheckBoxRow,
+    PillBadge,
+    SegmentProgressBar,
+    StyledLineEdit,
+    StyledSelect,
+} from "./widgets.slint";
+import { ConnectionRowModel } from "./app_types.slint";
+
+component FloatingChrome inherits HorizontalLayout {
+    in property <string> title-text;
+    in property <bool> show-minimize: true;
+    in property <bool> show-pin: false;
+    callback start-drag();
+    callback minimize-clicked();
+    callback close-clicked();
+
+    height: 36px;
+    padding-left: 12px;
+    padding-right: 4px;
+    spacing: 8px;
+
+    Rectangle {
+        horizontal-stretch: 1;
+        TouchArea {
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                    root.start-drag();
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+
+            Image {
+                source: @image-url("../icons/icon.png");
+                width: 18px;
+                height: 18px;
+                image-fit: contain;
+                y: (parent.height - self.height) / 2;
+            }
+
+            Text {
+                horizontal-stretch: 1;
+                text: root.title-text;
+                font-family: Theme.font-sans;
+                font-size: 12.5px;
+                font-weight: 600;
+                color: Theme.text-1;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+    }
+
+    if root.show-minimize : Rectangle {
+        width: 34px;
+        height: 28px;
+        y: 4px;
+        border-radius: 6px;
+        background: min-ta.has-hover ? Theme.bg-hover : transparent;
+
+        Image {
+            source: @image-url("icons/minus.svg");
+            width: 12px;
+            height: 12px;
+            colorize: Theme.text-2;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+        }
+
+        min-ta := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.minimize-clicked(); }
+        }
+    }
+
+    Rectangle {
+        width: 34px;
+        height: 28px;
+        y: 4px;
+        border-radius: 6px;
+        background: close-ta.has-hover ? Theme.red-hover : transparent;
+
+        Image {
+            source: @image-url("icons/x.svg");
+            width: 12px;
+            height: 12px;
+            colorize: close-ta.has-hover ? #FFFFFF : Theme.text-2;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+        }
+
+        close-ta := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.close-clicked(); }
+        }
+    }
+}
+
+component DuplicateRadioRow inherits Rectangle {
+    in property <bool> selected: false;
+    in property <string> label;
+    callback clicked();
+
+    height: 26px;
+    border-radius: 6px;
+    background: ta.has-hover ? Theme.bg-hover : transparent;
+
+    HorizontalLayout {
+        padding-left: 4px;
+        padding-right: 6px;
+        spacing: 8px;
+        alignment: start;
+
+        Rectangle {
+            width: 14px;
+            height: 14px;
+            border-radius: 7px;
+            y: (parent.height - self.height) / 2;
+            background: Theme.bg-input;
+            border-width: root.selected ? 4px : 1.5px;
+            border-color: root.selected ? Theme.accent : Theme.border-strong;
+        }
+
+        Text {
+            text: root.label;
+            font-family: Theme.font-sans;
+            font-size: 12.5px;
+            color: Theme.text-1;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component DownloadConfirmWindow inherits Window {
+    in property <bool> has-duplicate: false;
+    in property <bool> is-duplicate-view: false;
+    in property <string> duplicate-filename: "";
+    // 0=numbered, 1=overwrite, 2=resume_or_complete
+    in-out property <int> duplicate-choice: 0;
+    in property <string> url: "";
+    in property <string> source-domain: "";
+    in property <string> size-text: "Unknown size";
+    in property <int> icon-kind: 0;
+    in property <[string]> category-names: ["General", "Programs", "Compressed", "Video", "Music", "Documents"];
+    in-out property <int> category-index: 0;
+    in property <string> category-label: "General";
+    in-out property <string> save-dir: "";
+    in-out property <string> filename: "";
+    in-out property <bool> remember-category: true;
+    in property <string> resolved-dir-hint: "";
+    in-out property <string> description: "";
+    in-out property <bool> creating-category: false;
+    in-out property <string> new-category-name: "";
+    in-out property <string> new-category-extensions: "";
+    in property <bool> submitting: false;
+    in property <string> error-text: "";
+
+    callback start-drag();
+    callback minimize-window();
+    callback cancel-clicked();
+    callback duplicate-ok-clicked();
+    callback category-selected(int);
+    callback add-category-toggled();
+    callback save-new-category-clicked(string, string);
+    callback browse-dir-clicked();
+    callback download-later-clicked();
+    callback start-download-clicked();
+
+    title: root.is-duplicate-view ? "Duplicate download link" : "Download File Info";
+    icon: @image-url("../icons/icon.png");
+    width: root.is-duplicate-view ? 460px : 510px;
+    height: root.is-duplicate-view ? 275px : (root.creating-category ? 468px : 408px);
+    no-frame: true;
+    background: Theme.bg-canvas;
+    default-font-family: Theme.font-sans;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: Theme.bg-canvas;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        border-radius: 10px;
+        clip: true;
+
+        VerticalLayout {
+            padding: 0px;
+            spacing: 0px;
+
+            FloatingChrome {
+                title-text: root.is-duplicate-view ? "Duplicate download link" : "Download File Info";
+                show-minimize: !root.is-duplicate-view;
+                start-drag => { root.start-drag(); }
+                minimize-clicked => { root.minimize-window(); }
+                close-clicked => { root.cancel-clicked(); }
+            }
+
+            Rectangle { height: 1px; background: Theme.border; }
+
+            if root.is-duplicate-view : VerticalLayout {
+                vertical-stretch: 1;
+                padding-top: 14px; padding-right: 16px; padding-bottom: 14px; padding-left: 16px;
+                spacing: 8px;
+
+                Text {
+                    text: "This address is already in the list of downloads:";
+                    font-size: 12.5px;
+                    font-weight: 600;
+                    color: Theme.text-1;
+                }
+
+                Text {
+                    text: root.duplicate-filename;
+                    font-size: 12px;
+                    color: Theme.text-2;
+                    overflow: elide;
+                }
+
+                VerticalLayout {
+                    spacing: 4px;
+                    padding-top: 2px;
+                    DuplicateRadioRow {
+                        selected: root.duplicate-choice == 0;
+                        label: "Add the duplicate with a numbered file name";
+                        clicked => { root.duplicate-choice = 0; }
+                    }
+                    DuplicateRadioRow {
+                        selected: root.duplicate-choice == 1;
+                        label: "Add the duplicate and overwrite the existing file";
+                        clicked => { root.duplicate-choice = 1; }
+                    }
+                    DuplicateRadioRow {
+                        selected: root.duplicate-choice == 2;
+                        label: "If existing file is complete, show complete dialog; otherwise resume";
+                        clicked => { root.duplicate-choice = 2; }
+                    }
+                }
+
+                if root.error-text != "" : Text {
+                    text: root.error-text;
+                    font-size: 11.5px;
+                    color: Theme.danger;
+                    wrap: word-wrap;
+                }
+
+                Rectangle { vertical-stretch: 1; }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    PrimaryButton {
+                        label: root.submitting ? "Working..." : "OK";
+                        enabled: !root.submitting;
+                        clicked => { root.duplicate-ok-clicked(); }
+                    }
+                    GhostButton {
+                        label: "Cancel";
+                        enabled: !root.submitting;
+                        clicked => { root.cancel-clicked(); }
+                    }
+                }
+            }
+
+            if !root.is-duplicate-view : VerticalLayout {
+                vertical-stretch: 1;
+                padding-top: 12px; padding-right: 14px; padding-bottom: 12px; padding-left: 14px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    spacing: 14px;
+                    vertical-stretch: 1;
+
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 9px;
+
+                        // URL row
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text {
+                                width: 72px;
+                                text: "URL";
+                                font-size: 12px;
+                                font-weight: 550;
+                                color: Theme.text-2;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                            }
+                            StyledLineEdit {
+                                horizontal-stretch: 1;
+                                text: root.url;
+                                read-only: true;
+                                mono: true;
+                                box-height: 29px;
+                            }
+                        }
+
+                        // Category row
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text {
+                                width: 72px;
+                                text: "Category";
+                                font-size: 12px;
+                                font-weight: 550;
+                                color: Theme.text-2;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                            }
+                            StyledSelect {
+                                horizontal-stretch: 1;
+                                options: root.category-names;
+                                current-index <=> root.category-index;
+                                current-value: root.category-label;
+                                box-height: 29px;
+                                selected(idx, _) => { root.category-selected(idx); }
+                            }
+                            GhostButton {
+                                label: "+";
+                                btn-height: 29px;
+                                pad-x: 10px;
+                                clicked => { root.add-category-toggled(); }
+                            }
+                        }
+
+                        if root.creating-category : Rectangle {
+                            border-radius: 8px;
+                            background: Theme.bg-elevated;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            height: 78px;
+
+                            VerticalLayout {
+                                padding: 8px;
+                                spacing: 6px;
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    StyledLineEdit {
+                                        horizontal-stretch: 1;
+                                        text <=> root.new-category-name;
+                                        placeholder: "Category name";
+                                        box-height: 27px;
+                                    }
+                                    StyledLineEdit {
+                                        horizontal-stretch: 1;
+                                        text <=> root.new-category-extensions;
+                                        placeholder: "Extensions (exe, msi)";
+                                        box-height: 27px;
+                                    }
+                                }
+                                HorizontalLayout {
+                                    alignment: end;
+                                    spacing: 6px;
+                                    GhostButton {
+                                        label: "Cancel";
+                                        btn-height: 25px;
+                                        pad-x: 9px;
+                                        clicked => { root.creating-category = false; }
+                                    }
+                                    PrimaryButton {
+                                        label: "Create";
+                                        btn-height: 25px;
+                                        pad-x: 10px;
+                                        clicked => {
+                                            root.save-new-category-clicked(root.new-category-name, root.new-category-extensions);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Save As row
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text {
+                                width: 72px;
+                                text: "Save As";
+                                font-size: 12px;
+                                font-weight: 550;
+                                color: Theme.text-2;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                            }
+                            StyledLineEdit {
+                                horizontal-stretch: 1;
+                                text <=> root.filename;
+                                placeholder: "Filename";
+                                box-height: 29px;
+                                accepted => { root.start-download-clicked(); }
+                            }
+                            GhostButton {
+                                label: "...";
+                                btn-height: 29px;
+                                pad-x: 10px;
+                                clicked => { root.browse-dir-clicked(); }
+                            }
+                        }
+
+                        // Remember category path group
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Rectangle { width: 72px; }
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                border-radius: 7px;
+                                border-width: 1px;
+                                border-color: Theme.border;
+                                background: Theme.bg-sidebar;
+                                height: 54px;
+
+                                VerticalLayout {
+                                    padding-top: 7px; padding-right: 9px; padding-bottom: 7px; padding-left: 9px;
+                                    spacing: 4px;
+                                    CheckBoxRow {
+                                        checked <=> root.remember-category;
+                                        label: "Remember this path for \"" + root.category-label + "\" category";
+                                    }
+                                    Text {
+                                        text: root.save-dir != "" ? root.save-dir : root.resolved-dir-hint;
+                                        font-family: Theme.font-mono;
+                                        font-size: 11px;
+                                        color: Theme.text-3;
+                                        overflow: elide;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Description row
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text {
+                                width: 72px;
+                                text: "Description";
+                                font-size: 12px;
+                                font-weight: 550;
+                                color: Theme.text-2;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                            }
+                            StyledLineEdit {
+                                horizontal-stretch: 1;
+                                text <=> root.description;
+                                placeholder: "Optional note";
+                                box-height: 29px;
+                                accepted => { root.start-download-clicked(); }
+                            }
+                        }
+                    }
+
+                    // Right file-summary sidebar (116px)
+                    Rectangle {
+                        width: 112px;
+                        border-radius: 9px;
+                        background: Theme.bg-elevated;
+                        border-width: 1px;
+                        border-color: Theme.border;
+
+                        VerticalLayout {
+                            padding-top: 12px; padding-right: 8px; padding-bottom: 12px; padding-left: 8px;
+                            spacing: 8px;
+                            alignment: start;
+
+                            Rectangle {
+                                width: 52px;
+                                height: 52px;
+                                border-radius: 12px;
+                                x: (parent.width - self.width) / 2;
+                                background: Theme.accent-soft;
+
+                                Image {
+                                    source: root.icon-kind == 4 ? @image-url("icons/app-window.svg")
+                                        : root.icon-kind == 3 ? @image-url("icons/archive.svg")
+                                        : root.icon-kind == 1 ? @image-url("icons/film.svg")
+                                        : root.icon-kind == 2 ? @image-url("icons/music.svg")
+                                        : root.icon-kind == 6 ? @image-url("icons/file-text.svg")
+                                        : @image-url("icons/download.svg");
+                                    width: 24px;
+                                    height: 24px;
+                                    colorize: Theme.accent;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                }
+                            }
+
+                            Text {
+                                text: root.size-text;
+                                font-family: Theme.font-mono;
+                                font-size: 12px;
+                                font-weight: 600;
+                                color: Theme.text-1;
+                                horizontal-alignment: center;
+                            }
+
+                            Text {
+                                text: root.source-domain;
+                                font-size: 11px;
+                                color: Theme.text-3;
+                                horizontal-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                }
+
+                if root.error-text != "" : Text {
+                    text: root.error-text;
+                    font-size: 11.5px;
+                    color: Theme.danger;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    GhostButton {
+                        label: "Download Later";
+                        enabled: !root.submitting;
+                        clicked => { root.download-later-clicked(); }
+                    }
+                    PrimaryButton {
+                        label: root.submitting ? "Starting..." : "Start Download";
+                        enabled: !root.submitting;
+                        clicked => { root.start-download-clicked(); }
+                    }
+                    GhostButton {
+                        label: "Cancel";
+                        enabled: !root.submitting;
+                        clicked => { root.cancel-clicked(); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component DownloadProgressWindow inherits Window {
+    in property <string> title-bar-text: "0% Download";
+    in property <string> url: "";
+    in property <string> status-text: "Receiving data...";
+    in property <string> size-text: "Unknown";
+    in property <string> downloaded-text: "0 B";
+    in property <string> speed-text: "0 B/s";
+    in property <string> eta-text: "--";
+    in property <string> resume-text: "Yes";
+    in property <string> server-text: "";
+    in property <string> error-text: "";
+    in property <bool> is-paused: false;
+    in property <bool> is-completed: false;
+    in property <bool> can-pause-resume: true;
+    in property <[float]> segments: [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0];
+    in property <int> segment-tone: 0;
+    in-out property <bool> show-details: true;
+    in property <[ConnectionRowModel]> connections: [];
+    // 0=Download status, 1=Speed Limiter, 2=Options on completion
+    in-out property <int> active-tab: 0;
+    in-out property <bool> speed-limiter-enabled: false;
+    in-out property <string> speed-limit-value: "512";
+    in-out property <int> speed-limit-unit: 0; // 0=KB/s, 1=MB/s
+    in property <bool> options-loading: true;
+    in-out property <bool> opt-show-complete: true;
+    in-out property <bool> opt-auto-close: false;
+    in-out property <bool> opt-open-folder: false;
+
+    callback start-drag();
+    callback minimize-window();
+    callback close-clicked();
+    callback toggle-pause-clicked();
+    callback cancel-transfer-clicked();
+    callback toggle-details-clicked();
+    callback apply-speed-limit(bool, string, int);
+    callback speed-input-dirty();
+    callback completion-options-changed(bool, bool, bool);
+    callback open-file-clicked();
+    callback open-folder-clicked();
+
+    title: root.title-bar-text;
+    icon: @image-url("../icons/icon.png");
+    width: 540px;
+    height: root.show-details ? 512px : 334px;
+    no-frame: true;
+    background: Theme.bg-canvas;
+    default-font-family: Theme.font-sans;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: Theme.bg-canvas;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        border-radius: 10px;
+        clip: true;
+
+        VerticalLayout {
+            padding: 0px;
+            spacing: 0px;
+
+            FloatingChrome {
+                title-text: root.title-bar-text;
+                start-drag => { root.start-drag(); }
+                minimize-clicked => { root.minimize-window(); }
+                close-clicked => { root.close-clicked(); }
+            }
+
+            // Classic tab bar
+            Rectangle {
+                height: 32px;
+                background: Theme.bg-sidebar;
+                border-width: 1px;
+                border-color: Theme.border;
+
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    spacing: 4px;
+                    alignment: start;
+
+                    for tab-spec in [
+                        { idx: 0, label: "Download status" },
+                        { idx: 1, label: "Speed Limiter" },
+                        { idx: 2, label: "Options on completion" },
+                    ] : Rectangle {
+                        y: 4px;
+                        height: 27px;
+                        min-width: tab-txt.preferred-width + 20px;
+                        border-top-left-radius: 6px;
+                        border-top-right-radius: 6px;
+                        background: root.active-tab == tab-spec.idx
+                            ? Theme.bg-canvas
+                            : (t-ta.has-hover ? Theme.bg-hover : transparent);
+                        border-width: root.active-tab == tab-spec.idx ? 1px : 0px;
+                        border-color: Theme.border;
+
+                        tab-txt := Text {
+                            text: tab-spec.label;
+                            font-size: 12px;
+                            font-weight: root.active-tab == tab-spec.idx ? 600 : 500;
+                            color: root.active-tab == tab-spec.idx ? Theme.text-1 : Theme.text-2;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        t-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.active-tab = tab-spec.idx; }
+                        }
+                    }
+                }
+            }
+
+            if root.active-tab == 0 : VerticalLayout {
+                vertical-stretch: 1;
+                padding-top: 12px; padding-right: 14px; padding-bottom: 12px; padding-left: 14px;
+                spacing: 8px;
+
+                Text {
+                    text: root.url;
+                    font-family: Theme.font-mono;
+                    font-size: 11px;
+                    color: Theme.text-3;
+                    overflow: elide;
+                }
+
+                // Key/value stats grid
+                VerticalLayout {
+                    spacing: 5px;
+                    for kv in [
+                        { k: "Status", v: root.status-text, is-accent: true },
+                        { k: "File size", v: root.size-text, is-accent: false },
+                        { k: "Downloaded", v: root.downloaded-text, is-accent: false },
+                        { k: "Transfer rate", v: root.speed-text, is-accent: false },
+                        { k: "Time left", v: root.eta-text, is-accent: false },
+                        { k: "Resume capability", v: root.resume-text, is-accent: false },
+                        { k: "Server", v: root.server-text, is-accent: false },
+                    ] : HorizontalLayout {
+                        spacing: 10px;
+                        Text {
+                            width: 122px;
+                            text: kv.k;
+                            font-size: 12px;
+                            color: Theme.text-2;
+                        }
+                        Text {
+                            horizontal-stretch: 1;
+                            text: kv.v;
+                            font-size: 12px;
+                            font-weight: kv.is-accent ? 600 : 500;
+                            color: kv.is-accent ? Theme.accent : Theme.text-1;
+                            overflow: elide;
+                        }
+                    }
+                }
+
+                if root.error-text != "" : Text {
+                    text: root.error-text;
+                    font-size: 11.5px;
+                    color: Theme.danger;
+                    wrap: word-wrap;
+                }
+
+                // Segmented progress bar
+                SegmentProgressBar {
+                    segments: root.segments;
+                    tone: root.segment-tone;
+                }
+
+                // Action row
+                HorizontalLayout {
+                    spacing: 8px;
+                    GhostButton {
+                        label: root.show-details ? "<< Hide details" : "Show details >>";
+                        btn-height: 29px;
+                        clicked => { root.toggle-details-clicked(); }
+                    }
+
+                    Rectangle { horizontal-stretch: 1; }
+
+                    if root.is-completed : GhostButton {
+                        label: "Open";
+                        btn-height: 29px;
+                        clicked => { root.open-file-clicked(); }
+                    }
+                    if root.is-completed : GhostButton {
+                        label: "Open folder";
+                        btn-height: 29px;
+                        clicked => { root.open-folder-clicked(); }
+                    }
+                    if !root.is-completed && root.can-pause-resume : PrimaryButton {
+                        label: root.is-paused ? "Resume" : "Pause";
+                        btn-height: 29px;
+                        clicked => { root.toggle-pause-clicked(); }
+                    }
+                    if !root.is-completed : GhostButton {
+                        label: "Cancel";
+                        btn-height: 29px;
+                        clicked => { root.cancel-transfer-clicked(); }
+                    }
+                    if root.is-completed : PrimaryButton {
+                        label: "Close";
+                        btn-height: 29px;
+                        clicked => { root.close-clicked(); }
+                    }
+                }
+
+                if root.show-details : VerticalLayout {
+                    vertical-stretch: 1;
+                    spacing: 6px;
+                    padding-top: 2px;
+
+                    Text {
+                        text: "Start positions and download progress by connections";
+                        font-size: 11px;
+                        color: Theme.text-3;
+                        horizontal-alignment: center;
+                    }
+
+                    Rectangle {
+                        vertical-stretch: 1;
+                        border-radius: 7px;
+                        background: Theme.bg-input;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        clip: true;
+
+                        VerticalLayout {
+                            padding: 0px;
+                            spacing: 0px;
+
+                            Rectangle {
+                                height: 24px;
+                                background: Theme.bg-elevated;
+                                border-width: 1px;
+                                border-color: Theme.border;
+
+                                HorizontalLayout {
+                                    padding-left: 8px;
+                                    padding-right: 8px;
+                                    spacing: 8px;
+                                    Text { width: 34px; text: "N."; font-size: 11px; font-weight: 600; color: Theme.text-2; vertical-alignment: center; }
+                                    Text { width: 92px; text: "Downloaded"; font-size: 11px; font-weight: 600; color: Theme.text-2; vertical-alignment: center; }
+                                    Text { horizontal-stretch: 1; text: "Info"; font-size: 11px; font-weight: 600; color: Theme.text-2; vertical-alignment: center; }
+                                }
+                            }
+
+                            ScrollView {
+                                vertical-stretch: 1;
+                                VerticalLayout {
+                                    alignment: start;
+                                    padding-top: 3px; padding-right: 0px; padding-bottom: 4px; padding-left: 0px;
+                                    spacing: 1px;
+                                    for row in root.connections : HorizontalLayout {
+                                        height: 22px;
+                                        padding-left: 8px;
+                                        padding-right: 8px;
+                                        spacing: 8px;
+                                        Text { width: 34px; text: row.num-text; font-family: Theme.font-mono; font-size: 11px; color: Theme.text-2; vertical-alignment: center; }
+                                        Text { width: 92px; text: row.downloaded-text; font-family: Theme.font-mono; font-size: 11px; color: Theme.text-1; vertical-alignment: center; }
+                                        Text { horizontal-stretch: 1; text: row.info-text; font-size: 11px; color: Theme.text-2; vertical-alignment: center; overflow: elide; }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if root.active-tab == 1 : VerticalLayout {
+                vertical-stretch: 1;
+                padding: 16px;
+                spacing: 12px;
+                alignment: start;
+
+                CheckBoxRow {
+                    checked <=> root.speed-limiter-enabled;
+                    label: "Use speed limiter for this download";
+                    toggled(val) => {
+                        root.speed-input-dirty();
+                        root.apply-speed-limit(val, root.speed-limit-value, root.speed-limit-unit);
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "Maximum speed";
+                        font-size: 12px;
+                        color: Theme.text-2;
+                        vertical-alignment: center;
+                    }
+                    StyledLineEdit {
+                        width: 110px;
+                        text <=> root.speed-limit-value;
+                        enabled: root.speed-limiter-enabled;
+                        mono: true;
+                        edited(_) => { root.speed-input-dirty(); }
+                        accepted => {
+                            root.apply-speed-limit(root.speed-limiter-enabled, root.speed-limit-value, root.speed-limit-unit);
+                        }
+                    }
+                    StyledSelect {
+                        width: 90px;
+                        options: ["KB/s", "MB/s"];
+                        current-index <=> root.speed-limit-unit;
+                        current-value: root.speed-limit-unit == 1 ? "MB/s" : "KB/s";
+                        enabled: root.speed-limiter-enabled;
+                        selected(idx, _) => {
+                            root.speed-input-dirty();
+                            root.apply-speed-limit(root.speed-limiter-enabled, root.speed-limit-value, idx);
+                        }
+                    }
+                    PrimaryButton {
+                        label: "Apply";
+                        enabled: root.speed-limiter-enabled;
+                        clicked => {
+                            root.apply-speed-limit(root.speed-limiter-enabled, root.speed-limit-value, root.speed-limit-unit);
+                        }
+                    }
+                }
+            }
+
+            if root.active-tab == 2 : VerticalLayout {
+                vertical-stretch: 1;
+                padding: 16px;
+                spacing: 10px;
+                alignment: start;
+
+                CheckBoxRow {
+                    checked <=> root.opt-show-complete;
+                    enabled: !root.options-loading;
+                    label: "Show download complete dialog";
+                    toggled(v) => { root.completion-options-changed(v, root.opt-auto-close, root.opt-open-folder); }
+                }
+                CheckBoxRow {
+                    checked <=> root.opt-auto-close;
+                    enabled: !root.options-loading;
+                    label: "Automatically close progress window";
+                    toggled(v) => { root.completion-options-changed(root.opt-show-complete, v, root.opt-open-folder); }
+                }
+                CheckBoxRow {
+                    checked <=> root.opt-open-folder;
+                    enabled: !root.options-loading;
+                    label: "Open folder automatically when finished";
+                    toggled(v) => { root.completion-options-changed(root.opt-show-complete, root.opt-auto-close, v); }
+                }
+            }
+        }
+    }
+}
+
+export component DownloadCompleteWindow inherits Window {
+    in property <string> filename: "";
+    in property <string> url: "";
+    in property <string> size-text: "";
+    in property <string> save-path: "";
+    in property <int> sha-verified: 0; // 0=none, 1=verified, 2=failed
+    in property <string> error-text: "";
+
+    callback start-drag();
+    callback open-clicked();
+    callback open-with-clicked();
+    callback open-folder-clicked();
+    callback close-clicked();
+
+    title: "Download complete";
+    icon: @image-url("../icons/icon.png");
+    width: 460px;
+    height: 256px;
+    no-frame: true;
+    background: Theme.bg-canvas;
+    default-font-family: Theme.font-sans;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: Theme.bg-canvas;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        border-radius: 10px;
+        clip: true;
+
+        VerticalLayout {
+            padding: 0px;
+            spacing: 0px;
+
+            FloatingChrome {
+                title-text: "Download complete";
+                show-minimize: false;
+                start-drag => { root.start-drag(); }
+                close-clicked => { root.close-clicked(); }
+            }
+
+            Rectangle { height: 1px; background: Theme.border; }
+
+            VerticalLayout {
+                vertical-stretch: 1;
+                padding-top: 14px; padding-right: 16px; padding-bottom: 14px; padding-left: 16px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    Rectangle {
+                        width: 36px;
+                        height: 36px;
+                        border-radius: 9px;
+                        background: Theme.green-soft;
+                        Image {
+                            source: @image-url("icons/check-circle-2.svg");
+                            width: 18px;
+                            height: 18px;
+                            colorize: Theme.green;
+                            x: 9px;
+                            y: 9px;
+                        }
+                    }
+
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 3px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                horizontal-stretch: 1;
+                                text: root.filename;
+                                font-size: 13.5px;
+                                font-weight: 600;
+                                color: Theme.text-1;
+                                overflow: elide;
+                                vertical-alignment: center;
+                            }
+                            if root.sha-verified == 1 : PillBadge {
+                                text: "SHA-256 Verified";
+                                tone: 2;
+                                has-check: true;
+                            }
+                        }
+                        Text {
+                            text: root.size-text;
+                            font-family: Theme.font-mono;
+                            font-size: 11.5px;
+                            color: Theme.text-2;
+                        }
+                    }
+                }
+
+                VerticalLayout {
+                    spacing: 4px;
+                    Text {
+                        text: "Saved to " + root.save-path;
+                        font-family: Theme.font-mono;
+                        font-size: 11px;
+                        color: Theme.text-2;
+                        overflow: elide;
+                    }
+                    if root.url != "" : Text {
+                        text: root.url;
+                        font-family: Theme.font-mono;
+                        font-size: 10.5px;
+                        color: Theme.text-3;
+                        overflow: elide;
+                    }
+                }
+
+                if root.error-text != "" : Text {
+                    text: root.error-text;
+                    font-size: 11.5px;
+                    color: Theme.danger;
+                    wrap: word-wrap;
+                }
+
+                Rectangle { vertical-stretch: 1; }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    PrimaryButton {
+                        label: "Open";
+                        clicked => { root.open-clicked(); }
+                    }
+                    GhostButton {
+                        label: "Open with...";
+                        clicked => { root.open-with-clicked(); }
+                    }
+                    GhostButton {
+                        label: "Open folder";
+                        clicked => { root.open-folder-clicked(); }
+                    }
+                    GhostButton {
+                        label: "Close";
+                        clicked => { root.close-clicked(); }
+                    }
+                }
+            }
+        }
+    }
+}

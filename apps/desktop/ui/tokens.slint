@@ -1,0 +1,72 @@
+// Exact design tokens mirrored 1:1 from CSS tokens.css & dialogs.css
+
+export global Theme {
+    in-out property <bool> is-light: false;
+    in-out property <bool> is-mono: false;
+
+    out property <color> bg-canvas: is-light ? #FFFFFF : #1A1C22;
+    out property <color> bg-sidebar: is-light ? #F4F5F8 : #21242C;
+    out property <color> bg-inspector: is-light ? #F8F9FB : #1F222A;
+    out property <color> bg-elevated: is-light ? #F7F8FB : #262A34;
+    out property <color> bg-hover: is-light ? #EFF1F6 : #2C313D;
+    out property <color> bg-input: is-light ? #ECEEF3 : #15171C;
+    out property <color> track: is-light ? #E6E8EF : #2E3340;
+    out property <color> sidebar-footer-tint: is-light ? #0F172A04 : #00000008;
+
+    out property <color> border: is-light ? #0F172A14 : #FFFFFF14;
+    out property <color> border-strong: is-light ? #0F172A24 : #FFFFFF21;
+    out property <color> specular: is-light ? #FFFFFFD9 : #FFFFFF0F;
+    out property <color> card-shadow: is-light ? #0F172A0D : #0000002E;
+    out property <color> popover-shadow: #10121840;
+    out property <color> modal-backdrop: #0C0E128C;
+
+    out property <color> text-1: is-light ? #14171F : #F0F2F6;
+    out property <color> text-2: is-light ? #5C6374 : #9DA3B4;
+    out property <color> text-3: is-light ? #8B92A4 : #6E7587;
+
+    out property <color> accent: is-mono
+        ? (is-light ? #181B22 : #E4E7EE)
+        : (is-light ? #0071E3 : #3B8CFF);
+    out property <color> accent-hover: is-mono
+        ? (is-light ? #2C313D : #F5F7FA)
+        : (is-light ? #0077ED : #549BFF);
+    out property <color> accent-soft: is-mono
+        ? (is-light ? #181B2214 : #E4E7EE1F)
+        : (is-light ? #0071E31A : #3B8CFF24);
+    out property <color> accent-ink: is-mono
+        ? (is-light ? #FFFFFF : #14161C)
+        : #FFFFFF;
+
+    out property <color> green: is-light ? #1E9E49 : #34C759;
+    out property <color> green-soft: is-light ? #1E9E491C : #34C75924;
+    out property <color> amber: is-light ? #D9820B : #FFB340;
+    out property <color> amber-soft: is-light ? #D9820B1F : #FFB34024;
+    out property <color> amber-border: #FFB34040;
+    out property <color> danger: is-light ? #B82433 : #FF797F;
+    out property <color> red-hover: is-light ? #E81123 : #E81123D9;
+
+    // Add Download Porcelain surface (intentionally light in both app themes)
+    out property <color> add-surface: #FFFFFF;
+    out property <color> add-text: #14171F;
+    out property <color> add-muted: #5C6374;
+    out property <color> add-border: #0F172A14;
+    out property <color> add-border-strong: #0F172A24;
+    out property <color> add-control-border: #C4C9D4;
+    out property <color> add-input: #F1F3F7;
+    out property <color> add-raised: #F7F8FB;
+    out property <color> add-hover: #EFF1F6;
+    out property <color> add-switch-off: #D5D9E2;
+    out property <color> add-accent: is-mono ? #181B22 : #0071E3;
+    out property <color> add-accent-hover: is-mono ? #2C313D : #0077ED;
+    out property <color> add-accent-soft: is-mono ? #181B2214 : #0071E312;
+    out property <color> add-accent-ink: #FFFFFF;
+    out property <color> add-danger: #B82433;
+
+    out property <string> font-sans: "Segoe UI Variable Text";
+    out property <string> font-display: "Segoe UI Variable Display";
+    out property <string> font-mono: "Consolas";
+
+    out property <length> radius-lg: 11px;
+    out property <length> radius-md: 8px;
+    out property <length> radius-sm: 6px;
+}

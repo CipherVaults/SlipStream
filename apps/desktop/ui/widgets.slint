@@ -1,0 +1,563 @@
+import { Theme } from "./tokens.slint";
+
+// Primary accent button (30px or 32px height, crisp top specular highlight)
+export component PrimaryButton inherits Rectangle {
+    in property <string> label;
+    in property <image> icon;
+    in property <bool> has-icon: false;
+    in property <bool> enabled: true;
+    in property <length> btn-height: 30px;
+    in property <length> pad-x: 12px;
+    in property <bool> porcelain: false;
+    callback clicked();
+
+    property <color> base-bg: root.porcelain ? Theme.add-accent : Theme.accent;
+    property <color> hover-bg: root.porcelain ? Theme.add-accent-hover : Theme.accent-hover;
+    property <color> ink: root.porcelain ? Theme.add-accent-ink : Theme.accent-ink;
+
+    height: root.btn-height;
+    min-width: label-row.preferred-width + root.pad-x * 2;
+    border-radius: Theme.radius-md;
+    clip: true;
+    background: root.enabled && ta.has-hover ? root.hover-bg : root.base-bg;
+    opacity: root.enabled ? 1.0 : 0.5;
+    animate background { duration: 120ms; }
+
+    Rectangle {
+        x: 4px;
+        y: 1px;
+        width: Math.max(0px, parent.width - 8px);
+        height: 1px;
+        background: #FFFFFF30;
+        border-radius: 1px;
+    }
+
+    label-row := HorizontalLayout {
+        padding-left: root.pad-x;
+        padding-right: root.pad-x;
+        spacing: 5px;
+        alignment: center;
+
+        if root.has-icon : Image {
+            source: root.icon;
+            width: 14px;
+            height: 14px;
+            colorize: root.ink;
+            y: (parent.height - self.height) / 2;
+        }
+
+        Text {
+            text: root.label;
+            font-family: Theme.font-sans;
+            font-size: 12.5px;
+            font-weight: 600;
+            color: root.ink;
+            vertical-alignment: center;
+        }
+    }
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Ghost elevated button (matching .btn-ghost)
+export component GhostButton inherits Rectangle {
+    in property <string> label;
+    in property <image> icon;
+    in property <bool> has-icon: false;
+    in property <length> icon-size: 14px;
+    in property <bool> enabled: true;
+    in property <length> btn-height: 31px;
+    in property <length> pad-x: 11px;
+    in property <bool> porcelain: false;
+    in property <bool> active-highlight: false;
+    callback clicked();
+
+    property <color> rest-bg: root.porcelain ? Theme.add-raised : Theme.bg-elevated;
+    property <color> hover-bg: root.porcelain ? Theme.add-hover : Theme.bg-hover;
+    property <color> brd: root.active-highlight
+        ? (root.porcelain ? Theme.add-accent : Theme.accent)
+        : (root.porcelain ? Theme.add-border-strong : Theme.border-strong);
+    property <color> ink: root.porcelain ? Theme.add-text : Theme.text-1;
+
+    height: root.btn-height;
+    min-width: row.preferred-width + root.pad-x * 2;
+    border-radius: Theme.radius-md;
+    background: root.enabled && ta.has-hover ? root.hover-bg : root.rest-bg;
+    border-width: 1px;
+    border-color: root.brd;
+    opacity: root.enabled ? 1.0 : 0.5;
+    animate background { duration: 120ms; }
+
+    row := HorizontalLayout {
+        padding-left: root.pad-x;
+        padding-right: root.pad-x;
+        spacing: 6px;
+        alignment: center;
+
+        if root.has-icon : Image {
+            source: root.icon;
+            width: root.icon-size;
+            height: root.icon-size;
+            colorize: root.ink;
+            y: (parent.height - self.height) / 2;
+        }
+
+        if root.label != "" : Text {
+            text: root.label;
+            font-family: Theme.font-sans;
+            font-size: 12px;
+            font-weight: 550;
+            color: root.ink;
+            vertical-alignment: center;
+        }
+    }
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Circular 30px icon button (matching .icon-btn)
+export component CircleIconButton inherits Rectangle {
+    in property <image> icon;
+    in property <length> icon-size: 14px;
+    in property <bool> ghost-square: false;
+    in property <bool> enabled: true;
+    in property <bool> porcelain: false;
+    callback clicked();
+
+    width: root.ghost-square ? 26px : 30px;
+    height: root.ghost-square ? 26px : 30px;
+    border-radius: root.ghost-square ? 6px : 15px;
+    background: root.ghost-square
+        ? (ta.has-hover ? (root.porcelain ? Theme.add-hover : Theme.bg-hover) : transparent)
+        : (ta.has-hover ? (root.porcelain ? Theme.add-hover : Theme.bg-hover) : (root.porcelain ? Theme.add-input : Theme.bg-input));
+    border-width: 1px;
+    border-color: root.ghost-square
+        ? (ta.has-hover ? (root.porcelain ? Theme.add-border : Theme.border) : transparent)
+        : (ta.has-hover ? (root.porcelain ? Theme.add-border-strong : Theme.border-strong) : (root.porcelain ? Theme.add-border : Theme.border));
+    opacity: root.enabled ? 1.0 : 0.5;
+    animate background { duration: 120ms; }
+
+    Image {
+        source: root.icon;
+        width: root.icon-size;
+        height: root.icon-size;
+        colorize: ta.has-hover
+            ? (root.porcelain ? Theme.add-text : Theme.text-1)
+            : (root.ghost-square ? (root.porcelain ? Theme.add-muted : Theme.text-3) : (root.porcelain ? Theme.add-muted : Theme.text-2));
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Authentic macOS pill toggle (.mac-switch)
+export component PillSwitch inherits HorizontalLayout {
+    in-out property <bool> checked: false;
+    in property <string> label: "";
+    in property <bool> enabled: true;
+    in property <bool> porcelain: false;
+    callback toggled(bool);
+
+    spacing: 9px;
+    alignment: start;
+
+    Rectangle {
+        width: 34px;
+        height: 20px;
+        border-radius: 10px;
+        background: root.checked
+            ? (root.porcelain ? Theme.add-accent : Theme.accent)
+            : (root.porcelain ? Theme.add-switch-off : Theme.track);
+        opacity: root.enabled ? 1.0 : 0.5;
+        animate background { duration: 150ms; }
+        y: (parent.height - self.height) / 2;
+
+        Rectangle {
+            width: 16px;
+            height: 16px;
+            border-radius: 8px;
+            background: #FFFFFF;
+            x: root.checked ? 16px : 2px;
+            y: 2px;
+            drop-shadow-blur: 3px;
+            drop-shadow-offset-y: 1px;
+            drop-shadow-color: #00000038;
+            animate x { duration: 150ms; easing: ease-out; }
+        }
+
+        TouchArea {
+            enabled: root.enabled;
+            mouse-cursor: root.enabled ? pointer : default;
+            clicked => {
+                root.checked = !root.checked;
+                root.toggled(root.checked);
+            }
+        }
+    }
+
+    if root.label != "" : Text {
+        text: root.label;
+        font-family: Theme.font-sans;
+        font-size: 12.5px;
+        font-weight: 550;
+        color: root.porcelain ? Theme.add-text : Theme.text-1;
+        vertical-alignment: center;
+    }
+}
+
+// Checkbox control matching float-checkbox / check-row
+export component CheckBoxRow inherits Rectangle {
+    in-out property <bool> checked: false;
+    in property <string> label: "";
+    in property <bool> enabled: true;
+    in property <bool> porcelain: false;
+    callback toggled(bool);
+
+    height: 24px;
+    opacity: root.enabled ? 1.0 : 0.5;
+
+    HorizontalLayout {
+        spacing: 7px;
+        alignment: start;
+
+        Rectangle {
+            width: 15px;
+            height: 15px;
+            border-radius: 4px;
+            y: (parent.height - self.height) / 2;
+            background: root.checked
+                ? (root.porcelain ? Theme.add-accent : Theme.accent)
+                : (root.porcelain ? Theme.add-input : Theme.bg-input);
+            border-width: 1px;
+            border-color: root.checked
+                ? (root.porcelain ? Theme.add-accent : Theme.accent)
+                : (root.porcelain ? Theme.add-control-border : Theme.border-strong);
+
+            if root.checked : Image {
+                source: @image-url("icons/check.svg");
+                width: 11px;
+                height: 11px;
+                colorize: #FFFFFF;
+                x: 2px;
+                y: 2px;
+            }
+        }
+
+        Text {
+            text: root.label;
+            font-family: Theme.font-sans;
+            font-size: 12px;
+            color: root.porcelain ? Theme.add-text : Theme.text-1;
+            vertical-alignment: center;
+        }
+    }
+
+    TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => {
+            root.checked = !root.checked;
+            root.toggled(root.checked);
+        }
+    }
+}
+
+// Badge chip (.badge)
+export component PillBadge inherits Rectangle {
+    in property <string> text;
+    // tone: 0=default, 1=accent, 2=green, 3=amber, 4=porcelain-light-pill
+    in property <int> tone: 0;
+    in property <bool> has-check: false;
+    in property <bool> pill-round: false;
+
+    height: 18px;
+    min-width: inner.preferred-width + 12px;
+    border-radius: root.pill-round ? 9px : 5px;
+    border-width: root.tone == 0 || root.tone == 4 ? 1px : 0px;
+    border-color: root.tone == 4 ? Theme.add-border : Theme.border;
+    background: root.tone == 1 ? Theme.accent-soft
+        : root.tone == 2 ? Theme.green-soft
+        : root.tone == 3 ? Theme.amber-soft
+        : root.tone == 4 ? Theme.add-input
+        : Theme.bg-input;
+
+    inner := HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+        spacing: 4px;
+        alignment: center;
+
+        if root.has-check : Image {
+            source: @image-url("icons/check.svg");
+            width: 10px;
+            height: 10px;
+            colorize: Theme.green;
+            y: (parent.height - self.height) / 2;
+        }
+
+        Text {
+            text: root.text;
+            font-family: Theme.font-sans;
+            font-size: 10.5px;
+            font-weight: 600;
+            color: root.tone == 1 ? Theme.accent
+                : root.tone == 2 ? Theme.green
+                : root.tone == 3 ? Theme.amber
+                : root.tone == 4 ? Theme.add-muted
+                : Theme.text-2;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// 16-segment progress visualizer (.seg-progress)
+export component SegmentProgressBar inherits HorizontalLayout {
+    in property <[float]> segments: [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0];
+    // tone: 0=active (accent), 1=torrent (green), 2=paused (text-3)
+    in property <int> tone: 0;
+
+    height: 5px;
+    spacing: 2.5px;
+
+    for val in root.segments : Rectangle {
+        horizontal-stretch: 1;
+        height: 5px;
+        border-radius: 2px;
+        background: Theme.track;
+        clip: true;
+
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            height: parent.height;
+            width: parent.width * Math.clamp(val, 0.0, 1.0);
+            border-radius: 2px;
+            background: root.tone == 1 ? Theme.green
+                : root.tone == 2 ? Theme.text-3
+                : Theme.accent;
+            animate width { duration: 160ms; }
+        }
+    }
+}
+
+// Smooth cubic sparkline curve with translucent accent fill (.spark-svg / .speed-graph)
+export component SparklineChart inherits Rectangle {
+    in property <string> line-commands: "M 0 25 L 180 25";
+    in property <string> fill-commands: "M 0 25 L 180 25 L 180 28 L 0 28 Z";
+    in property <float> vb-width: 180;
+    in property <float> vb-height: 28;
+    in property <bool> detailed: false;
+
+    height: root.detailed ? 78px : 28px;
+    clip: true;
+
+    if root.detailed : Rectangle {
+        x: 0px;
+        y: 20px;
+        width: parent.width;
+        height: 1px;
+        background: Theme.border;
+    }
+
+    if root.detailed : Rectangle {
+        x: 0px;
+        y: 48px;
+        width: parent.width;
+        height: 1px;
+        background: Theme.border;
+    }
+
+    Path {
+        width: parent.width;
+        height: parent.height;
+        viewbox-x: 0;
+        viewbox-y: 0;
+        viewbox-width: root.vb-width;
+        viewbox-height: root.vb-height;
+        commands: root.fill-commands;
+        fill: @linear-gradient(180deg, Theme.accent-soft 0%, transparent 100%);
+        stroke: transparent;
+    }
+
+    Path {
+        width: parent.width;
+        height: parent.height;
+        viewbox-x: 0;
+        viewbox-y: 0;
+        viewbox-width: root.vb-width;
+        viewbox-height: root.vb-height;
+        commands: root.line-commands;
+        fill: transparent;
+        stroke: Theme.accent;
+        stroke-width: root.detailed ? 2px : 1.7px;
+        stroke-line-cap: round;
+    }
+}
+
+// Subtle text input field matching .field > input / .float-field input
+export component StyledLineEdit inherits Rectangle {
+    in-out property <string> text;
+    in property <string> placeholder: "";
+    in property <bool> read-only: false;
+    in property <bool> enabled: true;
+    in property <bool> mono: false;
+    in property <bool> porcelain: false;
+    in property <length> box-height: 31px;
+    callback edited(string);
+    callback accepted();
+
+    height: root.box-height;
+    border-radius: 7px;
+    background: root.porcelain ? Theme.add-input : Theme.bg-input;
+    border-width: 1px;
+    border-color: ti.has-focus
+        ? (root.porcelain ? Theme.add-accent : Theme.accent)
+        : (root.porcelain ? Theme.add-border : Theme.border);
+
+    if root.text == "" && root.placeholder != "" : Text {
+        x: 9px;
+        width: parent.width - 18px;
+        height: parent.height;
+        text: root.placeholder;
+        font-family: root.mono ? Theme.font-mono : Theme.font-sans;
+        font-size: root.mono ? 11.5px : 12.5px;
+        color: root.porcelain ? Theme.add-muted : Theme.text-3;
+        opacity: 0.78;
+        vertical-alignment: center;
+    }
+
+    ti := TextInput {
+        x: 9px;
+        width: parent.width - 18px;
+        height: parent.height;
+        text <=> root.text;
+        read-only: root.read-only;
+        enabled: root.enabled;
+        font-family: root.mono ? Theme.font-mono : Theme.font-sans;
+        font-size: root.mono ? 11.5px : 12.5px;
+        font-weight: 500;
+        color: root.read-only
+            ? (root.porcelain ? Theme.add-muted : Theme.text-2)
+            : (root.porcelain ? Theme.add-text : Theme.text-1);
+        vertical-alignment: center;
+        single-line: true;
+        edited => { root.edited(self.text); }
+        accepted => { root.accepted(); }
+    }
+}
+
+// Styled dropdown selector matching CSS <select>
+export component StyledSelect inherits Rectangle {
+    in property <[string]> options;
+    in-out property <int> current-index: 0;
+    in property <string> current-value: "";
+    in property <bool> enabled: true;
+    in property <bool> porcelain: false;
+    in property <length> box-height: 31px;
+    callback selected(int, string);
+
+    property <bool> popup-open: false;
+
+    height: root.box-height;
+    border-radius: 7px;
+    background: root.porcelain ? Theme.add-input : Theme.bg-input;
+    border-width: 1px;
+    border-color: root.popup-open
+        ? (root.porcelain ? Theme.add-accent : Theme.accent)
+        : (root.porcelain ? Theme.add-border-strong : Theme.border-strong);
+    opacity: root.enabled ? 1.0 : 0.5;
+
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 8px;
+        spacing: 6px;
+
+        Text {
+            horizontal-stretch: 1;
+            text: root.current-value;
+            font-family: Theme.font-sans;
+            font-size: 12px;
+            font-weight: 500;
+            color: root.porcelain ? Theme.add-text : Theme.text-1;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        Image {
+            source: @image-url("icons/chevron-down.svg");
+            width: 12px;
+            height: 12px;
+            colorize: root.porcelain ? Theme.add-muted : Theme.text-2;
+            y: (parent.height - self.height) / 2;
+        }
+    }
+
+    TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { popup.show(); }
+    }
+
+    popup := PopupWindow {
+        x: 0px;
+        y: root.height + 3px;
+        width: root.width;
+
+        Rectangle {
+            border-radius: 7px;
+            background: root.porcelain ? Theme.add-surface : Theme.bg-elevated;
+            border-width: 1px;
+            border-color: root.porcelain ? Theme.add-border-strong : Theme.border-strong;
+            drop-shadow-blur: 14px;
+            drop-shadow-offset-y: 4px;
+            drop-shadow-color: Theme.popover-shadow;
+
+            VerticalLayout {
+                padding: 4px;
+                spacing: 2px;
+                for opt[idx] in root.options : Rectangle {
+                    height: 26px;
+                    border-radius: 5px;
+                    background: item-ta.has-hover
+                        ? (root.porcelain ? Theme.add-hover : Theme.bg-hover)
+                        : (idx == root.current-index ? (root.porcelain ? Theme.add-accent-soft : Theme.accent-soft) : transparent);
+
+                    Text {
+                        x: 8px;
+                        width: parent.width - 16px;
+                        height: parent.height;
+                        text: opt;
+                        font-family: Theme.font-sans;
+                        font-size: 12px;
+                        font-weight: idx == root.current-index ? 600 : 500;
+                        color: root.porcelain ? Theme.add-text : Theme.text-1;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+
+                    item-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.current-index = idx;
+                            root.selected(idx, opt);
+                            popup.close();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

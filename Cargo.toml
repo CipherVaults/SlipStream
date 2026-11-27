@@ -6,15 +6,15 @@ members = [
     "crates/media",
     "crates/torrent",
     "crates/native-host",
-    "apps/desktop/src-tauri",
+    "apps/desktop",
     "tests/safety-eval",
 ]
 
 [workspace.package]
-version = "1.3.0"
+version = "2.0.0"
 edition = "2021"
 license = "MIT"
-authors = ["CipherVaults"]
+authors = ["Mohamed Sayed"]
 repository = "https://github.com/CipherVaults/SlipStream"
 
 [workspace.dependencies]

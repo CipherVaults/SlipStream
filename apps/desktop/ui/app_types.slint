@@ -1,0 +1,138 @@
+// Shared Slint data models mirroring SlipStream core protocol & UI state
+
+export struct TransferRowModel {
+    id: string,
+    filename: string,
+    kind: string,
+    status: string,
+    is-active: bool,
+    is-paused: bool,
+    is-completed: bool,
+    is-torrent: bool,
+    is-error: bool,
+    percent: float,
+    progress-label: string,
+    meta-line: string,
+    source-domain: string,
+    protocol-label: string,
+    tag-text: string,
+    sha-verified: int, // 0=none, 1=verified, 2=failed
+    error-text: string,
+    segments: [float],
+    segment-tone: int, // 0=accent, 1=green, 2=paused
+    icon-kind: int,    // 0=download, 1=video, 2=music, 3=archive, 4=program, 5=disc, 6=doc, 7=torrent
+    can-pause-resume: bool,
+    playlist-index-text: string,
+    format-summary: string,
+}
+
+export struct PlaylistGroupModel {
+    playlist-id: string,
+    title: string,
+    expanded: bool,
+    summary-line: string,
+    overall-percent: float,
+    is-paused: bool,
+    has-pause-items: bool,
+    has-resume-items: bool,
+    first-transfer-id: string,
+    items: [TransferRowModel],
+}
+
+export struct CompletedRowModel {
+    id: string,
+    filename: string,
+    source-domain: string,
+    size-text: string,
+    tag-text: string,
+    sha-verified: int,
+    icon-kind: int,
+}
+
+export struct SegmentTileModel {
+    index-text: string,
+    bytes-text: string,
+    state-code: int, // 0=active, 1=completed, 2=paused, 3=split, 4=error, 5=pending
+    state-label: string,
+}
+
+export struct TorrentFileRowModel {
+    index: int,
+    relative-path: string,
+    size-text: string,
+    downloaded-text: string,
+    selected: bool,
+}
+
+export struct InspectorModel {
+    has-selection: bool,
+    id: string,
+    filename: string,
+    source-url: string,
+    source-domain: string,
+    save-dir: string,
+    protocol-label: string,
+    status-label: string,
+    status-tone: int, // 0=default, 1=accent, 2=green, 3=amber
+    kind: string,
+    is-media: bool,
+    is-torrent: bool,
+    is-paused: bool,
+    is-completed: bool,
+    can-pause-resume: bool,
+    can-verify: bool,
+    can-refresh-url: bool,
+    speed-text: string,
+    eta-text: string,
+    size-text: string,
+    connections-text: string,
+    sha-text: string,
+    sha-tone: int, // 0=default, 2=green, 3=amber
+    error-message: string,
+    completion-notice: string,
+    duration-text: string,
+    segments: [SegmentTileModel],
+    torrent-files: [TorrentFileRowModel],
+}
+
+export struct FormatOptionModel {
+    format-id: string,
+    title: string,
+    detail: string,
+    selected: bool,
+}
+
+export struct SubtitleItemModel {
+    lang: string,
+    label: string,
+    is-auto: bool,
+    checked: bool,
+}
+
+export struct PlaylistItemModel {
+    index: int,
+    title: string,
+    duration-text: string,
+    checked: bool,
+}
+
+export struct BrowserCardModel {
+    id: string,
+    name: string,
+    installed: bool,
+    native-host-registered: bool,
+    extension-id: string,
+    bundled-extension-dir: string,
+}
+
+export struct PaletteActionModel {
+    id: string,
+    label: string,
+    hint: string,
+}
+
+export struct ConnectionRowModel {
+    num-text: string,
+    downloaded-text: string,
+    info-text: string,
+}

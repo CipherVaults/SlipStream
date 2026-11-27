@@ -1,6 +1,10 @@
+<p align="left">
+  <img src="apps/desktop/icons/icon.png" width="72" height="72" alt="SlipStream Icon" />
+</p>
+
 # SlipStream
 
-**A fast, quiet, security-hardened Windows 10/11 download manager built with Rust, Tauri v2, React 19, and a Manifest V3 browser extension.**
+**A fast, quiet, security-hardened Windows 10/11 download manager built cleanly with Pure Rust, Slint, and a Manifest V3 browser extension.**
 
 SlipStream combines a multi-segment HTTP download engine, a managed `yt-dlp` + `FFmpeg` media format/audio pipeline, native BitTorrent/Magnet support, and an isolated browser extension inside a dual-theme (**Soft Graphite Dark** ↔ **Porcelain Light**) native desktop workspace.
 
@@ -19,9 +23,10 @@ SlipStream combines a multi-segment HTTP download engine, a managed `yt-dlp` + `
 
 Traditional Windows download managers often expose an unauthenticated localhost HTTP server to intercept browser downloads—allowing arbitrary websites or local scripts to hit control APIs. SlipStream replaces that pattern with **Browser Native Messaging → current-user SID-ACL Windows Named Pipe (`PIPE_REJECT_REMOTE_CLIENTS` + 256-bit `D:P` `session.token`)**, narrowed browser RPC privileges, explicit path/junction confinement, and clean visual restraint.
 
+- **Created by:** Mohamed Sayed
 - **Target OS:** Windows 10 / Windows 11 (`x86_64`)
-- **Public repository** [CipherVaults/SlipStream](https://github.com/CipherVaults/SlipStream)
-- **Latest release** [v1.3.0](https://github.com/CipherVaults/SlipStream/releases/tag/v1.3.0)
+- **Public repository:** [CipherVaults/SlipStream](https://github.com/CipherVaults/SlipStream)
+- **Latest release:** [v2.0.0](https://github.com/CipherVaults/SlipStream/releases/tag/v2.0.0)
 
 ---
 
@@ -56,16 +61,17 @@ Traditional Windows download managers often expose an unauthenticated localhost 
   - **Duplicate Download Link:** Prompts with three choices—auto-numbered filename, overwrite existing file cleanly via atomic replacement, or resume/show existing completion dialog.
   - **Download File Info:** Auto-matches the file extension to pre-seeded IDM-style category subfolders (`General`, `Programs`, `Compressed`, `Video`, `Music`, `Documents`, plus `+` custom categories), offers **Save As** with a native Win32 folder picker (`Browse`), optional **Remember this path**, file size, **Description**, **Download Later**, and **Start Download**.
   - **Download Progress:** Shows live `{pct}% {filename}` titlebar updates, speed/ETA/resume stats, `host · protocol · connect_rtt_ms` server info, an expandable `Show details >>` connection map (`N. | Downloaded | Info`), a **Speed Limiter** tab, and **Options on completion**.
-  - **Download Complete:** Displays filename, size, SHA-256 verification status, and **Open**, **Open folder**, or **Close** actions.
+  - **Download Complete:** Displays filename, size, SHA-256 verification status, and **Open**, **Open with**, **Open folder**, or **Close** actions.
 - **Soft Graphite Dark ↔ Porcelain Light:** Live instant theme switching (plus `Follow System` and `Blue` / `Monochrome` accents), 16-segment progress visualizer, `T01–T16` active thread map, throughput sparkline, and `Ctrl+K` / `Ctrl+N` command shortcuts.
-- **Tray-Hibernate Mode & OS Security:** Closes the WebView2 surface cleanly to the Windows system tray while active downloads continue at minimal RAM, reveals completed files via `explorer.exe /select`, and optionally queues Windows Defender (`MpCmdRun.exe`) scans.
+- **Tray-Hibernate Mode & OS Security:** Closes cleanly to the Windows system tray while active downloads continue at minimal RAM with zero WebView processes, reveals completed files via `explorer.exe /select`, and optionally queues Windows Defender (`MpCmdRun.exe`) scans.
 - **Signed NSIS updates** In **Settings → About & Updates**, choose **Automatic on startup** or **Manual only**. An automatic check runs once per app process, including across tray restores. **Check for Updates** is available in either mode. **Install Update & Restart** shows live progress for the signed update. If installation is interrupted after downloads are stopped, quit and reopen SlipStream to resume them.
-- **Native WebView2 lockdown** SlipStream disables default browser context menus, status UI, browser accelerators, and zoom controls before showing the main window, including after restoring it from the tray. Release builds also disable DevTools. **Ctrl+F** selects the download search field, and text editing shortcuts and selection remain available in editable fields. You can also select paths, IDs, and error text where displayed.
+- **Pure Native Controls:** Built directly on Slint (`winit`, `femtovg` + software fallback) with Win32 DWM rounded corners and zero embedded browser processes. **Ctrl+F** / search box filters transfers, **Ctrl+K** opens the Command Palette, and **Ctrl+N** opens **Add Download**.
 
 ---
 
 ## Security & Verification
 
+- **v2.0.0 Pure Rust + Slint Audit & Verification:** Replaced Tauri v2, WebView2 (`msedgewebview2.exe`), and Node/React desktop dependencies with a single native Slint binary (`0` child WebView2 processes). Remediated all 19 findings from the cross-model Codex CLI (`gpt-6.2-sol`) audit across Win32 clipboard bounds/COM pickers/Open-with, origin-scoped seeded headers, overlay state handling, and signed update staging (`FILE_SHARE_READ` lock + CI `slipstream-sign --verify` gate), verified with **209 / 209** passing Rust workspace tests and **69 / 69** browser extension tests.
 - **v1.2.1 Security Audit & DevSecOps Review (`run-2`, `/security-audit` + `/security-auditor`):** Audited `23` coverage units (`15` `candidate`, `7` `covered`, `1` `out_of_scope`) across Rust engines, MV3 extension, React UI, and GitHub Actions with cross-model Codex CLI + Neon verification (`0` confirmed vulnerabilities under read-only/offline policy; `3` prior `v1.0.0` leads verified mitigated in `v1.2.0`). `v1.2.1` landed defense-in-depth hardening across `48+` files—including Completed/legacy SQLite credential scrubbing, strict cross-origin redirect header allowlists + origin-only `Referer` trimming, media userinfo rejection + proxy env cleanup, BitTorrent public-tracker filtering, Win32 Job Objects for `ffmpeg` grandchildren, `GrabBatchUrls` & probe concurrency bounds, WebView CSP/referrer hardening, floating pill live-format & incognito fixes, collision-safe playlist folders/filenames, SHA-pinned CI/Release actions, and lockfile-pinned `@tauri-apps/cli`.
 - **v1.0.0 Baseline (`run-1` & `tests/safety-eval`):** [v1.0.0 changelog entry](CHANGELOG.md#100---2026-11-21) — `3` hunting waves across `19` coverage units (`0` confirmed vulnerabilities) plus the preregistered `slipstream-safety-v1` deterministic oracle suite passing **1,200 / 1,200** single-input boundary cases and **108 / 108** orthogonal 5-factor stateful HTTP chaos chains (`0` broken items, `0` escapes, `0` benign false rejections, `bias-audit` Cramér's `V = 0.0`).
 
@@ -73,15 +79,15 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 
 ## Download, Installation & Browser Setup
 
-1. **Installer** Download `SlipStream_1.3.0_x64-setup.exe` and run the per-user installer. It includes the native messaging host, media tools, and both browser extension builds. [v1.3.0 release assets](https://github.com/CipherVaults/SlipStream/releases/tag/v1.3.0)
-2. **Portable ZIP** Extract `SlipStream-1.3.0-windows-x64-portable.zip` and run `SlipStream.exe`. Keep the extracted `bin/` and `extensions/` directories beside it.
+1. **Installer** Download `SlipStream_2.0.0_x64-setup.exe` and run the per-user installer. It includes the native messaging host, media tools, and both browser extension builds. [v2.0.0 release assets](https://github.com/CipherVaults/SlipStream/releases/tag/v2.0.0)
+2. **Portable ZIP** Extract `SlipStream-2.0.0-windows-x64-portable.zip` and run `SlipStream.exe`. Keep the extracted `bin/` and `extensions/` directories beside it.
 3. **Browser extension** In **Settings → Browser Integration**, select your browser. For Chrome, Edge, or Brave, enable **Developer mode**, select **Load unpacked**, and choose the revealed folder. In Firefox, choose **Load Temporary Add-on** and select the revealed `manifest.json`. Separate browser extension ZIPs are also available on the release page.
 
-**Upgrading from v1.0.0** SlipStream keeps the valid native messaging IDs already registered for each browser and adds the bundled extension ID. If an older unpacked copy’s ID is missing from the registration, copy the ID from the browser’s extensions page and enter it in **Settings → Browser Integration** for that browser.
+**Upgrading from v1.x** SlipStream keeps the valid native messaging IDs already registered for each browser and adds the bundled extension ID. If an older unpacked copy’s ID is missing from the registration, copy the ID from the browser’s extensions page and enter it in **Settings → Browser Integration** for that browser.
 
 ### Building from Source (Windows 10/11)
 
-Prerequisites: **Rust (stable)**, **Node.js 22**, **pnpm 9+**, **VS Build Tools (C++ x64)**, **WebView2 Runtime**.
+Prerequisites: **Rust (stable)**, **Node.js 22**, **pnpm 9+**, **VS Build Tools (C++ x64)** (and optionally **NSIS 3** for installer packaging).
 
 ```powershell
 pnpm.cmd install --frozen-lockfile
@@ -101,7 +107,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 if ($LASTEXITCODE -ne 0) { throw 'Clippy failed.' }
 cargo test --locked --workspace
 if ($LASTEXITCODE -ne 0) { throw 'Rust tests failed.' }
-cargo build --locked --release -p slipstream-desktop --features tauri/custom-protocol
+cargo build --locked --release -p slipstream-desktop --bin slipstream-desktop
 ```
 
 The release workflow smoke-tests pinned media tools in a job with no secrets. The signing job verifies fresh downloads against the same pinned SHA-256 digests and packages the tools, notices, and extensions. The release includes the yt-dlp source tarball alongside the installer and ZIPs. [Release workflow](.github/workflows/release.yml), [third-party notices](THIRD_PARTY_NOTICES.md)
@@ -111,9 +117,15 @@ The release workflow smoke-tests pinned media tools in a job with no secrets. Th
 ## Roadmap
 
 - **HTTP/3 (QUIC) Transport:** Upgrade HTTP engine beyond HTTP/1.1 & HTTP/2 with `reqwest` HTTP/3 support when stabilized.
-- **Active Clipboard Watcher & Power Actions:** Connect `monitor_clipboard` listener and OS `PostQueueAction::{Sleep, Shutdown}` execution in the daemon.
-- **Toolchain integrity and Authenticode** Show tool hashes in Settings and add trusted Windows code-signing for installers.
-- **Browser store listings** Publish the extension to Chrome Web Store, Edge Add-ons, and Firefox Add-ons.
+- **OS Power Actions:** Connect OS `PostQueueAction::{Sleep, Shutdown}` execution in the daemon.
+- **Toolchain integrity and Authenticode:** Show tool hashes in Settings and add trusted Windows code-signing for installers.
+- **Browser store listings:** Publish the extension to Chrome Web Store, Edge Add-ons, and Firefox Add-ons.
+
+---
+
+## Credits
+
+SlipStream is created, designed, and maintained by **Mohamed Sayed**.
 
 ---
 
@@ -122,7 +134,7 @@ The release workflow smoke-tests pinned media tools in a job with no secrets. Th
 ```text
 SlipStream/
 ├── .github/workflows/     # Windows CI + tag-driven signed NSIS/ZIP Release workflows
-├── apps/desktop/          # Tauri v2 shell (NSIS + updater) + React 19 / Tailwind v4 UI
+├── apps/desktop/          # Pure Rust + Slint native desktop app, NSIS installer & Minisign signer
 ├── crates/
 │   ├── protocol/          # Shared IPC schemas + strict path/URL/SSRF security primitives
 │   ├── engine/            # Dynamic segmented HTTP downloader, SQLite WAL, scheduler, MotW
@@ -137,4 +149,4 @@ SlipStream/
 
 ## License
 
-SlipStream is released under the MIT License. Bundled components have separate licenses. [SlipStream license](Cargo.toml), [third-party notices](THIRD_PARTY_NOTICES.md)
+Copyright (c) 2026 **Mohamed Sayed**. SlipStream is released under the [MIT License](LICENSE). Bundled components have separate licenses documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

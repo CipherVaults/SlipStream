@@ -1,0 +1,1430 @@
+import { ScrollView } from "std-widgets.slint";
+import { Theme } from "./tokens.slint";
+import {
+    PrimaryButton,
+    GhostButton,
+    CircleIconButton,
+    PillSwitch,
+    CheckBoxRow,
+    PillBadge,
+    StyledLineEdit,
+    StyledSelect,
+} from "./widgets.slint";
+import {
+    FormatOptionModel,
+    SubtitleItemModel,
+    PlaylistItemModel,
+    BrowserCardModel,
+    PaletteActionModel,
+} from "./app_types.slint";
+
+// Porcelain modal container helper
+component OverlayBackdrop inherits Rectangle {
+    callback backdrop-clicked();
+
+    width: 100%;
+    height: 100%;
+    background: Theme.modal-backdrop;
+
+    TouchArea {
+        clicked => { root.backdrop-clicked(); }
+    }
+}
+
+export component AddDownloadOverlay inherits Rectangle {
+    in-out property <bool> open: false;
+    in-out property <string> source-text: "";
+    in property <bool> probing: false;
+    in property <bool> submitting: false;
+    in property <string> error-text: "";
+    // 0=Video, 1=Audio Only, 2=Subtitles, 3=Torrent / Magnet
+    in-out property <int> active-tab: 0;
+    in property <bool> has-probe: false;
+    in property <bool> is-torrent-input: false;
+    in property <bool> is-direct-http: false;
+    in property <string> probe-title: "";
+    in property <string> probe-meta: "";
+    in property <bool> is-playlist: false;
+    in property <int> playlist-count: 0;
+    in property <int> playlist-selected-count: 0;
+    in-out property <string> playlist-folder-name: "";
+    in-out property <string> playlist-filter: "";
+    in property <[PlaylistItemModel]> playlist-items: [];
+    in property <[FormatOptionModel]> format-options: [];
+    in-out property <int> container-index: 0;
+    in-out property <int> audio-preset-index: 0;
+    in-out property <bool> embed-subtitles: true;
+    in-out property <bool> lossless-remux: true;
+    in-out property <bool> normalize-audio: false;
+    in property <[SubtitleItemModel]> subtitles: [];
+    in-out property <bool> torrent-sequential: true;
+    in-out property <string> save-dir: "";
+    in-out property <int> threads-index: 1; // 0=32, 1=16, 2=8, 3=4
+    in-out property <bool> advanced-open: false;
+    in-out property <string> filename-override: "";
+    in-out property <string> expected-sha256: "";
+    in property <int> batch-preview-count: 0;
+    in property <string> footer-hint: "";
+
+    callback close-requested();
+    callback source-edited(string);
+    callback probe-clicked();
+    callback browse-torrent-clicked();
+    callback browse-save-dir-clicked();
+    callback format-selected(string);
+    callback playlist-item-toggled(int);
+    callback playlist-select-all();
+    callback playlist-clear();
+    callback subtitle-toggled(string);
+    callback submit-clicked();
+
+    if root.open : OverlayBackdrop {
+        backdrop-clicked => { root.close-requested(); }
+
+        Rectangle {
+            width: 636px;
+            height: 604px;
+            border-radius: 16px;
+            background: Theme.add-surface;
+            border-width: 1px;
+            border-color: Theme.add-border-strong;
+            drop-shadow-blur: 42px;
+            drop-shadow-offset-y: 18px;
+            drop-shadow-color: #090C1470;
+            clip: true;
+
+            TouchArea { }
+
+            VerticalLayout {
+                padding-top: 18px; padding-right: 22px; padding-bottom: 18px; padding-left: 22px;
+                spacing: 12px;
+
+                // Header
+                HorizontalLayout {
+                    Text {
+                        horizontal-stretch: 1;
+                        text: "Add Download";
+                        font-family: Theme.font-display;
+                        font-size: 16.5px;
+                        font-weight: 700;
+                        color: Theme.add-text;
+                        vertical-alignment: center;
+                    }
+                    CircleIconButton {
+                        icon: @image-url("icons/x.svg");
+                        ghost-square: true;
+                        porcelain: true;
+                        clicked => { root.close-requested(); }
+                    }
+                }
+
+                // URL input + Probe button
+                VerticalLayout {
+                    spacing: 5px;
+                    Text {
+                        text: "URL, magnet link, .torrent path, or wildcard pattern";
+                        font-size: 11.5px;
+                        font-weight: 550;
+                        color: Theme.add-muted;
+                    }
+                    HorizontalLayout {
+                        spacing: 7px;
+                        StyledLineEdit {
+                            horizontal-stretch: 1;
+                            porcelain: true;
+                            mono: true;
+                            text <=> root.source-text;
+                            placeholder: "https://... or magnet:?xt=urn:btih:... or image-[001..050].jpg";
+                            edited(val) => { root.source-edited(val); }
+                            accepted => { root.probe-clicked(); }
+                        }
+                        if root.active-tab == 3 : GhostButton {
+                            label: "Browse";
+                            porcelain: true;
+                            btn-height: 31px;
+                            clicked => { root.browse-torrent-clicked(); }
+                        }
+                        GhostButton {
+                            label: root.probing ? "Probing..." : "Probe";
+                            porcelain: true;
+                            btn-height: 31px;
+                            enabled: !root.probing && !root.is-torrent-input;
+                            clicked => { root.probe-clicked(); }
+                        }
+                    }
+                }
+
+                // Tabs
+                Rectangle {
+                    height: 34px;
+                    border-radius: 10px;
+                    background: Theme.add-raised;
+                    border-width: 1px;
+                    border-color: Theme.add-border;
+
+                    HorizontalLayout {
+                        padding: 3px;
+                        spacing: 3px;
+                        for t in [
+                            { idx: 0, label: "Video" },
+                            { idx: 1, label: "Audio Only" },
+                            { idx: 2, label: "Subtitles" },
+                            { idx: 3, label: "Torrent / Magnet" },
+                        ] : Rectangle {
+                            horizontal-stretch: 1;
+                            border-radius: 7px;
+                            background: root.active-tab == t.idx
+                                ? Theme.add-surface
+                                : (tab-ta.has-hover ? Theme.add-hover : transparent);
+                            drop-shadow-blur: root.active-tab == t.idx ? 4px : 0px;
+                            drop-shadow-color: #0F172A18;
+
+                            Text {
+                                text: t.label;
+                                font-size: 12px;
+                                font-weight: root.active-tab == t.idx ? 600 : 500;
+                                color: root.active-tab == t.idx ? Theme.add-text : Theme.add-muted;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+
+                            tab-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.active-tab = t.idx; }
+                            }
+                        }
+                    }
+                }
+
+                // Scrollable body
+                ScrollView {
+                    vertical-stretch: 1;
+
+                    VerticalLayout {
+                        alignment: start;
+                        spacing: 11px;
+                        padding-right: 4px;
+
+                        // Probe header summary
+                        if root.has-probe : Rectangle {
+                            height: 68px;
+                            border-radius: 10px;
+                            background: Theme.add-raised;
+                            border-width: 1px;
+                            border-color: Theme.add-border;
+
+                            HorizontalLayout {
+                                padding: 8px;
+                                spacing: 11px;
+
+                                Image {
+                                    source: @image-url("assets/media-sheet.svg");
+                                    width: 96px;
+                                    height: 52px;
+                                    image-fit: cover;
+                                }
+
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    alignment: center;
+                                    spacing: 3px;
+                                    Text {
+                                        text: root.probe-title;
+                                        font-size: 13px;
+                                        font-weight: 600;
+                                        color: Theme.add-text;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: root.probe-meta;
+                                        font-size: 11.5px;
+                                        color: Theme.add-muted;
+                                        overflow: elide;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Batch hint
+                        if root.batch-preview-count > 0 : Rectangle {
+                            height: 36px;
+                            border-radius: 8px;
+                            background: Theme.add-accent-soft;
+                            border-width: 1px;
+                            border-color: Theme.add-border;
+
+                            HorizontalLayout {
+                                padding-left: 11px;
+                                padding-right: 11px;
+                                Text {
+                                    text: "Wildcard batch ready: " + root.batch-preview-count + " files will be queued in parallel.";
+                                    font-size: 12px;
+                                    font-weight: 550;
+                                    color: Theme.add-accent;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        // Playlist Picker when playlist probed
+                        if root.is-playlist && (root.active-tab == 0 || root.active-tab == 1) : Rectangle {
+                            border-radius: 10px;
+                            background: Theme.add-raised;
+                            border-width: 1px;
+                            border-color: Theme.add-border;
+                            height: 205px;
+
+                            VerticalLayout {
+                                padding: 10px;
+                                spacing: 7px;
+
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: "Playlist Items (" + root.playlist-selected-count + "/" + root.playlist-count + ")";
+                                        font-size: 12px;
+                                        font-weight: 600;
+                                        color: Theme.add-text;
+                                        vertical-alignment: center;
+                                    }
+                                    GhostButton {
+                                        label: "All";
+                                        porcelain: true;
+                                        btn-height: 24px;
+                                        pad-x: 8px;
+                                        clicked => { root.playlist-select-all(); }
+                                    }
+                                    GhostButton {
+                                        label: "Clear";
+                                        porcelain: true;
+                                        btn-height: 24px;
+                                        pad-x: 8px;
+                                        clicked => { root.playlist-clear(); }
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    StyledLineEdit {
+                                        horizontal-stretch: 1;
+                                        porcelain: true;
+                                        box-height: 27px;
+                                        text <=> root.playlist-folder-name;
+                                        placeholder: "Playlist folder name";
+                                    }
+                                    StyledLineEdit {
+                                        width: 165px;
+                                        porcelain: true;
+                                        box-height: 27px;
+                                        text <=> root.playlist-filter;
+                                        placeholder: "Filter entries...";
+                                    }
+                                }
+
+                                ScrollView {
+                                    vertical-stretch: 1;
+                                    VerticalLayout {
+                                        spacing: 2px;
+                                        for item in root.playlist-items : Rectangle {
+                                            height: 26px;
+                                            border-radius: 6px;
+                                            background: item-ta.has-hover ? Theme.add-hover : transparent;
+
+                                            HorizontalLayout {
+                                                padding-left: 6px;
+                                                padding-right: 8px;
+                                                spacing: 8px;
+                                                CheckBoxRow {
+                                                    checked: item.checked;
+                                                    porcelain: true;
+                                                    toggled(_) => { root.playlist-item-toggled(item.index); }
+                                                }
+                                                Text {
+                                                    width: 24px;
+                                                    text: item.index + ".";
+                                                    font-family: Theme.font-mono;
+                                                    font-size: 11px;
+                                                    color: Theme.add-muted;
+                                                    vertical-alignment: center;
+                                                }
+                                                Text {
+                                                    horizontal-stretch: 1;
+                                                    text: item.title;
+                                                    font-size: 12px;
+                                                    color: Theme.add-text;
+                                                    overflow: elide;
+                                                    vertical-alignment: center;
+                                                }
+                                                Text {
+                                                    text: item.duration-text;
+                                                    font-family: Theme.font-mono;
+                                                    font-size: 11px;
+                                                    color: Theme.add-muted;
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                            item-ta := TouchArea {
+                                                mouse-cursor: pointer;
+                                                clicked => { root.playlist-item-toggled(item.index); }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Tab 0: Video options
+                        if root.active-tab == 0 : VerticalLayout {
+                            spacing: 9px;
+
+                            if root.is-direct-http : Rectangle {
+                                height: 36px;
+                                border-radius: 8px;
+                                background: Theme.add-accent-soft;
+                                border-width: 1px;
+                                border-color: Theme.add-border;
+
+                                HorizontalLayout {
+                                    padding-left: 11px;
+                                    padding-right: 11px;
+                                    spacing: 8px;
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: "Direct HTTP download";
+                                        font-size: 12px;
+                                        font-weight: 600;
+                                        color: Theme.add-text;
+                                        vertical-alignment: center;
+                                    }
+                                    PillBadge { text: "HTTP"; tone: 4; }
+                                }
+                            }
+
+                            if root.has-probe && root.format-options.length > 0 : VerticalLayout {
+                                spacing: 5px;
+                                Text {
+                                    text: "Video Format";
+                                    font-size: 11.5px;
+                                    font-weight: 600;
+                                    color: Theme.add-muted;
+                                }
+                                for fmt in root.format-options : Rectangle {
+                                    height: 36px;
+                                    border-radius: 8px;
+                                    background: fmt.selected
+                                        ? Theme.add-accent-soft
+                                        : (f-ta.has-hover ? Theme.add-hover : Theme.add-raised);
+                                    border-width: 1px;
+                                    border-color: fmt.selected ? Theme.add-accent : Theme.add-border;
+
+                                    HorizontalLayout {
+                                        padding-left: 11px;
+                                        padding-right: 11px;
+                                        spacing: 8px;
+                                        Text {
+                                            horizontal-stretch: 1;
+                                            text: fmt.title;
+                                            font-size: 12.5px;
+                                            font-weight: 600;
+                                            color: Theme.add-text;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                        }
+                                        Text {
+                                            text: fmt.detail;
+                                            font-family: Theme.font-mono;
+                                            font-size: 11.5px;
+                                            color: Theme.add-muted;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    f-ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.format-selected(fmt.format-id); }
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 14px;
+                                PillSwitch {
+                                    checked <=> root.embed-subtitles;
+                                    porcelain: true;
+                                    label: "Embed Subtitles";
+                                }
+                                PillSwitch {
+                                    checked <=> root.lossless-remux;
+                                    porcelain: true;
+                                    label: "Lossless Remux";
+                                }
+                                PillSwitch {
+                                    checked <=> root.normalize-audio;
+                                    porcelain: true;
+                                    label: "Audio Track Normalization";
+                                }
+                            }
+
+                            if root.has-probe : HorizontalLayout {
+                                alignment: start;
+                                spacing: 10px;
+                                Text {
+                                    text: "Container";
+                                    font-size: 12px;
+                                    color: Theme.add-muted;
+                                    vertical-alignment: center;
+                                }
+                                StyledSelect {
+                                    width: 150px;
+                                    porcelain: true;
+                                    options: ["MP4 (Universal)", "MKV (Lossless)", "WebM (VP9)"];
+                                    current-index <=> root.container-index;
+                                    current-value: root.container-index == 2 ? "WebM (VP9)"
+                                        : (root.container-index == 1 ? "MKV (Lossless)" : "MP4 (Universal)");
+                                }
+                            }
+                        }
+
+                        // Tab 1: Audio Only
+                        if root.active-tab == 1 : VerticalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: "Audio Extraction Preset";
+                                font-size: 11.5px;
+                                font-weight: 600;
+                                color: Theme.add-muted;
+                            }
+                            for preset in [
+                                { idx: 0, label: "MP3 320 kbps", detail: "Universal compatibility" },
+                                { idx: 1, label: "M4A / AAC 256 kbps", detail: "Stream copy or high quality AAC" },
+                                { idx: 2, label: "Opus 160 kbps", detail: "Modern transparent compression" },
+                                { idx: 3, label: "FLAC", detail: "Lossless archive" },
+                                { idx: 4, label: "WAV", detail: "Uncompressed PCM" },
+                            ] : Rectangle {
+                                height: 34px;
+                                border-radius: 8px;
+                                background: root.audio-preset-index == preset.idx
+                                    ? Theme.add-accent-soft
+                                    : Theme.add-raised;
+                                border-width: 1px;
+                                border-color: root.audio-preset-index == preset.idx
+                                    ? Theme.add-accent
+                                    : Theme.add-border;
+
+                                HorizontalLayout {
+                                    padding-left: 11px;
+                                    padding-right: 11px;
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: preset.label;
+                                        font-size: 12.5px;
+                                        font-weight: 600;
+                                        color: Theme.add-text;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        text: preset.detail;
+                                        font-size: 11.5px;
+                                        color: Theme.add-muted;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.audio-preset-index = preset.idx; }
+                                }
+                            }
+                        }
+
+                        // Tab 2: Subtitles
+                        if root.active-tab == 2 : VerticalLayout {
+                            spacing: 6px;
+                            if root.subtitles.length == 0 : Text {
+                                text: "Probe a video URL first to see available subtitle tracks.";
+                                font-size: 12px;
+                                color: Theme.add-muted;
+                            }
+                            for sub in root.subtitles : Rectangle {
+                                height: 30px;
+                                border-radius: 7px;
+                                background: Theme.add-raised;
+                                border-width: 1px;
+                                border-color: Theme.add-border;
+
+                                HorizontalLayout {
+                                    padding-left: 9px;
+                                    padding-right: 9px;
+                                    spacing: 8px;
+                                    CheckBoxRow {
+                                        horizontal-stretch: 1;
+                                        checked: sub.checked;
+                                        porcelain: true;
+                                        label: sub.label + (sub.is-auto ? " (Auto)" : "");
+                                        toggled(_) => { root.subtitle-toggled(sub.lang); }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Tab 3: Torrent / Magnet
+                        if root.active-tab == 3 : VerticalLayout {
+                            spacing: 8px;
+                            PillSwitch {
+                                checked <=> root.torrent-sequential;
+                                porcelain: true;
+                                label: "Sequential Download (Stream-friendly order)";
+                            }
+                        }
+
+                        // Save folder & HTTP threads
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                height: 34px;
+                                border-radius: 8px;
+                                background: Theme.add-input;
+                                border-width: 1px;
+                                border-color: Theme.add-border;
+
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 6px;
+                                    spacing: 7px;
+                                    Image {
+                                        source: @image-url("icons/folder.svg");
+                                        width: 14px;
+                                        height: 14px;
+                                        colorize: Theme.add-muted;
+                                        y: (parent.height - self.height) / 2;
+                                    }
+                                    TextInput {
+                                        horizontal-stretch: 1;
+                                        text <=> root.save-dir;
+                                        font-family: Theme.font-mono;
+                                        font-size: 11.5px;
+                                        color: Theme.add-text;
+                                        vertical-alignment: center;
+                                        single-line: true;
+                                    }
+                                    GhostButton {
+                                        label: "Browse";
+                                        porcelain: true;
+                                        btn-height: 24px;
+                                        pad-x: 8px;
+                                        clicked => { root.browse-save-dir-clicked(); }
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: "Threads";
+                                    font-size: 12px;
+                                    color: Theme.add-muted;
+                                    vertical-alignment: center;
+                                }
+                                StyledSelect {
+                                    width: 72px;
+                                    porcelain: true;
+                                    box-height: 34px;
+                                    options: ["32", "16", "8", "4"];
+                                    current-index <=> root.threads-index;
+                                    current-value: root.threads-index == 0 ? "32"
+                                        : (root.threads-index == 2 ? "8" : (root.threads-index == 3 ? "4" : "16"));
+                                }
+                            }
+                        }
+
+                        // Advanced disclosure
+                        VerticalLayout {
+                            spacing: 7px;
+                            Rectangle {
+                                height: 22px;
+                                HorizontalLayout {
+                                    spacing: 5px;
+                                    alignment: start;
+                                    Image {
+                                        source: root.advanced-open ? @image-url("icons/chevron-down.svg") : @image-url("icons/chevron-right.svg");
+                                        width: 13px;
+                                        height: 13px;
+                                        colorize: Theme.add-muted;
+                                        y: (parent.height - self.height) / 2;
+                                    }
+                                    Text {
+                                        text: "Filename / Expected SHA-256";
+                                        font-size: 12px;
+                                        font-weight: 550;
+                                        color: Theme.add-muted;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.advanced-open = !root.advanced-open; }
+                                }
+                            }
+
+                            if root.advanced-open : HorizontalLayout {
+                                spacing: 8px;
+                                StyledLineEdit {
+                                    horizontal-stretch: 1;
+                                    porcelain: true;
+                                    text <=> root.filename-override;
+                                    placeholder: "Optional filename override";
+                                }
+                                StyledLineEdit {
+                                    horizontal-stretch: 1;
+                                    porcelain: true;
+                                    mono: true;
+                                    text <=> root.expected-sha256;
+                                    placeholder: "Optional 64-hex SHA-256";
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if root.error-text != "" : Text {
+                    text: root.error-text;
+                    font-size: 11.5px;
+                    color: Theme.add-danger;
+                    wrap: word-wrap;
+                }
+
+                // Footer
+                Rectangle {
+                    height: 1px;
+                    background: Theme.add-border;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: root.footer-hint;
+                        font-size: 11.5px;
+                        color: Theme.add-muted;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    GhostButton {
+                        label: "Cancel";
+                        porcelain: true;
+                        clicked => { root.close-requested(); }
+                    }
+                    PrimaryButton {
+                        label: root.submitting ? "Adding..." : "Download";
+                        icon: @image-url("icons/download.svg");
+                        has-icon: true;
+                        porcelain: true;
+                        enabled: !root.submitting;
+                        clicked => { root.submit-clicked(); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component SettingsOverlay inherits Rectangle {
+    in-out property <bool> open: false;
+    // 0=System, 1=Dark, 2=Light
+    in-out property <int> theme-index: 1;
+    // 0=Blue, 1=Mono
+    in-out property <int> accent-index: 0;
+    in-out property <string> default-download-dir: "";
+    in-out property <string> default-connections: "16";
+    in-out property <string> max-concurrent: "4";
+    in-out property <string> speed-limit-mbps: "";
+    in-out property <bool> close-to-tray: true;
+    in-out property <bool> auto-defender-scan: true;
+    in-out property <bool> monitor-clipboard: false;
+    in-out property <bool> show-download-dialog: true;
+    in-out property <bool> show-progress-dialog: true;
+    in-out property <bool> show-complete-dialog: true;
+    // 0=Auto, 1=Manual
+    in-out property <int> update-mode-index: 0;
+    in-out property <string> ytdlp-override: "";
+    in-out property <string> ffmpeg-override: "";
+    in property <string> ytdlp-status-label: "Ready";
+    in property <int> ytdlp-status-tone: 2;
+    in property <string> ytdlp-version: "";
+    in property <string> ytdlp-path: "";
+    in property <string> ffmpeg-status-label: "Ready";
+    in property <int> ffmpeg-status-tone: 2;
+    in property <string> ffmpeg-version: "";
+    in property <string> ffmpeg-path: "";
+    in property <string> ffprobe-status-label: "Ready";
+    in property <int> ffprobe-status-tone: 2;
+    in property <string> ffprobe-path: "";
+    in property <bool> ytdlp-updating: false;
+    in property <string> ytdlp-notice: "";
+    in property <string> ytdlp-error: "";
+    in property <[BrowserCardModel]> browsers: [];
+    in property <string> browser-notice: "";
+    in property <string> browser-error: "";
+    in property <string> about-version: "2.0.0";
+    in property <bool> update-checking: false;
+    in property <bool> update-installing: false;
+    in property <bool> update-available: false;
+    in property <string> update-version-label: "";
+    in property <string> update-notes: "";
+    in property <float> update-progress-percent: 0;
+    in property <string> update-progress-text: "";
+    in property <string> update-status-text: "";
+    in property <string> update-error: "";
+    in property <bool> saving: false;
+    in property <string> error-text: "";
+
+    callback close-requested();
+    callback save-clicked();
+    callback browse-download-dir();
+    callback hibernate-now-clicked();
+    callback refresh-toolchain-clicked();
+    callback update-ytdlp-clicked();
+    callback setup-browser-clicked(string);
+    callback copy-text-clicked(string);
+    callback check-updates-clicked();
+    callback install-update-clicked();
+
+    if root.open : OverlayBackdrop {
+        backdrop-clicked => { root.close-requested(); }
+
+        Rectangle {
+            width: 648px;
+            height: 642px;
+            border-radius: 16px;
+            background: Theme.bg-elevated;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 42px;
+            drop-shadow-offset-y: 18px;
+            drop-shadow-color: #090C1470;
+            clip: true;
+
+            TouchArea { }
+
+            VerticalLayout {
+                padding-top: 18px; padding-right: 22px; padding-bottom: 18px; padding-left: 22px;
+                spacing: 12px;
+
+                HorizontalLayout {
+                    Text {
+                        horizontal-stretch: 1;
+                        text: "Settings";
+                        font-family: Theme.font-display;
+                        font-size: 16.5px;
+                        font-weight: 700;
+                        color: Theme.text-1;
+                        vertical-alignment: center;
+                    }
+                    CircleIconButton {
+                        icon: @image-url("icons/x.svg");
+                        ghost-square: true;
+                        clicked => { root.close-requested(); }
+                    }
+                }
+
+                ScrollView {
+                    vertical-stretch: 1;
+
+                    VerticalLayout {
+                        alignment: start;
+                        spacing: 12px;
+                        padding-right: 6px;
+
+                        // Row 1: Theme & Accent
+                        HorizontalLayout {
+                            spacing: 10px;
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 5px;
+                                Text { text: "Theme"; font-size: 11.5px; font-weight: 600; color: Theme.text-2; }
+                                StyledSelect {
+                                    options: ["System", "Dark (Graphite)", "Light (Porcelain)"];
+                                    current-index <=> root.theme-index;
+                                    current-value: root.theme-index == 0 ? "System"
+                                        : (root.theme-index == 2 ? "Light (Porcelain)" : "Dark (Graphite)");
+                                }
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 5px;
+                                Text { text: "Accent"; font-size: 11.5px; font-weight: 600; color: Theme.text-2; }
+                                StyledSelect {
+                                    options: ["Alpine Blue", "Monochrome"];
+                                    current-index <=> root.accent-index;
+                                    current-value: root.accent-index == 1 ? "Monochrome" : "Alpine Blue";
+                                }
+                            }
+                        }
+
+                        // Row 2: Default Download Folder
+                        VerticalLayout {
+                            spacing: 5px;
+                            Text { text: "Default Download Folder"; font-size: 11.5px; font-weight: 600; color: Theme.text-2; }
+                            HorizontalLayout {
+                                spacing: 7px;
+                                StyledLineEdit {
+                                    horizontal-stretch: 1;
+                                    mono: true;
+                                    text <=> root.default-download-dir;
+                                }
+                                GhostButton {
+                                    label: "Browse";
+                                    clicked => { root.browse-download-dir(); }
+                                }
+                            }
+                        }
+
+                        // Row 3: Numeric settings
+                        HorizontalLayout {
+                            spacing: 10px;
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 5px;
+                                Text { text: "Default Connections (1-32)"; font-size: 11.5px; font-weight: 600; color: Theme.text-2; }
+                                StyledLineEdit { mono: true; text <=> root.default-connections; }
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 5px;
+                                Text { text: "Max Concurrent"; font-size: 11.5px; font-weight: 600; color: Theme.text-2; }
+                                StyledLineEdit { mono: true; text <=> root.max-concurrent; }
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 5px;
+                                Text { text: "Speed Limit (MB/s)"; font-size: 11.5px; font-weight: 600; color: Theme.text-2; }
+                                StyledLineEdit { mono: true; text <=> root.speed-limit-mbps; placeholder: "Unlimited"; }
+                            }
+                        }
+
+                        // Checkboxes / switches
+                        Rectangle {
+                            border-radius: 10px;
+                            background: Theme.bg-sidebar;
+                            border-width: 1px;
+                            border-color: Theme.border;
+
+                            VerticalLayout {
+                                padding-top: 11px; padding-right: 13px; padding-bottom: 11px; padding-left: 13px;
+                                spacing: 8px;
+
+                                HorizontalLayout {
+                                    PillSwitch {
+                                        horizontal-stretch: 1;
+                                        checked <=> root.close-to-tray;
+                                        label: "Close to Tray (Hibernate to background)";
+                                    }
+                                    GhostButton {
+                                        label: "Hibernate Now";
+                                        btn-height: 26px;
+                                        pad-x: 9px;
+                                        clicked => { root.hibernate-now-clicked(); }
+                                    }
+                                }
+                                PillSwitch {
+                                    checked <=> root.auto-defender-scan;
+                                    label: "Automatic Windows Defender scan on completion";
+                                }
+                                PillSwitch {
+                                    checked <=> root.monitor-clipboard;
+                                    label: "Monitor clipboard for supported download links";
+                                }
+                            }
+                        }
+
+                        // Floating Download Boxes
+                        Rectangle {
+                            border-radius: 10px;
+                            background: Theme.bg-sidebar;
+                            border-width: 1px;
+                            border-color: Theme.border;
+
+                            VerticalLayout {
+                                padding-top: 11px; padding-right: 13px; padding-bottom: 11px; padding-left: 13px;
+                                spacing: 7px;
+                                Text { text: "Floating Download Boxes"; font-size: 12px; font-weight: 600; color: Theme.text-1; }
+                                PillSwitch {
+                                    checked <=> root.show-download-dialog;
+                                    label: "Show download info / duplicate dialog for browser downloads";
+                                }
+                                PillSwitch {
+                                    checked <=> root.show-progress-dialog;
+                                    label: "Show floating download progress window";
+                                }
+                                PillSwitch {
+                                    checked <=> root.show-complete-dialog;
+                                    label: "Show floating download complete dialog";
+                                }
+                            }
+                        }
+
+                        // Media Toolchain
+                        Rectangle {
+                            border-radius: 10px;
+                            background: Theme.bg-sidebar;
+                            border-width: 1px;
+                            border-color: Theme.border;
+
+                            VerticalLayout {
+                                padding-top: 11px; padding-right: 13px; padding-bottom: 11px; padding-left: 13px;
+                                spacing: 8px;
+
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: "Media Toolchain";
+                                        font-size: 12px;
+                                        font-weight: 600;
+                                        color: Theme.text-1;
+                                        vertical-alignment: center;
+                                    }
+                                    GhostButton {
+                                        label: "Refresh";
+                                        btn-height: 25px;
+                                        pad-x: 9px;
+                                        clicked => { root.refresh-toolchain-clicked(); }
+                                    }
+                                    GhostButton {
+                                        label: root.ytdlp-updating ? "Updating..." : "Update yt-dlp";
+                                        btn-height: 25px;
+                                        pad-x: 9px;
+                                        enabled: !root.ytdlp-updating;
+                                        clicked => { root.update-ytdlp-clicked(); }
+                                    }
+                                }
+
+                                for tc in [
+                                    { name: "yt-dlp", status: root.ytdlp-status-label, tone: root.ytdlp-status-tone, info: root.ytdlp-version + "  " + root.ytdlp-path },
+                                    { name: "FFmpeg", status: root.ffmpeg-status-label, tone: root.ffmpeg-status-tone, info: root.ffmpeg-version + "  " + root.ffmpeg-path },
+                                    { name: "ffprobe", status: root.ffprobe-status-label, tone: root.ffprobe-status-tone, info: root.ffprobe-path },
+                                ] : HorizontalLayout {
+                                    spacing: 8px;
+                                    Text { width: 58px; text: tc.name; font-size: 12px; font-weight: 600; color: Theme.text-1; vertical-alignment: center; }
+                                    PillBadge { text: tc.status; tone: tc.tone; }
+                                    Text { horizontal-stretch: 1; text: tc.info; font-family: Theme.font-mono; font-size: 10.5px; color: Theme.text-3; overflow: elide; vertical-alignment: center; }
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    StyledLineEdit { horizontal-stretch: 1; mono: true; text <=> root.ytdlp-override; placeholder: "Custom yt-dlp.exe path (optional)"; }
+                                    StyledLineEdit { horizontal-stretch: 1; mono: true; text <=> root.ffmpeg-override; placeholder: "Custom ffmpeg.exe path (optional)"; }
+                                }
+
+                                if root.ytdlp-notice != "" : Text { text: root.ytdlp-notice; font-size: 11.5px; color: Theme.green; wrap: word-wrap; }
+                                if root.ytdlp-error != "" : Text { text: root.ytdlp-error; font-size: 11.5px; color: Theme.danger; wrap: word-wrap; }
+                            }
+                        }
+
+                        // Browser Integration
+                        Rectangle {
+                            border-radius: 10px;
+                            background: Theme.bg-sidebar;
+                            border-width: 1px;
+                            border-color: Theme.border;
+
+                            VerticalLayout {
+                                padding-top: 11px; padding-right: 13px; padding-bottom: 11px; padding-left: 13px;
+                                spacing: 7px;
+                                Text { text: "Browser Extension & Native Host"; font-size: 12px; font-weight: 600; color: Theme.text-1; }
+
+                                for br in root.browsers : Rectangle {
+                                    height: 36px;
+                                    border-radius: 8px;
+                                    background: Theme.bg-elevated;
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+
+                                    HorizontalLayout {
+                                        padding-left: 10px;
+                                        padding-right: 8px;
+                                        spacing: 8px;
+
+                                        Text {
+                                            horizontal-stretch: 1;
+                                            text: br.name;
+                                            font-size: 12px;
+                                            font-weight: 600;
+                                            color: Theme.text-1;
+                                            vertical-alignment: center;
+                                        }
+                                        PillBadge {
+                                            text: br.native-host-registered ? "Host Registered" : (br.installed ? "Detected" : "Not Found");
+                                            tone: br.native-host-registered ? 2 : (br.installed ? 1 : 0);
+                                        }
+                                        GhostButton {
+                                            label: "Setup & Connect";
+                                            btn-height: 24px;
+                                            pad-x: 9px;
+                                            clicked => { root.setup-browser-clicked(br.id); }
+                                        }
+                                    }
+                                }
+
+                                if root.browser-notice != "" : Text { text: root.browser-notice; font-size: 11.5px; color: Theme.green; wrap: word-wrap; }
+                                if root.browser-error != "" : Text { text: root.browser-error; font-size: 11.5px; color: Theme.danger; wrap: word-wrap; }
+                            }
+                        }
+
+                        // About & Updates
+                        Rectangle {
+                            border-radius: 10px;
+                            background: Theme.bg-sidebar;
+                            border-width: 1px;
+                            border-color: Theme.border;
+
+                            VerticalLayout {
+                                padding-top: 11px; padding-right: 13px; padding-bottom: 11px; padding-left: 13px;
+                                spacing: 8px;
+
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    Image {
+                                        source: @image-url("../icons/icon.png");
+                                        width: 28px;
+                                        height: 28px;
+                                        image-fit: contain;
+                                    }
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        spacing: 2px;
+                                        Text {
+                                            text: "SlipStream v" + root.about-version;
+                                            font-size: 12.5px;
+                                            font-weight: 650;
+                                            color: Theme.text-1;
+                                        }
+                                        Text {
+                                            text: "By Mohamed Sayed • Pure Rust & Slint • MIT License";
+                                            font-size: 11px;
+                                            color: Theme.text-3;
+                                        }
+                                    }
+                                    StyledSelect {
+                                        width: 126px;
+                                        options: ["Auto Check", "Manual Only"];
+                                        current-index <=> root.update-mode-index;
+                                        current-value: root.update-mode-index == 1 ? "Manual Only" : "Auto Check";
+                                    }
+                                    GhostButton {
+                                        label: root.update-checking ? "Checking..." : "Check for Updates";
+                                        enabled: !root.update-checking && !root.update-installing;
+                                        clicked => { root.check-updates-clicked(); }
+                                    }
+                                }
+
+                                if root.update-available : HorizontalLayout {
+                                    spacing: 8px;
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: "Update available: " + root.update-version-label;
+                                        font-size: 12px;
+                                        font-weight: 600;
+                                        color: Theme.accent;
+                                        vertical-alignment: center;
+                                    }
+                                    PrimaryButton {
+                                        label: root.update-installing ? "Installing..." : "Install Update & Restart";
+                                        enabled: !root.update-installing;
+                                        clicked => { root.install-update-clicked(); }
+                                    }
+                                }
+
+                                if root.update-installing && root.update-progress-text != "" : VerticalLayout {
+                                    spacing: 4px;
+                                    Rectangle {
+                                        height: 5px;
+                                        border-radius: 3px;
+                                        background: Theme.track;
+                                        Rectangle {
+                                            width: parent.width * Math.clamp(root.update-progress-percent, 0.0, 1.0);
+                                            height: 5px;
+                                            border-radius: 3px;
+                                            background: Theme.accent;
+                                        }
+                                    }
+                                    Text {
+                                        text: root.update-progress-text;
+                                        font-family: Theme.font-mono;
+                                        font-size: 11px;
+                                        color: Theme.text-2;
+                                    }
+                                }
+
+                                if root.update-status-text != "" : Text { text: root.update-status-text; font-size: 11.5px; color: Theme.text-2; wrap: word-wrap; }
+                                if root.update-error != "" : Text { text: root.update-error; font-size: 11.5px; color: Theme.danger; wrap: word-wrap; }
+                            }
+                        }
+                    }
+                }
+
+                if root.error-text != "" : Text {
+                    text: root.error-text;
+                    font-size: 11.5px;
+                    color: Theme.danger;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    GhostButton {
+                        label: "Cancel";
+                        clicked => { root.close-requested(); }
+                    }
+                    PrimaryButton {
+                        label: root.saving ? "Saving..." : "Save Settings";
+                        enabled: !root.saving;
+                        clicked => { root.save-clicked(); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component CommandPaletteOverlay inherits Rectangle {
+    in-out property <bool> open: false;
+    in-out property <string> query: "";
+    in-out property <int> selected-index: 0;
+    in property <[PaletteActionModel]> actions: [];
+
+    callback close-requested();
+    callback query-edited(string);
+    callback action-triggered(string);
+
+    if root.open : OverlayBackdrop {
+        backdrop-clicked => { root.close-requested(); }
+
+        Rectangle {
+            width: 520px;
+            height: Math.min(390px, 74px + root.actions.length * 36px);
+            y: 96px;
+            border-radius: 14px;
+            background: Theme.bg-elevated;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 36px;
+            drop-shadow-offset-y: 14px;
+            drop-shadow-color: #090C1470;
+            clip: true;
+
+            TouchArea { }
+
+            VerticalLayout {
+                padding: 10px;
+                spacing: 8px;
+
+                StyledLineEdit {
+                    text <=> root.query;
+                    placeholder: "Type a command or search...";
+                    edited(q) => { root.query-edited(q); }
+                    accepted => {
+                        if (root.actions.length > 0 && root.selected-index < root.actions.length) {
+                            root.action-triggered(root.actions[root.selected-index].id);
+                        }
+                    }
+                }
+
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        spacing: 3px;
+                        for act[idx] in root.actions : Rectangle {
+                            height: 34px;
+                            border-radius: 8px;
+                            background: idx == root.selected-index || act-ta.has-hover
+                                ? Theme.accent-soft
+                                : transparent;
+
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                spacing: 8px;
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: act.label;
+                                    font-size: 12.5px;
+                                    font-weight: 550;
+                                    color: Theme.text-1;
+                                    vertical-alignment: center;
+                                }
+                                if act.hint != "" : PillBadge { text: act.hint; }
+                            }
+                            act-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.action-triggered(act.id); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component RefreshLinkOverlay inherits Rectangle {
+    in-out property <bool> open: false;
+    in property <string> filename: "";
+    in-out property <string> new-url: "";
+    in property <bool> submitting: false;
+    in property <string> error-text: "";
+
+    callback close-requested();
+    callback submit-clicked();
+
+    if root.open : OverlayBackdrop {
+        backdrop-clicked => { root.close-requested(); }
+
+        Rectangle {
+            width: 460px;
+            height: 215px;
+            border-radius: 14px;
+            background: Theme.bg-elevated;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 36px;
+            drop-shadow-color: #090C1470;
+
+            TouchArea { }
+
+            VerticalLayout {
+                padding-top: 18px; padding-right: 20px; padding-bottom: 18px; padding-left: 20px;
+                spacing: 11px;
+
+                HorizontalLayout {
+                    Text {
+                        horizontal-stretch: 1;
+                        text: "Refresh Download Address";
+                        font-family: Theme.font-display;
+                        font-size: 15.5px;
+                        font-weight: 700;
+                        color: Theme.text-1;
+                        vertical-alignment: center;
+                    }
+                    CircleIconButton {
+                        icon: @image-url("icons/x.svg");
+                        ghost-square: true;
+                        clicked => { root.close-requested(); }
+                    }
+                }
+
+                Text {
+                    text: root.filename;
+                    font-size: 12px;
+                    color: Theme.text-2;
+                    overflow: elide;
+                }
+
+                StyledLineEdit {
+                    mono: true;
+                    text <=> root.new-url;
+                    placeholder: "https://...";
+                    accepted => { root.submit-clicked(); }
+                }
+
+                if root.error-text != "" : Text {
+                    text: root.error-text;
+                    font-size: 11.5px;
+                    color: Theme.danger;
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    GhostButton { label: "Cancel"; clicked => { root.close-requested(); } }
+                    PrimaryButton {
+                        label: root.submitting ? "Updating..." : "Refresh & Resume";
+                        enabled: !root.submitting;
+                        clicked => { root.submit-clicked(); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component VerifyShaOverlay inherits Rectangle {
+    in-out property <bool> open: false;
+    in property <string> filename: "";
+    in-out property <string> expected-sha256: "";
+    in property <bool> submitting: false;
+    in property <string> error-text: "";
+
+    callback close-requested();
+    callback submit-clicked();
+
+    if root.open : OverlayBackdrop {
+        backdrop-clicked => { root.close-requested(); }
+
+        Rectangle {
+            width: 460px;
+            height: 215px;
+            border-radius: 14px;
+            background: Theme.bg-elevated;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 36px;
+            drop-shadow-color: #090C1470;
+
+            TouchArea { }
+
+            VerticalLayout {
+                padding-top: 18px; padding-right: 20px; padding-bottom: 18px; padding-left: 20px;
+                spacing: 11px;
+
+                HorizontalLayout {
+                    Text {
+                        horizontal-stretch: 1;
+                        text: "Verify SHA-256 Checksum";
+                        font-family: Theme.font-display;
+                        font-size: 15.5px;
+                        font-weight: 700;
+                        color: Theme.text-1;
+                        vertical-alignment: center;
+                    }
+                    CircleIconButton {
+                        icon: @image-url("icons/x.svg");
+                        ghost-square: true;
+                        clicked => { root.close-requested(); }
+                    }
+                }
+
+                Text {
+                    text: root.filename;
+                    font-size: 12px;
+                    color: Theme.text-2;
+                    overflow: elide;
+                }
+
+                StyledLineEdit {
+                    mono: true;
+                    text <=> root.expected-sha256;
+                    placeholder: "Paste 64-character SHA-256 hex digest";
+                    accepted => { root.submit-clicked(); }
+                }
+
+                if root.error-text != "" : Text {
+                    text: root.error-text;
+                    font-size: 11.5px;
+                    color: Theme.danger;
+                }
+
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    GhostButton { label: "Cancel"; clicked => { root.close-requested(); } }
+                    PrimaryButton {
+                        label: root.submitting ? "Verifying..." : "Verify File";
+                        enabled: !root.submitting;
+                        clicked => { root.submit-clicked(); }
+                    }
+                }
+            }
+        }
+    }
+}

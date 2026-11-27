@@ -2,6 +2,23 @@
 
 All notable changes to **SlipStream** are documented in this file following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [2.0.0] - 2026-11-27
+
+### Changed
+
+- **Pure Rust + Slint Native Desktop Architecture (`apps/desktop`):**
+  - Replaced Tauri v2, Microsoft Edge WebView2 (`msedgewebview2.exe`), and the React/TypeScript frontend in `apps/desktop` with a native **Rust + Slint (`1.19.1`, `winit`, `femtovg` + software fallback)** GUI compiled directly into a single lightweight binary.
+  - Preserved all 5 Rust core crates (`crates/{protocol,engine,media,torrent,native-host}`), `packages/ipc-types`, and the **Manifest V3** browser extension unchanged, keeping 100% SQLite WAL (`slipstream.sqlite`), settings (`settings.json`), and `%LOCALAPPDATA%\SlipStream\session.token` data compatibility.
+  - Preserved exact Graphite Dark ↔ Porcelain Light theming (`Blue` / `Mono` accents), 16-segment progress bars, `T01–T16` segment map, live throughput sparkline, collapsible playlist queues, Porcelain **Add Download** dialog (Video / Audio Only / Subtitles / Torrent+Magnet + origin-isolated header forwarding), **Settings**, Command Palette (`Ctrl+K`), Refresh Link, SHA-256 verification, and standalone frameless floating windows (**Duplicate Download Link**, **Download File Info**, **Download Progress** with **Speed Limiter** & **Options on completion**, and **Download Complete**).
+- **Native System Tray, Win32 Shell & Signed Auto-Updater (`apps/desktop`):**
+  - Replaced Tauri plugin dependencies with native `tray-icon` / `muda` system tray menus, Win32 COM folder & `.torrent` pickers, DWM rounded window corners, Windows disk-space metrics, and clipboard URL watcher (`monitor_clipboard`).
+  - Replaced Tauri updater/signer with native Minisign (`minisign` / `minisign-verify` + `slipstream-sign`) compatible with `v1.3.0` signatures and `latest.json`, packaged via a per-user Unicode NSIS installer (`apps/desktop/installer/slipstream.nsi`).
+- **Concept #2 (Geometric S-Stream) Icon Rebrand (`apps/desktop`, `extensions/browser`, `README.md`):**
+  - Replaced desktop and extension icons with the halo-free rounded-squircle Concept #2 Geometric S-Stream icon (`apps/desktop/icons/icon.png` `1024×1024` RGBA, multi-res `apps/desktop/icons/icon.ico` `16/24/32/48/64/128/256` px, Windows executable resources, system tray, NSIS installer/uninstaller, all 4 Slint windows including **Settings → About & Updates**, and Chrome/Edge/Brave/Firefox `icon{16,32,48,128}.png` assets + popup).
+- **Security Hardening & Author Attribution:**
+  - Remediated all 19 findings from the cross-model Codex CLI (`gpt-6.2-sol`) audit across Win32 clipboard bounds/file pickers/open-with, origin-scoped seeded headers, overlay state handling, and update staging/signature verification (`FILE_SHARE_READ` lock + CI `slipstream-sign --verify` gate).
+  - Added MIT `LICENSE` and updated author/publisher credits (`Mohamed Sayed`) across workspace manifests, Windows executable metadata, installer metadata, and About UI.
+
 ## [1.3.0] - 2026-11-26
 
 ### Added

@@ -1,0 +1,73 @@
+[package]
+name = "slipstream-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[lib]
+name = "slipstream_desktop_lib"
+
+[[bin]]
+name = "slipstream-desktop"
+path = "src/main.rs"
+
+[[bin]]
+name = "slipstream-sign"
+path = "src/bin/slipstream_sign.rs"
+
+[[bin]]
+name = "render-previews"
+path = "src/bin/render_previews.rs"
+
+[dependencies]
+slipstream-protocol = { path = "../../crates/protocol" }
+slipstream-engine = { path = "../../crates/engine" }
+slipstream-media = { path = "../../crates/media" }
+slipstream-torrent = { path = "../../crates/torrent" }
+slipstream-native-host = { path = "../../crates/native-host" }
+base64 = "0.22"
+chrono.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+i-slint-backend-winit = "=1.19.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+minisign = "0.10.0"
+minisign-verify = "0.3.0"
+muda = "0.20"
+png = "0.18"
+raw-window-handle = "0.6"
+reqwest.workspace = true
+semver = "1"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+slint = "=1.19.1"
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tray-icon = "0.25"
+url.workspace = true
+uuid.workspace = true
+windows-sys = { workspace = true, features = [
+    "Win32_Graphics_Dwm",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Registry",
+    "Win32_System_SystemServices",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+slint-build = "=1.19.1"
+winresource = "0.1.34"

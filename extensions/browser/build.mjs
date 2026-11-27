@@ -22,6 +22,7 @@ for (const entry of ["early", "background", "content"]) {
     },
   });
 }
+await cp(path("icons"), path("dist/chrome/icons"), { recursive: true });
 await rm(firefoxDir, { recursive: true, force: true });
 await cp(outDir, firefoxDir, { recursive: true });
 await copyFile(path("manifest.firefox.json"), path("dist/firefox/manifest.json"));

@@ -1,0 +1,1780 @@
+import { ScrollView } from "std-widgets.slint";
+import { Theme } from "./tokens.slint";
+import {
+    PrimaryButton,
+    GhostButton,
+    CircleIconButton,
+    CheckBoxRow,
+    PillBadge,
+    SegmentProgressBar,
+    SparklineChart,
+    StyledLineEdit,
+} from "./widgets.slint";
+import {
+    TransferRowModel,
+    PlaylistGroupModel,
+    CompletedRowModel,
+    InspectorModel,
+    FormatOptionModel,
+    SubtitleItemModel,
+    PlaylistItemModel,
+    BrowserCardModel,
+    PaletteActionModel,
+} from "./app_types.slint";
+import {
+    AddDownloadOverlay,
+    SettingsOverlay,
+    CommandPaletteOverlay,
+    RefreshLinkOverlay,
+    VerifyShaOverlay,
+} from "./dialogs.slint";
+
+component TransferKindIcon inherits Image {
+    in property <int> icon-kind: 0;
+    in property <color> tint: Theme.accent;
+
+    width: 18px;
+    height: 18px;
+    colorize: root.tint;
+    source: root.icon-kind == 1 ? @image-url("icons/film.svg")
+        : root.icon-kind == 2 ? @image-url("icons/music.svg")
+        : root.icon-kind == 3 ? @image-url("icons/archive.svg")
+        : root.icon-kind == 4 ? @image-url("icons/app-window.svg")
+        : root.icon-kind == 5 ? @image-url("icons/disc.svg")
+        : root.icon-kind == 6 ? @image-url("icons/file-text.svg")
+        : root.icon-kind == 7 ? @image-url("icons/magnet.svg")
+        : @image-url("icons/download.svg");
+}
+
+component SidebarNavRow inherits Rectangle {
+    in property <string> label;
+    in property <image> icon;
+    in property <int> count: 0;
+    in property <bool> active: false;
+    callback clicked();
+
+    height: 32px;
+    border-radius: 7px;
+    background: root.active
+        ? Theme.accent-soft
+        : (ta.has-hover ? Theme.bg-hover : transparent);
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 9px;
+        spacing: 9px;
+
+        Image {
+            source: root.icon;
+            width: 15px;
+            height: 15px;
+            colorize: root.active ? Theme.accent : Theme.text-2;
+            y: (parent.height - self.height) / 2;
+        }
+
+        Text {
+            horizontal-stretch: 1;
+            text: root.label;
+            font-size: 12.5px;
+            font-weight: root.active ? 600 : 500;
+            color: root.active ? Theme.text-1 : Theme.text-2;
+            vertical-alignment: center;
+        }
+
+        if root.count > 0 : Rectangle {
+            min-width: 22px;
+            height: 18px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 9px;
+            background: root.active ? Theme.accent : Theme.bg-input;
+
+            Text {
+                x: 6px;
+                width: parent.width - 12px;
+                height: parent.height;
+                text: root.count;
+                font-family: Theme.font-mono;
+                font-size: 10.5px;
+                font-weight: 600;
+                color: root.active ? Theme.accent-ink : Theme.text-3;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component ActiveTransferCard inherits Rectangle {
+    in property <TransferRowModel> item;
+    in property <bool> selected: false;
+    in property <bool> compact: false;
+
+    callback select-clicked(string);
+    callback toggle-pause-clicked(string, bool);
+    callback open-floating-clicked(string);
+    callback refresh-link-clicked(string);
+    callback remove-clicked(string);
+
+    min-height: root.compact ? 64px : 76px;
+    border-radius: Theme.radius-lg;
+    background: root.selected
+        ? Theme.accent-soft
+        : (row-ta.has-hover ? Theme.bg-hover : Theme.bg-elevated);
+    border-width: 1px;
+    border-color: root.selected ? Theme.accent : Theme.border;
+    drop-shadow-blur: 6px;
+    drop-shadow-offset-y: 2px;
+    drop-shadow-color: Theme.card-shadow;
+
+    row-ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.select-clicked(root.item.id); }
+        double-clicked => { root.open-floating-clicked(root.item.id); }
+    }
+
+    HorizontalLayout {
+        padding: root.compact ? 10px : 13px;
+        spacing: 12px;
+
+        // 44x44 thumbnail tile
+        Rectangle {
+            width: root.compact ? 36px : 44px;
+            height: root.compact ? 36px : 44px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 9px;
+            background: root.item.is-torrent ? Theme.green-soft
+                : (root.item.is-error ? Theme.amber-soft : Theme.accent-soft);
+
+            TransferKindIcon {
+                icon-kind: root.item.icon-kind;
+                tint: root.item.is-torrent ? Theme.green
+                    : (root.item.is-error ? Theme.amber : Theme.accent);
+                width: root.compact ? 16px : 20px;
+                height: root.compact ? 16px : 20px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+
+        // Main metadata + 16-segment bar
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 5px;
+            alignment: center;
+
+            HorizontalLayout {
+                spacing: 7px;
+
+                if root.item.playlist-index-text != "" : PillBadge {
+                    text: "#" + root.item.playlist-index-text;
+                }
+
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.item.filename;
+                    font-size: 13px;
+                    font-weight: 600;
+                    color: Theme.text-1;
+                    overflow: elide;
+                    vertical-alignment: center;
+                }
+
+                if root.item.tag-text != "" : PillBadge {
+                    text: root.item.tag-text;
+                    tone: root.item.is-torrent ? 2 : 0;
+                }
+
+                if root.item.sha-verified == 1 : PillBadge {
+                    text: "SHA-256";
+                    tone: 2;
+                    has-check: true;
+                }
+
+                Text {
+                    text: root.item.progress-label;
+                    font-family: Theme.font-mono;
+                    font-size: 11.5px;
+                    font-weight: 650;
+                    color: root.item.is-paused ? Theme.text-3
+                        : (root.item.is-torrent ? Theme.green : Theme.accent);
+                    vertical-alignment: center;
+                }
+            }
+
+            SegmentProgressBar {
+                segments: root.item.segments;
+                tone: root.item.segment-tone;
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.item.error-text != "" ? root.item.error-text : root.item.meta-line;
+                    font-size: 11.5px;
+                    color: root.item.error-text != "" ? Theme.danger : Theme.text-2;
+                    overflow: elide;
+                }
+                Text {
+                    text: root.item.source-domain;
+                    font-size: 11px;
+                    color: Theme.text-3;
+                }
+            }
+        }
+
+        // Quick actions
+        HorizontalLayout {
+            spacing: 5px;
+            alignment: center;
+
+            if root.item.can-pause-resume : CircleIconButton {
+                icon: root.item.is-paused ? @image-url("icons/play-filled.svg") : @image-url("icons/pause-filled.svg");
+                icon-size: 12px;
+                clicked => { root.toggle-pause-clicked(root.item.id, root.item.is-paused); }
+            }
+
+            if !root.item.is-completed : CircleIconButton {
+                icon: @image-url("icons/app-window.svg");
+                icon-size: 13px;
+                clicked => { root.open-floating-clicked(root.item.id); }
+            }
+
+            if root.item.is-error : CircleIconButton {
+                icon: @image-url("icons/refresh-cw.svg");
+                icon-size: 13px;
+                clicked => { root.refresh-link-clicked(root.item.id); }
+            }
+
+            CircleIconButton {
+                icon: @image-url("icons/trash-2.svg");
+                icon-size: 13px;
+                ghost-square: true;
+                clicked => { root.remove-clicked(root.item.id); }
+            }
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    // Theme binding
+    in-out property <bool> theme-light: false;
+    in-out property <bool> theme-mono: false;
+    in-out property <bool> is-maximized: false;
+
+    // App header / counts / filter state
+    in property <string> version-label: "2.0.0";
+    // "all" | "active" | "completed" | "queued" | "torrents" | "paused"
+    in-out property <string> active-nav: "all";
+    in-out property <string> search-query: "";
+    in property <int> count-all: 0;
+    in property <int> count-active: 0;
+    in property <int> count-completed: 0;
+    in property <int> count-queued: 0;
+    in property <int> count-torrents: 0;
+    in property <int> count-paused: 0;
+
+    // Live global stats
+    in property <string> speed-down-text: "0 B/s";
+    in property <string> speed-up-text: "0 B/s";
+    in property <string> active-summary-text: "Idle";
+    in property <string> spark-line-cmd: "M 0 25 L 180 25";
+    in property <string> spark-fill-cmd: "M 0 25 L 180 25 L 180 28 L 0 28 Z";
+    in property <string> inspector-spark-line-cmd: "M 0 25 L 260 25";
+    in property <string> inspector-spark-fill-cmd: "M 0 25 L 260 25 L 260 28 L 0 28 Z";
+    in property <string> disk-free-text: "-- free";
+    in property <float> disk-used-ratio: 0.45;
+    in property <string> speed-limit-label: "Unlimited";
+    in property <bool> speed-limit-active: false;
+    in property <bool> all-paused: false;
+
+    // Speed limit popover state
+    in-out property <bool> speed-popover-open: false;
+    in-out property <string> speed-popover-input: "";
+
+    // Transfer lists & selection
+    in-out property <string> selected-id: "";
+    in property <[PlaylistGroupModel]> playlist-groups: [];
+    in property <[TransferRowModel]> active-rows: [];
+    in property <[CompletedRowModel]> completed-rows: [];
+    in property <InspectorModel> inspector;
+
+    // Demo badge
+    in property <bool> demo-mode: false;
+
+    // Overlay component states
+    in-out property <bool> add-open: false;
+    in-out property <string> add-source-text: "";
+    in property <bool> add-probing: false;
+    in property <bool> add-submitting: false;
+    in property <string> add-error-text: "";
+    in-out property <int> add-tab: 0;
+    in property <bool> add-has-probe: false;
+    in property <bool> add-is-torrent-input: false;
+    in property <bool> add-is-direct-http: false;
+    in property <string> add-probe-title: "";
+    in property <string> add-probe-meta: "";
+    in property <bool> add-is-playlist: false;
+    in property <int> add-playlist-count: 0;
+    in property <int> add-playlist-selected-count: 0;
+    in-out property <string> add-playlist-folder-name: "";
+    in-out property <string> add-playlist-filter: "";
+    in property <[PlaylistItemModel]> add-playlist-items: [];
+    in property <[FormatOptionModel]> add-format-options: [];
+    in-out property <int> add-container-index: 0;
+    in-out property <int> add-audio-preset-index: 0;
+    in-out property <bool> add-embed-subtitles: true;
+    in-out property <bool> add-lossless-remux: true;
+    in-out property <bool> add-normalize-audio: false;
+    in property <[SubtitleItemModel]> add-subtitles: [];
+    in-out property <bool> add-torrent-sequential: true;
+    in-out property <string> add-save-dir: "";
+    in-out property <int> add-threads-index: 1;
+    in-out property <bool> add-advanced-open: false;
+    in-out property <string> add-filename-override: "";
+    in-out property <string> add-expected-sha256: "";
+    in property <int> add-batch-preview-count: 0;
+    in property <string> add-footer-hint: "";
+
+    in-out property <bool> settings-open: false;
+    in-out property <int> set-theme-index: 1;
+    in-out property <int> set-accent-index: 0;
+    in-out property <string> set-default-download-dir: "";
+    in-out property <string> set-default-connections: "16";
+    in-out property <string> set-max-concurrent: "4";
+    in-out property <string> set-speed-limit-mbps: "";
+    in-out property <bool> set-close-to-tray: true;
+    in-out property <bool> set-auto-defender-scan: true;
+    in-out property <bool> set-monitor-clipboard: false;
+    in-out property <bool> set-show-download-dialog: true;
+    in-out property <bool> set-show-progress-dialog: true;
+    in-out property <bool> set-show-complete-dialog: true;
+    in-out property <int> set-update-mode-index: 0;
+    in-out property <string> set-ytdlp-override: "";
+    in-out property <string> set-ffmpeg-override: "";
+    in property <string> set-ytdlp-status-label: "Ready";
+    in property <int> set-ytdlp-status-tone: 2;
+    in property <string> set-ytdlp-version: "";
+    in property <string> set-ytdlp-path: "";
+    in property <string> set-ffmpeg-status-label: "Ready";
+    in property <int> set-ffmpeg-status-tone: 2;
+    in property <string> set-ffmpeg-version: "";
+    in property <string> set-ffmpeg-path: "";
+    in property <string> set-ffprobe-status-label: "Ready";
+    in property <int> set-ffprobe-status-tone: 2;
+    in property <string> set-ffprobe-path: "";
+    in property <bool> set-ytdlp-updating: false;
+    in property <string> set-ytdlp-notice: "";
+    in property <string> set-ytdlp-error: "";
+    in property <[BrowserCardModel]> set-browsers: [];
+    in property <string> set-browser-notice: "";
+    in property <string> set-browser-error: "";
+    in property <bool> set-update-checking: false;
+    in property <bool> set-update-installing: false;
+    in property <bool> set-update-available: false;
+    in property <string> set-update-version-label: "";
+    in property <string> set-update-notes: "";
+    in property <float> set-update-progress-percent: 0;
+    in property <string> set-update-progress-text: "";
+    in property <string> set-update-status-text: "";
+    in property <string> set-update-error: "";
+    in property <bool> set-saving: false;
+    in property <string> set-error-text: "";
+
+    in-out property <bool> palette-open: false;
+    in-out property <string> palette-query: "";
+    in-out property <int> palette-selected-index: 0;
+    in property <[PaletteActionModel]> palette-actions: [];
+
+    in-out property <bool> refresh-open: false;
+    in property <string> refresh-filename: "";
+    in-out property <string> refresh-url: "";
+    in property <bool> refresh-submitting: false;
+    in property <string> refresh-error: "";
+
+    in-out property <bool> verify-open: false;
+    in property <string> verify-filename: "";
+    in-out property <string> verify-sha: "";
+    in property <bool> verify-submitting: false;
+    in property <string> verify-error: "";
+
+    // Window & Navigation Callbacks
+    callback start-drag();
+    callback minimize-window();
+    callback toggle-maximize-window();
+    callback close-window();
+    callback nav-selected(string);
+    callback search-changed(string);
+    callback toggle-theme-clicked();
+    callback toggle-pause-all-clicked();
+    callback open-add-dialog-clicked();
+    callback open-settings-clicked();
+    callback open-palette-clicked();
+    callback apply-speed-limit-clicked(string);
+
+    // Transfer & Playlist Callbacks
+    callback select-transfer(string);
+    callback toggle-transfer-pause(string, bool);
+    callback open-floating-progress(string);
+    callback remove-transfer(string);
+    callback open-completed-file(string);
+    callback reveal-in-explorer(string);
+    callback open-refresh-dialog(string);
+    callback open-verify-dialog(string);
+    callback toggle-playlist-expand(string);
+    callback toggle-playlist-pause(string, bool);
+    callback reveal-playlist-folder(string);
+    callback toggle-torrent-file(int);
+    callback apply-torrent-files(string);
+
+    // Add Download Callbacks
+    callback add-close-requested();
+    callback add-source-edited(string);
+    callback add-probe-clicked();
+    callback add-browse-torrent-clicked();
+    callback add-browse-save-dir-clicked();
+    callback add-format-selected(string);
+    callback add-playlist-item-toggled(int);
+    callback add-playlist-select-all();
+    callback add-playlist-clear();
+    callback add-subtitle-toggled(string);
+    callback add-submit-clicked();
+
+    // Settings Callbacks
+    callback settings-close-requested();
+    callback settings-save-clicked();
+    callback settings-browse-download-dir();
+    callback settings-hibernate-now();
+    callback settings-refresh-toolchain();
+    callback settings-update-ytdlp();
+    callback settings-setup-browser(string);
+    callback settings-copy-text(string);
+    callback settings-check-updates();
+    callback settings-install-update();
+
+    // Command Palette, Refresh & Verify Callbacks
+    callback palette-query-edited(string);
+    callback palette-action-triggered(string);
+    callback refresh-submit-clicked();
+    callback verify-submit-clicked();
+
+    title: "SlipStream";
+    icon: @image-url("../icons/icon.png");
+    preferred-width: 1340px;
+    preferred-height: 820px;
+    min-width: 1024px;
+    min-height: 640px;
+    no-frame: true;
+    background: Theme.bg-canvas;
+    default-font-family: Theme.font-sans;
+
+    changed theme-light => { Theme.is-light = root.theme-light; }
+    changed theme-mono => { Theme.is-mono = root.theme-mono; }
+
+    FocusScope {
+        width: 100%;
+        height: 100%;
+
+        key-pressed(event) => {
+            if (event.modifiers.control && (event.text == "k" || event.text == "K")) {
+                root.open-palette-clicked();
+                return accept;
+            }
+            if (event.modifiers.control && (event.text == "n" || event.text == "N")) {
+                root.open-add-dialog-clicked();
+                return accept;
+            }
+            if (event.text == Key.Escape) {
+                if (root.palette-open) { root.palette-open = false; return accept; }
+                if (root.verify-open) { root.verify-open = false; return accept; }
+                if (root.refresh-open) { root.refresh-open = false; return accept; }
+                if (root.add-open) { root.add-close-requested(); return accept; }
+                if (root.settings-open) { root.settings-close-requested(); return accept; }
+                if (root.speed-popover-open) { root.speed-popover-open = false; return accept; }
+            }
+            return reject;
+        }
+
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            background: Theme.bg-canvas;
+            border-radius: root.is-maximized ? 0px : 10px;
+            border-width: root.is-maximized ? 0px : 1px;
+            border-color: Theme.border-strong;
+            clip: true;
+
+            HorizontalLayout {
+                padding: 0px;
+                spacing: 0px;
+
+                // ========================= LEFT SIDEBAR (228px) =========================
+                Rectangle {
+                    width: 228px;
+                    background: Theme.bg-sidebar;
+
+                    Rectangle {
+                        x: parent.width - 1px;
+                        y: 0px;
+                        width: 1px;
+                        height: parent.height;
+                        background: Theme.border;
+                    }
+
+                    VerticalLayout {
+                        padding: 0px;
+                        spacing: 0px;
+
+                        // Brand Bar (52px)
+                        Rectangle {
+                            height: 52px;
+
+                            TouchArea {
+                                pointer-event(event) => {
+                                    if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                                        root.start-drag();
+                                    }
+                                }
+                                double-clicked => { root.toggle-maximize-window(); }
+                            }
+
+                            HorizontalLayout {
+                                padding-left: 16px;
+                                padding-right: 12px;
+                                spacing: 9px;
+
+                                Image {
+                                    source: @image-url("../icons/icon.png");
+                                    width: 28px;
+                                    height: 28px;
+                                    image-fit: contain;
+                                    y: (parent.height - self.height) / 2;
+                                }
+
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: "SlipStream";
+                                    font-family: Theme.font-display;
+                                    font-size: 14.5px;
+                                    font-weight: 700;
+                                    color: Theme.text-1;
+                                    vertical-alignment: center;
+                                }
+
+                                if root.demo-mode : PillBadge {
+                                    text: "DEMO";
+                                    tone: 3;
+                                }
+                            }
+                        }
+
+                        // Nav list
+                        VerticalLayout {
+                            padding-top: 10px; padding-right: 10px; padding-bottom: 10px; padding-left: 10px;
+                            spacing: 2px;
+
+                            Text {
+                                text: "TRANSFERS";
+                                font-size: 10.5px;
+                                font-weight: 700;
+                                letter-spacing: 0.7px;
+                                color: Theme.text-3;
+                                height: 22px;
+                                vertical-alignment: center;
+                            }
+
+                            SidebarNavRow {
+                                label: "All Transfers";
+                                icon: @image-url("icons/grid-2x2.svg");
+                                count: root.count-all;
+                                active: root.active-nav == "all";
+                                clicked => { root.nav-selected("all"); }
+                            }
+                            SidebarNavRow {
+                                label: "Active";
+                                icon: @image-url("icons/arrow-down-to-line.svg");
+                                count: root.count-active;
+                                active: root.active-nav == "active";
+                                clicked => { root.nav-selected("active"); }
+                            }
+                            SidebarNavRow {
+                                label: "Completed";
+                                icon: @image-url("icons/check-circle-2.svg");
+                                count: root.count-completed;
+                                active: root.active-nav == "completed";
+                                clicked => { root.nav-selected("completed"); }
+                            }
+                            SidebarNavRow {
+                                label: "Queued";
+                                icon: @image-url("icons/clock-3.svg");
+                                count: root.count-queued;
+                                active: root.active-nav == "queued";
+                                clicked => { root.nav-selected("queued"); }
+                            }
+                            SidebarNavRow {
+                                label: "Torrents";
+                                icon: @image-url("icons/magnet.svg");
+                                count: root.count-torrents;
+                                active: root.active-nav == "torrents";
+                                clicked => { root.nav-selected("torrents"); }
+                            }
+                            SidebarNavRow {
+                                label: "Paused";
+                                icon: @image-url("icons/pause.svg");
+                                count: root.count-paused;
+                                active: root.active-nav == "paused";
+                                clicked => { root.nav-selected("paused"); }
+                            }
+                        }
+
+                        Rectangle { vertical-stretch: 1; }
+
+                        // Sidebar Footer: Telemetry Card + Storage + Controls
+                        Rectangle {
+                            vertical-stretch: 0;
+                            background: Theme.sidebar-footer-tint;
+                            border-width: 1px;
+                            border-color: Theme.border;
+
+                            VerticalLayout {
+                                alignment: start;
+                                padding-top: 13px; padding-right: 14px; padding-bottom: 13px; padding-left: 14px;
+                                spacing: 10px;
+
+                                // Speed summary
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    HorizontalLayout {
+                                        Text {
+                                            text: "Down";
+                                            font-size: 11px;
+                                            color: Theme.text-3;
+                                            vertical-alignment: center;
+                                        }
+                                        Rectangle { horizontal-stretch: 1; }
+                                        Text {
+                                            text: root.speed-down-text;
+                                            font-family: Theme.font-mono;
+                                            font-size: 12.5px;
+                                            font-weight: 700;
+                                            color: Theme.text-1;
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        Text {
+                                            text: "Up";
+                                            font-size: 11px;
+                                            color: Theme.text-3;
+                                            vertical-alignment: center;
+                                        }
+                                        Rectangle { horizontal-stretch: 1; }
+                                        Text {
+                                            text: root.speed-up-text;
+                                            font-family: Theme.font-mono;
+                                            font-size: 11.5px;
+                                            font-weight: 600;
+                                            color: Theme.text-2;
+                                        }
+                                    }
+                                }
+
+                                SparklineChart {
+                                    line-commands: root.spark-line-cmd;
+                                    fill-commands: root.spark-fill-cmd;
+                                    vb-width: 180;
+                                    vb-height: 28;
+                                    detailed: false;
+                                }
+
+                                Text {
+                                    text: root.active-summary-text;
+                                    font-size: 11px;
+                                    color: Theme.text-3;
+                                    overflow: elide;
+                                }
+
+                                // Disk bar
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    HorizontalLayout {
+                                        Text {
+                                            text: "Storage";
+                                            font-size: 11px;
+                                            color: Theme.text-3;
+                                        }
+                                        Rectangle { horizontal-stretch: 1; }
+                                        Text {
+                                            text: root.disk-free-text;
+                                            font-family: Theme.font-mono;
+                                            font-size: 10.5px;
+                                            color: Theme.text-2;
+                                        }
+                                    }
+                                    Rectangle {
+                                        height: 4px;
+                                        border-radius: 2px;
+                                        background: Theme.track;
+                                        clip: true;
+                                        Rectangle {
+                                            x: 0px;
+                                            y: 0px;
+                                            height: 4px;
+                                            width: parent.width * Math.clamp(root.disk-used-ratio, 0.04, 1.0);
+                                            border-radius: 2px;
+                                            background: Theme.accent;
+                                        }
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    GhostButton {
+                                        horizontal-stretch: 1;
+                                        label: root.all-paused ? "Resume All" : "Pause All";
+                                        icon: root.all-paused ? @image-url("icons/play.svg") : @image-url("icons/pause.svg");
+                                        has-icon: true;
+                                        btn-height: 28px;
+                                        pad-x: 8px;
+                                        clicked => { root.toggle-pause-all-clicked(); }
+                                    }
+                                    CircleIconButton {
+                                        icon: @image-url("icons/settings.svg");
+                                        clicked => { root.open-settings-clicked(); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ========================= RIGHT COLUMN (TOOLBAR + WORKSPACE) =========================
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    padding: 0px;
+                    spacing: 0px;
+
+                    // Top Toolbar (52px)
+                    Rectangle {
+                        height: 52px;
+                        background: Theme.bg-canvas;
+
+                        Rectangle {
+                            x: 0px;
+                            y: parent.height - 1px;
+                            width: parent.width;
+                            height: 1px;
+                            background: Theme.border;
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 18px;
+                            padding-right: 8px;
+                            spacing: 9px;
+
+                            PrimaryButton {
+                                y: 11px;
+                                label: "Add Download";
+                                icon: @image-url("icons/plus.svg");
+                                has-icon: true;
+                                clicked => { root.open-add-dialog-clicked(); }
+                            }
+
+                            // Search box
+                            Rectangle {
+                                width: 250px;
+                                height: 30px;
+                                y: 11px;
+                                border-radius: Theme.radius-md;
+                                background: Theme.bg-input;
+                                border-width: 1px;
+                                border-color: search-ti.has-focus ? Theme.accent : Theme.border;
+
+                                HorizontalLayout {
+                                    padding-left: 9px;
+                                    padding-right: 8px;
+                                    spacing: 7px;
+
+                                    Image {
+                                        source: @image-url("icons/search.svg");
+                                        width: 13px;
+                                        height: 13px;
+                                        colorize: Theme.text-3;
+                                        y: (parent.height - self.height) / 2;
+                                    }
+
+                                    search-ti := TextInput {
+                                        horizontal-stretch: 1;
+                                        text <=> root.search-query;
+                                        font-family: Theme.font-sans;
+                                        font-size: 12px;
+                                        color: Theme.text-1;
+                                        vertical-alignment: center;
+                                        single-line: true;
+                                        edited => { root.search-changed(self.text); }
+                                    }
+
+                                    if root.search-query == "" : PillBadge {
+                                        text: "Ctrl K";
+                                        y: 6px;
+                                    }
+                                }
+                            }
+
+                            // Drag spacer
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                TouchArea {
+                                    pointer-event(event) => {
+                                        if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                                            root.start-drag();
+                                        }
+                                    }
+                                    double-clicked => { root.toggle-maximize-window(); }
+                                }
+                            }
+
+                            GhostButton {
+                                y: 11px;
+                                label: root.speed-limit-label;
+                                icon: @image-url("icons/gauge.svg");
+                                has-icon: true;
+                                btn-height: 30px;
+                                active-highlight: root.speed-limit-active;
+                                clicked => {
+                                    root.speed-popover-open = !root.speed-popover-open;
+                                }
+                            }
+
+                            CircleIconButton {
+                                y: 11px;
+                                icon: @image-url("icons/command.svg");
+                                clicked => { root.open-palette-clicked(); }
+                            }
+
+                            CircleIconButton {
+                                y: 11px;
+                                icon: root.theme-light ? @image-url("icons/moon.svg") : @image-url("icons/sun.svg");
+                                clicked => { root.toggle-theme-clicked(); }
+                            }
+
+                            CircleIconButton {
+                                y: 11px;
+                                icon: @image-url("icons/settings.svg");
+                                clicked => { root.open-settings-clicked(); }
+                            }
+
+                            // Window Chrome controls
+                            HorizontalLayout {
+                                y: 11px;
+                                height: 30px;
+                                spacing: 2px;
+                                padding-left: 6px;
+
+                                Rectangle {
+                                    width: 34px;
+                                    height: 30px;
+                                    border-radius: 6px;
+                                    background: w-min.has-hover ? Theme.bg-hover : transparent;
+                                    Image {
+                                        source: @image-url("icons/minus.svg");
+                                        width: 12px;
+                                        height: 12px;
+                                        colorize: Theme.text-2;
+                                        x: 11px;
+                                        y: 9px;
+                                    }
+                                    w-min := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.minimize-window(); }
+                                    }
+                                }
+
+                                Rectangle {
+                                    width: 34px;
+                                    height: 30px;
+                                    border-radius: 6px;
+                                    background: w-max.has-hover ? Theme.bg-hover : transparent;
+                                    Image {
+                                        source: @image-url("icons/square.svg");
+                                        width: 11px;
+                                        height: 11px;
+                                        colorize: Theme.text-2;
+                                        x: 11.5px;
+                                        y: 9.5px;
+                                    }
+                                    w-max := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.toggle-maximize-window(); }
+                                    }
+                                }
+
+                                Rectangle {
+                                    width: 34px;
+                                    height: 30px;
+                                    border-radius: 6px;
+                                    background: w-close.has-hover ? Theme.red-hover : transparent;
+                                    Image {
+                                        source: @image-url("icons/x.svg");
+                                        width: 12px;
+                                        height: 12px;
+                                        colorize: w-close.has-hover ? #FFFFFF : Theme.text-2;
+                                        x: 11px;
+                                        y: 9px;
+                                    }
+                                    w-close := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.close-window(); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Workspace split: Transfer List + Inspector
+                    HorizontalLayout {
+                        vertical-stretch: 1;
+                        padding: 0px;
+                        spacing: 0px;
+
+                        // Central Transfer Pane
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            background: Theme.bg-canvas;
+
+                            if root.playlist-groups.length == 0 && root.active-rows.length == 0 && root.completed-rows.length == 0 : VerticalLayout {
+                                alignment: center;
+                                spacing: 10px;
+
+                                Rectangle {
+                                    width: 56px;
+                                    height: 56px;
+                                    border-radius: 16px;
+                                    background: Theme.accent-soft;
+                                    x: (parent.width - self.width) / 2;
+
+                                    Image {
+                                        source: @image-url("icons/download.svg");
+                                        width: 24px;
+                                        height: 24px;
+                                        colorize: Theme.accent;
+                                        x: 16px;
+                                        y: 16px;
+                                    }
+                                }
+
+                                Text {
+                                    text: root.search-query != "" ? "No matching transfers" : "Ready to download";
+                                    font-family: Theme.font-display;
+                                    font-size: 15px;
+                                    font-weight: 650;
+                                    color: Theme.text-1;
+                                    horizontal-alignment: center;
+                                }
+
+                                Text {
+                                    text: "Paste a direct URL, YouTube video/playlist, magnet link, or drop a .torrent file.";
+                                    font-size: 12.5px;
+                                    color: Theme.text-2;
+                                    horizontal-alignment: center;
+                                }
+
+                                HorizontalLayout {
+                                    alignment: center;
+                                    PrimaryButton {
+                                        label: "Add Download";
+                                        icon: @image-url("icons/plus.svg");
+                                        has-icon: true;
+                                        clicked => { root.open-add-dialog-clicked(); }
+                                    }
+                                }
+                            }
+
+                            if root.playlist-groups.length > 0 || root.active-rows.length > 0 || root.completed-rows.length > 0 : ScrollView {
+                                width: 100%;
+                                height: 100%;
+
+                                VerticalLayout {
+                                    alignment: start;
+                                    padding-top: 18px; padding-right: 22px; padding-bottom: 20px; padding-left: 22px;
+                                    spacing: 16px;
+
+                                    // Playlist Queue Groups
+                                    if root.playlist-groups.length > 0 : VerticalLayout {
+                                        spacing: 8px;
+
+                                        Text {
+                                            text: "PLAYLIST QUEUES";
+                                            font-size: 10.5px;
+                                            font-weight: 700;
+                                            letter-spacing: 0.7px;
+                                            color: Theme.text-3;
+                                        }
+
+                                        for grp in root.playlist-groups : Rectangle {
+                                            border-radius: Theme.radius-lg;
+                                            background: Theme.bg-elevated;
+                                            border-width: 1px;
+                                            border-color: Theme.border;
+                                            drop-shadow-blur: 6px;
+                                            drop-shadow-color: Theme.card-shadow;
+
+                                            VerticalLayout {
+                                                padding-top: 12px; padding-right: 14px; padding-bottom: 12px; padding-left: 14px;
+                                                spacing: 10px;
+
+                                                HorizontalLayout {
+                                                    spacing: 10px;
+
+                                                    CircleIconButton {
+                                                        icon: grp.expanded ? @image-url("icons/chevron-down.svg") : @image-url("icons/chevron-right.svg");
+                                                        ghost-square: true;
+                                                        y: 6px;
+                                                        clicked => { root.toggle-playlist-expand(grp.playlist-id); }
+                                                    }
+
+                                                    Rectangle {
+                                                        width: 38px;
+                                                        height: 38px;
+                                                        border-radius: 9px;
+                                                        background: Theme.accent-soft;
+                                                        Image {
+                                                            source: @image-url("icons/list-video.svg");
+                                                            width: 18px;
+                                                            height: 18px;
+                                                            colorize: Theme.accent;
+                                                            x: 10px;
+                                                            y: 10px;
+                                                        }
+                                                    }
+
+                                                    VerticalLayout {
+                                                        horizontal-stretch: 1;
+                                                        spacing: 3px;
+                                                        Text {
+                                                            text: grp.title;
+                                                            font-size: 13px;
+                                                            font-weight: 650;
+                                                            color: Theme.text-1;
+                                                            overflow: elide;
+                                                        }
+                                                        Text {
+                                                            text: grp.summary-line;
+                                                            font-size: 11.5px;
+                                                            color: Theme.text-2;
+                                                            overflow: elide;
+                                                        }
+                                                    }
+
+                                                    if grp.has-pause-items || grp.has-resume-items : CircleIconButton {
+                                                        icon: grp.is-paused ? @image-url("icons/play-filled.svg") : @image-url("icons/pause-filled.svg");
+                                                        icon-size: 12px;
+                                                        y: 4px;
+                                                        clicked => { root.toggle-playlist-pause(grp.playlist-id, grp.is-paused); }
+                                                    }
+
+                                                    CircleIconButton {
+                                                        icon: @image-url("icons/folder-open.svg");
+                                                        icon-size: 13px;
+                                                        y: 4px;
+                                                        clicked => { root.reveal-playlist-folder(grp.playlist-id); }
+                                                    }
+                                                }
+
+                                                if grp.expanded : VerticalLayout {
+                                                    spacing: 7px;
+                                                    padding-left: 14px;
+                                                    for child in grp.items : ActiveTransferCard {
+                                                        item: child;
+                                                        compact: true;
+                                                        selected: root.selected-id == child.id;
+                                                        select-clicked(id) => { root.select-transfer(id); }
+                                                        toggle-pause-clicked(id, paused) => { root.toggle-transfer-pause(id, paused); }
+                                                        open-floating-clicked(id) => { root.open-floating-progress(id); }
+                                                        refresh-link-clicked(id) => { root.open-refresh-dialog(id); }
+                                                        remove-clicked(id) => { root.remove-transfer(id); }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Active / Queued / Paused Transfers
+                                    if root.active-rows.length > 0 : VerticalLayout {
+                                        spacing: 8px;
+
+                                        Text {
+                                            text: "ACTIVE & QUEUED";
+                                            font-size: 10.5px;
+                                            font-weight: 700;
+                                            letter-spacing: 0.7px;
+                                            color: Theme.text-3;
+                                        }
+
+                                        for item in root.active-rows : ActiveTransferCard {
+                                            item: item;
+                                            compact: false;
+                                            selected: root.selected-id == item.id;
+                                            select-clicked(id) => { root.select-transfer(id); }
+                                            toggle-pause-clicked(id, paused) => { root.toggle-transfer-pause(id, paused); }
+                                            open-floating-clicked(id) => { root.open-floating-progress(id); }
+                                            refresh-link-clicked(id) => { root.open-refresh-dialog(id); }
+                                            remove-clicked(id) => { root.remove-transfer(id); }
+                                        }
+                                    }
+
+                                    // Completed Section
+                                    if root.completed-rows.length > 0 : VerticalLayout {
+                                        spacing: 6px;
+
+                                        Text {
+                                            text: "COMPLETED";
+                                            font-size: 10.5px;
+                                            font-weight: 700;
+                                            letter-spacing: 0.7px;
+                                            color: Theme.text-3;
+                                        }
+
+                                        for c in root.completed-rows : Rectangle {
+                                            height: 44px;
+                                            border-radius: 9px;
+                                            background: root.selected-id == c.id
+                                                ? Theme.accent-soft
+                                                : (c-ta.has-hover ? Theme.bg-hover : transparent);
+                                            border-width: 1px;
+                                            border-color: root.selected-id == c.id ? Theme.accent : Theme.border;
+
+                                            c-ta := TouchArea {
+                                                mouse-cursor: pointer;
+                                                clicked => { root.select-transfer(c.id); }
+                                                double-clicked => { root.open-completed-file(c.id); }
+                                            }
+
+                                            HorizontalLayout {
+                                                padding-left: 10px;
+                                                padding-right: 10px;
+                                                spacing: 10px;
+
+                                                Rectangle {
+                                                    width: 26px;
+                                                    height: 26px;
+                                                    y: 9px;
+                                                    border-radius: 7px;
+                                                    background: Theme.green-soft;
+                                                    TransferKindIcon {
+                                                        icon-kind: c.icon-kind;
+                                                        tint: Theme.green;
+                                                        width: 14px;
+                                                        height: 14px;
+                                                        x: 6px;
+                                                        y: 6px;
+                                                    }
+                                                }
+
+                                                Text {
+                                                    horizontal-stretch: 1;
+                                                    text: c.filename;
+                                                    font-size: 12.5px;
+                                                    font-weight: 550;
+                                                    color: Theme.text-1;
+                                                    overflow: elide;
+                                                    vertical-alignment: center;
+                                                }
+
+                                                if c.sha-verified == 1 : PillBadge {
+                                                    text: "SHA-256";
+                                                    tone: 2;
+                                                    has-check: true;
+                                                    y: 13px;
+                                                }
+
+                                                if c.tag-text != "" : PillBadge {
+                                                    text: c.tag-text;
+                                                    y: 13px;
+                                                }
+
+                                                Text {
+                                                    text: c.size-text;
+                                                    font-family: Theme.font-mono;
+                                                    font-size: 11.5px;
+                                                    color: Theme.text-2;
+                                                    vertical-alignment: center;
+                                                }
+
+                                                CircleIconButton {
+                                                    icon: @image-url("icons/external-link.svg");
+                                                    icon-size: 12px;
+                                                    ghost-square: true;
+                                                    y: 9px;
+                                                    clicked => { root.open-completed-file(c.id); }
+                                                }
+
+                                                CircleIconButton {
+                                                    icon: @image-url("icons/folder-open.svg");
+                                                    icon-size: 12px;
+                                                    ghost-square: true;
+                                                    y: 9px;
+                                                    clicked => { root.reveal-in-explorer(c.id); }
+                                                }
+
+                                                CircleIconButton {
+                                                    icon: @image-url("icons/trash-2.svg");
+                                                    icon-size: 12px;
+                                                    ghost-square: true;
+                                                    y: 9px;
+                                                    clicked => { root.remove-transfer(c.id); }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ========================= RIGHT INSPECTOR PANEL (316px) =========================
+                        Rectangle {
+                            width: 316px;
+                            background: Theme.bg-inspector;
+
+                            Rectangle {
+                                x: 0px;
+                                y: 0px;
+                                width: 1px;
+                                height: parent.height;
+                                background: Theme.border;
+                            }
+
+                            if !root.inspector.has-selection : VerticalLayout {
+                                padding: 24px;
+                                alignment: center;
+                                spacing: 8px;
+
+                                Image {
+                                    source: @image-url("icons/info.svg");
+                                    width: 24px;
+                                    height: 24px;
+                                    colorize: Theme.text-3;
+                                    x: (parent.width - self.width) / 2;
+                                }
+                                Text {
+                                    text: "Select a transfer";
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    color: Theme.text-2;
+                                    horizontal-alignment: center;
+                                }
+                                Text {
+                                    text: "Segment map, live throughput, and verification details appear here.";
+                                    font-size: 11.5px;
+                                    color: Theme.text-3;
+                                    horizontal-alignment: center;
+                                    wrap: word-wrap;
+                                }
+                            }
+
+                            if root.inspector.has-selection : ScrollView {
+                                width: 100%;
+                                height: 100%;
+
+                                VerticalLayout {
+                                    alignment: start;
+                                    padding: 16px;
+                                    spacing: 13px;
+
+                                    // Inspector title + status
+                                    VerticalLayout {
+                                        spacing: 5px;
+                                        HorizontalLayout {
+                                            spacing: 6px;
+                                            Text {
+                                                text: "INSPECTOR";
+                                                font-size: 10.5px;
+                                                font-weight: 700;
+                                                letter-spacing: 0.7px;
+                                                color: Theme.text-3;
+                                                vertical-alignment: center;
+                                            }
+                                            Rectangle { horizontal-stretch: 1; }
+                                            PillBadge {
+                                                text: root.inspector.status-label;
+                                                tone: root.inspector.status-tone;
+                                            }
+                                        }
+                                        Text {
+                                            text: root.inspector.filename;
+                                            font-size: 13.5px;
+                                            font-weight: 650;
+                                            color: Theme.text-1;
+                                            wrap: word-wrap;
+                                        }
+                                        Text {
+                                            text: root.inspector.source-domain + " • " + root.inspector.protocol-label;
+                                            font-size: 11.5px;
+                                            color: Theme.text-2;
+                                            overflow: elide;
+                                        }
+                                    }
+
+                                    // 16:9 Alpine / Transfer Preview Card
+                                    Rectangle {
+                                        height: 156px;
+                                        border-radius: 10px;
+                                        border-width: 1px;
+                                        border-color: Theme.border;
+                                        clip: true;
+
+                                        Image {
+                                            source: root.inspector.is-media
+                                                ? @image-url("assets/media-sheet.svg")
+                                                : @image-url("assets/alpine-preview.svg");
+                                            width: parent.width;
+                                            height: parent.height;
+                                            image-fit: cover;
+                                        }
+
+                                        if root.inspector.duration-text != "" : Rectangle {
+                                            x: parent.width - self.width - 8px;
+                                            y: parent.height - self.height - 8px;
+                                            width: dur-txt.preferred-width + 12px;
+                                            height: 20px;
+                                            border-radius: 5px;
+                                            background: #0F172ACC;
+                                            dur-txt := Text {
+                                                text: root.inspector.duration-text;
+                                                font-family: Theme.font-mono;
+                                                font-size: 10.5px;
+                                                font-weight: 600;
+                                                color: #FFFFFF;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                    }
+
+                                    // Metrics 2x2 Grid
+                                    Rectangle {
+                                        border-radius: 10px;
+                                        background: Theme.bg-elevated;
+                                        border-width: 1px;
+                                        border-color: Theme.border;
+
+                                        VerticalLayout {
+                                            padding-top: 10px; padding-right: 12px; padding-bottom: 10px; padding-left: 12px;
+                                            spacing: 8px;
+
+                                            HorizontalLayout {
+                                                spacing: 8px;
+                                                VerticalLayout {
+                                                    horizontal-stretch: 1;
+                                                    spacing: 1px;
+                                                    Text { text: "Speed"; font-size: 10.5px; color: Theme.text-3; }
+                                                    Text { text: root.inspector.speed-text; font-family: Theme.font-mono; font-size: 12px; font-weight: 650; color: Theme.text-1; }
+                                                }
+                                                VerticalLayout {
+                                                    horizontal-stretch: 1;
+                                                    spacing: 1px;
+                                                    Text { text: "Remaining"; font-size: 10.5px; color: Theme.text-3; }
+                                                    Text { text: root.inspector.eta-text; font-family: Theme.font-mono; font-size: 12px; font-weight: 650; color: Theme.text-1; }
+                                                }
+                                            }
+                                            HorizontalLayout {
+                                                spacing: 8px;
+                                                VerticalLayout {
+                                                    horizontal-stretch: 1;
+                                                    spacing: 1px;
+                                                    Text { text: "Progress"; font-size: 10.5px; color: Theme.text-3; }
+                                                    Text { text: root.inspector.size-text; font-family: Theme.font-mono; font-size: 11.5px; color: Theme.text-1; overflow: elide; }
+                                                }
+                                                VerticalLayout {
+                                                    horizontal-stretch: 1;
+                                                    spacing: 1px;
+                                                    Text { text: "Connections"; font-size: 10.5px; color: Theme.text-3; }
+                                                    Text { text: root.inspector.connections-text; font-family: Theme.font-mono; font-size: 11.5px; color: Theme.text-1; }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // SHA & Notices
+                                    if root.inspector.sha-text != "" : PillBadge {
+                                        text: root.inspector.sha-text;
+                                        tone: root.inspector.sha-tone;
+                                        has-check: root.inspector.sha-tone == 2;
+                                    }
+
+                                    if root.inspector.error-message != "" : Rectangle {
+                                        border-radius: 8px;
+                                        background: Theme.amber-soft;
+                                        border-width: 1px;
+                                        border-color: Theme.amber-border;
+                                        VerticalLayout {
+                                            padding-top: 8px; padding-right: 10px; padding-bottom: 8px; padding-left: 10px;
+                                            Text {
+                                                text: root.inspector.error-message;
+                                                font-size: 11.5px;
+                                                color: Theme.amber;
+                                                wrap: word-wrap;
+                                            }
+                                        }
+                                    }
+
+                                    if root.inspector.completion-notice != "" : Rectangle {
+                                        border-radius: 8px;
+                                        background: Theme.green-soft;
+                                        VerticalLayout {
+                                            padding-top: 8px; padding-right: 10px; padding-bottom: 8px; padding-left: 10px;
+                                            Text {
+                                                text: root.inspector.completion-notice;
+                                                font-size: 11.5px;
+                                                color: Theme.green;
+                                                wrap: word-wrap;
+                                            }
+                                        }
+                                    }
+
+                                    // Segment Matrix (first 8 / 16 segments compact list)
+                                    if root.inspector.segments.length > 0 : VerticalLayout {
+                                        spacing: 6px;
+                                        Text {
+                                            text: "SEGMENTS (" + root.inspector.segments.length + ")";
+                                            font-size: 10.5px;
+                                            font-weight: 700;
+                                            letter-spacing: 0.7px;
+                                            color: Theme.text-3;
+                                        }
+                                        for seg in root.inspector.segments : Rectangle {
+                                            height: 24px;
+                                            border-radius: 6px;
+                                            background: Theme.bg-elevated;
+                                            border-width: 1px;
+                                            border-color: Theme.border;
+                                            HorizontalLayout {
+                                                padding-left: 8px;
+                                                padding-right: 8px;
+                                                spacing: 8px;
+                                                Rectangle {
+                                                    width: 7px;
+                                                    height: 7px;
+                                                    border-radius: 3.5px;
+                                                    y: 8.5px;
+                                                    background: seg.state-code == 1 ? Theme.green
+                                                        : (seg.state-code == 0 || seg.state-code == 3 ? Theme.accent
+                                                        : (seg.state-code == 4 ? Theme.danger : Theme.text-3));
+                                                }
+                                                Text { width: 22px; text: seg.index-text; font-family: Theme.font-mono; font-size: 11px; color: Theme.text-2; vertical-alignment: center; }
+                                                Text { horizontal-stretch: 1; text: seg.bytes-text; font-family: Theme.font-mono; font-size: 11px; color: Theme.text-1; vertical-alignment: center; }
+                                                Text { text: seg.state-label; font-size: 10.5px; color: Theme.text-3; vertical-alignment: center; }
+                                            }
+                                        }
+                                    }
+
+                                    // Torrent files if any
+                                    if root.inspector.is-torrent && root.inspector.torrent-files.length > 0 : VerticalLayout {
+                                        spacing: 6px;
+                                        HorizontalLayout {
+                                            Text {
+                                                horizontal-stretch: 1;
+                                                text: "TORRENT FILES";
+                                                font-size: 10.5px;
+                                                font-weight: 700;
+                                                letter-spacing: 0.7px;
+                                                color: Theme.text-3;
+                                                vertical-alignment: center;
+                                            }
+                                            GhostButton {
+                                                label: "Apply";
+                                                btn-height: 22px;
+                                                pad-x: 8px;
+                                                clicked => { root.apply-torrent-files(root.inspector.id); }
+                                            }
+                                        }
+                                        for tf in root.inspector.torrent-files : CheckBoxRow {
+                                            checked: tf.selected;
+                                            label: tf.relative-path + " (" + tf.size-text + ")";
+                                            toggled(_) => { root.toggle-torrent-file(tf.index); }
+                                        }
+                                    }
+
+                                    // Action buttons
+                                    VerticalLayout {
+                                        spacing: 6px;
+                                        padding-top: 4px;
+
+                                        HorizontalLayout {
+                                            spacing: 6px;
+                                            if root.inspector.can-pause-resume : PrimaryButton {
+                                                horizontal-stretch: 1;
+                                                label: root.inspector.is-paused ? "Resume" : "Pause";
+                                                icon: root.inspector.is-paused ? @image-url("icons/play.svg") : @image-url("icons/pause.svg");
+                                                has-icon: true;
+                                                clicked => { root.toggle-transfer-pause(root.inspector.id, root.inspector.is-paused); }
+                                            }
+                                            if !root.inspector.is-completed : GhostButton {
+                                                horizontal-stretch: 1;
+                                                label: "Floating Box";
+                                                icon: @image-url("icons/app-window.svg");
+                                                has-icon: true;
+                                                clicked => { root.open-floating-progress(root.inspector.id); }
+                                            }
+                                            if root.inspector.is-completed : PrimaryButton {
+                                                horizontal-stretch: 1;
+                                                label: "Open File";
+                                                icon: @image-url("icons/external-link.svg");
+                                                has-icon: true;
+                                                clicked => { root.open-completed-file(root.inspector.id); }
+                                            }
+                                        }
+
+                                        HorizontalLayout {
+                                            spacing: 6px;
+                                            GhostButton {
+                                                horizontal-stretch: 1;
+                                                label: "Open Folder";
+                                                icon: @image-url("icons/folder-open.svg");
+                                                has-icon: true;
+                                                clicked => { root.reveal-in-explorer(root.inspector.id); }
+                                            }
+                                            if root.inspector.can-verify : GhostButton {
+                                                horizontal-stretch: 1;
+                                                label: "Verify SHA-256";
+                                                icon: @image-url("icons/file-check-2.svg");
+                                                has-icon: true;
+                                                clicked => { root.open-verify-dialog(root.inspector.id); }
+                                            }
+                                            if root.inspector.can-refresh-url : GhostButton {
+                                                horizontal-stretch: 1;
+                                                label: "Refresh Link";
+                                                icon: @image-url("icons/refresh-cw.svg");
+                                                has-icon: true;
+                                                clicked => { root.open-refresh-dialog(root.inspector.id); }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Speed limit quick popover (top right of toolbar)
+            if root.speed-popover-open : Rectangle {
+                x: parent.width - 390px;
+                y: 54px;
+                width: 240px;
+                height: 112px;
+                border-radius: 12px;
+                background: Theme.bg-elevated;
+                border-width: 1px;
+                border-color: Theme.border-strong;
+                drop-shadow-blur: 20px;
+                drop-shadow-offset-y: 8px;
+                drop-shadow-color: Theme.popover-shadow;
+
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 8px;
+                    Text {
+                        text: "Global Speed Limit (MB/s)";
+                        font-size: 12px;
+                        font-weight: 600;
+                        color: Theme.text-1;
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        StyledLineEdit {
+                            horizontal-stretch: 1;
+                            mono: true;
+                            text <=> root.speed-popover-input;
+                            placeholder: "Empty = Unlimited";
+                            accepted => {
+                                root.apply-speed-limit-clicked(root.speed-popover-input);
+                                root.speed-popover-open = false;
+                            }
+                        }
+                        PrimaryButton {
+                            label: "Set";
+                            btn-height: 31px;
+                            clicked => {
+                                root.apply-speed-limit-clicked(root.speed-popover-input);
+                                root.speed-popover-open = false;
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        GhostButton {
+                            label: "Unlimited";
+                            btn-height: 24px;
+                            pad-x: 8px;
+                            clicked => {
+                                root.speed-popover-input = "";
+                                root.apply-speed-limit-clicked("");
+                                root.speed-popover-open = false;
+                            }
+                        }
+                        GhostButton {
+                            label: "5 MB/s";
+                            btn-height: 24px;
+                            pad-x: 8px;
+                            clicked => {
+                                root.speed-popover-input = "5";
+                                root.apply-speed-limit-clicked("5");
+                                root.speed-popover-open = false;
+                            }
+                        }
+                        GhostButton {
+                            label: "25 MB/s";
+                            btn-height: 24px;
+                            pad-x: 8px;
+                            clicked => {
+                                root.speed-popover-input = "25";
+                                root.apply-speed-limit-clicked("25");
+                                root.speed-popover-open = false;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Overlays
+            AddDownloadOverlay {
+                open <=> root.add-open;
+                source-text <=> root.add-source-text;
+                probing: root.add-probing;
+                submitting: root.add-submitting;
+                error-text: root.add-error-text;
+                active-tab <=> root.add-tab;
+                has-probe: root.add-has-probe;
+                is-torrent-input: root.add-is-torrent-input;
+                is-direct-http: root.add-is-direct-http;
+                probe-title: root.add-probe-title;
+                probe-meta: root.add-probe-meta;
+                is-playlist: root.add-is-playlist;
+                playlist-count: root.add-playlist-count;
+                playlist-selected-count: root.add-playlist-selected-count;
+                playlist-folder-name <=> root.add-playlist-folder-name;
+                playlist-filter <=> root.add-playlist-filter;
+                playlist-items: root.add-playlist-items;
+                format-options: root.add-format-options;
+                container-index <=> root.add-container-index;
+                audio-preset-index <=> root.add-audio-preset-index;
+                embed-subtitles <=> root.add-embed-subtitles;
+                lossless-remux <=> root.add-lossless-remux;
+                normalize-audio <=> root.add-normalize-audio;
+                subtitles: root.add-subtitles;
+                torrent-sequential <=> root.add-torrent-sequential;
+                save-dir <=> root.add-save-dir;
+                threads-index <=> root.add-threads-index;
+                advanced-open <=> root.add-advanced-open;
+                filename-override <=> root.add-filename-override;
+                expected-sha256 <=> root.add-expected-sha256;
+                batch-preview-count: root.add-batch-preview-count;
+                footer-hint: root.add-footer-hint;
+                close-requested => { root.add-close-requested(); }
+                source-edited(val) => { root.add-source-edited(val); }
+                probe-clicked => { root.add-probe-clicked(); }
+                browse-torrent-clicked => { root.add-browse-torrent-clicked(); }
+                browse-save-dir-clicked => { root.add-browse-save-dir-clicked(); }
+                format-selected(id) => { root.add-format-selected(id); }
+                playlist-item-toggled(idx) => { root.add-playlist-item-toggled(idx); }
+                playlist-select-all => { root.add-playlist-select-all(); }
+                playlist-clear => { root.add-playlist-clear(); }
+                subtitle-toggled(lang) => { root.add-subtitle-toggled(lang); }
+                submit-clicked => { root.add-submit-clicked(); }
+            }
+
+            SettingsOverlay {
+                open <=> root.settings-open;
+                theme-index <=> root.set-theme-index;
+                accent-index <=> root.set-accent-index;
+                default-download-dir <=> root.set-default-download-dir;
+                default-connections <=> root.set-default-connections;
+                max-concurrent <=> root.set-max-concurrent;
+                speed-limit-mbps <=> root.set-speed-limit-mbps;
+                close-to-tray <=> root.set-close-to-tray;
+                auto-defender-scan <=> root.set-auto-defender-scan;
+                monitor-clipboard <=> root.set-monitor-clipboard;
+                show-download-dialog <=> root.set-show-download-dialog;
+                show-progress-dialog <=> root.set-show-progress-dialog;
+                show-complete-dialog <=> root.set-show-complete-dialog;
+                update-mode-index <=> root.set-update-mode-index;
+                ytdlp-override <=> root.set-ytdlp-override;
+                ffmpeg-override <=> root.set-ffmpeg-override;
+                ytdlp-status-label: root.set-ytdlp-status-label;
+                ytdlp-status-tone: root.set-ytdlp-status-tone;
+                ytdlp-version: root.set-ytdlp-version;
+                ytdlp-path: root.set-ytdlp-path;
+                ffmpeg-status-label: root.set-ffmpeg-status-label;
+                ffmpeg-status-tone: root.set-ffmpeg-status-tone;
+                ffmpeg-version: root.set-ffmpeg-version;
+                ffmpeg-path: root.set-ffmpeg-path;
+                ffprobe-status-label: root.set-ffprobe-status-label;
+                ffprobe-status-tone: root.set-ffprobe-status-tone;
+                ffprobe-path: root.set-ffprobe-path;
+                ytdlp-updating: root.set-ytdlp-updating;
+                ytdlp-notice: root.set-ytdlp-notice;
+                ytdlp-error: root.set-ytdlp-error;
+                browsers: root.set-browsers;
+                browser-notice: root.set-browser-notice;
+                browser-error: root.set-browser-error;
+                about-version: root.version-label;
+                update-checking: root.set-update-checking;
+                update-installing: root.set-update-installing;
+                update-available: root.set-update-available;
+                update-version-label: root.set-update-version-label;
+                update-notes: root.set-update-notes;
+                update-progress-percent: root.set-update-progress-percent;
+                update-progress-text: root.set-update-progress-text;
+                update-status-text: root.set-update-status-text;
+                update-error: root.set-update-error;
+                saving: root.set-saving;
+                error-text: root.set-error-text;
+                close-requested => { root.settings-close-requested(); }
+                save-clicked => { root.settings-save-clicked(); }
+                browse-download-dir => { root.settings-browse-download-dir(); }
+                hibernate-now-clicked => { root.settings-hibernate-now(); }
+                refresh-toolchain-clicked => { root.settings-refresh-toolchain(); }
+                update-ytdlp-clicked => { root.settings-update-ytdlp(); }
+                setup-browser-clicked(id) => { root.settings-setup-browser(id); }
+                copy-text-clicked(txt) => { root.settings-copy-text(txt); }
+                check-updates-clicked => { root.settings-check-updates(); }
+                install-update-clicked => { root.settings-install-update(); }
+            }
+
+            CommandPaletteOverlay {
+                open <=> root.palette-open;
+                query <=> root.palette-query;
+                selected-index <=> root.palette-selected-index;
+                actions: root.palette-actions;
+                close-requested => { root.palette-open = false; }
+                query-edited(q) => { root.palette-query-edited(q); }
+                action-triggered(id) => { root.palette-action-triggered(id); }
+            }
+
+            RefreshLinkOverlay {
+                open <=> root.refresh-open;
+                filename: root.refresh-filename;
+                new-url <=> root.refresh-url;
+                submitting: root.refresh-submitting;
+                error-text: root.refresh-error;
+                close-requested => { root.refresh-open = false; }
+                submit-clicked => { root.refresh-submit-clicked(); }
+            }
+
+            VerifyShaOverlay {
+                open <=> root.verify-open;
+                filename: root.verify-filename;
+                expected-sha256 <=> root.verify-sha;
+                submitting: root.verify-submitting;
+                error-text: root.verify-error;
+                close-requested => { root.verify-open = false; }
+                submit-clicked => { root.verify-submit-clicked(); }
+            }
+        }
+    }
+}

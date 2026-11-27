@@ -88,8 +88,13 @@ jobs:
           $head = git rev-parse HEAD
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($head -cne $tagCommit) { throw "The checkout does not match $tag." }
-          $appConfig = Get-Content -LiteralPath apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
-          if ($appConfig.version -cne $version) { throw "Tauri version $($appConfig.version) does not match $tag." }
+          $workspaceToml = Get-Content -LiteralPath Cargo.toml -Raw
+          $verMatch = [regex]::Match($workspaceToml, '(?ms)^\[workspace\.package\].*?^\s*version\s*=\s*"([^"]+)"')
+          if (-not $verMatch.Success) { throw "Could not find workspace version in Cargo.toml." }
+          $cargoVersion = $verMatch.Groups[1].Value
+          if ($cargoVersion -cne $version) { throw "Workspace Cargo.toml version $cargoVersion does not match $tag." }
+          $ipcPkg = Get-Content -LiteralPath packages/ipc-types/package.json -Raw | ConvertFrom-Json
+          if ($ipcPkg.version -cne $version) { throw "packages/ipc-types version $($ipcPkg.version) does not match $tag." }
           Write-Output "tag=$tag" >> $env:GITHUB_OUTPUT
           Write-Output "version=$version" >> $env:GITHUB_OUTPUT
 
@@ -137,29 +142,33 @@ jobs:
           cargo clippy --locked --workspace --all-targets -- -D warnings
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Build native messaging host and stage extensions
+      - name: Build desktop, native host, signer and stage resources
         env:
           CARGO_NET_OFFLINE: 'true'
         run: |
-          cargo build --release -p slipstream-native-host --locked
+          cargo build --release --locked -p slipstream-desktop --bin slipstream-desktop --bin slipstream-sign
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $resources = "apps/desktop/src-tauri/resources"
-          New-Item -ItemType Directory -Force "$resources/bin", "$resources/extensions" | Out-Null
-          Copy-Item -LiteralPath "target/release/slipstream-native-host.exe" -Destination "$resources/bin/"
+          cargo build --release --locked -p slipstream-native-host
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $stage = "target/release/stage"
+          if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+          New-Item -ItemType Directory -Force "$stage/bin", "$stage/extensions" | Out-Null
+          Copy-Item -LiteralPath "target/release/slipstream-desktop.exe" -Destination "$stage/SlipStream.exe"
+          Copy-Item -LiteralPath "target/release/slipstream-native-host.exe" -Destination "$stage/bin/"
           foreach ($browser in @("chrome", "firefox")) {
             $extension = "extensions/browser/dist/$browser"
             if (-not (Test-Path -LiteralPath "$extension/manifest.json" -PathType Leaf)) {
               throw "Missing $browser extension build."
             }
-            Copy-Item -LiteralPath $extension -Destination "$resources/extensions/$browser" -Recurse
+            Copy-Item -LiteralPath $extension -Destination "$stage/extensions/$browser" -Recurse
           }
-          Copy-Item -LiteralPath "THIRD_PARTY_NOTICES.md" -Destination $resources
+          Copy-Item -LiteralPath "THIRD_PARTY_NOTICES.md" -Destination $stage
 
       - *download_media_tools
 
       - name: Stage verified media tools and required notices
         run: |
-          $bin = "apps/desktop/src-tauri/resources/bin"
+          $bin = "target/release/stage/bin"
           $downloadDir = Join-Path $env:RUNNER_TEMP "slipstream-media"
           $ffmpegName = "ffmpeg-$env:FFMPEG_VERSION-essentials_build"
           $ffmpegDir = Join-Path $downloadDir $ffmpegName
@@ -179,12 +188,46 @@ jobs:
           Copy-RequiredNotice "$ffmpegDir/LICENSE" "ffmpeg-LICENSE.txt"
           Copy-RequiredNotice "$ffmpegDir/README.txt" "ffmpeg-README.txt"
 
-      - name: Build signed NSIS installer and updater artifacts
-        working-directory: apps/desktop
+      - name: Build signed NSIS installer and updater signature
+        shell: pwsh
         env:
-          CARGO_NET_OFFLINE: 'true'
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        run: pnpm.cmd exec tauri build --bundles nsis --config src-tauri/tauri.release.conf.json -- --locked
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw "Missing TAURI_SIGNING_PRIVATE_KEY secret for release signing."
+          }
+          $makensis = Get-Command makensis -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -First 1
+          if (-not $makensis) {
+            foreach ($cand in @("C:\Program Files (x86)\NSIS\makensis.exe", "C:\Program Files\NSIS\makensis.exe")) {
+              if (Test-Path -LiteralPath $cand -PathType Leaf) { $makensis = $cand; break }
+            }
+          }
+          if (-not $makensis) {
+            choco install nsis --version=3.10 -y --no-progress | Out-Host
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            foreach ($cand in @("C:\Program Files (x86)\NSIS\makensis.exe", "C:\Program Files\NSIS\makensis.exe")) {
+              if (Test-Path -LiteralPath $cand -PathType Leaf) { $makensis = $cand; break }
+            }
+          }
+          if (-not $makensis) { throw "NSIS makensis.exe could not be installed." }
+
+          $bundleDir = "target/release/bundle/nsis"
+          New-Item -ItemType Directory -Force $bundleDir | Out-Null
+          $stageAbs = (Resolve-Path "target/release/stage").Path
+          $setupAbs = Join-Path (Resolve-Path $bundleDir).Path "SlipStream_${env:RELEASE_VERSION}_x64-setup.exe"
+          $sigAbs = "$setupAbs.sig"
+
+          & $makensis /DVERSION="$env:RELEASE_VERSION" /DSTAGE_DIR="$stageAbs" /DOUTFILE="$setupAbs" "apps/desktop/installer/slipstream.nsi"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path -LiteralPath $setupAbs -PathType Leaf)) {
+            throw "NSIS installer was not created at $setupAbs."
+          }
+
+          & "target/release/slipstream-sign.exe" --file "$setupAbs" --version "$env:RELEASE_VERSION" --out "$sigAbs"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Package release assets, latest.json, and SHA256SUMS.txt
         shell: pwsh
@@ -196,7 +239,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $out = "release-assets"
           New-Item -ItemType Directory -Force $out | Out-Null
-          $resources = "apps/desktop/src-tauri/resources"
+          $stage = "target/release/stage"
 
           $setupName = "SlipStream_${env:RELEASE_VERSION}_x64-setup.exe"
           $setup = Get-Item -LiteralPath "target/release/bundle/nsis/$setupName"
@@ -206,16 +249,17 @@ jobs:
           $sigContent = $sigContent.Trim()
 
           $requiredResources = @(
+            "SlipStream.exe",
             "THIRD_PARTY_NOTICES.md",
             "bin/slipstream-native-host.exe", "bin/yt-dlp.exe", "bin/ffmpeg.exe", "bin/ffprobe.exe",
             "bin/yt-dlp-LICENSE.txt", "bin/ffmpeg-LICENSE.txt", "bin/ffmpeg-README.txt",
-            "extensions/chrome/manifest.json", "extensions/firefox/manifest.json"
+            "extensions/chrome/manifest.json", "extensions/chrome/icons/icon128.png",
+            "extensions/firefox/manifest.json", "extensions/firefox/icons/icon128.png"
           )
-          $installerScript = Get-Content -Raw -LiteralPath "target/release/nsis/x64/installer.nsi"
           foreach ($resource in $requiredResources) {
-            $destination = $resource.Replace('/', '\')
-            if (-not $installerScript.Contains('"/oname=' + $destination + '"')) {
-              throw "NSIS installer is missing $resource."
+            $path = Join-Path $stage $resource
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Staged release bundle is missing $resource."
             }
           }
 
@@ -226,16 +270,18 @@ jobs:
 
           # Portable Windows x64 ZIP
           $portableStage = Join-Path $env:RUNNER_TEMP "slipstream-portable"
+          if (Test-Path -LiteralPath $portableStage) { Remove-Item -LiteralPath $portableStage -Recurse -Force }
           New-Item -ItemType Directory -Force $portableStage | Out-Null
-          Copy-Item -LiteralPath "target/release/slipstream-desktop.exe" -Destination "$portableStage/SlipStream.exe"
-          Copy-Item -LiteralPath "$resources/bin", "$resources/extensions" -Destination $portableStage -Recurse
-          Copy-Item -LiteralPath "$resources/THIRD_PARTY_NOTICES.md", "README.md", "CHANGELOG.md" -Destination $portableStage
+          Get-ChildItem -LiteralPath $stage | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $portableStage $_.Name) -Recurse -Force
+          }
+          Copy-Item -LiteralPath "README.md", "CHANGELOG.md" -Destination $portableStage
           $portableZip = Join-Path $out "SlipStream-$env:RELEASE_VERSION-windows-x64-portable.zip"
           Compress-Archive -Path "$portableStage/*" -DestinationPath $portableZip -CompressionLevel Optimal -Force
           $archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $portableZip).Path)
           try {
             $entries = @($archive.Entries | Where-Object Length -gt 0 | ForEach-Object { $_.FullName.Replace('\', '/') })
-            foreach ($name in $requiredResources + @("SlipStream.exe")) {
+            foreach ($name in $requiredResources) {
               if ($entries -cnotcontains $name) { throw "Portable ZIP is missing $name." }
             }
             foreach ($browser in @("chrome", "firefox")) {
@@ -249,9 +295,9 @@ jobs:
 
           # Cross-browser MV3 extension ZIPs
           $chromeZip = Join-Path $out "slipstream-extension-$env:RELEASE_VERSION-chrome-edge-brave.zip"
-          Compress-Archive -Path "$resources/extensions/chrome/*" -DestinationPath $chromeZip -CompressionLevel Optimal -Force
+          Compress-Archive -Path "$stage/extensions/chrome/*" -DestinationPath $chromeZip -CompressionLevel Optimal -Force
           $firefoxZip = Join-Path $out "slipstream-extension-$env:RELEASE_VERSION-firefox.zip"
-          Compress-Archive -Path "$resources/extensions/firefox/*" -DestinationPath $firefoxZip -CompressionLevel Optimal -Force
+          Compress-Archive -Path "$stage/extensions/firefox/*" -DestinationPath $firefoxZip -CompressionLevel Optimal -Force
 
           # Tauri v2 updater latest.json manifest
           $changelog = Get-Content -Raw -LiteralPath "CHANGELOG.md"
@@ -278,6 +324,10 @@ jobs:
             throw "latest.json does not match the tagged installer and its signature."
           }
 
+          # Verify signature against desktop embedded public key before publication
+          & "target/release/slipstream-sign.exe" --verify --file "$($setup.FullName)" --version "$($latest.version)" --sig "$($platform.signature)"
+          if ($LASTEXITCODE -ne 0) { throw "Updater signature failed verification against embedded desktop public key." }
+
           # Checksums
           $files = Get-ChildItem -LiteralPath $out -File | Where-Object { $_.Name -ne "SHA256SUMS.txt" } | Sort-Object Name
           $lines = foreach ($f in $files) {
@@ -301,7 +351,7 @@ jobs:
           $template = @'
           # SlipStream __TAG__
 
-          High-speed Windows 10/11 download manager built with **Rust**, **Tauri v2**, **React 19**, and a **Manifest V3** browser extension.
+          High-speed Windows 10/11 download manager built cleanly with **Pure Rust**, **Slint**, and a **Manifest V3** browser extension.
 
           ## Downloads
           - **Installer (Recommended, Signed Auto-Update):** `__SETUP__`
