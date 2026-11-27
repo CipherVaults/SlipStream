@@ -172,6 +172,30 @@ Section "SlipStream" SecMain
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SlipStream" "NoModify" 1
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SlipStream" "NoRepair" 1
 
+  StrCpy $1 '"$INSTDIR\SlipStream.exe" "%1"'
+  ReadRegStr $2 HKCU "Software\Classes\SlipStream.Magnet\shell\open\command" ""
+  ClearErrors
+  ReadRegStr $0 HKCU "Software\Classes\magnet\shell\open\command" ""
+  ${IfNot} ${Errors}
+  ${AndIf} $0 != $1
+    ${If} $2 == ""
+    ${OrIf} $0 != $2
+      WriteRegStr HKCU "Software\SlipStream" "PrevMagnetCommand" "$0"
+    ${EndIf}
+  ${EndIf}
+
+  WriteRegStr HKCU "Software\Classes\SlipStream.Magnet" "" "URL:Magnet Protocol"
+  WriteRegStr HKCU "Software\Classes\SlipStream.Magnet" "URL Protocol" ""
+  WriteRegStr HKCU "Software\Classes\SlipStream.Magnet\shell\open\command" "" "$1"
+  ; Preserve an existing protocol marker and remember if we add one.
+  ClearErrors
+  ReadRegStr $0 HKCU "Software\Classes\magnet" "URL Protocol"
+  ${If} ${Errors}
+    WriteRegStr HKCU "Software\Classes\magnet" "URL Protocol" ""
+    WriteRegDWORD HKCU "Software\SlipStream" "MagnetAddedUrlProtocol" 1
+  ${EndIf}
+  WriteRegStr HKCU "Software\Classes\magnet\shell\open\command" "" "$1"
+
   ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
   IntFmt $0 "0x%08X" $0
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SlipStream" "EstimatedSize" "$0"
@@ -247,4 +271,28 @@ Section "Uninstall"
   RMDir "$INSTDIR"
 
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SlipStream"
+  DeleteRegKey HKCU "Software\Classes\SlipStream.Magnet"
+  ReadRegStr $0 HKCU "Software\Classes\magnet\shell\open\command" ""
+  ${If} $0 == '"$INSTDIR\SlipStream.exe" "%1"'
+    ClearErrors
+    ReadRegStr $0 HKCU "Software\SlipStream" "PrevMagnetCommand"
+    ${If} ${Errors}
+      DeleteRegValue HKCU "Software\Classes\magnet\shell\open\command" ""
+      DeleteRegKey /ifempty HKCU "Software\Classes\magnet\shell\open\command"
+      DeleteRegKey /ifempty HKCU "Software\Classes\magnet\shell\open"
+      DeleteRegKey /ifempty HKCU "Software\Classes\magnet\shell"
+    ${Else}
+      WriteRegStr HKCU "Software\Classes\magnet\shell\open\command" "" "$0"
+    ${EndIf}
+    ReadRegDWORD $0 HKCU "Software\SlipStream" "MagnetAddedUrlProtocol"
+    ${If} $0 == 1
+      ReadRegStr $0 HKCU "Software\Classes\magnet" "URL Protocol"
+      ${If} $0 == ""
+        DeleteRegValue HKCU "Software\Classes\magnet" "URL Protocol"
+      ${EndIf}
+    ${EndIf}
+    DeleteRegKey /ifempty HKCU "Software\Classes\magnet"
+  ${EndIf}
+  DeleteRegValue HKCU "Software\SlipStream" "PrevMagnetCommand"
+  DeleteRegValue HKCU "Software\SlipStream" "MagnetAddedUrlProtocol"
 SectionEnd

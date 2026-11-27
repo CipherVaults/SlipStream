@@ -14,6 +14,7 @@ import {
     FormatOptionModel,
     SubtitleItemModel,
     PlaylistItemModel,
+    TorrentPreviewFileModel,
     BrowserCardModel,
     PaletteActionModel,
 } from "./app_types.slint";
@@ -57,6 +58,14 @@ export component AddDownloadOverlay inherits Rectangle {
     in-out property <bool> lossless-remux: true;
     in-out property <bool> normalize-audio: false;
     in property <[SubtitleItemModel]> subtitles: [];
+    in property <bool> torrent-preview-loading: false;
+    in property <bool> has-torrent-preview: false;
+    in property <string> torrent-preview-name: "";
+    in property <string> torrent-preview-meta: "";
+    in property <int> torrent-preview-trackers: 0;
+    in property <[TorrentPreviewFileModel]> torrent-preview-files: [];
+    in-out property <string> torrent-preview-filter: "";
+    in-out property <bool> torrent-start-paused: false;
     in-out property <bool> torrent-sequential: true;
     in-out property <string> save-dir: "";
     in-out property <int> threads-index: 1; // 0=32, 1=16, 2=8, 3=4
@@ -69,7 +78,12 @@ export component AddDownloadOverlay inherits Rectangle {
     callback close-requested();
     callback source-edited(string);
     callback probe-clicked();
+    callback cancel-torrent-preview-clicked();
     callback browse-torrent-clicked();
+    callback torrent-preview-file-toggled(int);
+    callback torrent-preview-select-all();
+    callback torrent-preview-select-none();
+    callback torrent-preview-filter-edited(string);
     callback browse-save-dir-clicked();
     callback format-selected(string);
     callback playlist-item-toggled(int);
@@ -134,22 +148,32 @@ export component AddDownloadOverlay inherits Rectangle {
                             porcelain: true;
                             mono: true;
                             text <=> root.source-text;
-                            placeholder: "https://... or magnet:?xt=urn:btih:... or image-[001..050].jpg";
+                            read-only: root.submitting;
+                            placeholder: "https://... or magnet:?xt=urn:btih:... or image-[001-050].jpg";
                             edited(val) => { root.source-edited(val); }
                             accepted => { root.probe-clicked(); }
                         }
                         if root.active-tab == 3 : GhostButton {
                             label: "Browse";
+                            enabled: !root.submitting;
                             porcelain: true;
                             btn-height: 31px;
                             clicked => { root.browse-torrent-clicked(); }
                         }
                         GhostButton {
-                            label: root.probing ? "Probing..." : "Probe";
+                            label: root.is-torrent-input
+                                ? (root.torrent-preview-loading ? "Cancel inspection" : "Inspect")
+                                : (root.probing ? "Probing..." : "Probe");
                             porcelain: true;
                             btn-height: 31px;
-                            enabled: !root.probing && !root.is-torrent-input;
-                            clicked => { root.probe-clicked(); }
+                            enabled: !root.submitting && (root.is-torrent-input || !root.probing);
+                            clicked => {
+                                if (root.torrent-preview-loading) {
+                                    root.cancel-torrent-preview-clicked();
+                                } else {
+                                    root.probe-clicked();
+                                }
+                            }
                         }
                     }
                 }
@@ -336,6 +360,7 @@ export component AddDownloadOverlay inherits Rectangle {
                                                 padding-right: 8px;
                                                 spacing: 8px;
                                                 CheckBoxRow {
+                                                    controlled: true;
                                                     checked: item.checked;
                                                     porcelain: true;
                                                     toggled(_) => { root.playlist-item-toggled(item.index); }
@@ -557,6 +582,7 @@ export component AddDownloadOverlay inherits Rectangle {
                                     spacing: 8px;
                                     CheckBoxRow {
                                         horizontal-stretch: 1;
+                                        controlled: true;
                                         checked: sub.checked;
                                         porcelain: true;
                                         label: sub.label + (sub.is-auto ? " (Auto)" : "");
@@ -566,13 +592,89 @@ export component AddDownloadOverlay inherits Rectangle {
                             }
                         }
 
-                        // Tab 3: Torrent / Magnet
                         if root.active-tab == 3 : VerticalLayout {
                             spacing: 8px;
+                            if root.torrent-preview-loading : Rectangle {
+                                background: Theme.add-accent-soft;
+                                border-radius: Theme.radius-md;
+                                VerticalLayout {
+                                    padding: 10px;
+                                    spacing: 4px;
+                                    Text { text: "Fetching torrent metadata from peers & DHT..."; color: Theme.add-text; font-weight: 600; }
+                                    Text { text: "Wait for inspection to finish or cancel it to continue."; color: Theme.add-muted; }
+                                }
+                            }
+                            if root.has-torrent-preview : VerticalLayout {
+                                spacing: 7px;
+                                Rectangle {
+                                    background: Theme.add-raised;
+                                    border-radius: Theme.radius-md;
+                                    VerticalLayout {
+                                        padding: 10px;
+                                        spacing: 4px;
+                                        Text { text: root.torrent-preview-name; color: Theme.add-text; font-weight: 650; overflow: elide; }
+                                        Text {
+                                            text: root.torrent-preview-meta + "  •  " + root.torrent-preview-trackers
+                                                + (root.torrent-preview-trackers == 1 ? " tracker" : " trackers");
+                                            color: Theme.add-muted;
+                                            font-size: 11px;
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    GhostButton { label: "Select All"; porcelain: true; clicked => { root.torrent-preview-select-all(); } }
+                                    GhostButton { label: "None"; porcelain: true; clicked => { root.torrent-preview-select-none(); } }
+                                    StyledLineEdit {
+                                        horizontal-stretch: 1;
+                                        porcelain: true;
+                                        placeholder: "Filter files...";
+                                        text <=> root.torrent-preview-filter;
+                                        edited(value) => { root.torrent-preview-filter-edited(value); }
+                                    }
+                                }
+                                ScrollView {
+                                    height: Math.clamp(root.torrent-preview-files.length * 26px, 38px, 150px);
+                                    content-width: self.visible-width;
+                                    VerticalLayout {
+                                        alignment: start;
+                                        if root.torrent-preview-files.length == 0 : Text {
+                                            text: "No files match this filter.";
+                                            color: Theme.add-muted;
+                                        }
+                                        for file in root.torrent-preview-files : HorizontalLayout {
+                                            spacing: 8px;
+                                            CheckBoxRow {
+                                                horizontal-stretch: 1;
+                                                min-width: 0px;
+                                                controlled: true;
+                                                porcelain: true;
+                                                checked: file.checked;
+                                                label: file.relative-path;
+                                                toggled => { root.torrent-preview-file-toggled(file.index); }
+                                            }
+                                            Text {
+                                                horizontal-stretch: 0;
+                                                min-width: 68px;
+                                                text: file.size-text;
+                                                color: Theme.add-muted;
+                                                horizontal-alignment: right;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             PillSwitch {
                                 checked <=> root.torrent-sequential;
                                 porcelain: true;
                                 label: "Sequential Download (Stream-friendly order)";
+                            }
+                            PillSwitch {
+                                checked <=> root.torrent-start-paused;
+                                porcelain: true;
+                                label: "Add Paused (Download later)";
                             }
                         }
 
@@ -617,7 +719,7 @@ export component AddDownloadOverlay inherits Rectangle {
                                 }
                             }
 
-                            HorizontalLayout {
+                            if root.active-tab != 3 && !root.is-torrent-input : HorizontalLayout {
                                 spacing: 6px;
                                 Text {
                                     text: "Threads";
@@ -714,11 +816,11 @@ export component AddDownloadOverlay inherits Rectangle {
                         clicked => { root.close-requested(); }
                     }
                     PrimaryButton {
-                        label: root.submitting ? "Adding..." : "Download";
+                        label: root.submitting ? "Adding..." : ((root.active-tab == 3 || root.is-torrent-input) && root.torrent-start-paused ? "Add Paused" : "Download");
                         icon: @image-url("icons/download.svg");
                         has-icon: true;
                         porcelain: true;
-                        enabled: !root.submitting;
+                        enabled: !root.submitting && !((root.active-tab == 3 || root.is-torrent-input) && root.torrent-preview-loading);
                         clicked => { root.submit-clicked(); }
                     }
                 }
@@ -764,7 +866,7 @@ export component SettingsOverlay inherits Rectangle {
     in property <[BrowserCardModel]> browsers: [];
     in property <string> browser-notice: "";
     in property <string> browser-error: "";
-    in property <string> about-version: "2.0.0";
+    in property <string> about-version: "2.1.0";
     in property <bool> update-checking: false;
     in property <bool> update-installing: false;
     in property <bool> update-available: false;

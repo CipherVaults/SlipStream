@@ -175,6 +175,7 @@ export interface AddTorrentRequest {
   save_dir?: string | null;
   selected_file_indices?: number[] | null;
   sequential: boolean;
+  start_paused?: boolean;
 }
 
 export type ThemeMode = "system" | "dark" | "light";

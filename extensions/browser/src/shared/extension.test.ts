@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 // @vitest-environment-options { "url": "https://media.example/watch?v=1" }
 import type { NativeBridgeRequest, NativeBridgeResponse, TransferSnapshot } from "@slipstream/ipc-types";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import popupHtml from "../../popup.html?raw";
-import { downloadLinks, magnetUri, readSettings, safeFilename } from "./downloads";
-import { applyAppearance, canUseSiteStorage, emptyState, PILL_SPOTS_KEY, readPillSpot, readState, rememberPillSpot, SETTINGS_KEY, STATE_KEY } from "./state";
+import { downloadLinks, magnetUri, readSettings, safeFilename, type InterceptionSettings } from "./downloads";
+import { applyAppearance, canUseSiteStorage, emptyState, PILL_SPOTS_KEY, readPillSpot, readState, rememberPillSpot, SETTINGS_KEY, STATE_KEY, type BrowserMessage } from "./state";
 import { resolveVideoPostUrl } from "./streams";
 
 function makeTransfer(overrides: Partial<TransferSnapshot> = {}): TransferSnapshot {
@@ -76,6 +76,7 @@ function makeFakePort() {
 }
 
 const listener = <T>() => ({ addListener: vi.fn<(callback: T) => void>() });
+const magnetLink = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Fedora";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -87,10 +88,9 @@ afterEach(() => {
 
 describe("URL, filename, and preference guards", () => {
   it("validates magnet URIs for user-initiated torrent actions", () => {
-    const hex = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Fedora";
     const b32 = "magnet:?xt=urn:btih:ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     const v2 = `magnet:?xt=urn:btmh:1220${"a".repeat(64)}`;
-    expect(magnetUri(hex)).toBe(hex);
+    expect(magnetUri(magnetLink)).toBe(magnetLink);
     expect(magnetUri(b32)).toBe(b32);
     expect(magnetUri(v2)).toBe(v2);
     expect(magnetUri("magnet:?xt=urn:btih:invalid")).toBeUndefined();
@@ -132,6 +132,9 @@ describe("URL, filename, and preference guards", () => {
   it("sanitizes persisted settings and state", () => {
     const settings = readSettings({ enabled: false, minBytes: -5, extensions: ["iso", 123] });
     expect(settings.enabled).toBe(false);
+    expect(settings.interceptMagnets).toBe(true);
+    expect(readSettings({ interceptMagnets: false }).interceptMagnets).toBe(false);
+    expect(readSettings({ interceptMagnets: "false" }).interceptMagnets).toBe(true);
     expect(settings.minBytes).toBe(0);
     expect(settings.extensions).toEqual(["iso"]);
     expect(settings.showInFullscreen).toBe(false);
@@ -334,11 +337,14 @@ describe("toolbar popup", () => {
       request: { type: "open_desktop_window" },
     });
     const fullscreen = document.getElementById("show-in-fullscreen") as HTMLInputElement;
+    const magnets = document.getElementById("intercept-magnets") as HTMLInputElement;
     expect(fullscreen.checked).toBe(false);
+    expect(magnets.checked).toBe(true);
     fullscreen.checked = true;
+    magnets.checked = false;
     document.getElementById("settings")!.dispatchEvent(new Event("submit", { cancelable: true }));
     await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
-      kind: "save-settings", settings: expect.objectContaining({ showInFullscreen: true }),
+      kind: "save-settings", settings: expect.objectContaining({ showInFullscreen: true, interceptMagnets: false }),
     })));
   });
 
@@ -477,7 +483,129 @@ describe("SPA navigation stream cache invalidation", () => {
   });
 });
 
-describe("direct HTTP handoff", () => {
+describe("magnet link click capture", () => {
+  async function setupClick(tabOrigin?: string) {
+    vi.resetModules();
+    let loadSettings!: (values: Record<string, unknown>) => void;
+    const savedSettings = new Promise<Record<string, unknown>>((resolve) => { loadSettings = resolve; });
+    const magnetClick = vi.fn<() => Promise<{ handled: boolean } | undefined>>().mockResolvedValue({ handled: true });
+    const sendMessage = vi.fn((message: BrowserMessage) => message.kind === "magnet-click"
+      ? magnetClick() : Promise.resolve({ tabOrigin }));
+    const onChanged = listener<Parameters<typeof chrome.storage.onChanged.addListener>[0]>();
+    vi.stubGlobal("chrome", {
+      runtime: { id: "ext-test-id", sendMessage, onMessage: listener() },
+      storage: { local: { get: vi.fn(() => savedSettings) }, onChanged },
+    });
+    if (tabOrigin) vi.stubGlobal("window", { top: window });
+    vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn() }));
+    vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} });
+    vi.stubGlobal("MutationObserver", class { observe() {} });
+    const requestFrame = vi.fn((callback: FrameRequestCallback) => { callback(0); return 1; });
+    vi.stubGlobal("requestAnimationFrame", requestFrame);
+    const addListener = vi.spyOn(document, "addEventListener");
+    document.body.innerHTML = `<a href="${magnetLink}"><span>Fedora</span></a>
+      <a id="http" href="https://media.example/file.torrent">Torrent file</a>
+      <a id="invalid" href="magnet:?xt=urn:btih:invalid">Invalid magnet</a>`;
+    await import("../content");
+    const registration = addListener.mock.calls.find(([type]) => type === "click");
+    expect(registration).toEqual(["click", expect.any(Function), true]);
+    const handleClick = registration![1] as EventListener;
+    onTestFinished(() => document.removeEventListener("click", handleClick, true));
+
+    const magnetTarget = document.querySelector("a span")!;
+    const click = (target: Element, overrides: MouseEventInit & { isTrusted?: boolean } = {}) => {
+      // jsdom marks dispatched clicks as untrusted, so call the registered handler with a trusted event fixture.
+      const event = {
+        target, isTrusted: true, button: 0, altKey: false, ctrlKey: false, metaKey: false, shiftKey: false,
+        preventDefault: vi.fn(), stopImmediatePropagation: vi.fn(), ...overrides,
+      };
+      handleClick(event as unknown as MouseEvent);
+      return event;
+    };
+
+    async function ready(preferences?: Partial<InterceptionSettings>) {
+      requestFrame.mockClear();
+      loadSettings({ [SETTINGS_KEY]: preferences });
+      await vi.waitFor(() => expect(requestFrame).toHaveBeenCalled());
+    }
+
+    return { click, magnetTarget, ready, magnetClick, sendMessage, onChanged };
+  }
+
+  function expectIgnored({ preventDefault, stopImmediatePropagation }: ReturnType<Awaited<ReturnType<typeof setupClick>>["click"]>) {
+    expect(preventDefault).not.toHaveBeenCalled();
+    expect(stopImmediatePropagation).not.toHaveBeenCalled();
+  }
+
+  it("intercepts only trusted, unmodified left clicks on valid magnet anchors when enabled", async () => {
+    const { click, magnetTarget, ready, sendMessage, onChanged } = await setupClick();
+    expectIgnored(click(magnetTarget));
+    await ready();
+
+    for (const overrides of [
+      { isTrusted: false }, { button: 1 }, { altKey: true }, { ctrlKey: true }, { metaKey: true }, { shiftKey: true },
+    ]) expectIgnored(click(magnetTarget, overrides));
+    expectIgnored(click(document.getElementById("http")!));
+    expectIgnored(click(document.getElementById("invalid")!));
+
+    const changeSettings = onChanged.addListener.mock.calls[0][0];
+    for (const newValue of [{ enabled: false }, { interceptMagnets: false }, { mutedSites: [location.hostname] }]) {
+      changeSettings({ [SETTINGS_KEY]: { newValue } }, "local");
+      expectIgnored(click(magnetTarget));
+    }
+    expect(sendMessage.mock.calls.filter(([message]) => message.kind === "magnet-click")).toEqual([]);
+
+    changeSettings({ [SETTINGS_KEY]: { newValue: { interceptMagnets: true } } }, "local");
+    const event = click(magnetTarget);
+    expect(event.preventDefault).toHaveBeenCalledOnce();
+    expect(event.stopImmediatePropagation).toHaveBeenCalledOnce();
+    expect(sendMessage.mock.calls.filter(([message]) => message.kind === "magnet-click")).toEqual([
+      [{ kind: "magnet-click", url: magnetLink }],
+    ]);
+  });
+
+  it.each([
+    { failure: "declined", respond: async () => ({ handled: false }) },
+    { failure: "missing", respond: async () => undefined },
+    { failure: "rejected", respond: async () => { throw new Error("Message channel closed"); } },
+    { failure: "unavailable", respond: () => { throw new Error("Extension context invalidated"); } },
+  ])("lets the browser navigate once when the magnet handoff response is $failure", async ({ respond }) => {
+    const { click, magnetTarget, ready, magnetClick } = await setupClick();
+    await ready();
+    magnetClick.mockImplementationOnce(respond);
+    const navigate = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      expect(this.href).toBe(magnetLink);
+      expect(click(this).preventDefault).not.toHaveBeenCalled();
+    });
+
+    const event = click(magnetTarget);
+    expect(event.preventDefault).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(navigate).toHaveBeenCalledOnce());
+    expect(magnetClick).toHaveBeenCalledOnce();
+  });
+
+  it("leaves a magnet click untouched in an iframe on an excluded top-level site", async () => {
+    const { click, magnetTarget, ready, magnetClick } = await setupClick("https://container.example");
+    await ready({ excludedSites: ["container.example"] });
+
+    expectIgnored(click(magnetTarget));
+    expect(magnetClick).not.toHaveBeenCalled();
+  });
+
+  it("skips browser navigation when the magnet handoff succeeds", async () => {
+    const { click, magnetTarget, ready, magnetClick } = await setupClick();
+    await ready();
+    const navigate = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+
+    expect(click(magnetTarget).preventDefault).toHaveBeenCalledOnce();
+    expect(magnetClick).toHaveBeenCalledOnce();
+    await magnetClick.mock.results[0].value;
+    await Promise.resolve();
+    expect(navigate).not.toHaveBeenCalled();
+  });
+});
+
+describe("download handoff", () => {
   const page = "https://vidtube.example/watch?video=1";
   const start = "https://vidtube.example/download";
   const cdn = "https://s42.cdn.example/file.mp4?signature=test";
@@ -490,7 +618,7 @@ describe("direct HTTP handoff", () => {
     { name: "Authorization", value: "Bearer private" },
   ];
 
-  async function setup() {
+  async function setup(preferences?: Partial<InterceptionSettings>) {
     vi.resetModules();
     vi.useFakeTimers();
     vi.spyOn(navigator, "userAgent", "get").mockReturnValue(browserAgent);
@@ -519,7 +647,7 @@ describe("direct HTTP handoff", () => {
       tabs: { get: vi.fn(async () => tab), query: vi.fn(async () => [tab]), onUpdated: listener(), onRemoved: listener() },
       webRequest: { onSendHeaders: onHeaders, onHeadersReceived: listener() },
       storage: {
-        onChanged: listener(), local: { get: vi.fn(async () => ({})), set: vi.fn(async () => {}) },
+        onChanged: listener(), local: { get: vi.fn(async () => ({ [SETTINGS_KEY]: preferences })), set: vi.fn(async () => {}) },
         session: { get: sessionGet, set: vi.fn(async () => {}), remove: vi.fn(async () => {}) },
       },
     };
@@ -554,6 +682,75 @@ describe("direct HTTP handoff", () => {
 
     return { intercept, observe, onMenu, onMessage, port, sessionGet, tab };
   }
+
+  describe("magnet links", () => {
+    const picker = { type: "open_desktop_window", open_picker_url: magnetLink };
+
+    function clickMagnet(
+      { onMessage, tab }: Awaited<ReturnType<typeof setup>>,
+      url: unknown,
+      topUrl = page,
+    ) {
+      return new Promise((resolve) => {
+        const sender = { id: "ext-test-id", url: page, tab: { ...tab, url: topUrl }, frameId: topUrl === page ? 0 : 1 };
+        const handled = onMessage.addListener.mock.calls[0][0]({ kind: "magnet-click", url }, sender, resolve);
+        if (!handled) resolve(undefined);
+      });
+    }
+
+    it("opens the desktop picker with the validated URI from a content-script message", async () => {
+      const context = await setup();
+      const reply = clickMagnet(context, ` ${magnetLink} `);
+      await vi.waitFor(() => expect(context.port.posted).toEqual([{ type: "get_status" }, picker]));
+      context.port.emitMessage({ type: "ack", ok: true, message: null });
+      expect(await reply).toEqual({ handled: true });
+    });
+
+    it("reports an unsuccessful handoff when the native host rejects the picker", async () => {
+      const context = await setup();
+      const reply = clickMagnet(context, magnetLink);
+      await vi.waitFor(() => expect(context.port.posted).toEqual([{ type: "get_status" }, picker]));
+      context.port.emitMessage({ type: "ack", ok: false, message: "Picker rejected" });
+      expect(await reply).toEqual({ handled: false });
+    });
+
+    it("reports an unsuccessful handoff when desktop is disconnected", async () => {
+      const context = await setup();
+      context.port.emitDisconnect();
+      vi.mocked(chrome.runtime.connectNative).mockImplementationOnce(() => { throw new Error("Native host unavailable"); });
+      expect(await clickMagnet(context, magnetLink)).toEqual({ handled: false });
+      expect(context.port.posted).toEqual([{ type: "get_status" }]);
+    });
+
+    it.each([
+      { guard: "download interception disabled", preferences: { enabled: false } },
+      { guard: "magnet interception disabled", preferences: { interceptMagnets: false } },
+      { guard: "an excluded frame site", preferences: { excludedSites: ["vidtube.example"] }, reason: "excluded" },
+      { guard: "a muted frame site", preferences: { mutedSites: ["vidtube.example"] }, reason: "excluded" },
+      { guard: "an excluded top-level site", preferences: { excludedSites: ["container.example"] }, reason: "excluded" },
+      { guard: "a muted top-level site", preferences: { mutedSites: ["container.example"] }, reason: "excluded" },
+    ])("ignores magnet-click with $guard", async ({ preferences, reason }) => {
+      const context = await setup(preferences);
+      const expected = reason ? { handled: false, reason } : { handled: false };
+      expect(await clickMagnet(context, magnetLink, "https://container.example/feed")).toEqual(expected);
+      expect(context.port.posted).toEqual([{ type: "get_status" }]);
+    });
+
+    it("rejects invalid magnet-click URLs", async () => {
+      const context = await setup();
+      for (const url of ["magnet:?xt=urn:btih:invalid", "https://vidtube.example/file.torrent", 42]) {
+        expect(await clickMagnet(context, url)).toEqual({ handled: false });
+      }
+      expect(context.port.posted).toEqual([{ type: "get_status" }]);
+    });
+
+    it("opens the desktop picker from the context menu with automatic interception disabled", async () => {
+      const { onMenu, port, tab } = await setup({ interceptMagnets: false });
+      onMenu.addListener.mock.calls[0][0]({ menuItemId: "download", linkUrl: magnetLink, pageUrl: page }, tab);
+      await vi.waitFor(() => expect(port.posted).toEqual([{ type: "get_status" }, picker]));
+      port.emitMessage({ type: "ack", ok: true, message: null });
+    });
+  });
 
   it("uses the final URL's captured headers after a cross-origin redirect", async () => {
     const { observe, intercept } = await setup();

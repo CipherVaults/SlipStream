@@ -1,3 +1,5 @@
+import { ScrollView } from "std-widgets.slint";
+import { TorrentPeerRowModel } from "./app_types.slint";
 import { Theme } from "./tokens.slint";
 
 // Primary accent button (30px or 32px height, crisp top specular highlight)
@@ -20,7 +22,7 @@ export component PrimaryButton inherits Rectangle {
     border-radius: Theme.radius-md;
     clip: true;
     background: root.enabled && ta.has-hover ? root.hover-bg : root.base-bg;
-    opacity: root.enabled ? 1.0 : 0.5;
+    opacity: !root.enabled ? 0.5 : (ta.pressed ? 0.78 : 1.0);
     animate background { duration: 120ms; }
 
     Rectangle {
@@ -89,7 +91,7 @@ export component GhostButton inherits Rectangle {
     background: root.enabled && ta.has-hover ? root.hover-bg : root.rest-bg;
     border-width: 1px;
     border-color: root.brd;
-    opacity: root.enabled ? 1.0 : 0.5;
+    opacity: !root.enabled ? 0.5 : (ta.pressed ? 0.78 : 1.0);
     animate background { duration: 120ms; }
 
     row := HorizontalLayout {
@@ -142,7 +144,7 @@ export component CircleIconButton inherits Rectangle {
     border-color: root.ghost-square
         ? (ta.has-hover ? (root.porcelain ? Theme.add-border : Theme.border) : transparent)
         : (ta.has-hover ? (root.porcelain ? Theme.add-border-strong : Theme.border-strong) : (root.porcelain ? Theme.add-border : Theme.border));
-    opacity: root.enabled ? 1.0 : 0.5;
+    opacity: !root.enabled ? 0.5 : (ta.pressed ? 0.78 : 1.0);
     animate background { duration: 120ms; }
 
     Image {
@@ -221,6 +223,7 @@ export component PillSwitch inherits HorizontalLayout {
 // Checkbox control matching float-checkbox / check-row
 export component CheckBoxRow inherits Rectangle {
     in-out property <bool> checked: false;
+    in property <bool> controlled: false;
     in property <string> label: "";
     in property <bool> enabled: true;
     in property <bool> porcelain: false;
@@ -230,6 +233,7 @@ export component CheckBoxRow inherits Rectangle {
     opacity: root.enabled ? 1.0 : 0.5;
 
     HorizontalLayout {
+        min-width: 0px;
         spacing: 7px;
         alignment: start;
 
@@ -257,11 +261,14 @@ export component CheckBoxRow inherits Rectangle {
         }
 
         Text {
+            horizontal-stretch: 1;
+            min-width: 0px;
             text: root.label;
             font-family: Theme.font-sans;
             font-size: 12px;
             color: root.porcelain ? Theme.add-text : Theme.text-1;
             vertical-alignment: center;
+            overflow: elide;
         }
     }
 
@@ -269,8 +276,11 @@ export component CheckBoxRow inherits Rectangle {
         enabled: root.enabled;
         mouse-cursor: root.enabled ? pointer : default;
         clicked => {
-            root.checked = !root.checked;
-            root.toggled(root.checked);
+            let next = !root.checked;
+            if (!root.controlled) {
+                root.checked = next;
+            }
+            root.toggled(next);
         }
     }
 }
@@ -556,6 +566,110 @@ export component StyledSelect inherits Rectangle {
                             popup.close();
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+component PeerCell inherits Text {
+    in property <bool> heading: false;
+    color: root.heading ? Theme.text-2 : Theme.text-1;
+    font-size: 10px;
+    font-weight: root.heading ? 650 : 450;
+    vertical-alignment: center;
+    overflow: elide;
+}
+
+component PeerTableRow inherits HorizontalLayout {
+    in property <TorrentPeerRowModel> peer;
+    in property <bool> heading: false;
+    in property <bool> show-peer-details: false;
+
+    height: 24px;
+    padding-left: 5px;
+    padding-right: 5px;
+    spacing: 4px;
+
+    PeerCell {
+        min-width: 0px;
+        horizontal-stretch: 1;
+        heading: root.heading;
+        text: root.peer.address;
+    }
+    PeerCell {
+        width: root.show-peer-details ? 48px : 88px;
+        heading: root.heading;
+        text: root.peer.state-label;
+        color: root.heading ? Theme.text-2
+            : (root.peer.state-tone == 2 ? Theme.green
+            : (root.peer.state-tone == 3 ? Theme.amber : Theme.text-1));
+    }
+    PeerCell {
+        width: root.show-peer-details ? 58px : 90px;
+        heading: root.heading;
+        text: root.peer.speed-text;
+    }
+    PeerCell {
+        width: root.show-peer-details ? 49px : 90px;
+        heading: root.heading;
+        text: root.peer.downloaded-text;
+    }
+    if root.show-peer-details : PeerCell {
+        width: 30px;
+        heading: root.heading;
+        text: root.peer.pieces-text;
+    }
+    if root.show-peer-details : PeerCell {
+        width: 24px;
+        heading: root.heading;
+        text: root.peer.direction-text;
+    }
+}
+
+export component TorrentPeerTable inherits Rectangle {
+    in property <[TorrentPeerRowModel]> peers: [];
+    in property <bool> show-peer-details: false;
+
+    min-height: 74px;
+    background: Theme.bg-input;
+    border-radius: Theme.radius-md;
+    border-width: 1px;
+    border-color: Theme.border;
+    clip: true;
+
+    VerticalLayout {
+        padding: 1px;
+        Rectangle {
+            height: 24px;
+            background: Theme.bg-elevated;
+            PeerTableRow {
+                heading: true;
+                show-peer-details: root.show-peer-details;
+                peer: {
+                    address: "Address",
+                    state-label: "State",
+                    speed-text: root.show-peer-details ? "Speed" : "Down Speed",
+                    downloaded-text: root.show-peer-details ? "Down" : "Downloaded",
+                    pieces-text: "Pieces",
+                    direction-text: "Dir",
+                };
+            }
+        }
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                alignment: start;
+                if root.peers.length == 0 : Text {
+                    height: 28px;
+                    text: "No live peers yet.";
+                    color: Theme.text-2;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                for peer in root.peers : PeerTableRow {
+                    peer: peer;
+                    show-peer-details: root.show-peer-details;
                 }
             }
         }

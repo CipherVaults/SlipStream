@@ -9,6 +9,7 @@ import {
     SegmentProgressBar,
     SparklineChart,
     StyledLineEdit,
+    TorrentPeerTable,
 } from "./widgets.slint";
 import {
     TransferRowModel,
@@ -18,6 +19,7 @@ import {
     FormatOptionModel,
     SubtitleItemModel,
     PlaylistItemModel,
+    TorrentPreviewFileModel,
     BrowserCardModel,
     PaletteActionModel,
 } from "./app_types.slint";
@@ -119,6 +121,7 @@ component ActiveTransferCard inherits Rectangle {
     callback open-floating-clicked(string);
     callback refresh-link-clicked(string);
     callback remove-clicked(string);
+    callback context-clicked(string, float, float);
 
     min-height: root.compact ? 64px : 76px;
     border-radius: Theme.radius-lg;
@@ -135,6 +138,14 @@ component ActiveTransferCard inherits Rectangle {
         mouse-cursor: pointer;
         clicked => { root.select-clicked(root.item.id); }
         double-clicked => { root.open-floating-clicked(root.item.id); }
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down && event.button == PointerEventButton.right {
+                root.context-clicked(root.item.id, (self.absolute-position.x + self.mouse-x) / 1px, (self.absolute-position.y + self.mouse-y) / 1px);
+            }
+            if event.kind == PointerEventKind.down && event.button == PointerEventButton.middle {
+                root.remove-clicked(root.item.id);
+            }
+        }
     }
 
     HorizontalLayout {
@@ -261,6 +272,93 @@ component ActiveTransferCard inherits Rectangle {
     }
 }
 
+component InspectorMetric inherits VerticalLayout {
+    in property <string> label;
+    in property <string> value;
+    horizontal-stretch: 1;
+    spacing: 3px;
+    Text { text: root.label; font-size: 9px; font-weight: 700; color: Theme.text-3; }
+    Text { text: root.value; font-size: 11px; font-weight: 550; color: Theme.text-1; overflow: elide; }
+}
+
+enum TransferAction { pause, stop, floating, open-file, open-folder, copy, refresh, verify, remove }
+
+component TransferActionButton inherits GhostButton {
+    btn-height: 26px;
+    pad-x: 6px;
+}
+
+component TransferActions inherits VerticalLayout {
+    in property <InspectorModel> transfer;
+    in property <bool> expanded: false;
+    callback action(TransferAction);
+    spacing: 5px;
+
+    HorizontalLayout {
+        alignment: start;
+        spacing: 4px;
+        if root.transfer.can-pause-resume : TransferActionButton {
+            label: root.transfer.is-paused ? "Resume" : "Pause";
+            clicked => { root.action(TransferAction.pause); }
+        }
+        if root.transfer.can-stop : TransferActionButton {
+            label: "Stop";
+            clicked => { root.action(TransferAction.stop); }
+        }
+        TransferActionButton {
+            label: "Floating Box";
+            clicked => { root.action(TransferAction.floating); }
+        }
+        if root.transfer.is-completed : TransferActionButton {
+            label: "Open File";
+            clicked => { root.action(TransferAction.open-file); }
+        }
+        if !root.expanded : TransferActionButton {
+            label: "Open Folder";
+            clicked => { root.action(TransferAction.open-folder); }
+        }
+        if !root.expanded : TransferActionButton {
+            label: "Copy Link";
+            clicked => { root.action(TransferAction.copy); }
+        }
+        if !root.expanded : TransferActionButton {
+            label: "Remove...";
+            clicked => { root.action(TransferAction.remove); }
+        }
+    }
+
+    if root.expanded : HorizontalLayout {
+        alignment: start;
+        spacing: 4px;
+        TransferActionButton {
+            label: "Open Folder";
+            clicked => { root.action(TransferAction.open-folder); }
+        }
+        if root.transfer.can-refresh-url : TransferActionButton {
+            label: "Refresh Link";
+            clicked => { root.action(TransferAction.refresh); }
+        }
+        if root.transfer.can-verify : TransferActionButton {
+            label: "Verify SHA";
+            clicked => { root.action(TransferAction.verify); }
+        }
+        TransferActionButton {
+            label: "Remove...";
+            clicked => { root.action(TransferAction.remove); }
+        }
+    }
+}
+
+component ResizeGrip inherits TouchArea {
+    in property <int> direction;
+    callback resize(int);
+    pointer-event(event) => {
+        if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+            root.resize(root.direction);
+        }
+    }
+}
+
 export component MainWindow inherits Window {
     // Theme binding
     in-out property <bool> theme-light: false;
@@ -268,7 +366,7 @@ export component MainWindow inherits Window {
     in-out property <bool> is-maximized: false;
 
     // App header / counts / filter state
-    in property <string> version-label: "2.0.0";
+    in property <string> version-label: "2.1.0";
     // "all" | "active" | "completed" | "queued" | "torrents" | "paused"
     in-out property <string> active-nav: "all";
     in-out property <string> search-query: "";
@@ -285,8 +383,6 @@ export component MainWindow inherits Window {
     in property <string> active-summary-text: "Idle";
     in property <string> spark-line-cmd: "M 0 25 L 180 25";
     in property <string> spark-fill-cmd: "M 0 25 L 180 25 L 180 28 L 0 28 Z";
-    in property <string> inspector-spark-line-cmd: "M 0 25 L 260 25";
-    in property <string> inspector-spark-fill-cmd: "M 0 25 L 260 25 L 260 28 L 0 28 Z";
     in property <string> disk-free-text: "-- free";
     in property <float> disk-used-ratio: 0.45;
     in property <string> speed-limit-label: "Unlimited";
@@ -303,6 +399,31 @@ export component MainWindow inherits Window {
     in property <[TransferRowModel]> active-rows: [];
     in property <[CompletedRowModel]> completed-rows: [];
     in property <InspectorModel> inspector;
+    in-out property <bool> inspector-collapsed: false;
+    in-out property <int> inspector-tab: 0;
+    in property <bool> torrent-files-applying: false;
+    in-out property <bool> context-menu-open: false;
+    in property <float> context-menu-x: 0;
+    in property <float> context-menu-y: 0;
+    in-out property <bool> remove-confirm-open: false;
+    in property <string> remove-confirm-id: "";
+    in property <string> remove-confirm-filename: "";
+    in property <bool> toast-visible: false;
+    in property <string> toast-text: "";
+    in property <bool> toast-error: false;
+
+    function run-transfer-action(action: TransferAction) {
+        root.context-menu-open = false;
+        if action == TransferAction.pause { root.toggle-transfer-pause(root.inspector.id, root.inspector.is-paused); }
+        if action == TransferAction.stop { root.stop-transfer(root.inspector.id); }
+        if action == TransferAction.floating { root.open-floating-progress(root.inspector.id); }
+        if action == TransferAction.open-file { root.open-completed-file(root.inspector.id); }
+        if action == TransferAction.open-folder { root.reveal-in-explorer(root.inspector.id); }
+        if action == TransferAction.copy { root.copy-transfer-url(root.inspector.id); }
+        if action == TransferAction.refresh { root.open-refresh-dialog(root.inspector.id); }
+        if action == TransferAction.verify { root.open-verify-dialog(root.inspector.id); }
+        if action == TransferAction.remove { root.request-remove-transfer(root.inspector.id); }
+    }
 
     // Demo badge
     in property <bool> demo-mode: false;
@@ -332,6 +453,14 @@ export component MainWindow inherits Window {
     in-out property <bool> add-lossless-remux: true;
     in-out property <bool> add-normalize-audio: false;
     in property <[SubtitleItemModel]> add-subtitles: [];
+    in property <bool> add-torrent-probing: false;
+    in property <bool> has-torrent-preview: false;
+    in property <string> add-torrent-preview-name: "";
+    in property <string> add-torrent-preview-meta: "";
+    in property <int> add-torrent-preview-trackers: 0;
+    in property <[TorrentPreviewFileModel]> torrent-preview-files: [];
+    in-out property <string> add-torrent-preview-filter: "";
+    in-out property <bool> add-torrent-start-paused: false;
     in-out property <bool> add-torrent-sequential: true;
     in-out property <string> add-save-dir: "";
     in-out property <int> add-threads-index: 1;
@@ -421,7 +550,13 @@ export component MainWindow inherits Window {
     callback select-transfer(string);
     callback toggle-transfer-pause(string, bool);
     callback open-floating-progress(string);
-    callback remove-transfer(string);
+    callback request-remove-transfer(string);
+    callback confirm-remove-transfer(string, bool);
+    callback stop-transfer(string);
+    callback copy-transfer-url(string);
+    callback open-context-menu(string, float, float);
+    callback select-torrent-files(bool);
+    callback start-resize(int);
     callback open-completed-file(string);
     callback reveal-in-explorer(string);
     callback open-refresh-dialog(string);
@@ -435,8 +570,13 @@ export component MainWindow inherits Window {
     // Add Download Callbacks
     callback add-close-requested();
     callback add-source-edited(string);
+    callback add-cancel-torrent-preview-clicked();
     callback add-probe-clicked();
     callback add-browse-torrent-clicked();
+    callback torrent-preview-file-toggled(int);
+    callback torrent-preview-select-all();
+    callback torrent-preview-select-none();
+    callback torrent-preview-filter-edited(string);
     callback add-browse-save-dir-clicked();
     callback add-format-selected(string);
     callback add-playlist-item-toggled(int);
@@ -475,12 +615,20 @@ export component MainWindow inherits Window {
 
     changed theme-light => { Theme.is-light = root.theme-light; }
     changed theme-mono => { Theme.is-mono = root.theme-mono; }
+    changed remove-confirm-open => {
+        if (!root.remove-confirm-open) { shortcuts.focus(); }
+    }
 
-    FocusScope {
+    public function focus-remove-confirm() {
+        remove-confirm-focus.focus();
+    }
+
+    shortcuts := FocusScope {
         width: 100%;
         height: 100%;
 
         key-pressed(event) => {
+            if (root.remove-confirm-open) { return reject; }
             if (event.modifiers.control && (event.text == "k" || event.text == "K")) {
                 root.open-palette-clicked();
                 return accept;
@@ -490,6 +638,7 @@ export component MainWindow inherits Window {
                 return accept;
             }
             if (event.text == Key.Escape) {
+                if (root.context-menu-open) { root.context-menu-open = false; return accept; }
                 if (root.palette-open) { root.palette-open = false; return accept; }
                 if (root.verify-open) { root.verify-open = false; return accept; }
                 if (root.refresh-open) { root.refresh-open = false; return accept; }
@@ -825,6 +974,14 @@ export component MainWindow inherits Window {
                                 }
                             }
 
+                            GhostButton {
+                                y: 11px;
+                                label: root.inspector-collapsed ? "Show Inspector" : "Hide Inspector";
+                                btn-height: 30px;
+                                pad-x: 8px;
+                                clicked => { root.inspector-collapsed = !root.inspector-collapsed; }
+                            }
+
                             // Drag spacer
                             Rectangle {
                                 horizontal-stretch: 1;
@@ -994,9 +1151,22 @@ export component MainWindow inherits Window {
                                 }
                             }
 
+                            if root.inspector.has-selection : Rectangle {
+                                y: 0px;
+                                height: 42px;
+                                background: Theme.bg-inspector;
+                                TransferActions {
+                                    x: 12px;
+                                    y: 8px;
+                                    width: parent.width - 24px;
+                                    transfer: root.inspector;
+                                    action(action) => { root.run-transfer-action(action); }
+                                }
+                            }
                             if root.playlist-groups.length > 0 || root.active-rows.length > 0 || root.completed-rows.length > 0 : ScrollView {
+                                y: root.inspector.has-selection ? 42px : 0px;
                                 width: 100%;
-                                height: 100%;
+                                height: parent.height - self.y;
 
                                 VerticalLayout {
                                     alignment: start;
@@ -1096,7 +1266,8 @@ export component MainWindow inherits Window {
                                                         toggle-pause-clicked(id, paused) => { root.toggle-transfer-pause(id, paused); }
                                                         open-floating-clicked(id) => { root.open-floating-progress(id); }
                                                         refresh-link-clicked(id) => { root.open-refresh-dialog(id); }
-                                                        remove-clicked(id) => { root.remove-transfer(id); }
+                                                        remove-clicked(id) => { root.request-remove-transfer(id); }
+                                                        context-clicked(id, x, y) => { root.open-context-menu(id, x, y); }
                                                     }
                                                 }
                                             }
@@ -1123,7 +1294,8 @@ export component MainWindow inherits Window {
                                             toggle-pause-clicked(id, paused) => { root.toggle-transfer-pause(id, paused); }
                                             open-floating-clicked(id) => { root.open-floating-progress(id); }
                                             refresh-link-clicked(id) => { root.open-refresh-dialog(id); }
-                                            remove-clicked(id) => { root.remove-transfer(id); }
+                                            remove-clicked(id) => { root.request-remove-transfer(id); }
+                                            context-clicked(id, x, y) => { root.open-context-menu(id, x, y); }
                                         }
                                     }
 
@@ -1152,6 +1324,14 @@ export component MainWindow inherits Window {
                                                 mouse-cursor: pointer;
                                                 clicked => { root.select-transfer(c.id); }
                                                 double-clicked => { root.open-completed-file(c.id); }
+                                                pointer-event(event) => {
+                                                    if event.kind == PointerEventKind.down && event.button == PointerEventButton.right {
+                                                        root.open-context-menu(c.id, (self.absolute-position.x + self.mouse-x) / 1px, (self.absolute-position.y + self.mouse-y) / 1px);
+                                                    }
+                                                    if event.kind == PointerEventKind.down && event.button == PointerEventButton.middle {
+                                                        root.request-remove-transfer(c.id);
+                                                    }
+                                                }
                                             }
 
                                             HorizontalLayout {
@@ -1226,7 +1406,7 @@ export component MainWindow inherits Window {
                                                     icon-size: 12px;
                                                     ghost-square: true;
                                                     y: 9px;
-                                                    clicked => { root.remove-transfer(c.id); }
+                                                    clicked => { root.request-remove-transfer(c.id); }
                                                 }
                                             }
                                         }
@@ -1235,322 +1415,264 @@ export component MainWindow inherits Window {
                             }
                         }
 
-                        // ========================= RIGHT INSPECTOR PANEL (316px) =========================
-                        Rectangle {
-                            width: 316px;
+                        if !root.inspector-collapsed : Rectangle {
+                            width: 360px;
                             background: Theme.bg-inspector;
+                            border-width: 1px;
+                            border-color: Theme.border;
 
-                            Rectangle {
-                                x: 0px;
-                                y: 0px;
-                                width: 1px;
-                                height: parent.height;
-                                background: Theme.border;
+                            if !root.inspector.has-selection : Text {
+                                text: "Select a transfer to see its details";
+                                color: Theme.text-2;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
                             }
 
-                            if !root.inspector.has-selection : VerticalLayout {
-                                padding: 24px;
-                                alignment: center;
-                                spacing: 8px;
+                            if root.inspector.has-selection : VerticalLayout {
+                                padding: 12px;
+                                spacing: 10px;
 
-                                Image {
-                                    source: @image-url("icons/info.svg");
-                                    width: 24px;
-                                    height: 24px;
-                                    colorize: Theme.text-3;
-                                    x: (parent.width - self.width) / 2;
+                                HorizontalLayout {
+                                    spacing: 4px;
+                                    TransferActionButton {
+                                        label: "General";
+                                        active-highlight: root.inspector-tab == 0;
+                                        clicked => { root.inspector-tab = 0; }
+                                    }
+                                    TransferActionButton {
+                                        label: root.inspector.is-torrent ? "Files (" + root.inspector.torrent-files.length + ")" : "Files";
+                                        active-highlight: root.inspector-tab == 1;
+                                        clicked => { root.inspector-tab = 1; }
+                                    }
+                                    if root.inspector.is-torrent : TransferActionButton {
+                                        label: "Peers";
+                                        active-highlight: root.inspector-tab == 2;
+                                        clicked => { root.inspector-tab = 2; }
+                                    }
+                                    TransferActionButton {
+                                        label: "Segments";
+                                        active-highlight: root.inspector-tab == 3;
+                                        clicked => { root.inspector-tab = 3; }
+                                    }
                                 }
-                                Text {
-                                    text: "Select a transfer";
-                                    font-size: 13px;
-                                    font-weight: 600;
-                                    color: Theme.text-2;
-                                    horizontal-alignment: center;
-                                }
-                                Text {
-                                    text: "Segment map, live throughput, and verification details appear here.";
-                                    font-size: 11.5px;
-                                    color: Theme.text-3;
-                                    horizontal-alignment: center;
-                                    wrap: word-wrap;
-                                }
-                            }
 
-                            if root.inspector.has-selection : ScrollView {
-                                width: 100%;
-                                height: 100%;
-
-                                VerticalLayout {
-                                    alignment: start;
-                                    padding: 16px;
-                                    spacing: 13px;
-
-                                    // Inspector title + status
+                                if root.inspector-tab == 0 : ScrollView {
+                                    vertical-stretch: 1;
+                                    content-width: self.visible-width;
                                     VerticalLayout {
-                                        spacing: 5px;
+                                        alignment: start;
+                                        spacing: 10px;
                                         HorizontalLayout {
-                                            spacing: 6px;
-                                            Text {
-                                                text: "INSPECTOR";
-                                                font-size: 10.5px;
-                                                font-weight: 700;
-                                                letter-spacing: 0.7px;
-                                                color: Theme.text-3;
-                                                vertical-alignment: center;
-                                            }
-                                            Rectangle { horizontal-stretch: 1; }
-                                            PillBadge {
-                                                text: root.inspector.status-label;
-                                                tone: root.inspector.status-tone;
-                                            }
+                                            alignment: start;
+                                            PillBadge { text: root.inspector.status-label; tone: root.inspector.status-tone; }
                                         }
-                                        Text {
-                                            text: root.inspector.filename;
-                                            font-size: 13.5px;
-                                            font-weight: 650;
-                                            color: Theme.text-1;
-                                            wrap: word-wrap;
-                                        }
-                                        Text {
-                                            text: root.inspector.source-domain + " • " + root.inspector.protocol-label;
-                                            font-size: 11.5px;
-                                            color: Theme.text-2;
-                                            overflow: elide;
-                                        }
-                                    }
+                                        Text { text: root.inspector.filename; font-size: 15px; font-weight: 650; color: Theme.text-1; wrap: char-wrap; }
+                                        Text { text: root.inspector.source-domain + " • " + root.inspector.protocol-label; color: Theme.text-2; font-size: 11px; overflow: elide; }
 
-                                    // 16:9 Alpine / Transfer Preview Card
-                                    Rectangle {
-                                        height: 156px;
-                                        border-radius: 10px;
-                                        border-width: 1px;
-                                        border-color: Theme.border;
-                                        clip: true;
-
-                                        Image {
-                                            source: root.inspector.is-media
-                                                ? @image-url("assets/media-sheet.svg")
-                                                : @image-url("assets/alpine-preview.svg");
-                                            width: parent.width;
-                                            height: parent.height;
-                                            image-fit: cover;
-                                        }
-
-                                        if root.inspector.duration-text != "" : Rectangle {
-                                            x: parent.width - self.width - 8px;
-                                            y: parent.height - self.height - 8px;
-                                            width: dur-txt.preferred-width + 12px;
-                                            height: 20px;
-                                            border-radius: 5px;
-                                            background: #0F172ACC;
-                                            dur-txt := Text {
-                                                text: root.inspector.duration-text;
-                                                font-family: Theme.font-mono;
-                                                font-size: 10.5px;
-                                                font-weight: 600;
-                                                color: #FFFFFF;
-                                                horizontal-alignment: center;
-                                                vertical-alignment: center;
-                                            }
-                                        }
-                                    }
-
-                                    // Metrics 2x2 Grid
-                                    Rectangle {
-                                        border-radius: 10px;
-                                        background: Theme.bg-elevated;
-                                        border-width: 1px;
-                                        border-color: Theme.border;
-
-                                        VerticalLayout {
-                                            padding-top: 10px; padding-right: 12px; padding-bottom: 10px; padding-left: 12px;
-                                            spacing: 8px;
-
-                                            HorizontalLayout {
-                                                spacing: 8px;
-                                                VerticalLayout {
-                                                    horizontal-stretch: 1;
-                                                    spacing: 1px;
-                                                    Text { text: "Speed"; font-size: 10.5px; color: Theme.text-3; }
-                                                    Text { text: root.inspector.speed-text; font-family: Theme.font-mono; font-size: 12px; font-weight: 650; color: Theme.text-1; }
-                                                }
-                                                VerticalLayout {
-                                                    horizontal-stretch: 1;
-                                                    spacing: 1px;
-                                                    Text { text: "Remaining"; font-size: 10.5px; color: Theme.text-3; }
-                                                    Text { text: root.inspector.eta-text; font-family: Theme.font-mono; font-size: 12px; font-weight: 650; color: Theme.text-1; }
-                                                }
-                                            }
-                                            HorizontalLayout {
-                                                spacing: 8px;
-                                                VerticalLayout {
-                                                    horizontal-stretch: 1;
-                                                    spacing: 1px;
-                                                    Text { text: "Progress"; font-size: 10.5px; color: Theme.text-3; }
-                                                    Text { text: root.inspector.size-text; font-family: Theme.font-mono; font-size: 11.5px; color: Theme.text-1; overflow: elide; }
-                                                }
-                                                VerticalLayout {
-                                                    horizontal-stretch: 1;
-                                                    spacing: 1px;
-                                                    Text { text: "Connections"; font-size: 10.5px; color: Theme.text-3; }
-                                                    Text { text: root.inspector.connections-text; font-family: Theme.font-mono; font-size: 11.5px; color: Theme.text-1; }
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // SHA & Notices
-                                    if root.inspector.sha-text != "" : PillBadge {
-                                        text: root.inspector.sha-text;
-                                        tone: root.inspector.sha-tone;
-                                        has-check: root.inspector.sha-tone == 2;
-                                    }
-
-                                    if root.inspector.error-message != "" : Rectangle {
-                                        border-radius: 8px;
-                                        background: Theme.amber-soft;
-                                        border-width: 1px;
-                                        border-color: Theme.amber-border;
-                                        VerticalLayout {
-                                            padding-top: 8px; padding-right: 10px; padding-bottom: 8px; padding-left: 10px;
-                                            Text {
-                                                text: root.inspector.error-message;
-                                                font-size: 11.5px;
-                                                color: Theme.amber;
-                                                wrap: word-wrap;
-                                            }
-                                        }
-                                    }
-
-                                    if root.inspector.completion-notice != "" : Rectangle {
-                                        border-radius: 8px;
-                                        background: Theme.green-soft;
-                                        VerticalLayout {
-                                            padding-top: 8px; padding-right: 10px; padding-bottom: 8px; padding-left: 10px;
-                                            Text {
-                                                text: root.inspector.completion-notice;
-                                                font-size: 11.5px;
-                                                color: Theme.green;
-                                                wrap: word-wrap;
-                                            }
-                                        }
-                                    }
-
-                                    // Segment Matrix (first 8 / 16 segments compact list)
-                                    if root.inspector.segments.length > 0 : VerticalLayout {
-                                        spacing: 6px;
-                                        Text {
-                                            text: "SEGMENTS (" + root.inspector.segments.length + ")";
-                                            font-size: 10.5px;
-                                            font-weight: 700;
-                                            letter-spacing: 0.7px;
-                                            color: Theme.text-3;
-                                        }
-                                        for seg in root.inspector.segments : Rectangle {
-                                            height: 24px;
-                                            border-radius: 6px;
+                                        Rectangle {
                                             background: Theme.bg-elevated;
+                                            border-radius: Theme.radius-md;
                                             border-width: 1px;
                                             border-color: Theme.border;
-                                            HorizontalLayout {
-                                                padding-left: 8px;
-                                                padding-right: 8px;
+                                            VerticalLayout {
+                                                padding: 9px;
                                                 spacing: 8px;
-                                                Rectangle {
-                                                    width: 7px;
-                                                    height: 7px;
-                                                    border-radius: 3.5px;
-                                                    y: 8.5px;
-                                                    background: seg.state-code == 1 ? Theme.green
-                                                        : (seg.state-code == 0 || seg.state-code == 3 ? Theme.accent
-                                                        : (seg.state-code == 4 ? Theme.danger : Theme.text-3));
+                                                HorizontalLayout {
+                                                    spacing: 8px;
+                                                    InspectorMetric { label: "DOWN SPEED"; value: root.inspector.speed-text; }
+                                                    InspectorMetric { label: "UP SPEED"; value: root.inspector.upload-speed-text; }
+                                                    InspectorMetric { label: "REMAINING"; value: root.inspector.eta-text; }
                                                 }
-                                                Text { width: 22px; text: seg.index-text; font-family: Theme.font-mono; font-size: 11px; color: Theme.text-2; vertical-alignment: center; }
-                                                Text { horizontal-stretch: 1; text: seg.bytes-text; font-family: Theme.font-mono; font-size: 11px; color: Theme.text-1; vertical-alignment: center; }
-                                                Text { text: seg.state-label; font-size: 10.5px; color: Theme.text-3; vertical-alignment: center; }
+                                                HorizontalLayout {
+                                                    spacing: 8px;
+                                                    InspectorMetric { label: "PROGRESS"; value: root.inspector.size-text; }
+                                                    InspectorMetric { label: root.inspector.is-torrent ? "PEERS" : "CONNECTIONS"; value: root.inspector.connections-text; }
+                                                    if root.inspector.is-torrent : InspectorMetric {
+                                                        label: "RATIO & PIECES";
+                                                        value: root.inspector.ratio-text + " • " + root.inspector.pieces-text;
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        InspectorMetric { label: "SAVE FOLDER"; value: root.inspector.save-dir; }
+                                        HorizontalLayout {
+                                            spacing: 6px;
+                                            InspectorMetric { label: "SOURCE URL"; value: root.inspector.source-url; }
+                                            GhostButton { label: "Copy"; btn-height: 25px; pad-x: 7px; clicked => { root.copy-transfer-url(root.inspector.id); } }
+                                        }
+
+                                        if root.inspector.trackers-text != "" : InspectorMetric {
+                                            label: "TRACKERS";
+                                            value: root.inspector.trackers-text;
+                                        }
+
+                                        if root.inspector.sha-text != "" : HorizontalLayout {
+                                            alignment: start;
+                                            PillBadge {
+                                                text: root.inspector.sha-text;
+                                                tone: root.inspector.sha-tone;
+                                                has-check: root.inspector.sha-tone == 2;
+                                            }
+                                        }
+
+                                        if root.inspector.error-message != "" : Rectangle {
+                                            border-radius: 8px;
+                                            background: Theme.amber-soft;
+                                            border-width: 1px;
+                                            border-color: Theme.amber-border;
+                                            VerticalLayout {
+                                                padding-top: 8px; padding-right: 10px; padding-bottom: 8px; padding-left: 10px;
+                                                Text {
+                                                    text: root.inspector.error-message;
+                                                    font-size: 11.5px;
+                                                    color: Theme.amber;
+                                                    wrap: word-wrap;
+                                                }
+                                            }
+                                        }
+
+                                        if root.inspector.completion-notice != "" : Rectangle {
+                                            border-radius: 8px;
+                                            background: Theme.green-soft;
+                                            VerticalLayout {
+                                                padding-top: 8px; padding-right: 10px; padding-bottom: 8px; padding-left: 10px;
+                                                Text {
+                                                    text: root.inspector.completion-notice;
+                                                    font-size: 11.5px;
+                                                    color: Theme.green;
+                                                    wrap: word-wrap;
+                                                }
+                                            }
+                                        }
+
+                                        TransferActions {
+                                            transfer: root.inspector;
+                                            expanded: true;
+                                            action(action) => { root.run-transfer-action(action); }
+                                        }
+                                    }
+                                }
+
+                                if root.inspector-tab == 1 : VerticalLayout {
+                                    vertical-stretch: 1;
+                                    spacing: 8px;
+                                    if root.inspector.is-torrent && root.inspector.torrent-files.length > 0 : HorizontalLayout {
+                                        spacing: 6px;
+                                        GhostButton { label: "All"; enabled: !root.torrent-files-applying; clicked => { root.select-torrent-files(true); } }
+                                        GhostButton { label: "None"; enabled: !root.torrent-files-applying; clicked => { root.select-torrent-files(false); } }
+                                        PrimaryButton { label: "Apply"; enabled: !root.torrent-files-applying; clicked => { root.apply-torrent-files(root.inspector.id); } }
+                                        Rectangle { horizontal-stretch: 1; }
+                                    }
+                                    if root.inspector.torrent-files.length == 0 : Text {
+                                        text: root.inspector.is-torrent ? "Torrent files will appear when metadata is available." : "File selection is available for torrent transfers.";
+                                        color: Theme.text-2;
+                                        wrap: word-wrap;
+                                    }
+                                    if root.inspector.torrent-files.length > 0 : ScrollView {
+                                        vertical-stretch: 1;
+                                        content-width: self.visible-width;
+                                        VerticalLayout {
+                                            alignment: start;
+                                            spacing: 3px;
+                                            for file in root.inspector.torrent-files : HorizontalLayout {
+                                                spacing: 8px;
+                                                CheckBoxRow {
+                                                    horizontal-stretch: 1;
+                                                    min-width: 0px;
+                                                    controlled: true;
+                                                    enabled: !root.torrent-files-applying;
+                                                    checked: file.selected;
+                                                    label: file.relative-path;
+                                                    toggled => { root.toggle-torrent-file(file.index); }
+                                                }
+                                                Text {
+                                                    horizontal-stretch: 0;
+                                                    min-width: 68px;
+                                                    text: file.downloaded-text + " / " + file.size-text;
+                                                    color: Theme.text-2;
+                                                    font-size: 10px;
+                                                    horizontal-alignment: right;
+                                                    vertical-alignment: center;
+                                                }
                                             }
                                         }
                                     }
+                                }
 
-                                    // Torrent files if any
-                                    if root.inspector.is-torrent && root.inspector.torrent-files.length > 0 : VerticalLayout {
-                                        spacing: 6px;
-                                        HorizontalLayout {
+                                if root.inspector-tab == 2 : VerticalLayout {
+                                    vertical-stretch: 1;
+                                    spacing: 8px;
+                                    Text {
+                                        text: root.inspector.peers-summary-text;
+                                        color: Theme.text-2;
+                                        font-size: 11px;
+                                        wrap: word-wrap;
+                                    }
+                                    TorrentPeerTable {
+                                        vertical-stretch: 2;
+                                        peers: root.inspector.peers;
+                                        show-peer-details: true;
+                                    }
+                                    Text { text: "TRACKERS"; color: Theme.text-3; font-size: 10px; font-weight: 700; }
+                                    ScrollView {
+                                        vertical-stretch: 1;
+                                        min-height: 48px;
+                                        content-width: self.visible-width;
+                                        VerticalLayout {
+                                            alignment: start;
                                             Text {
-                                                horizontal-stretch: 1;
-                                                text: "TORRENT FILES";
+                                                text: root.inspector.trackers-text == "" ? "No trackers reported." : root.inspector.trackers-text;
+                                                color: Theme.text-2;
+                                                font-size: 11px;
+                                                wrap: char-wrap;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if root.inspector-tab == 3 : ScrollView {
+                                    vertical-stretch: 1;
+                                    content-width: self.visible-width;
+                                    VerticalLayout {
+                                        alignment: start;
+                                        spacing: 8px;
+                                        if root.inspector.segments.length == 0 : Text {
+                                            text: "No segments reported for this transfer.";
+                                            color: Theme.text-2;
+                                        }
+                                        if root.inspector.segments.length > 0 : VerticalLayout {
+                                            spacing: 6px;
+                                            Text {
+                                                text: "SEGMENTS (" + root.inspector.segments.length + ")";
                                                 font-size: 10.5px;
                                                 font-weight: 700;
                                                 letter-spacing: 0.7px;
                                                 color: Theme.text-3;
-                                                vertical-alignment: center;
                                             }
-                                            GhostButton {
-                                                label: "Apply";
-                                                btn-height: 22px;
-                                                pad-x: 8px;
-                                                clicked => { root.apply-torrent-files(root.inspector.id); }
-                                            }
-                                        }
-                                        for tf in root.inspector.torrent-files : CheckBoxRow {
-                                            checked: tf.selected;
-                                            label: tf.relative-path + " (" + tf.size-text + ")";
-                                            toggled(_) => { root.toggle-torrent-file(tf.index); }
-                                        }
-                                    }
-
-                                    // Action buttons
-                                    VerticalLayout {
-                                        spacing: 6px;
-                                        padding-top: 4px;
-
-                                        HorizontalLayout {
-                                            spacing: 6px;
-                                            if root.inspector.can-pause-resume : PrimaryButton {
-                                                horizontal-stretch: 1;
-                                                label: root.inspector.is-paused ? "Resume" : "Pause";
-                                                icon: root.inspector.is-paused ? @image-url("icons/play.svg") : @image-url("icons/pause.svg");
-                                                has-icon: true;
-                                                clicked => { root.toggle-transfer-pause(root.inspector.id, root.inspector.is-paused); }
-                                            }
-                                            if !root.inspector.is-completed : GhostButton {
-                                                horizontal-stretch: 1;
-                                                label: "Floating Box";
-                                                icon: @image-url("icons/app-window.svg");
-                                                has-icon: true;
-                                                clicked => { root.open-floating-progress(root.inspector.id); }
-                                            }
-                                            if root.inspector.is-completed : PrimaryButton {
-                                                horizontal-stretch: 1;
-                                                label: "Open File";
-                                                icon: @image-url("icons/external-link.svg");
-                                                has-icon: true;
-                                                clicked => { root.open-completed-file(root.inspector.id); }
-                                            }
-                                        }
-
-                                        HorizontalLayout {
-                                            spacing: 6px;
-                                            GhostButton {
-                                                horizontal-stretch: 1;
-                                                label: "Open Folder";
-                                                icon: @image-url("icons/folder-open.svg");
-                                                has-icon: true;
-                                                clicked => { root.reveal-in-explorer(root.inspector.id); }
-                                            }
-                                            if root.inspector.can-verify : GhostButton {
-                                                horizontal-stretch: 1;
-                                                label: "Verify SHA-256";
-                                                icon: @image-url("icons/file-check-2.svg");
-                                                has-icon: true;
-                                                clicked => { root.open-verify-dialog(root.inspector.id); }
-                                            }
-                                            if root.inspector.can-refresh-url : GhostButton {
-                                                horizontal-stretch: 1;
-                                                label: "Refresh Link";
-                                                icon: @image-url("icons/refresh-cw.svg");
-                                                has-icon: true;
-                                                clicked => { root.open-refresh-dialog(root.inspector.id); }
+                                            for seg in root.inspector.segments : Rectangle {
+                                                height: 24px;
+                                                border-radius: 6px;
+                                                background: Theme.bg-elevated;
+                                                border-width: 1px;
+                                                border-color: Theme.border;
+                                                HorizontalLayout {
+                                                    padding-left: 8px;
+                                                    padding-right: 8px;
+                                                    spacing: 8px;
+                                                    Rectangle {
+                                                        width: 7px;
+                                                        height: 7px;
+                                                        border-radius: 3.5px;
+                                                        y: 8.5px;
+                                                        background: seg.state-code == 1 ? Theme.green
+                                                            : (seg.state-code == 0 || seg.state-code == 3 ? Theme.accent
+                                                            : (seg.state-code == 4 ? Theme.danger : Theme.text-3));
+                                                    }
+                                                    Text { width: 22px; text: seg.index-text; font-family: Theme.font-mono; font-size: 11px; color: Theme.text-2; vertical-alignment: center; }
+                                                    Text { horizontal-stretch: 1; text: seg.bytes-text; font-family: Theme.font-mono; font-size: 11px; color: Theme.text-1; vertical-alignment: center; }
+                                                    Text { text: seg.state-label; font-size: 10.5px; color: Theme.text-3; vertical-alignment: center; }
+                                                }
                                             }
                                         }
                                     }
@@ -1641,53 +1763,56 @@ export component MainWindow inherits Window {
                 }
             }
 
-            // Overlays
-            AddDownloadOverlay {
-                open <=> root.add-open;
-                source-text <=> root.add-source-text;
-                probing: root.add-probing;
-                submitting: root.add-submitting;
-                error-text: root.add-error-text;
-                active-tab <=> root.add-tab;
-                has-probe: root.add-has-probe;
-                is-torrent-input: root.add-is-torrent-input;
-                is-direct-http: root.add-is-direct-http;
-                probe-title: root.add-probe-title;
-                probe-meta: root.add-probe-meta;
-                is-playlist: root.add-is-playlist;
-                playlist-count: root.add-playlist-count;
-                playlist-selected-count: root.add-playlist-selected-count;
-                playlist-folder-name <=> root.add-playlist-folder-name;
-                playlist-filter <=> root.add-playlist-filter;
-                playlist-items: root.add-playlist-items;
-                format-options: root.add-format-options;
-                container-index <=> root.add-container-index;
-                audio-preset-index <=> root.add-audio-preset-index;
-                embed-subtitles <=> root.add-embed-subtitles;
-                lossless-remux <=> root.add-lossless-remux;
-                normalize-audio <=> root.add-normalize-audio;
-                subtitles: root.add-subtitles;
-                torrent-sequential <=> root.add-torrent-sequential;
-                save-dir <=> root.add-save-dir;
-                threads-index <=> root.add-threads-index;
-                advanced-open <=> root.add-advanced-open;
-                filename-override <=> root.add-filename-override;
-                expected-sha256 <=> root.add-expected-sha256;
-                batch-preview-count: root.add-batch-preview-count;
-                footer-hint: root.add-footer-hint;
-                close-requested => { root.add-close-requested(); }
-                source-edited(val) => { root.add-source-edited(val); }
-                probe-clicked => { root.add-probe-clicked(); }
-                browse-torrent-clicked => { root.add-browse-torrent-clicked(); }
-                browse-save-dir-clicked => { root.add-browse-save-dir-clicked(); }
-                format-selected(id) => { root.add-format-selected(id); }
-                playlist-item-toggled(idx) => { root.add-playlist-item-toggled(idx); }
-                playlist-select-all => { root.add-playlist-select-all(); }
-                playlist-clear => { root.add-playlist-clear(); }
-                subtitle-toggled(lang) => { root.add-subtitle-toggled(lang); }
-                submit-clicked => { root.add-submit-clicked(); }
+            if root.context-menu-open : TouchArea {
+                width: 100%;
+                height: 100%;
+                pointer-event(event) => {
+                    if event.kind == PointerEventKind.down { root.context-menu-open = false; }
+                }
+            }
+            if root.context-menu-open : Rectangle {
+                width: 174px;
+                height: menu.preferred-height;
+                x: Math.clamp(root.context-menu-x * 1px, 6px, parent.width - self.width - 6px);
+                y: Math.clamp(root.context-menu-y * 1px, 6px, parent.height - self.height - 6px);
+                border-radius: Theme.radius-md;
+                background: Theme.bg-elevated;
+                border-width: 1px;
+                border-color: Theme.border-strong;
+                drop-shadow-blur: 12px;
+                drop-shadow-offset-y: 3px;
+                drop-shadow-color: Theme.popover-shadow;
+
+                TouchArea {}
+                menu := VerticalLayout {
+                    padding: 5px;
+                    spacing: 3px;
+                    for entry in [
+                        { action: TransferAction.pause, label: "Pause" },
+                        { action: TransferAction.stop, label: "Stop" },
+                        { action: TransferAction.floating, label: "Open Floating Window" },
+                        { action: TransferAction.open-file, label: "Open File" },
+                        { action: TransferAction.open-folder, label: "Open Folder" },
+                        { action: TransferAction.copy, label: "Copy URL / Magnet" },
+                        { action: TransferAction.refresh, label: "Refresh Link" },
+                        { action: TransferAction.verify, label: "Verify SHA-256" },
+                        { action: TransferAction.remove, label: "Remove..." },
+                    ] : GhostButton {
+                        label: entry.action == TransferAction.pause && root.inspector.is-paused ? "Resume" : entry.label;
+                        enabled: entry.action == TransferAction.pause ? root.inspector.can-pause-resume
+                            : entry.action == TransferAction.stop ? root.inspector.can-stop
+                            : entry.action == TransferAction.open-file ? root.inspector.is-completed
+                            : entry.action == TransferAction.copy ? root.inspector.source-url != ""
+                            : entry.action == TransferAction.refresh ? root.inspector.can-refresh-url
+                            : entry.action != TransferAction.verify || root.inspector.can-verify;
+                        btn-height: 25px;
+                        pad-x: 5px;
+                        clicked => { root.run-transfer-action(entry.action); }
+                    }
+                }
             }
 
+            // Overlays
             SettingsOverlay {
                 open <=> root.settings-open;
                 theme-index <=> root.set-theme-index;
@@ -1746,6 +1871,65 @@ export component MainWindow inherits Window {
                 install-update-clicked => { root.settings-install-update(); }
             }
 
+            AddDownloadOverlay {
+                open <=> root.add-open;
+                source-text <=> root.add-source-text;
+                probing: root.add-probing;
+                submitting: root.add-submitting;
+                error-text: root.add-error-text;
+                active-tab <=> root.add-tab;
+                has-probe: root.add-has-probe;
+                is-torrent-input: root.add-is-torrent-input;
+                is-direct-http: root.add-is-direct-http;
+                probe-title: root.add-probe-title;
+                probe-meta: root.add-probe-meta;
+                is-playlist: root.add-is-playlist;
+                playlist-count: root.add-playlist-count;
+                playlist-selected-count: root.add-playlist-selected-count;
+                playlist-folder-name <=> root.add-playlist-folder-name;
+                playlist-filter <=> root.add-playlist-filter;
+                playlist-items: root.add-playlist-items;
+                format-options: root.add-format-options;
+                container-index <=> root.add-container-index;
+                audio-preset-index <=> root.add-audio-preset-index;
+                embed-subtitles <=> root.add-embed-subtitles;
+                lossless-remux <=> root.add-lossless-remux;
+                normalize-audio <=> root.add-normalize-audio;
+                subtitles: root.add-subtitles;
+                torrent-preview-loading: root.add-torrent-probing;
+                has-torrent-preview: root.has-torrent-preview;
+                torrent-preview-name: root.add-torrent-preview-name;
+                torrent-preview-meta: root.add-torrent-preview-meta;
+                torrent-preview-trackers: root.add-torrent-preview-trackers;
+                torrent-preview-files: root.torrent-preview-files;
+                torrent-preview-filter <=> root.add-torrent-preview-filter;
+                torrent-start-paused <=> root.add-torrent-start-paused;
+                torrent-preview-file-toggled(index) => { root.torrent-preview-file-toggled(index); }
+                torrent-preview-select-all => { root.torrent-preview-select-all(); }
+                torrent-preview-select-none => { root.torrent-preview-select-none(); }
+                torrent-preview-filter-edited(value) => { root.torrent-preview-filter-edited(value); }
+                torrent-sequential <=> root.add-torrent-sequential;
+                save-dir <=> root.add-save-dir;
+                threads-index <=> root.add-threads-index;
+                advanced-open <=> root.add-advanced-open;
+                filename-override <=> root.add-filename-override;
+                expected-sha256 <=> root.add-expected-sha256;
+                batch-preview-count: root.add-batch-preview-count;
+                footer-hint: root.add-footer-hint;
+                close-requested => { root.add-close-requested(); }
+                source-edited(val) => { root.add-source-edited(val); }
+                probe-clicked => { root.add-probe-clicked(); }
+                cancel-torrent-preview-clicked => { root.add-cancel-torrent-preview-clicked(); }
+                browse-torrent-clicked => { root.add-browse-torrent-clicked(); }
+                browse-save-dir-clicked => { root.add-browse-save-dir-clicked(); }
+                format-selected(id) => { root.add-format-selected(id); }
+                playlist-item-toggled(idx) => { root.add-playlist-item-toggled(idx); }
+                playlist-select-all => { root.add-playlist-select-all(); }
+                playlist-clear => { root.add-playlist-clear(); }
+                subtitle-toggled(lang) => { root.add-subtitle-toggled(lang); }
+                submit-clicked => { root.add-submit-clicked(); }
+            }
+
             CommandPaletteOverlay {
                 open <=> root.palette-open;
                 query <=> root.palette-query;
@@ -1775,6 +1959,120 @@ export component MainWindow inherits Window {
                 close-requested => { root.verify-open = false; }
                 submit-clicked => { root.verify-submit-clicked(); }
             }
+            remove-confirm-focus := FocusScope {
+                width: 100%;
+                height: 100%;
+                visible: root.remove-confirm-open;
+                enabled: root.remove-confirm-open;
+
+                key-pressed(event) => {
+                    if (event.text == Key.Escape) { root.remove-confirm-open = false; }
+                    return accept;
+                }
+
+                Rectangle {
+                    width: 100%;
+                    height: 100%;
+                    background: Theme.modal-backdrop;
+                    TouchArea {}
+                    Rectangle {
+                        width: 436px;
+                        height: remove-content.preferred-height;
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        border-radius: Theme.radius-lg;
+                        background: Theme.bg-elevated;
+                        border-width: 1px;
+                        border-color: Theme.border-strong;
+                        remove-content := VerticalLayout {
+                            padding: 16px;
+                            spacing: 12px;
+                            Text { text: "Remove transfer?"; font-size: 16px; font-weight: 650; color: Theme.text-1; }
+                            Text { text: root.remove-confirm-filename; color: Theme.text-2; wrap: char-wrap; }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                GhostButton { label: "Cancel"; clicked => { root.remove-confirm-open = false; } }
+                                Rectangle { horizontal-stretch: 1; }
+                                GhostButton { label: "Remove from List"; clicked => { root.confirm-remove-transfer(root.remove-confirm-id, false); } }
+                                PrimaryButton { label: "Delete Files Too"; clicked => { root.confirm-remove-transfer(root.remove-confirm-id, true); } }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if root.toast-visible : Rectangle {
+                x: parent.width - self.width - 18px;
+                y: parent.height - self.height - 18px;
+                width: Math.min(420px, toast-label.preferred-width + 28px);
+                height: toast-content.preferred-height;
+                border-radius: Theme.radius-lg;
+                background: Theme.bg-elevated;
+                border-width: 1px;
+                border-color: root.toast-error ? Theme.danger : Theme.accent;
+                drop-shadow-blur: 10px;
+                drop-shadow-color: Theme.popover-shadow;
+                toast-content := VerticalLayout {
+                    padding: 9px;
+                    padding-left: 14px;
+                    padding-right: 14px;
+                    toast-label := Text {
+                        text: root.toast-text;
+                        color: root.toast-error ? Theme.danger : Theme.text-1;
+                        wrap: word-wrap;
+                        font-size: 12px;
+                    }
+                }
+            }
         }
+    }
+
+    if !root.is-maximized : ResizeGrip {
+        x: 10px; y: 0px; width: parent.width - 20px; height: 5px;
+        direction: 0;
+        mouse-cursor: ns-resize;
+        resize(direction) => { root.start-resize(direction); }
+    }
+    if !root.is-maximized : ResizeGrip {
+        x: 10px; y: parent.height - 5px; width: parent.width - 20px; height: 5px;
+        direction: 1;
+        mouse-cursor: ns-resize;
+        resize(direction) => { root.start-resize(direction); }
+    }
+    if !root.is-maximized : ResizeGrip {
+        x: 0px; y: 10px; width: 5px; height: parent.height - 20px;
+        direction: 2;
+        mouse-cursor: ew-resize;
+        resize(direction) => { root.start-resize(direction); }
+    }
+    if !root.is-maximized : ResizeGrip {
+        x: parent.width - 5px; y: 10px; width: 5px; height: parent.height - 20px;
+        direction: 3;
+        mouse-cursor: ew-resize;
+        resize(direction) => { root.start-resize(direction); }
+    }
+    if !root.is-maximized : ResizeGrip {
+        x: 0px; y: 0px; width: 10px; height: 10px;
+        direction: 4;
+        mouse-cursor: nwse-resize;
+        resize(direction) => { root.start-resize(direction); }
+    }
+    if !root.is-maximized : ResizeGrip {
+        x: parent.width - 10px; y: 0px; width: 10px; height: 10px;
+        direction: 5;
+        mouse-cursor: nesw-resize;
+        resize(direction) => { root.start-resize(direction); }
+    }
+    if !root.is-maximized : ResizeGrip {
+        x: 0px; y: parent.height - 10px; width: 10px; height: 10px;
+        direction: 6;
+        mouse-cursor: nesw-resize;
+        resize(direction) => { root.start-resize(direction); }
+    }
+    if !root.is-maximized : ResizeGrip {
+        x: parent.width - 10px; y: parent.height - 10px; width: 10px; height: 10px;
+        direction: 7;
+        mouse-cursor: nwse-resize;
+        resize(direction) => { root.start-resize(direction); }
     }
 }

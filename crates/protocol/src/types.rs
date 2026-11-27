@@ -315,11 +315,56 @@ pub struct TorrentFileEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TorrentPeerEntry {
+    pub address: String,
+    pub state: String,
+    pub downloaded_bytes: u64,
+    pub download_speed_bps: u64,
+    pub pieces_downloaded: u32,
+    pub incoming: bool,
+    pub errors: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TorrentPeerSummary {
+    pub live: u32,
+    pub connecting: u32,
+    pub queued: u32,
+    pub seen: u32,
+    pub dead: u32,
+    pub upload_speed_bps: u64,
+    pub ratio: f64,
+    pub completed_pieces: u32,
+    pub total_pieces: u32,
+    pub trackers: Vec<String>,
+    pub peers: Vec<TorrentPeerEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TorrentPreviewResult {
+    pub info_hash: String,
+    pub name: String,
+    pub version: String,
+    pub total_bytes: u64,
+    pub piece_length: u64,
+    pub total_pieces: usize,
+    pub private: bool,
+    pub trackers: Vec<String>,
+    pub files: Vec<TorrentFileEntry>,
+    pub seen_peers: u32,
+    pub is_magnet: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTorrentRequest {
     pub source: String, // magnet:?... or path to .torrent file
     pub save_dir: Option<String>,
     pub selected_file_indices: Option<Vec<usize>>,
     pub sequential: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub start_paused: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -833,8 +833,23 @@ api.runtime.onMessage.addListener((message: BrowserMessage, sender, reply) => {
       url: stream?.url,
       formats,
       childActive: frame.frameId === 0 && childPlayers.has(frame.tabId),
+      tabOrigin: frame.frameId === 0 ? undefined : httpUrl(frame.tabUrl)?.origin,
     });
     return;
+  }
+
+  if (message.kind === "magnet-click") {
+    void settingsReady.then(async () => {
+      const magnet = typeof message.url === "string" ? magnetUri(message.url) : undefined;
+      if (!frame || !magnet) return { handled: false };
+      if (blockedSite(frame.page, settings) || blockedSite(httpUrl(frame.tabUrl), settings)) {
+        return { handled: false, reason: "excluded" };
+      }
+      if (!settings.enabled || !settings.interceptMagnets) return { handled: false };
+      const handoff = await native.send({ type: "open_desktop_window", open_picker_url: magnet });
+      return { handled: handoff.type === "ack" && handoff.ok === true };
+    }).then(reply, () => reply({ handled: false }));
+    return true;
   }
 
   const fromPopup = sender.url?.split(/[?#]/, 1)[0] === popupUrl;
@@ -917,7 +932,10 @@ api.contextMenus.onClicked.addListener((info, tab) => {
     const page = httpUrl(info.frameUrl ?? info.pageUrl);
     const tabInScope = page && page.origin === httpUrl(tab?.url)?.origin ? tab : undefined;
     if (info.menuItemId === "download" && magnet) {
-      await native.send({ type: "add_torrent", request: { source: magnet, sequential: false } });
+      await settingsReady;
+      if (native.state.connected || await native.ensureConnected()) {
+        await native.send({ type: "open_desktop_window", open_picker_url: magnet });
+      }
     } else if (info.menuItemId === "download" && url) {
       await handoffHttp(url, httpHandoffContext(url, tabInScope, tabReferrer(url, tabInScope)));
     } else if (info.menuItemId === "links" && tab?.id !== undefined) {

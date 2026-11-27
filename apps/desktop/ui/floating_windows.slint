@@ -8,10 +8,11 @@ import {
     CheckBoxRow,
     PillBadge,
     SegmentProgressBar,
+    TorrentPeerTable,
     StyledLineEdit,
     StyledSelect,
 } from "./widgets.slint";
-import { ConnectionRowModel } from "./app_types.slint";
+import { ConnectionRowModel, TorrentPeerRowModel } from "./app_types.slint";
 
 component FloatingChrome inherits HorizontalLayout {
     in property <string> title-text;
@@ -550,6 +551,23 @@ export component DownloadConfirmWindow inherits Window {
     }
 }
 
+component ProgressStat inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+    in property <bool> accent: false;
+
+    spacing: 10px;
+    Text { width: 122px; text: root.label; font-size: 12px; color: Theme.text-2; }
+    Text {
+        horizontal-stretch: 1;
+        text: root.value;
+        font-size: 12px;
+        font-weight: root.accent ? 600 : 500;
+        color: root.accent ? Theme.accent : Theme.text-1;
+        overflow: elide;
+    }
+}
+
 export component DownloadProgressWindow inherits Window {
     in property <string> title-bar-text: "0% Download";
     in property <string> url: "";
@@ -564,9 +582,15 @@ export component DownloadProgressWindow inherits Window {
     in property <bool> is-paused: false;
     in property <bool> is-completed: false;
     in property <bool> can-pause-resume: true;
+    in-out property <bool> can-stop: true;
     in property <[float]> segments: [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0];
     in property <int> segment-tone: 0;
+    in property <bool> is-torrent: false;
+    in property <string> upload-speed-text: "0 B/s";
+    in property <string> peers-summary-text: "";
+    in property <[TorrentPeerRowModel]> peers: [];
     in-out property <bool> show-details: true;
+    property <length> expanded-height: 0px;
     in property <[ConnectionRowModel]> connections: [];
     // 0=Download status, 1=Speed Limiter, 2=Options on completion
     in-out property <int> active-tab: 0;
@@ -583,6 +607,7 @@ export component DownloadProgressWindow inherits Window {
     callback close-clicked();
     callback toggle-pause-clicked();
     callback cancel-transfer-clicked();
+    callback stop-transfer-clicked();
     callback toggle-details-clicked();
     callback apply-speed-limit(bool, string, int);
     callback speed-input-dirty();
@@ -593,10 +618,20 @@ export component DownloadProgressWindow inherits Window {
     title: root.title-bar-text;
     icon: @image-url("../icons/icon.png");
     width: 540px;
-    height: root.show-details ? 512px : 334px;
+    min-height: 120px;
+    preferred-height: (root.show-details ? 512px : 334px) + (root.is-torrent ? 20px : 0px);
     no-frame: true;
     background: Theme.bg-canvas;
     default-font-family: Theme.font-sans;
+
+    changed show-details => {
+        if (root.show-details) {
+            root.height = root.expanded-height > 0px ? root.expanded-height : root.preferred-height;
+        } else {
+            root.expanded-height = root.height;
+            root.height = Math.min(root.height, root.preferred-height);
+        }
+    }
 
     Rectangle {
         width: 100%;
@@ -666,62 +701,136 @@ export component DownloadProgressWindow inherits Window {
 
             if root.active-tab == 0 : VerticalLayout {
                 vertical-stretch: 1;
-                padding-top: 12px; padding-right: 14px; padding-bottom: 12px; padding-left: 14px;
-                spacing: 8px;
 
-                Text {
-                    text: root.url;
-                    font-family: Theme.font-mono;
-                    font-size: 11px;
-                    color: Theme.text-3;
-                    overflow: elide;
-                }
+                status-scroll := Flickable {
+                    vertical-stretch: 1;
+                    min-height: 0px;
+                    content-width: self.width;
+                    content-height: Math.max(self.height, status-body.min-height);
 
-                // Key/value stats grid
-                VerticalLayout {
-                    spacing: 5px;
-                    for kv in [
-                        { k: "Status", v: root.status-text, is-accent: true },
-                        { k: "File size", v: root.size-text, is-accent: false },
-                        { k: "Downloaded", v: root.downloaded-text, is-accent: false },
-                        { k: "Transfer rate", v: root.speed-text, is-accent: false },
-                        { k: "Time left", v: root.eta-text, is-accent: false },
-                        { k: "Resume capability", v: root.resume-text, is-accent: false },
-                        { k: "Server", v: root.server-text, is-accent: false },
-                    ] : HorizontalLayout {
-                        spacing: 10px;
+                    status-body := VerticalLayout {
+                        width: status-scroll.content-width;
+                        height: status-scroll.content-height;
+                        padding-top: 12px; padding-right: 14px; padding-bottom: 8px; padding-left: 14px;
+                        spacing: 8px;
+
                         Text {
-                            width: 122px;
-                            text: kv.k;
-                            font-size: 12px;
-                            color: Theme.text-2;
-                        }
-                        Text {
-                            horizontal-stretch: 1;
-                            text: kv.v;
-                            font-size: 12px;
-                            font-weight: kv.is-accent ? 600 : 500;
-                            color: kv.is-accent ? Theme.accent : Theme.text-1;
+                            text: root.url;
+                            font-family: Theme.font-mono;
+                            font-size: 11px;
+                            color: Theme.text-3;
                             overflow: elide;
+                        }
+
+                        // Key/value stats grid
+                        VerticalLayout {
+                            spacing: 5px;
+                            ProgressStat { label: "Status"; value: root.status-text; accent: true; }
+                            ProgressStat { label: "File size"; value: root.size-text; }
+                            ProgressStat { label: "Downloaded"; value: root.downloaded-text; }
+                            ProgressStat { label: "Transfer rate"; value: root.speed-text; }
+                            ProgressStat { label: "Time left"; value: root.eta-text; }
+                            ProgressStat { label: "Resume capability"; value: root.resume-text; }
+                            ProgressStat { label: "Server"; value: root.server-text; }
+                            if root.is-torrent : HorizontalLayout {
+                                spacing: 10px;
+                                Text { width: 122px; text: "Upload / Peers"; font-size: 12px; color: Theme.text-2; }
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: root.upload-speed-text + "  •  " + root.peers-summary-text;
+                                    font-size: 12px;
+                                    color: Theme.text-1;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+
+                        if root.error-text != "" : Text {
+                            text: root.error-text;
+                            font-size: 11.5px;
+                            color: Theme.danger;
+                            wrap: word-wrap;
+                        }
+
+                        // Segmented progress bar
+                        SegmentProgressBar {
+                            segments: root.segments;
+                            tone: root.segment-tone;
+                        }
+
+                        if root.show-details && root.is-torrent : VerticalLayout {
+                            vertical-stretch: 1;
+                            spacing: 6px;
+                            Text { text: "Connected Peers"; font-size: 11px; color: Theme.text-2; }
+                            TorrentPeerTable { vertical-stretch: 1; peers: root.peers; }
+                        }
+
+                        if root.show-details && !root.is-torrent : VerticalLayout {
+                            vertical-stretch: 1;
+                            spacing: 6px;
+                            padding-top: 2px;
+
+                            Text {
+                                text: "Start positions and download progress by connections";
+                                font-size: 11px;
+                                color: Theme.text-3;
+                                horizontal-alignment: center;
+                            }
+
+                            Rectangle {
+                                vertical-stretch: 1;
+                                border-radius: 7px;
+                                background: Theme.bg-input;
+                                border-width: 1px;
+                                border-color: Theme.border;
+                                clip: true;
+
+                                VerticalLayout {
+                                    padding: 0px;
+                                    spacing: 0px;
+
+                                    Rectangle {
+                                        height: 24px;
+                                        background: Theme.bg-elevated;
+                                        border-width: 1px;
+                                        border-color: Theme.border;
+
+                                        HorizontalLayout {
+                                            padding-left: 8px;
+                                            padding-right: 8px;
+                                            spacing: 8px;
+                                            Text { width: 34px; text: "N."; font-size: 11px; font-weight: 600; color: Theme.text-2; vertical-alignment: center; }
+                                            Text { width: 92px; text: "Downloaded"; font-size: 11px; font-weight: 600; color: Theme.text-2; vertical-alignment: center; }
+                                            Text { horizontal-stretch: 1; text: "Info"; font-size: 11px; font-weight: 600; color: Theme.text-2; vertical-alignment: center; }
+                                        }
+                                    }
+
+                                    ScrollView {
+                                        vertical-stretch: 1;
+                                        VerticalLayout {
+                                            alignment: start;
+                                            padding-top: 3px; padding-right: 0px; padding-bottom: 4px; padding-left: 0px;
+                                            spacing: 1px;
+                                            for row in root.connections : HorizontalLayout {
+                                                height: 22px;
+                                                padding-left: 8px;
+                                                padding-right: 8px;
+                                                spacing: 8px;
+                                                Text { width: 34px; text: row.num-text; font-family: Theme.font-mono; font-size: 11px; color: Theme.text-2; vertical-alignment: center; }
+                                                Text { width: 92px; text: row.downloaded-text; font-family: Theme.font-mono; font-size: 11px; color: Theme.text-1; vertical-alignment: center; }
+                                                Text { horizontal-stretch: 1; text: row.info-text; font-size: 11px; color: Theme.text-2; vertical-alignment: center; overflow: elide; }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
 
-                if root.error-text != "" : Text {
-                    text: root.error-text;
-                    font-size: 11.5px;
-                    color: Theme.danger;
-                    wrap: word-wrap;
-                }
-
-                // Segmented progress bar
-                SegmentProgressBar {
-                    segments: root.segments;
-                    tone: root.segment-tone;
-                }
-
                 // Action row
                 HorizontalLayout {
+                    padding-top: 4px; padding-right: 14px; padding-bottom: 12px; padding-left: 14px;
                     spacing: 8px;
                     GhostButton {
                         label: root.show-details ? "<< Hide details" : "Show details >>";
@@ -746,8 +855,14 @@ export component DownloadProgressWindow inherits Window {
                         btn-height: 29px;
                         clicked => { root.toggle-pause-clicked(); }
                     }
-                    if !root.is-completed : GhostButton {
-                        label: "Cancel";
+                    if !root.is-completed && root.can-pause-resume : GhostButton {
+                        label: "Stop";
+                        enabled: root.can-stop;
+                        btn-height: 29px;
+                        clicked => { root.stop-transfer-clicked(); }
+                    }
+                    GhostButton {
+                        label: "Remove";
                         btn-height: 29px;
                         clicked => { root.cancel-transfer-clicked(); }
                     }
@@ -755,67 +870,6 @@ export component DownloadProgressWindow inherits Window {
                         label: "Close";
                         btn-height: 29px;
                         clicked => { root.close-clicked(); }
-                    }
-                }
-
-                if root.show-details : VerticalLayout {
-                    vertical-stretch: 1;
-                    spacing: 6px;
-                    padding-top: 2px;
-
-                    Text {
-                        text: "Start positions and download progress by connections";
-                        font-size: 11px;
-                        color: Theme.text-3;
-                        horizontal-alignment: center;
-                    }
-
-                    Rectangle {
-                        vertical-stretch: 1;
-                        border-radius: 7px;
-                        background: Theme.bg-input;
-                        border-width: 1px;
-                        border-color: Theme.border;
-                        clip: true;
-
-                        VerticalLayout {
-                            padding: 0px;
-                            spacing: 0px;
-
-                            Rectangle {
-                                height: 24px;
-                                background: Theme.bg-elevated;
-                                border-width: 1px;
-                                border-color: Theme.border;
-
-                                HorizontalLayout {
-                                    padding-left: 8px;
-                                    padding-right: 8px;
-                                    spacing: 8px;
-                                    Text { width: 34px; text: "N."; font-size: 11px; font-weight: 600; color: Theme.text-2; vertical-alignment: center; }
-                                    Text { width: 92px; text: "Downloaded"; font-size: 11px; font-weight: 600; color: Theme.text-2; vertical-alignment: center; }
-                                    Text { horizontal-stretch: 1; text: "Info"; font-size: 11px; font-weight: 600; color: Theme.text-2; vertical-alignment: center; }
-                                }
-                            }
-
-                            ScrollView {
-                                vertical-stretch: 1;
-                                VerticalLayout {
-                                    alignment: start;
-                                    padding-top: 3px; padding-right: 0px; padding-bottom: 4px; padding-left: 0px;
-                                    spacing: 1px;
-                                    for row in root.connections : HorizontalLayout {
-                                        height: 22px;
-                                        padding-left: 8px;
-                                        padding-right: 8px;
-                                        spacing: 8px;
-                                        Text { width: 34px; text: row.num-text; font-family: Theme.font-mono; font-size: 11px; color: Theme.text-2; vertical-alignment: center; }
-                                        Text { width: 92px; text: row.downloaded-text; font-family: Theme.font-mono; font-size: 11px; color: Theme.text-1; vertical-alignment: center; }
-                                        Text { horizontal-stretch: 1; text: row.info-text; font-size: 11px; color: Theme.text-2; vertical-alignment: center; overflow: elide; }
-                                    }
-                                }
-                            }
-                        }
                     }
                 }
             }

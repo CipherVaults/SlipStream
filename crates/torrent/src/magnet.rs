@@ -2,8 +2,12 @@ use crate::TorrentError;
 use slipstream_protocol::{
     is_private_or_loopback_ip, sanitize_filename, validate_magnet_uri, UrlSecurityError,
 };
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, net::IpAddr, time::Duration};
+use tokio::{net::lookup_host, time::timeout};
 use url::{Host, Url};
+
+const MAX_MAGNET_TRACKERS: usize = 8;
+const TRACKER_DNS_TIMEOUT: Duration = Duration::from_secs(2);
 
 // `so` is peer/user input. Bound expansion independently of the index values.
 const MAX_SELECTED_INDICES: usize = 100_000;
@@ -30,21 +34,43 @@ impl ParsedMagnet {
             .unwrap_or_else(|| self.info_hash_hex.clone())
     }
 
-    pub(crate) fn v1_uri(&self, use_trackers: bool) -> Option<String> {
+    pub(crate) fn v1_uri(&self, trackers: &[String]) -> Option<String> {
         let hash = self.info_hash_v1_hex.as_ref()?;
         let mut uri = Url::parse("magnet:?").expect("constant magnet URI");
         uri.query_pairs_mut()
             .append_pair("xt", &format!("urn:btih:{hash}"));
-        if use_trackers {
-            for tracker in &self.trackers {
-                uri.query_pairs_mut().append_pair("tr", tracker);
-            }
+        for tracker in trackers {
+            uri.query_pairs_mut().append_pair("tr", tracker);
         }
         Some(uri.into())
+    }
+
+    pub(crate) async fn resolve_trackers(
+        &self,
+        udp_only: bool,
+        allow_loopback: bool,
+    ) -> Vec<String> {
+        let mut urls = Vec::new();
+        for tracker in &self.trackers {
+            if let Some(url) = resolve_tracker(tracker, udp_only, allow_loopback)
+                .await
+                .filter(|url| !urls.contains(url))
+            {
+                urls.push(url);
+            }
+        }
+        urls
     }
 }
 
 pub fn parse_magnet_uri(raw: &str) -> Result<ParsedMagnet, TorrentError> {
+    parse_magnet_uri_with_loopback(raw, false)
+}
+
+pub(crate) fn parse_magnet_uri_with_loopback(
+    raw: &str,
+    allow_loopback: bool,
+) -> Result<ParsedMagnet, TorrentError> {
     let verified = validate_magnet_uri(raw)?;
     let uri = Url::parse(&verified.raw).map_err(|_| UrlSecurityError::InvalidMagnet)?;
     let mut magnet = ParsedMagnet {
@@ -77,7 +103,12 @@ pub fn parse_magnet_uri(raw: &str) -> Result<ParsedMagnet, TorrentError> {
                     magnet.info_hash_v2_hex = Some(hash);
                 }
             }
-            "tr" if allowed_tracker_url(&value) => magnet.trackers.push(value.into_owned()),
+            "tr" if magnet.trackers.len() < MAX_MAGNET_TRACKERS
+                && tracker_url(&value, allow_loopback).is_some()
+                && !magnet.trackers.iter().any(|tracker| tracker == &value) =>
+            {
+                magnet.trackers.push(value.into_owned());
+            }
             "xs" if !value.is_empty() => magnet.exact_sources.push(value.into_owned()),
             "xl" => magnet.exact_length = Some(decimal(&value)?),
             "so" => {
@@ -94,29 +125,75 @@ pub fn parse_magnet_uri(raw: &str) -> Result<ParsedMagnet, TorrentError> {
 }
 
 pub(crate) fn allowed_tracker_url(raw: &str) -> bool {
-    let Ok(url) = Url::parse(raw) else {
-        return false;
-    };
+    tracker_url(raw, false).is_some()
+}
+
+fn tracker_url(raw: &str, allow_loopback: bool) -> Option<Url> {
+    let url = Url::parse(raw).ok()?;
     if !matches!(url.scheme(), "http" | "https" | "udp") || raw.chars().any(char::is_control) {
-        return false;
+        return None;
     }
-    // UDP is a non-special URL scheme, so normalize its opaque host as an HTTP host
-    // before checking alternate spellings of IPv4 addresses and localhost.
-    match url
-        .host_str()
-        .map(|host| Host::parse(host.trim_end_matches('.')))
-    {
-        Some(Ok(Host::Ipv4(ip))) => !is_private_or_loopback_ip(ip.into()),
-        Some(Ok(Host::Ipv6(ip))) => {
-            !is_private_or_loopback_ip(ip.into())
-                && (ip.segments()[0] != 0x2001 || ip.segments()[1] != 0xdb8)
+    let allowed = match tracker_host(&url)? {
+        Host::Ipv4(ip) => tracker_ip_allowed(ip.into(), allow_loopback),
+        Host::Ipv6(ip) => tracker_ip_allowed(ip.into(), allow_loopback),
+        Host::Domain(host) => {
+            let host = host.trim_end_matches('.');
+            !host.is_empty()
+                && (allow_loopback || (host != "localhost" && !host.ends_with(".localhost")))
         }
-        Some(Ok(Host::Domain(host))) => {
-            let host = host.trim_end_matches('.').to_ascii_lowercase();
-            !host.is_empty() && host != "localhost" && !host.ends_with(".localhost")
-        }
-        _ => false,
+    };
+    allowed.then_some(url)
+}
+
+fn tracker_host(url: &Url) -> Option<Host<String>> {
+    // Normalize UDP's opaque host to recognize alternate IPv4 spellings.
+    Host::parse(url.host_str()?).ok()
+}
+
+fn tracker_ip_allowed(ip: IpAddr, allow_loopback: bool) -> bool {
+    let ip = ip.to_canonical();
+    (allow_loopback && ip.is_loopback())
+        || (!is_private_or_loopback_ip(ip)
+            && !matches!(ip, IpAddr::V6(ip) if ip.segments()[..2] == [0x2001, 0xdb8]))
+}
+
+async fn resolve_tracker(raw: &str, udp_only: bool, allow_loopback: bool) -> Option<String> {
+    let mut url = tracker_url(raw, allow_loopback)?;
+    let udp = url.scheme() == "udp";
+    if udp_only && !udp {
+        return None;
     }
+    let port = url.port_or_known_default().filter(|port| *port != 0)?;
+    let host = match tracker_host(&url)? {
+        Host::Ipv4(ip) => ip.to_string(),
+        Host::Ipv6(ip) => ip.to_string(),
+        Host::Domain(host) => host,
+    };
+    let mut addrs = timeout(TRACKER_DNS_TIMEOUT, lookup_host((host.as_str(), port)))
+        .await
+        .ok()?
+        .ok()?;
+    let first = addrs.next()?.ip();
+    if !tracker_ip_allowed(first, allow_loopback) {
+        return None;
+    }
+    let mut v4 = match first.to_canonical() {
+        IpAddr::V4(ip) => Some(ip),
+        IpAddr::V6(_) => None,
+    };
+    for addr in addrs {
+        if !tracker_ip_allowed(addr.ip(), allow_loopback) {
+            return None;
+        }
+        if let IpAddr::V4(ip) = addr.ip().to_canonical() {
+            v4.get_or_insert(ip);
+        }
+    }
+    if udp {
+        // librqbit uses an IPv4 UDP socket. Pin the checked address to avoid a second DNS lookup.
+        url.set_ip_host(IpAddr::V4(v4?)).ok()?;
+    }
+    Some(url.into())
 }
 
 fn is_hex(hash: &str, len: usize) -> bool {
@@ -218,6 +295,42 @@ pub(crate) mod tests {
         );
         let parsed = parse_magnet_uri(magnet.as_str()).unwrap();
         assert_eq!(parsed.trackers, PUBLIC_TRACKERS);
+    }
+
+    #[test]
+    fn caps_distinct_magnet_trackers() {
+        let mut magnet =
+            Url::parse("magnet:?xt=urn:btih:0000000000000000000000000000000000000000").unwrap();
+        let trackers: Vec<_> = (0..10)
+            .map(|i| format!("udp://tracker{i}.example:6969/announce"))
+            .collect();
+        magnet.query_pairs_mut().extend_pairs(
+            BLOCKED_TRACKERS
+                .iter()
+                .copied()
+                .chain(std::iter::once(trackers[0].as_str()))
+                .chain(trackers.iter().map(String::as_str))
+                .map(|url| ("tr", url)),
+        );
+        assert_eq!(
+            parse_magnet_uri(magnet.as_str()).unwrap().trackers,
+            trackers[..8]
+        );
+    }
+
+    #[tokio::test]
+    async fn pins_loopback_udp_tracker_only_when_explicitly_allowed() {
+        let tracker = "udp://localhost:6969/announce";
+        assert_eq!(resolve_tracker(tracker, true, false).await, None);
+        let pinned = resolve_tracker(tracker, true, true).await.unwrap();
+        let pinned = Url::parse(&pinned).unwrap();
+        assert!(pinned
+            .host_str()
+            .unwrap()
+            .parse::<IpAddr>()
+            .unwrap()
+            .is_loopback());
+        assert_eq!(pinned.port(), Some(6969));
     }
 
     #[test]

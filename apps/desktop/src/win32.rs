@@ -8,8 +8,13 @@ use std::{
     ptr::{self, null, null_mut},
 };
 use windows_sys::Win32::{
-    Foundation::{GetLastError, GlobalFree, SetLastError, ERROR_SUCCESS, HGLOBAL, HWND},
-    Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND},
+    Foundation::{
+        GetLastError, GlobalFree, SetLastError, ERROR_SUCCESS, HGLOBAL, HWND, POINT, RECT,
+    },
+    Graphics::{
+        Dwm::{DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND},
+        Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST},
+    },
     Storage::FileSystem::GetDiskFreeSpaceExW,
     System::{
         Com::{
@@ -35,10 +40,92 @@ use windows_sys::Win32::{
             GPFIDL_DEFAULT,
         },
         WindowsAndMessaging::{
-            CreateWindowExW, DestroyWindow, SendMessageW, HWND_MESSAGE, SW_SHOWNORMAL,
+            BringWindowToTop, CreateWindowExW, DestroyWindow, FlashWindowEx, GetCursorPos,
+            GetWindowRect, IsIconic, SendMessageW, SetForegroundWindow, SetWindowPos, ShowWindow,
+            FLASHWINFO, FLASHW_TIMERNOFG, FLASHW_TRAY, HWND_MESSAGE, HWND_NOTOPMOST, HWND_TOPMOST,
+            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_RESTORE,
+            SW_SHOWNORMAL,
         },
     },
 };
+
+pub fn bring_window_to_front(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+
+    let hwnd = hwnd as HWND;
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+        SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+        let activated = SetForegroundWindow(hwnd);
+        BringWindowToTop(hwnd);
+        if activated == 0 {
+            FlashWindowEx(&FLASHWINFO {
+                cbSize: size_of::<FLASHWINFO>() as u32,
+                hwnd,
+                dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+                uCount: 0,
+                dwTimeout: 0,
+            });
+        }
+    }
+}
+
+pub fn center_window_on_active_monitor(hwnd: isize, cascade_index: i32) {
+    if hwnd == 0 {
+        return;
+    }
+    let hwnd = hwnd as HWND;
+    let mut cursor = POINT { x: 0, y: 0 };
+    let empty_rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    let mut monitor_info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        rcMonitor: empty_rect,
+        rcWork: empty_rect,
+        dwFlags: 0,
+    };
+    let mut window = empty_rect;
+    unsafe {
+        if GetCursorPos(&mut cursor) == 0 {
+            return;
+        }
+        let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_null()
+            || GetMonitorInfoW(monitor, &mut monitor_info) == 0
+            || GetWindowRect(hwnd, &mut window) == 0
+        {
+            return;
+        }
+
+        let work = monitor_info.rcWork;
+        let current_width = window.right - window.left;
+        let current_height = window.bottom - window.top;
+        let width = current_width.min(work.right - work.left);
+        let height = current_height.min(work.bottom - work.top);
+        let offset = (cascade_index % 5) * 24;
+        let center = |start: i32, end: i32, size: i32| {
+            let last = (end - size).max(start);
+            (start + (last - start) / 2 + offset).clamp(start, last)
+        };
+        let x = center(work.left, work.right, width);
+        let y = center(work.top, work.bottom, height);
+        let mut flags = SWP_NOZORDER | SWP_NOACTIVATE;
+        if width == current_width && height == current_height {
+            flags |= SWP_NOSIZE;
+        }
+        SetWindowPos(hwnd, null_mut(), x, y, width, height, flags);
+    }
+}
 
 pub fn open_file(path: &Path) -> io::Result<()> {
     let file = path

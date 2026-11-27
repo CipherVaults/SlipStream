@@ -73,6 +73,7 @@ export type BrowserMessage =
   | { kind: "pill-open"; url: string; isPlaylist: boolean; requestId?: number; embedded?: boolean }
   | { kind: "frame-reset" }
   | { kind: "wake" }
+  | { kind: "magnet-click"; url: string }
   | { kind: "media"; action: MediaAction; url: string; links?: string[]; embedded?: boolean }
   | { kind: "desktop"; request: PopupAction }
   | { kind: "save-settings"; settings: InterceptionSettings }

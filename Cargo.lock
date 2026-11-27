@@ -6249,7 +6249,7 @@ dependencies = [
 
 [[package]]
 name = "slipstream-desktop"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -6287,7 +6287,7 @@ dependencies = [
 
 [[package]]
 name = "slipstream-engine"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "async-compression",
  "chrono",
@@ -6310,7 +6310,7 @@ dependencies = [
 
 [[package]]
 name = "slipstream-media"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "chrono",
  "hex 0.4.3",
@@ -6327,7 +6327,7 @@ dependencies = [
 
 [[package]]
 name = "slipstream-native-host"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "chrono",
  "hex 0.4.3",
@@ -6344,7 +6344,7 @@ dependencies = [
 
 [[package]]
 name = "slipstream-protocol"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "chrono",
  "serde",
@@ -6356,7 +6356,7 @@ dependencies = [
 
 [[package]]
 name = "slipstream-safety-eval"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "chrono",
  "serde",
@@ -6374,7 +6374,7 @@ dependencies = [
 
 [[package]]
 name = "slipstream-torrent"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "bytes",

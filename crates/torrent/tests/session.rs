@@ -3,7 +3,8 @@ use slipstream_protocol::{AddTorrentRequest, SegmentState, TransferKind, Transfe
 use slipstream_torrent::{
     bencode::{self, BencodeValue as V},
     build_v1_multi_file_torrent, build_v1_single_file_torrent, parse_torrent_bytes,
-    TorrentAddOptions, TorrentError, TorrentManager, TorrentManagerConfig, MAX_TORRENT_BYTES,
+    CancellationToken, TorrentAddOptions, TorrentError, TorrentManager, TorrentManagerConfig,
+    MAX_TORRENT_BYTES,
 };
 use std::{
     fs,
@@ -236,6 +237,7 @@ async fn hostile_manifests_create_no_files() {
                 save_dir: None,
                 selected_file_indices: None,
                 sequential: false,
+                start_paused: false,
             })
             .await,
         Err(TorrentError::PathSecurity(_))
@@ -278,6 +280,7 @@ async fn add_torrent_from_disk_and_hybrid_metadata_and_empty_selection() {
             save_dir: Some("sub_folder".into()),
             selected_file_indices: None,
             sequential: true,
+            start_paused: false,
         })
         .await
         .unwrap();
@@ -411,33 +414,145 @@ fn fixture(name: &[u8], paths: &[&[u8]], attr: Option<(&[u8], V)>) -> Vec<u8> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preview_torrent_file_and_attach_cached_magnet_metadata_offline() {
+    let temp = tempdir().unwrap();
+    let tracker = V::Bytes(b"https://tracker.example/announce".to_vec());
+    let manifest = build_v1_single_file_torrent("preview.bin", b"payload", PIECE as u32).unwrap();
+    let V::Dict(mut metainfo) = bencode::decode(&manifest).unwrap() else {
+        panic!("expected a torrent dictionary");
+    };
+    metainfo.insert(b"announce".to_vec(), tracker.clone());
+    metainfo.insert(
+        b"announce-list".to_vec(),
+        V::List(vec![V::List(vec![tracker])]),
+    );
+    let manifest = bencode::encode(&V::Dict(metainfo));
+    let path = temp.path().join("preview.torrent");
+    fs::write(&path, &manifest).unwrap();
+    let manager = TorrentManager::new(local_config(temp.path()))
+        .await
+        .unwrap();
+    let (preview, bytes) = manager
+        .preview_source(
+            path.to_str().unwrap(),
+            Some(Path::new("outputs")),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview.name, "preview.bin");
+    assert_eq!(preview.version, "BTv1");
+    assert_eq!(preview.total_bytes, 7);
+    assert_eq!(preview.piece_length, PIECE as u64);
+    assert_eq!(preview.total_pieces, 1);
+    assert_eq!(preview.files[0].relative_path, "preview.bin");
+    assert_eq!(preview.trackers, ["https://tracker.example/announce"]);
+    assert_eq!(preview.seen_peers, 0);
+    assert!(!preview.is_magnet);
+    assert!(preview.preview_token.is_none());
+    assert!(manager.list_snapshots().is_empty());
+    assert!(!temp.path().join("outputs").exists());
+    let bytes = bytes.unwrap();
+    assert_eq!(&bytes[..], manifest);
+
+    let magnet = format!(
+        "magnet:?xt=urn:btih:{}&tr=https://tracker.example/announce",
+        preview.info_hash
+    );
+    assert!(matches!(
+        manager.preview_source(&magnet, None, CancellationToken::new()).await,
+        Err(TorrentError::InvalidState(reason)) if reason.contains("DHT and trackers are disabled")
+    ));
+    let canceled = CancellationToken::new();
+    canceled.cancel();
+    assert!(matches!(
+        manager.preview_source(&magnet, None, canceled).await,
+        Err(TorrentError::InvalidState(reason)) if reason == "preview canceled"
+    ));
+    let id = manager
+        .add_pre_resolved_torrent(
+            magnet,
+            bytes,
+            TorrentAddOptions {
+                start_paused: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(id, preview.info_hash);
+    manager.wait_until_initialized(&id, WAIT).await.unwrap();
+    assert_eq!(
+        manager.snapshot(&id).unwrap().status,
+        TransferStatus::Paused
+    );
+    let summary = manager.peer_summary(&id).unwrap();
+    assert_eq!(summary.total_pieces, 1);
+    assert_eq!(summary.trackers, ["https://tracker.example/announce"]);
+    assert!(summary.peers.is_empty());
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn magnet_preview_skips_http_and_nonpublic_udp_trackers() {
+    let temp = tempdir().unwrap();
+    let manager = TorrentManager::new(TorrentManagerConfig {
+        enable_trackers: true,
+        allow_loopback: true,
+        magnet_metadata_timeout: Duration::from_secs(1),
+        ..local_config(temp.path())
+    })
+    .await
+    .unwrap();
+    let hash = "ab".repeat(20);
+    let magnet = format!(
+        "magnet:?xt=urn:btih:{hash}&tr=http://127.0.0.1:6969&tr=https://127.0.0.1:6969\
+         &tr=udp://192.168.1.1:6969&tr=udp://169.254.1.1:6969"
+    );
+    assert!(matches!(
+        manager
+            .preview_source(&magnet, None, CancellationToken::new())
+            .await,
+        Err(TorrentError::InvalidState(reason)) if reason.contains("public UDP tracker")
+    ));
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offline_magnets_are_registered_and_lifecycle_is_prompt() {
     let temp = tempdir().unwrap();
     let manager = TorrentManager::new(local_config(temp.path()))
         .await
         .unwrap();
     let source = format!("magnet:?xt=urn:btih:{}&dn=offline&xl=1234", "ab".repeat(20));
-    let id = tokio::time::timeout(
-        Duration::from_secs(1),
-        manager.add_torrent(AddTorrentRequest {
-            source,
-            save_dir: None,
-            selected_file_indices: None,
-            sequential: true,
-        }),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    let mut request = AddTorrentRequest {
+        source,
+        save_dir: None,
+        selected_file_indices: None,
+        sequential: true,
+        start_paused: false,
+    };
+    let id = tokio::time::timeout(Duration::from_secs(1), manager.add_torrent(request.clone()))
+        .await
+        .unwrap()
+        .unwrap();
     let snapshot = manager.snapshot(&id).unwrap();
     assert_eq!(snapshot.status, TransferStatus::Probing);
     assert_eq!(snapshot.total_bytes, Some(1234));
     assert_eq!(snapshot.filename, "offline");
+    let peers = manager.peer_summary(&id).unwrap();
+    assert_eq!(peers.live, 0);
+    assert_eq!(peers.seen, 0);
+    assert_eq!(peers.total_pieces, 0);
+    assert!(peers.peers.is_empty());
     assert!(manager
         .wait_until_initialized(&id, Duration::from_millis(60))
         .await
         .is_err());
-    manager.pause(&id).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), manager.pause(&id))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         manager.snapshot(&id).unwrap().status,
         TransferStatus::Paused
@@ -449,6 +564,12 @@ async fn offline_magnets_are_registered_and_lifecycle_is_prompt() {
     );
     manager.remove(&id, true).await.unwrap();
     assert!(matches!(manager.stats(&id), Err(TorrentError::NotFound(_))));
+    request.start_paused = true;
+    let paused = manager.add_torrent(request).await.unwrap();
+    assert_eq!(
+        manager.snapshot(&paused).unwrap().status,
+        TransferStatus::Paused
+    );
     assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
     manager.shutdown().await;
 }
@@ -545,6 +666,20 @@ async fn real_tcp_transfer_and_magnet_selection() {
                     .ui_segments
                     .iter()
                     .any(|progress| *progress < 1.0));
+                let peers = leech.peer_summary(&id).unwrap();
+                assert!(peers.live >= 1);
+                assert!(peers.seen >= 1);
+                assert!(peers.completed_pieces > 0);
+                assert_eq!(peers.total_pieces, 24);
+                let seeder = peers
+                    .peers
+                    .iter()
+                    .find(|entry| entry.address == peer.to_string())
+                    .unwrap();
+                assert_eq!(seeder.state, "live");
+                assert!(seeder.downloaded_bytes >= PIECE as u64);
+                assert!(seeder.pieces_downloaded >= 1);
+                assert!(!seeder.incoming);
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -669,6 +804,7 @@ async fn rejects_oversized_and_non_regular_torrent_sources() {
                 save_dir: None,
                 selected_file_indices: None,
                 sequential: false,
+                start_paused: false,
             })
             .await,
         Err(TorrentError::Metadata(_))
@@ -681,6 +817,7 @@ async fn rejects_oversized_and_non_regular_torrent_sources() {
                 save_dir: None,
                 selected_file_indices: None,
                 sequential: false,
+                start_paused: false,
             })
             .await,
         Err(TorrentError::Metadata(_))
@@ -696,6 +833,7 @@ async fn rejects_oversized_and_non_regular_torrent_sources() {
                     save_dir: None,
                     selected_file_indices: None,
                     sequential: false,
+                    start_paused: false,
                 })
                 .await,
             Err(TorrentError::PathSecurity(_))
@@ -707,6 +845,7 @@ async fn rejects_oversized_and_non_regular_torrent_sources() {
                     save_dir: None,
                     selected_file_indices: None,
                     sequential: false,
+                    start_paused: false,
                 })
                 .await,
             Err(TorrentError::PathSecurity(_))
@@ -727,6 +866,7 @@ async fn rejects_oversized_and_non_regular_torrent_sources() {
                     save_dir: None,
                     selected_file_indices: None,
                     sequential: false,
+                    start_paused: false,
                 })
                 .await,
             Err(TorrentError::PathSecurity(_))

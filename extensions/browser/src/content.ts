@@ -1,5 +1,5 @@
 import { extension as api } from "./shared/browser";
-import { blockedSite, defaults, downloadLinks, httpUrl, readSettings } from "./shared/downloads";
+import { blockedSite, defaults, downloadLinks, httpUrl, magnetUri, readSettings } from "./shared/downloads";
 import { createMediaPill, pillAnchor, PILL_HEIGHT, PILL_WIDTH } from "./shared/pill";
 import { isPillHost } from "./shared/pillGuard";
 import {
@@ -38,6 +38,8 @@ let lastStreamRequest = 0;
 let scheduled = false;
 let altHeld = false;
 let optionsReady = false;
+let tabOrigin: URL | undefined;
+let fallbackMagnetLink: HTMLAnchorElement | undefined;
 let lastScan = -Infinity;
 let lastMutationLayout = -Infinity;
 let needsScan = false;
@@ -71,6 +73,47 @@ function keyEvent(event: KeyboardEvent | MouseEvent): void {
 addEventListener("keydown", keyEvent, true);
 addEventListener("keyup", keyEvent, true);
 addEventListener("mousedown", keyEvent, true);
+document.addEventListener("click", async (event) => {
+  if (event.target === fallbackMagnetLink) {
+    fallbackMagnetLink = undefined;
+    event.stopImmediatePropagation();
+    return;
+  }
+  if (!event.isTrusted || event.button !== 0 || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+  const anchor = (event.target as Element | null)?.closest?.("a[href]") as HTMLAnchorElement | null;
+  if (!anchor || event.defaultPrevented) return;
+  const magnet = magnetUri(anchor.href);
+  if (!magnet) return;
+  const page = httpUrl(location.href);
+  if (!optionsReady || !settings.enabled || !settings.interceptMagnets || !page || blockedSite(page, settings)
+    || (!topFrame && (!tabOrigin || blockedSite(tabOrigin, settings)))) return;
+
+  const fallback = document.createElement("a");
+  fallback.href = magnet;
+  for (const name of ["target", "rel", "referrerpolicy"]) {
+    const value = anchor.getAttribute(name);
+    if (value !== null) fallback.setAttribute(name, value);
+  }
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  let response: { handled?: boolean } | undefined;
+  try {
+    response = await send({ kind: "magnet-click", url: magnet });
+  } catch {
+    // A closed message channel also falls back to browser navigation.
+  }
+  if (response?.handled === true) return;
+
+  // Scope the bypass to this synthetic click and clear it even if the event never reaches us.
+  fallbackMagnetLink = fallback;
+  try {
+    document.documentElement.append(fallback);
+    fallback.click();
+  } finally {
+    fallbackMagnetLink = undefined;
+    fallback.remove();
+  }
+}, true);
 addEventListener("blur", () => reportAlt(false));
 addEventListener("pagehide", () => {
   reportAlt(false);
@@ -86,10 +129,11 @@ function updateStream(): void {
   const href = location.href;
   const epoch = navigation.epoch;
   const requestId = ++lastStreamRequest;
-  void send<{ url?: string; formats?: PillFormat[]; childActive?: boolean }>({ kind: "stream" }).then((reply) => {
+  void send<{ url?: string; formats?: PillFormat[]; childActive?: boolean; tabOrigin?: string }>({ kind: "stream" }).then((reply) => {
     if (href !== location.href || epoch !== navigation.epoch || requestId !== lastStreamRequest) return;
     navigation.update(epoch, href, location.href, reply?.url);
     hlsFormats = reply?.formats ?? [];
+    tabOrigin = httpUrl(reply?.tabOrigin);
     if (topFrame && typeof reply?.childActive === "boolean") childActive = reply.childActive;
     schedule();
   }).catch(() => {});

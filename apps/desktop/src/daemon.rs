@@ -3,7 +3,8 @@ use crate::{
     paths::{
         build_defender_scan_args, decode_sha256, delete_files, ensure_playlist_subfolder,
         ensure_safe_directory, ensure_safe_tree, hash_file, local_drive_path, media_title_stem,
-        reveal_action, with_completed_file, write_zone_identifier, RevealAction,
+        reveal_action, validate_existing_ancestors, with_completed_file, write_zone_identifier,
+        RevealAction,
     },
     pending_downloads::{
         PendingConfirmation, PendingDownloads, PendingHttpEntry, ScrubbedRequest,
@@ -35,15 +36,18 @@ use slipstream_protocol::{
     AddHttpDownloadRequest, AddMediaDownloadRequest, AddTorrentRequest, AppSettings,
     ConfirmPendingDownloadRequest, DownloadCategory, MediaProbeResult, NativeBridgeRequest,
     NativeBridgeResponse, PendingDownloadPreview, RefreshDownloadUrlRequest, SelectedPlaylistEntry,
-    TelemetryBatch, TorrentFileEntry, TransferCompletionOptions, TransferSnapshot, TransferStatus,
-    UpdateMode, MAX_NATIVE_MESSAGE_BYTES,
+    TelemetryBatch, TorrentFileEntry, TorrentPeerSummary, TorrentPreviewResult,
+    TransferCompletionOptions, TransferSnapshot, TransferStatus, UpdateMode,
+    MAX_NATIVE_MESSAGE_BYTES,
 };
-use slipstream_torrent::{TorrentManager, TorrentManagerConfig};
+use slipstream_torrent::{
+    Bytes, CancellationToken, TorrentAddOptions, TorrentManager, TorrentManagerConfig,
+};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Display,
     future::{pending, Future},
-    os::windows::process::CommandExt,
+    os::windows::{fs::MetadataExt, process::CommandExt},
     path::{Path, PathBuf},
     pin::Pin,
     process::{Command as StdCommand, Stdio},
@@ -64,11 +68,16 @@ use tokio::{
 };
 use url::Url;
 use uuid::Uuid;
-use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+use windows_sys::Win32::{
+    Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT, System::Threading::CREATE_NO_WINDOW,
+};
 
 type Result<T> = std::result::Result<T, String>;
 const DISMISSED_FILE: &str = "dismissed-http.json";
-const TELEMETRY_INTERVAL: Duration = Duration::from_millis(50);
+const TELEMETRY_INTERVAL: Duration = Duration::from_millis(250);
+const TORRENT_PREVIEW_TTL: Duration = Duration::from_secs(600);
+const TORRENT_PREVIEW_CAPACITY: usize = 8;
+const LOCAL_PICKER_STARTUP_CAPACITY: usize = 64;
 const DEFENDER_SCAN_QUEUE_CAPACITY: usize = 128;
 const DEFENDER_SCAN_TIMEOUT: Duration = Duration::from_secs(60);
 const PROBE_CACHE_TTL: Duration = Duration::from_secs(300);
@@ -121,7 +130,7 @@ pub struct DaemonOptions {
 }
 
 struct TorrentSession {
-    manager: TorrentManager,
+    manager: Arc<TorrentManager>,
     base: PathBuf,
 }
 
@@ -251,6 +260,7 @@ pub struct AppState {
     picker: Mutex<Picker>,
     window_changed: Notify,
     torrent_changed: Notify,
+    torrent_previews: Mutex<HashMap<String, (Instant, Bytes, String)>>,
     torrent_completions: Mutex<HashSet<String>>,
     torrent_completed_files: Mutex<HashMap<String, TorrentCompletedFiles>>,
     scans: mpsc::Sender<ScanRequest>,
@@ -284,7 +294,7 @@ impl AppState {
     pub async fn start(
         data_dir: PathBuf,
         ui: Arc<dyn UiBridge>,
-        options: DaemonOptions,
+        mut options: DaemonOptions,
     ) -> Result<Arc<Self>> {
         let data_dir = std::path::absolute(data_dir).map_err(message)?;
         std::fs::create_dir_all(&data_dir).map_err(message)?;
@@ -298,6 +308,24 @@ impl AppState {
             .map_err(message)?;
         let server =
             PipeServer::bind(&pipe_name, &data_dir.join("session.token")).map_err(message)?;
+        let local_picker_server = PipeServer::bind(
+            &crate::local_picker_pipe_name(&pipe_name),
+            &data_dir.join(crate::LOCAL_PICKER_TOKEN_FILE),
+        )
+        .map_err(message)?;
+        let (stop, _) = watch::channel(false);
+        let local_picker_target = Arc::new(Mutex::new(LocalPickerTarget::Starting(Vec::new())));
+        let local_handler = LocalPickerHandler(local_picker_target.clone());
+        let local_stopped = stop.subscribe();
+        let local_picker_task = tokio::spawn(async move {
+            if let Err(error) = local_picker_server
+                .run(local_handler, stopped_signal(local_stopped))
+                .await
+            {
+                tracing::error!(%error, "local picker pipe server stopped");
+            }
+        });
+        options.torrent.allow_loopback |= options.allow_loopback;
         let torrent = TorrentSession::new(&options.torrent, &settings).await?;
         let engine = match DownloadEngine::new(EngineConfig {
             db_path: data_dir.join("slipstream.sqlite"),
@@ -325,7 +353,6 @@ impl AppState {
             .collect();
         let (scans, scan_requests) = mpsc::channel(DEFENDER_SCAN_QUEUE_CAPACITY);
         let (media_finished, media_events) = mpsc::unbounded_channel();
-        let (stop, _) = watch::channel(false);
         let ready = ui.has_main_window();
         let registry_base_key = options
             .registry_base_key
@@ -359,6 +386,7 @@ impl AppState {
             }),
             window_changed: Notify::new(),
             torrent_changed: Notify::new(),
+            torrent_previews: Mutex::default(),
             torrent_completions: Mutex::default(),
             torrent_completed_files: Mutex::default(),
             scans,
@@ -378,6 +406,7 @@ impl AppState {
                     tracing::error!(%error, "named pipe server stopped");
                 }
             }),
+            local_picker_task,
             tokio::spawn(emit_telemetry(state.clone(), state.stop.subscribe())),
             tokio::spawn(expire_pending_downloads(
                 state.clone(),
@@ -401,6 +430,29 @@ impl AppState {
             )),
         ];
         *state.tasks.lock().await = Some(tasks);
+        if let Some(source) = crate::take_initial_picker_source() {
+            if let Err(error) = state.open_picker_local_source(source).await {
+                tracing::warn!(%error, "could not open the initial torrent source");
+            }
+        }
+        let has_pending = {
+            let mut target = local_picker_target.lock().unwrap();
+            let starting = std::mem::replace(
+                &mut *target,
+                LocalPickerTarget::Ready(Arc::downgrade(&state)),
+            );
+            let LocalPickerTarget::Starting(events) = starting else {
+                unreachable!("picker target is published once");
+            };
+            let has_pending = !events.is_empty();
+            state.picker.lock().unwrap().pending.extend(events);
+            has_pending
+        };
+        if has_pending {
+            if let Err(error) = state.show_queued_picker().await {
+                tracing::warn!(%error, "could not open queued torrent sources");
+            }
+        }
         Ok(state)
     }
 
@@ -822,14 +874,24 @@ impl AppState {
     }
 
     pub async fn set_transfer_speed_limit(&self, id: &str, limit_bps: Option<u64>) -> Result<()> {
-        let _operation = self.operation().await?;
-        if self.http_snapshot(id).is_none() {
-            return Err("HTTP transfer not found".into());
+        let operation = self.operation().await?;
+        if self.http_snapshot(id).is_some() {
+            return self
+                .engine
+                .set_transfer_speed_limit(id, limit_bps)
+                .await
+                .map_err(message);
         }
-        self.engine
-            .set_transfer_speed_limit(id, limit_bps)
+        let manager = self.torrent.read().await.manager.clone();
+        drop(operation);
+        manager
+            .set_torrent_rate_limits(id, limit_bps, None)
             .await
             .map_err(message)
+    }
+
+    pub async fn get_transfer_snapshot(&self, id: &str) -> Result<TransferSnapshot> {
+        self.transfer_snapshot(id).await
     }
 
     async fn transfer_snapshot(&self, id: &str) -> Result<TransferSnapshot> {
@@ -1351,9 +1413,80 @@ impl AppState {
         .await
     }
 
-    pub async fn add_torrent(&self, mut request: AddTorrentRequest) -> Result<String> {
+    pub async fn preview_torrent(
+        &self,
+        source: &str,
+        save_dir: Option<&str>,
+        cancel: CancellationToken,
+    ) -> Result<TorrentPreviewResult> {
+        let settings = self.settings();
+        let source = source.trim();
+        let (manager, save_dir) = {
+            let torrent = self.torrent.read().await;
+            let save_dir = save_dir.unwrap_or(&settings.default_download_dir);
+            (
+                torrent.manager.clone(),
+                torrent
+                    .save_dir_override(Path::new(save_dir))
+                    .map(Path::to_path_buf),
+            )
+        };
+        let (mut preview, bytes) = manager
+            .preview_source(source, save_dir.as_deref(), cancel)
+            .await
+            .map_err(message)?;
+        if let Some(bytes) = bytes {
+            let token = Uuid::new_v4().to_string();
+            let mut previews = self.torrent_previews.lock().unwrap();
+            if *self.stop.borrow() {
+                return Err("SlipStream is shutting down".into());
+            }
+            let now = Instant::now();
+            previews
+                .retain(|_, (created, _, _)| now.duration_since(*created) < TORRENT_PREVIEW_TTL);
+            if previews.len() >= TORRENT_PREVIEW_CAPACITY {
+                if let Some(oldest) = previews.iter().min_by_key(|(_, (created, _, _))| *created) {
+                    let oldest = oldest.0.clone();
+                    previews.remove(&oldest);
+                }
+            }
+            previews.insert(token.clone(), (now, bytes, torrent_source_key(source)));
+            preview.preview_token = Some(token);
+        }
+        Ok(preview)
+    }
+
+    pub async fn add_torrent(&self, request: AddTorrentRequest) -> Result<String> {
+        self.add_torrent_with_preview(request, None).await
+    }
+
+    pub async fn add_torrent_with_preview(
+        &self,
+        mut request: AddTorrentRequest,
+        preview_token: Option<String>,
+    ) -> Result<String> {
         let _operation = self.operation().await?;
         let settings = self.settings();
+        request.source = request.source.trim().to_owned();
+        let bytes = if let Some(token) = preview_token {
+            let mut previews = self.torrent_previews.lock().unwrap();
+            let now = Instant::now();
+            previews
+                .retain(|_, (created, _, _)| now.duration_since(*created) < TORRENT_PREVIEW_TTL);
+            let source = torrent_source_key(&request.source);
+            let Some((_, bytes, _)) = previews
+                .get(&token)
+                .filter(|(_, _, cached_source)| *cached_source == source)
+            else {
+                return Err(
+                    "Torrent preview expired. Please click Inspect again before downloading."
+                        .to_string(),
+                );
+            };
+            Some(bytes.clone())
+        } else {
+            None
+        };
         {
             let mut torrent = self.torrent.write().await;
             if torrent.base != Path::new(&settings.default_download_dir)
@@ -1369,24 +1502,45 @@ impl AppState {
             .save_dir
             .as_deref()
             .unwrap_or(&settings.default_download_dir);
-        let requested = Path::new(requested);
-        let matches_base = requested == torrent.base
-            || (requested.is_absolute()
-                && std::fs::canonicalize(requested)
-                    .is_ok_and(|path| path == torrent.canonical_base()));
-        request.save_dir = if matches_base {
-            None
-        } else {
-            Some(requested.to_string_lossy().into_owned())
+        request.save_dir = torrent
+            .save_dir_override(Path::new(requested))
+            .map(|path| path.to_string_lossy().into_owned());
+        let start_paused = request.start_paused;
+        let id = match bytes {
+            Some(bytes) => {
+                torrent
+                    .manager
+                    .add_pre_resolved_torrent(
+                        request.source,
+                        bytes,
+                        TorrentAddOptions {
+                            save_dir: request.save_dir.map(PathBuf::from),
+                            selected_file_indices: request.selected_file_indices,
+                            sequential: Some(request.sequential),
+                            start_paused,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+            None => torrent.manager.add_torrent(request).await,
         };
-        let id = torrent
-            .manager
-            .add_torrent(request)
-            .await
-            .map_err(message)?;
+        let id = id.map_err(message)?;
         self.torrent_completions.lock().unwrap().insert(id.clone());
         self.torrent_changed.notify_one();
+        if !start_paused {
+            self.open_progress_if_enabled(&id, &settings);
+        }
         Ok(id)
+    }
+
+    pub async fn get_torrent_peers(&self, id: &str) -> Result<TorrentPeerSummary> {
+        self.torrent
+            .read()
+            .await
+            .manager
+            .peer_summary(id)
+            .map_err(message)
     }
 
     pub async fn list_torrent_files(&self, id: &str) -> Result<Vec<TorrentFileEntry>> {
@@ -1768,7 +1922,16 @@ impl AppState {
     }
 
     pub async fn open_picker(&self, url: Option<String>) -> Result<()> {
+        if let Some(source) = &url {
+            if is_torrent_path(source.trim()) && validate_http_url(source).is_err() {
+                return self.open_picker_local_source(source.clone()).await;
+            }
+        }
         self.open_picker_with_headers(url, HashMap::new()).await
+    }
+
+    pub async fn open_picker_local_source(&self, source: String) -> Result<()> {
+        self.queue_picker(local_picker_event(&source)?).await
     }
 
     pub async fn open_picker_with_headers(
@@ -1777,31 +1940,36 @@ impl AppState {
         headers: HashMap<String, String>,
     ) -> Result<()> {
         if let Some(url) = url.as_deref() {
-            if url
-                .trim()
-                .split_once(':')
-                .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("magnet"))
-            {
+            if is_magnet_source(url) {
                 validate_magnet_uri(url).map_err(message)?;
             } else {
                 validate_http_url(url).map_err(message)?;
             }
         }
-        self.show_main_window().await?;
-        let event = OpenPickerEvent {
+        self.queue_picker(OpenPickerEvent {
             headers: if url.is_some() {
                 filter_media_headers(&headers)
             } else {
                 HashMap::new()
             },
             url,
-        };
-        let needs_ready_check = {
-            let mut picker = self.picker.lock().unwrap();
-            picker.pending.push_back(event);
-            !picker.ready
-        };
-        if needs_ready_check {
+        })
+        .await
+    }
+
+    async fn queue_picker(&self, event: OpenPickerEvent) -> Result<()> {
+        self.show_main_window().await?;
+        self.picker.lock().unwrap().pending.push_back(event);
+        self.flush_or_check_picker()
+    }
+
+    async fn show_queued_picker(&self) -> Result<()> {
+        self.show_main_window().await?;
+        self.flush_or_check_picker()
+    }
+
+    fn flush_or_check_picker(&self) -> Result<()> {
+        if !self.picker.lock().unwrap().ready {
             self.ui.trigger_ready_check();
         }
         self.flush_picker()
@@ -1883,6 +2051,7 @@ impl AppState {
             self.ui.close_confirm_dialog(&id);
         }
         self.completion_options.lock().unwrap().clear();
+        self.torrent_previews.lock().unwrap().clear();
         let jobs: Vec<_> = self.media.read().unwrap().values().cloned().collect();
         for job in jobs {
             if let Err(failure) = job.shutdown().await {
@@ -2012,11 +2181,22 @@ impl TorrentSession {
         })
         .await
         .map_err(message)?;
-        Ok(Self { manager, base })
+        Ok(Self {
+            manager: Arc::new(manager),
+            base,
+        })
     }
 
     fn canonical_base(&self) -> PathBuf {
         std::fs::canonicalize(&self.base).unwrap_or_else(|_| self.base.clone())
+    }
+
+    fn save_dir_override<'a>(&self, requested: &'a Path) -> Option<&'a Path> {
+        let matches_base = requested == self.base
+            || (requested.is_absolute()
+                && std::fs::canonicalize(requested)
+                    .is_ok_and(|path| path == self.canonical_base()));
+        (!matches_base).then_some(requested)
     }
 }
 
@@ -2031,6 +2211,112 @@ impl PipeRequestHandler for NativeHandler {
             .native_request(request)
             .await
             .unwrap_or_else(|error| error_response("request_failed", &error))
+    }
+}
+
+enum LocalPickerTarget {
+    Starting(Vec<OpenPickerEvent>),
+    Ready(Weak<AppState>),
+}
+
+struct LocalPickerHandler(Arc<Mutex<LocalPickerTarget>>);
+
+impl PipeRequestHandler for LocalPickerHandler {
+    async fn handle(&self, request: NativeBridgeRequest) -> NativeBridgeResponse {
+        let NativeBridgeRequest::OpenDesktopWindow {
+            open_picker_url: Some(source),
+            headers,
+        } = request
+        else {
+            return error_response("unsupported_request", "Expected a local picker request");
+        };
+        if !headers.is_empty() {
+            return error_response(
+                "unsupported_request",
+                "Local picker requests cannot include headers",
+            );
+        }
+        let event = match local_picker_event(&source) {
+            Ok(event) => event,
+            Err(error) => return error_response("request_failed", &error),
+        };
+        let state = {
+            let mut target = self.0.lock().unwrap();
+            match &mut *target {
+                LocalPickerTarget::Starting(events) => {
+                    if events.len() >= LOCAL_PICKER_STARTUP_CAPACITY {
+                        return error_response("picker_busy", "The local picker queue is full");
+                    }
+                    events.push(event);
+                    return NativeBridgeResponse::Ack {
+                        ok: true,
+                        message: None,
+                    };
+                }
+                LocalPickerTarget::Ready(state) => state.upgrade(),
+            }
+        };
+        let Some(state) = state else {
+            return error_response("daemon_stopped", "SlipStream has stopped");
+        };
+        match state.queue_picker(event).await {
+            Ok(()) => NativeBridgeResponse::Ack {
+                ok: true,
+                message: None,
+            },
+            Err(error) => error_response("request_failed", &error),
+        }
+    }
+}
+
+fn local_picker_event(source: &str) -> Result<OpenPickerEvent> {
+    let source = source.trim();
+    let url = if is_magnet_source(source) {
+        validate_magnet_uri(source).map_err(message)?;
+        source.to_owned()
+    } else {
+        if !is_torrent_path(source) {
+            return Err("expected a magnet link or a local .torrent file".into());
+        }
+        let absolute = std::path::absolute(source).map_err(message)?;
+        let path = local_drive_path(&absolute).map_err(message)?;
+        let parent = path
+            .parent()
+            .ok_or("torrent source has no parent directory")?;
+        validate_existing_ancestors(parent).map_err(message)?;
+        let metadata = std::fs::symlink_metadata(&path).map_err(message)?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err("torrent source must be a regular local file".into());
+        }
+        path.to_string_lossy().into_owned()
+    };
+    Ok(OpenPickerEvent {
+        url: Some(url),
+        headers: HashMap::new(),
+    })
+}
+
+fn is_magnet_source(source: &str) -> bool {
+    source
+        .trim_start()
+        .split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("magnet"))
+}
+
+fn is_torrent_path(source: &str) -> bool {
+    Path::new(source)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("torrent"))
+}
+
+fn torrent_source_key(source: &str) -> String {
+    if is_magnet_source(source) {
+        let (_, query) = source.split_once(':').expect("magnet URI scheme");
+        format!("magnet:{query}")
+    } else {
+        std::path::absolute(source)
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| source.to_owned())
     }
 }
 

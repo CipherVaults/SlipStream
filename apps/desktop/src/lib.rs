@@ -30,6 +30,27 @@ pub use settings::{match_category_for_filename, next_numbered_filename, resolve_
 #[cfg(windows)]
 pub use tools::{install_browser_hosts_into, ToolchainStatus};
 
+#[cfg(windows)]
+static INITIAL_PICKER_SOURCE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(windows)]
+pub const LOCAL_PICKER_TOKEN_FILE: &str = "local-picker.token";
+
+#[cfg(windows)]
+pub fn local_picker_pipe_name(native_pipe_name: &str) -> String {
+    format!("{native_pipe_name}.local-picker")
+}
+
+#[cfg(windows)]
+pub fn set_initial_picker_source(source: Option<String>) {
+    *INITIAL_PICKER_SOURCE.lock().unwrap() = source;
+}
+
+#[cfg(windows)]
+pub fn take_initial_picker_source() -> Option<String> {
+    INITIAL_PICKER_SOURCE.lock().unwrap().take()
+}
+
 pub fn desktop_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }

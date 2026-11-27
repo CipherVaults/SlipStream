@@ -1,6 +1,9 @@
 #![cfg(windows)]
 
-use slipstream_desktop_lib::{AppState, DaemonOptions, OpenPickerEvent, UiBridge};
+use slipstream_desktop_lib::{
+    local_picker_pipe_name, AppState, DaemonOptions, OpenPickerEvent, UiBridge,
+    LOCAL_PICKER_TOKEN_FILE,
+};
 use slipstream_native_host::{pipe::PipeClient, token::SessionToken};
 use slipstream_protocol::{
     AccentMode, AddHttpDownloadRequest, AddMediaDownloadRequest, AddTorrentRequest, AppSettings,
@@ -9,7 +12,7 @@ use slipstream_protocol::{
     TelemetryBatch, ThemeMode, TransferCompletionOptions, TransferKind, TransferSnapshot,
     TransferStatus,
 };
-use slipstream_torrent::TorrentManagerConfig;
+use slipstream_torrent::{CancellationToken, TorrentManagerConfig};
 use std::{
     collections::HashMap,
     env, fs,
@@ -787,6 +790,146 @@ impl Bridge {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn local_torrent_picker_and_preview_cache_are_available_to_the_desktop() {
+    let temp = TempDir::new();
+    let downloads = temp.0.join("Downloads");
+    installed_settings(&temp.0, &downloads);
+    let pipe = format!(r"\\.\pipe\SlipStream.DesktopTest.{}", Uuid::new_v4());
+    let registry_key = RegistryKey::isolated();
+    let ui = Arc::new(DialogUi::default());
+    let state = AppState::start(temp.0.clone(), ui.clone(), options(&pipe, &registry_key.0))
+        .await
+        .unwrap();
+    let path = torrent_file(&temp.0);
+    let source = path.to_string_lossy().into_owned();
+    let picker_request = Request::OpenDesktopWindow {
+        open_picker_url: Some(source.clone()),
+        headers: HashMap::new(),
+    };
+    let native_token = SessionToken::read(&temp.0.join("session.token")).unwrap();
+    let local_pipe = local_picker_pipe_name(&pipe);
+    assert!(
+        PipeClient::connect(&local_pipe, &native_token, "cli-handoff")
+            .await
+            .is_err()
+    );
+    let mut browser = Bridge(Some(
+        PipeClient::connect(&pipe, &native_token, "browser")
+            .await
+            .unwrap(),
+    ));
+    assert!(matches!(
+        browser.request(picker_request.clone()).await,
+        Response::Error { .. }
+    ));
+    let local_token = SessionToken::read(&temp.0.join(LOCAL_PICKER_TOKEN_FILE)).unwrap();
+    let mut cli = Bridge(Some(
+        PipeClient::connect(&local_pipe, &local_token, "cli-handoff")
+            .await
+            .unwrap(),
+    ));
+    assert!(matches!(
+        cli.request(Request::OpenDesktopWindow {
+            open_picker_url: Some(r"\\server\share\blocked.torrent".into()),
+            headers: HashMap::new(),
+        })
+        .await,
+        Response::Error { .. }
+    ));
+    cli.ack(picker_request).await;
+    let magnet = format!("magnet:?xt=urn:btih:{}", "ab".repeat(20));
+    cli.ack(Request::OpenDesktopWindow {
+        open_picker_url: Some(magnet.clone()),
+        headers: HashMap::new(),
+    })
+    .await;
+    state.window_ready(state.window_generation()).unwrap();
+    {
+        let events = ui.main.events.lock().unwrap();
+        assert_eq!(events[0].url.as_deref(), Some(source.as_str()));
+        assert_eq!(events[1].url.as_deref(), Some(magnet.as_str()));
+    }
+
+    let preview = state
+        .preview_torrent(&source, None, CancellationToken::new())
+        .await
+        .unwrap();
+    let mut request = AddTorrentRequest {
+        source: format!("  {source}  "),
+        save_dir: None,
+        selected_file_indices: None,
+        sequential: false,
+        start_paused: false,
+    };
+    let mut stale_request = request.clone();
+    stale_request.selected_file_indices = Some(vec![0]);
+    assert_eq!(
+        state
+            .add_torrent_with_preview(stale_request, Some(Uuid::new_v4().to_string()))
+            .await
+            .unwrap_err(),
+        "Torrent preview expired. Please click Inspect again before downloading."
+    );
+    fs::remove_file(&path).unwrap();
+    let mut wrong_source = request.clone();
+    wrong_source.source = temp
+        .0
+        .join("missing.torrent")
+        .to_string_lossy()
+        .into_owned();
+    assert!(state
+        .add_torrent_with_preview(wrong_source, preview.preview_token.clone())
+        .await
+        .is_err());
+    request.start_paused = true;
+    let id = state
+        .add_torrent_with_preview(request, preview.preview_token)
+        .await
+        .unwrap();
+    assert_eq!(id, preview.info_hash);
+    assert_eq!(
+        state.get_transfer_snapshot(&id).await.unwrap().status,
+        TransferStatus::Paused
+    );
+    assert_eq!(state.get_torrent_peers(&id).await.unwrap().total_pieces, 1);
+    assert!(state
+        .set_transfer_speed_limit(&id, Some(1024))
+        .await
+        .unwrap_err()
+        .contains("16 KiB"));
+    state
+        .set_transfer_speed_limit(&id, Some(128_000))
+        .await
+        .unwrap();
+    assert_eq!(
+        state
+            .get_transfer_snapshot(&id)
+            .await
+            .unwrap()
+            .speed_limit_bps,
+        Some(128_000)
+    );
+    assert!(ui
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(action, _)| *action != "progress"));
+    let live = state
+        .add_torrent(AddTorrentRequest {
+            source: format!("magnet:?xt=urn:btih:{}", "ab".repeat(20)),
+            save_dir: None,
+            selected_file_indices: None,
+            sequential: false,
+            start_paused: false,
+        })
+        .await
+        .unwrap();
+    assert!(ui.calls.lock().unwrap().contains(&("progress", live)));
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
     let temp = TempDir::new();
     let dir = &temp.0;
@@ -800,7 +943,7 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
         .unwrap();
     sleep(Duration::from_millis(80)).await;
     let checks = ui.presence_checks.load(Ordering::SeqCst);
-    sleep(Duration::from_millis(140)).await;
+    sleep(Duration::from_millis(300)).await;
     assert_eq!(checks, ui.presence_checks.load(Ordering::SeqCst));
     assert!(ui.snapshots.lock().unwrap().is_empty());
 
@@ -965,6 +1108,7 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
                     save_dir: None,
                     selected_file_indices: None,
                     sequential: false,
+                    start_paused: false,
                 },
             })
             .await,
@@ -978,6 +1122,7 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
                     save_dir: None,
                     selected_file_indices: None,
                     sequential: false,
+                    start_paused: false,
                 },
             })
             .await,
@@ -1025,6 +1170,7 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
             save_dir: Some(downloads.to_string_lossy().into_owned()),
             selected_file_indices: Some(vec![0]),
             sequential: false,
+            start_paused: false,
         })
         .await
         .unwrap();
@@ -1036,6 +1182,7 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
                 save_dir: None,
                 selected_file_indices: None,
                 sequential: false,
+                start_paused: false,
             },
         })
         .await;
@@ -1126,7 +1273,7 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
     sleep(Duration::from_millis(80)).await;
     let checks = ui.presence_checks.load(Ordering::SeqCst);
     let emissions = ui.snapshots.lock().unwrap().len();
-    sleep(Duration::from_millis(140)).await;
+    sleep(Duration::from_millis(300)).await;
     assert_eq!(ui.presence_checks.load(Ordering::SeqCst), checks);
     assert_eq!(ui.snapshots.lock().unwrap().len(), emissions);
     let magnet = format!("magnet:?xt=urn:btih:{torrent}");
@@ -1315,6 +1462,7 @@ async fn settings_reload_and_rebase_an_empty_torrent_manager() {
             save_dir: None,
             selected_file_indices: None,
             sequential: true,
+            start_paused: false,
         })
         .await
         .unwrap();

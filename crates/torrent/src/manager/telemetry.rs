@@ -1,7 +1,11 @@
-use super::{Entry, EntryState, ManagerInner};
+use super::{torrent_trackers, Entry, EntryState, ManagerInner};
 use crate::{TorrentError, TorrentVersion};
 use librqbit::{api::TorrentIdOrHash, Api, TorrentStats, TorrentStatsState};
-use slipstream_protocol::{TorrentFileEntry, TransferKind, TransferSnapshot, TransferStatus};
+use slipstream_protocol::{
+    TorrentFileEntry, TorrentPeerEntry, TorrentPeerSummary, TransferKind, TransferSnapshot,
+    TransferStatus,
+};
+use std::{cmp::Reverse, time::Instant};
 
 #[derive(Debug, Clone)]
 pub struct TorrentStatsReport {
@@ -36,15 +40,101 @@ impl Entry {
     pub(super) fn report(&self, manager: &ManagerInner) -> TorrentStatsReport {
         let mut state = self.state.lock().unwrap();
         let stats = state.handle.as_ref().map(|handle| handle.stats());
-        let engine_state = stats.as_ref().map(|stats| stats.state);
+        self.report_with_stats(manager, &mut state, stats.as_ref())
+    }
+
+    pub(super) fn peer_summary(&self, manager: &ManagerInner) -> TorrentPeerSummary {
+        let mut state = self.state.lock().unwrap();
+        let stats = state.handle.as_ref().map(|handle| handle.stats());
+        let report = self.report_with_stats(manager, &mut state, stats.as_ref());
+        let aggregate = stats
+            .as_ref()
+            .and_then(|stats| stats.live.as_ref())
+            .map(|live| &live.snapshot.peer_stats);
+        let count = |value| u32::try_from(value).unwrap_or(u32::MAX);
+        let mut peers = Vec::new();
+        // The public snapshot API takes librqbit's default filter for live connections.
+        let snapshot = state
+            .handle
+            .as_ref()
+            .and_then(|handle| handle.live())
+            .map(|live| live.per_peer_stats_snapshot(Default::default()));
+        if let Some(snapshot) = snapshot {
+            let now = Instant::now();
+            state
+                .peer_rate_samples
+                .retain(|address, _| snapshot.peers.contains_key(address));
+            for (address, peer) in snapshot.peers {
+                let counters = peer.counters;
+                let downloaded_bytes = counters.fetched_bytes;
+                let sample = state
+                    .peer_rate_samples
+                    .entry(address.clone())
+                    .or_insert((downloaded_bytes, now));
+                let elapsed = now.duration_since(sample.1).as_secs_f64();
+                let download_speed_bps = if elapsed >= 0.1 {
+                    let delta = downloaded_bytes.saturating_sub(sample.0);
+                    *sample = (downloaded_bytes, now);
+                    (delta as f64 / elapsed) as u64
+                } else {
+                    0
+                };
+                peers.push(TorrentPeerEntry {
+                    address,
+                    state: peer.state.into(),
+                    downloaded_bytes,
+                    download_speed_bps,
+                    pieces_downloaded: counters.downloaded_and_checked_pieces,
+                    incoming: counters.incoming_connections > 0,
+                    errors: counters.errors,
+                });
+            }
+            peers.sort_unstable_by(|a, b| {
+                let rank = |peer: &TorrentPeerEntry| {
+                    (
+                        peer.state != "live",
+                        Reverse(peer.download_speed_bps),
+                        Reverse(peer.downloaded_bytes),
+                    )
+                };
+                rank(a)
+                    .cmp(&rank(b))
+                    .then_with(|| a.address.cmp(&b.address))
+            });
+            peers.truncate(128);
+        } else {
+            state.peer_rate_samples.clear();
+        }
+        TorrentPeerSummary {
+            live: aggregate.map_or(0, |stats| count(stats.live)),
+            connecting: aggregate.map_or(0, |stats| count(stats.connecting)),
+            queued: aggregate.map_or(0, |stats| count(stats.queued)),
+            seen: report.seen_peers,
+            dead: aggregate.map_or(0, |stats| count(stats.dead)),
+            upload_speed_bps: report.snapshot.upload_speed_bps,
+            ratio: report.ratio,
+            completed_pieces: count(report.completed_pieces),
+            total_pieces: count(report.total_pieces),
+            trackers: torrent_trackers(state.metadata.as_deref(), self.magnet.as_ref()),
+            peers,
+        }
+    }
+
+    fn report_with_stats(
+        &self,
+        manager: &ManagerInner,
+        state: &mut EntryState,
+        stats: Option<&TorrentStats>,
+    ) -> TorrentStatsReport {
+        let engine_state = stats.map(|stats| stats.state);
         let initialized = matches!(
             engine_state,
             Some(TorrentStatsState::Live | TorrentStatsState::Paused)
         );
         if initialized && !state.bitmap_synced {
-            self.sync_bitmap(manager, &mut state, stats.as_ref().unwrap());
+            self.sync_bitmap(manager, state, stats.unwrap());
         }
-        let finished = initialized && stats.as_ref().is_some_and(|stats| stats.finished);
+        let finished = initialized && stats.is_some_and(|stats| stats.finished);
         let metadata = state.metadata.as_ref();
         let (total_bytes, downloaded_bytes) = metadata.map_or_else(
             || {
@@ -61,7 +151,7 @@ impl Entry {
                     .fold((0, 0), |(total, downloaded), file| {
                         (
                             total + file.size_bytes,
-                            downloaded + file_progress(stats.as_ref(), file),
+                            downloaded + file_progress(stats, file),
                         )
                     });
                 (Some(total), downloaded)
@@ -70,7 +160,7 @@ impl Entry {
         let error_message = state
             .error
             .clone()
-            .or_else(|| stats.as_ref().and_then(|stats| stats.error.clone()));
+            .or_else(|| stats.and_then(|stats| stats.error.clone()));
         let bitmap = self.bitmap.read().unwrap();
         let status = if error_message.is_some() {
             TransferStatus::Failed
@@ -89,7 +179,7 @@ impl Entry {
                 _ => TransferStatus::Probing,
             }
         };
-        let live = stats.as_ref().and_then(|stats| stats.live.as_ref());
+        let live = stats.and_then(|stats| stats.live.as_ref());
         let (download_speed_bps, upload_speed_bps, active_peers) = live.map_or((0, 0, 0), |live| {
             let peers = &live.snapshot.peer_stats;
             (
@@ -103,7 +193,7 @@ impl Entry {
         }));
         let uploaded_bytes = state
             .previous_uploads
-            .saturating_add(stats.as_ref().map_or(0, |stats| stats.uploaded_bytes));
+            .saturating_add(stats.map_or(0, |stats| stats.uploaded_bytes));
         let ratio = if downloaded_bytes > 0 {
             uploaded_bytes as f64 / downloaded_bytes as f64
         } else {
@@ -113,11 +203,8 @@ impl Entry {
             .options
             .sequential
             .unwrap_or(manager.config.default_sequential);
-        let version = match metadata.map(|metadata| metadata.version) {
-            Some(TorrentVersion::Hybrid) => "BTv1 + BTv2",
-            Some(TorrentVersion::V2) => "BTv2",
-            _ => "BTv1",
-        };
+        let version =
+            version_label(metadata.map_or(TorrentVersion::V1, |metadata| metadata.version));
         let mut format_tags = vec![version.to_owned()];
         if sequential {
             format_tags.push("sequential".into());
@@ -174,7 +261,7 @@ impl Entry {
             playlist_paused: None,
             playlist_index: None,
             playlist_total: None,
-            speed_limit_bps: None,
+            speed_limit_bps: state.options.download_limit_bps,
             connect_rtt_ms: None,
             description: None,
             created_at: self.created_at,
@@ -223,6 +310,14 @@ impl EntryState {
                 .selected_file_indices
                 .as_ref()
                 .is_none_or(|indices| indices.binary_search(&file.index).is_ok())
+    }
+}
+
+pub(super) fn version_label(version: TorrentVersion) -> &'static str {
+    match version {
+        TorrentVersion::Hybrid => "BTv1 + BTv2",
+        TorrentVersion::V2 => "BTv2",
+        TorrentVersion::V1 => "BTv1",
     }
 }
 

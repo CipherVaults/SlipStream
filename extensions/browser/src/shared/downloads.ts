@@ -1,5 +1,6 @@
 export interface InterceptionSettings {
   enabled: boolean;
+  interceptMagnets: boolean;
   showInFullscreen: boolean;
   extensions: string[];
   minBytes: number;
@@ -9,6 +10,7 @@ export interface InterceptionSettings {
 
 export const defaults: InterceptionSettings = {
   enabled: true,
+  interceptMagnets: true,
   showInFullscreen: false,
   extensions: [
     "zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "zst", "iso", "img", "bin", "cab",
@@ -29,6 +31,7 @@ export function readSettings(value: unknown): InterceptionSettings {
   const minBytes = saved?.minBytes;
   return {
     enabled: typeof saved?.enabled === "boolean" ? saved.enabled : defaults.enabled,
+    interceptMagnets: typeof saved?.interceptMagnets === "boolean" ? saved.interceptMagnets : defaults.interceptMagnets,
     showInFullscreen: saved?.showInFullscreen === true,
     extensions: strings(saved?.extensions, defaults.extensions),
     minBytes: typeof minBytes === "number" && Number.isSafeInteger(minBytes) && minBytes >= 0 ? minBytes : defaults.minBytes,

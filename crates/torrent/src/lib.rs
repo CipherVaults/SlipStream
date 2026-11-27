@@ -7,6 +7,7 @@ pub mod metadata;
 pub mod storage;
 
 pub use bitmap::PieceBitmap;
+pub use bytes::Bytes;
 pub use error::TorrentError;
 pub use magnet::{parse_magnet_uri, ParsedMagnet};
 pub use manager::{TorrentAddOptions, TorrentManager, TorrentManagerConfig, TorrentStatsReport};
@@ -15,6 +16,7 @@ pub use metadata::{
     TorrentFileSpec, TorrentMetadata, TorrentVersion, MAX_TORRENT_BYTES,
 };
 pub use storage::{ConfinedStorageFactory, ConfinedTorrentStorage};
+pub use tokio_util::sync::CancellationToken;
 
 pub fn torrent_version() -> &'static str {
     env!("CARGO_PKG_VERSION")

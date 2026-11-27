@@ -175,6 +175,7 @@ if (refreshId) {
     const values = await api.storage.local.get(SETTINGS_KEY);
     const preferences = readSettings(values[SETTINGS_KEY]);
     input("enabled").checked = preferences.enabled;
+    input("intercept-magnets").checked = preferences.interceptMagnets;
     input("show-in-fullscreen").checked = preferences.showInFullscreen;
     input("extensions").value = preferences.extensions.join(", ");
     input("min-size").value = String(preferences.minBytes / mib);
@@ -192,6 +193,7 @@ if (refreshId) {
       kind: "save-settings",
       settings: {
         enabled: input("enabled").checked,
+        interceptMagnets: input("intercept-magnets").checked,
         showInFullscreen: input("show-in-fullscreen").checked,
         extensions: parseList("extensions"),
         minBytes: Math.min(Number.MAX_SAFE_INTEGER, Math.round(input("min-size").valueAsNumber * mib)),

@@ -26,7 +26,7 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 - **Created by:** Mohamed Sayed
 - **Target OS:** Windows 10 / Windows 11 (`x86_64`)
 - **Public repository:** [CipherVaults/SlipStream](https://github.com/CipherVaults/SlipStream)
-- **Latest release:** [v2.0.0](https://github.com/CipherVaults/SlipStream/releases/tag/v2.0.0)
+- **Latest release:** [v2.1.0](https://github.com/CipherVaults/SlipStream/releases/tag/v2.1.0)
 
 ---
 
@@ -48,11 +48,12 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 
 ### 3. Native BitTorrent & Magnet (`crates/torrent`)
 - **Embedded Rust Engine (`librqbit`):** Supports `.torrent` files, raw torrent bytes, and `magnet:` URIs without external torrent daemons.
-- **Manifest & Confinement Guards:** Depth-64 bencode decoder with duplicate-key and symlink (`attr 'l'` / `symlink path`) rejection, Windows reserved DOS device and BiDi control filtering, `ConfinedTorrentStorage`, selective file priorities, 16-segment piece-bitmap projection, and NTFS `:Zone.Identifier` tagging on completed files.
+- **Pre-Download File Checklist & Live Peer Inspector:** Inspect `.torrent` files and `magnet:` metadata before starting a download (with searchable file selection, **Sequential Download**, **Add Paused**, selected size vs. free space, and `preview_token` verification), then monitor live connected peers, per-peer speeds, share ratio, piece progress, and trackers in the tabbed Inspector and floating progress window.
+- **Manifest & Confinement Guards:** Depth-64 bencode decoder with duplicate-key and symlink (`attr 'l'` / `symlink path`) rejection, Windows reserved DOS device and BiDi control filtering, `ConfinedTorrentStorage`, DNS-validated magnet previews, 16-segment piece-bitmap projection, and NTFS `:Zone.Identifier` tagging on completed files.
 
 ### 4. Browser Integration (`crates/native-host` + `extensions/browser`)
 - **Cross-Browser MV3:** Supports **Chrome**, **Edge**, **Brave**, and **Firefox** (`slipstream@ciphervaults.com`) using `4`-byte little-endian `1 MiB` Native Messaging framing and per-user `HKCU` registration.
-- **One-click Browser Picker** Choose **Add Extension** or **Open Setup** for your browser in **Settings → Browser Integration**. SlipStream opens the browser’s extension setup page and reveals the bundled extension folder. Chrome, Edge, and Brave share the fixed ID `nikdbkenglojniombimjdkneanmponcp`.
+- **One-click Browser Picker & Magnet Link Interception:** Choose **Add Extension** or **Open Setup** for your browser in **Settings → Browser Integration**. Chromium (`Chrome`/`Edge`/`Brave`) and Firefox intercept HTTP/HTTPS downloads, media streams, and `magnet:` links (`Alt`/modifier click bypasses, falling back cleanly to the browser if desktop is closed), opening and foregrounding SlipStream directly to **Add Download**. Chrome, Edge, and Brave share the fixed ID `nikdbkenglojniombimjdkneanmponcp`.
 - **Floating media pill.** Open the closed Shadow DOM pill for direct HTTP video downloads (`HTTP 200`/`206`), HLS master variants, probed `yt-dlp` qualities, audio presets, or **Download Playlist…** across embedded players and third-party CDNs. Drag the pill to snap it to a player edge, dismiss it in one click, or enable it in fullscreen from the extension popup. Capture-phase protection helps keep page click handlers from interfering with the pill.
 - **Privacy & Context Isolation:** Uses Chromium `downloads.onDeterminingFilename` (plus `downloads.onCreated` fallback) with `Alt`-key bypass, broadened extension and inferred-MIME matching, non-private `"cookies"` retrieval, `Alt`-key bypass protection, muted/excluded sites, and **Incognito / Firefox private `cookieStoreId` isolation**. Browser `GetStatus` responses redact desktop query tokens and filesystem paths before leaving the daemon.
 
@@ -71,6 +72,7 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 
 ## Security & Verification
 
+- **v2.1.0 Reliability, Torrent Preview & Audit Verification:** Remediated all 19 findings from the independent cross-model Codex CLI (`gpt-6.2-sol`) audit across DNS-validated magnet previews, expired preview token rejection, keyed `Rc<VecModel>` click stability, Win32 foreground/monitor fit without `AttachThreadInput`, concurrent `.local-picker` handoff retries, extension `magnet:` fallback navigation, non-destructive `SlipStream.Magnet` NSIS registration, and `skip_serializing_if` backward wire compatibility—verified with **219 / 219** passing Rust workspace tests (including `slipstream-safety-eval`) and **87 / 87** browser extension Vitest tests.
 - **v2.0.0 Pure Rust + Slint Audit & Verification:** Replaced Tauri v2, WebView2 (`msedgewebview2.exe`), and Node/React desktop dependencies with a single native Slint binary (`0` child WebView2 processes). Remediated all 19 findings from the cross-model Codex CLI (`gpt-6.2-sol`) audit across Win32 clipboard bounds/COM pickers/Open-with, origin-scoped seeded headers, overlay state handling, and signed update staging (`FILE_SHARE_READ` lock + CI `slipstream-sign --verify` gate), verified with **209 / 209** passing Rust workspace tests and **69 / 69** browser extension tests.
 - **v1.2.1 Security Audit & DevSecOps Review (`run-2`, `/security-audit` + `/security-auditor`):** Audited `23` coverage units (`15` `candidate`, `7` `covered`, `1` `out_of_scope`) across Rust engines, MV3 extension, React UI, and GitHub Actions with cross-model Codex CLI + Neon verification (`0` confirmed vulnerabilities under read-only/offline policy; `3` prior `v1.0.0` leads verified mitigated in `v1.2.0`). `v1.2.1` landed defense-in-depth hardening across `48+` files—including Completed/legacy SQLite credential scrubbing, strict cross-origin redirect header allowlists + origin-only `Referer` trimming, media userinfo rejection + proxy env cleanup, BitTorrent public-tracker filtering, Win32 Job Objects for `ffmpeg` grandchildren, `GrabBatchUrls` & probe concurrency bounds, WebView CSP/referrer hardening, floating pill live-format & incognito fixes, collision-safe playlist folders/filenames, SHA-pinned CI/Release actions, and lockfile-pinned `@tauri-apps/cli`.
 - **v1.0.0 Baseline (`run-1` & `tests/safety-eval`):** [v1.0.0 changelog entry](CHANGELOG.md#100---2026-11-21) — `3` hunting waves across `19` coverage units (`0` confirmed vulnerabilities) plus the preregistered `slipstream-safety-v1` deterministic oracle suite passing **1,200 / 1,200** single-input boundary cases and **108 / 108** orthogonal 5-factor stateful HTTP chaos chains (`0` broken items, `0` escapes, `0` benign false rejections, `bias-audit` Cramér's `V = 0.0`).
@@ -79,8 +81,8 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 
 ## Download, Installation & Browser Setup
 
-1. **Installer** Download `SlipStream_2.0.0_x64-setup.exe` and run the per-user installer. It includes the native messaging host, media tools, and both browser extension builds. [v2.0.0 release assets](https://github.com/CipherVaults/SlipStream/releases/tag/v2.0.0)
-2. **Portable ZIP** Extract `SlipStream-2.0.0-windows-x64-portable.zip` and run `SlipStream.exe`. Keep the extracted `bin/` and `extensions/` directories beside it.
+1. **Installer** Download `SlipStream_2.1.0_x64-setup.exe` and run the per-user installer. It includes the native messaging host, media tools, and both browser extension builds. [v2.1.0 release assets](https://github.com/CipherVaults/SlipStream/releases/tag/v2.1.0)
+2. **Portable ZIP** Extract `SlipStream-2.1.0-windows-x64-portable.zip` and run `SlipStream.exe`. Keep the extracted `bin/` and `extensions/` directories beside it.
 3. **Browser extension** In **Settings → Browser Integration**, select your browser. For Chrome, Edge, or Brave, enable **Developer mode**, select **Load unpacked**, and choose the revealed folder. In Firefox, choose **Load Temporary Add-on** and select the revealed `manifest.json`. Separate browser extension ZIPs are also available on the release page.
 
 **Upgrading from v1.x** SlipStream keeps the valid native messaging IDs already registered for each browser and adds the bundled extension ID. If an older unpacked copy’s ID is missing from the registration, copy the ID from the browser’s extensions page and enter it in **Settings → Browser Integration** for that browser.

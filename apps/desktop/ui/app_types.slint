@@ -64,6 +64,23 @@ export struct TorrentFileRowModel {
     selected: bool,
 }
 
+export struct TorrentPeerRowModel {
+    address: string,
+    state-label: string,
+    state-tone: int,
+    downloaded-text: string,
+    speed-text: string,
+    pieces-text: string,
+    direction-text: string,
+}
+
+export struct TorrentPreviewFileModel {
+    index: int,
+    relative-path: string,
+    size-text: string,
+    checked: bool,
+}
+
 export struct InspectorModel {
     has-selection: bool,
     id: string,
@@ -80,12 +97,18 @@ export struct InspectorModel {
     is-paused: bool,
     is-completed: bool,
     can-pause-resume: bool,
+    can-stop: bool,
     can-verify: bool,
     can-refresh-url: bool,
     speed-text: string,
     eta-text: string,
     size-text: string,
     connections-text: string,
+    upload-speed-text: string,
+    ratio-text: string,
+    pieces-text: string,
+    peers-summary-text: string,
+    trackers-text: string,
     sha-text: string,
     sha-tone: int, // 0=default, 2=green, 3=amber
     error-message: string,
@@ -93,6 +116,7 @@ export struct InspectorModel {
     duration-text: string,
     segments: [SegmentTileModel],
     torrent-files: [TorrentFileRowModel],
+    peers: [TorrentPeerRowModel],
 }
 
 export struct FormatOptionModel {

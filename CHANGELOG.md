@@ -2,6 +2,26 @@
 
 All notable changes to **SlipStream** are documented in this file following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] - 2026-11-27
+
+### Added
+
+- **Pre-Download Torrent & Magnet File Checklist (`crates/torrent`, `apps/desktop`):**
+  - Added `TorrentManager::preview_source` and bounded `torrent_previews` metadata cache (rejecting expired or mismatched `preview_token`s explicitly) so users can inspect files, sizes, tracker count, free disk space, and toggle **Select All** / **None** / search filters, **Sequential Download**, or **Add Paused** before starting a torrent or magnet transfer.
+  - Enforced a 8-tracker cap, DNS validation of UDP trackers against private/loopback IPs, and HTTP(S) tracker stripping during automatic magnet previews to prevent redirect SSRF or unbounded response buffering.
+- **Live BitTorrent Peers, Ratio & Trackers (`crates/torrent`, `crates/protocol`, `apps/desktop`):**
+  - Added `get_torrent_peers` (`Api::api_peer_stats` at `1 Hz` with per-peer download speeds, states, pieces, incoming/outgoing direction, live/connecting/queued/seen counts, share ratio, piece totals, and trackers) displayed in both the collapsible Tabbed Inspector (**Peers** tab) and `DownloadProgressWindow`.
+- **Browser Extension `magnet:` Interception (`extensions/browser`):**
+  - Added capture-phase trusted `<a href="magnet:...">` interception with `Alt`/`Ctrl`/`Meta`/`Shift` modifier bypass, **Intercept magnet links** popup toggle, top-level + iframe `excludedDomains` checks, and automatic one-shot browser fallback navigation if SlipStream desktop is closed or declines handoff.
+- **Fluid Desktop Controls (`apps/desktop`):**
+  - Added 8-direction frameless window resize grips, selected-transfer **Transfer Actions** toolbar (`Pause`/`Resume`, `Stop`, `Floating Box`, `Open Folder`, `Copy Link`, `Remove...`), right-click context menu, `Escape`-trapped Remove confirmation modal (`Keep` / `Delete Files Too`), `360 px` collapsible Tabbed Inspector (`General` / `Files` / `Peers` / `Segments`), scrollable high-DPI floating torrent details, and toast notifications.
+
+### Fixed
+
+- **Transfer Click Reliability & Responsive Controls:** Paced daemon telemetry to `250 ms` and replaced per-tick `VecModel` teardowns with keyed in-place `Rc<VecModel>` reconciliation (`reconcile_vec_model_by_key`), fixed-cell `PeerRow`/status bindings, `controlled: true` Slint `CheckBox` bindings, elided long file paths with reserved size columns, and synced `can-stop` states across the main and floating windows.
+- **Floating Progress Launch, Window Focus & Full Format Picker:** Made `add_torrent_with_preview` automatically open `DownloadProgressWindow` when `!start_paused` (with async snapshot fallback and duplicate-window guards), implemented `bring_window_to_front` (without cross-process `AttachThreadInput` hangs, falling back to `FlashWindowEx`) and `center_window_on_active_monitor`, auto-probed seeded media URLs and auto-inspected torrents/magnets above Settings, queued concurrent incoming picker requests (bounded to 16), and retried cold-launch `.local-picker` handoffs up to 2.5 s.
+- **Rate Limits, Wire Compat & Installer Association:** Released the daemon-wide mutex across torrent speed-limit updates, surfaced `TorrentManager` minimum-rate validation errors directly instead of clamping silently in the daemon, added `skip_serializing_if` to `AddTorrentRequest::start_paused` for legacy wire backward compatibility, and updated `slipstream.nsi` to register `SlipStream.Magnet` while preserving/restoring prior user `magnet:` handlers.
+
 ## [2.0.0] - 2026-11-27
 
 ### Changed
