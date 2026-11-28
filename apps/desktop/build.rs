@@ -6,7 +6,7 @@ fn main() {
         res.set_icon("icons/icon.ico");
         res.set("ProductName", "SlipStream");
         res.set("FileDescription", "SlipStream Download Manager");
-        res.set("CompanyName", "Mohamed Sayed");
+        res.set("CompanyName", "CipherVaults");
         res.set("LegalCopyright", "Copyright (c) 2026 Mohamed Sayed");
         res.compile().expect("failed to compile Windows resources");
     }

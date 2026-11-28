@@ -164,7 +164,7 @@ Section "SlipStream" SecMain
   ; Write Add/Remove Programs metadata (per-user HKCU)
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SlipStream" "DisplayName" "SlipStream"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SlipStream" "DisplayVersion" "${VERSION}"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SlipStream" "Publisher" "Mohamed Sayed"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SlipStream" "Publisher" "CipherVaults"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SlipStream" "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SlipStream" "DisplayIcon" "$INSTDIR\SlipStream.exe"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SlipStream" "UninstallString" '"$INSTDIR\Uninstall.exe"'

@@ -193,6 +193,8 @@ impl MediaJob {
             speed_limit_bps: None,
             connect_rtt_ms: None,
             description: None,
+            category_id: None,
+            tags: Vec::new(),
             created_at: now,
             updated_at: now,
         };
@@ -608,6 +610,7 @@ mod tests {
             selected_entries: None,
             playlist_folder_name: None,
             headers: HashMap::new(),
+            ..AddMediaDownloadRequest::default()
         };
         let job = MediaJob::new(
             request,

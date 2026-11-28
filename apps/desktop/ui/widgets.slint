@@ -1,5 +1,5 @@
 import { ScrollView } from "std-widgets.slint";
-import { TorrentPeerRowModel } from "./app_types.slint";
+import { TorrentPeerRowModel, TransferRowModel, SpeedGraphModel } from "./app_types.slint";
 import { Theme } from "./tokens.slint";
 
 // Primary accent button (30px or 32px height, crisp top specular highlight)
@@ -227,9 +227,10 @@ export component CheckBoxRow inherits Rectangle {
     in property <string> label: "";
     in property <bool> enabled: true;
     in property <bool> porcelain: false;
+    in property <bool> wrap-label: false;
     callback toggled(bool);
 
-    height: 24px;
+    height: root.wrap-label ? 36px : 24px;
     opacity: root.enabled ? 1.0 : 0.5;
 
     HorizontalLayout {
@@ -269,6 +270,7 @@ export component CheckBoxRow inherits Rectangle {
             color: root.porcelain ? Theme.add-text : Theme.text-1;
             vertical-alignment: center;
             overflow: elide;
+            wrap: root.wrap-label ? word-wrap : no-wrap;
         }
     }
 
@@ -425,6 +427,7 @@ export component StyledLineEdit inherits Rectangle {
     in property <bool> enabled: true;
     in property <bool> mono: false;
     in property <bool> porcelain: false;
+    in property <InputType> input-type: InputType.text;
     in property <length> box-height: 31px;
     callback edited(string);
     callback accepted();
@@ -454,6 +457,7 @@ export component StyledLineEdit inherits Rectangle {
         width: parent.width - 18px;
         height: parent.height;
         text <=> root.text;
+        input-type: root.input-type;
         read-only: root.read-only;
         enabled: root.enabled;
         font-family: root.mono ? Theme.font-mono : Theme.font-sans;
@@ -568,6 +572,137 @@ export component StyledSelect inherits Rectangle {
                     }
                 }
             }
+        }
+    }
+}
+
+export component TransferTableRow inherits Rectangle {
+    in property <TransferRowModel> item;
+    in property <bool> heading: false;
+    in property <string> sort-column;
+    in property <bool> sort-ascending;
+    callback sort(string);
+    callback clicked();
+    callback double-clicked();
+    callback context-clicked(float, float);
+
+    height: 34px;
+    min-width: 638px;
+    background: root.heading ? Theme.bg-inspector
+        : root.item.selected ? Theme.accent-soft
+        : row-touch.has-hover ? Theme.bg-hover : Theme.bg-canvas;
+
+    row-touch := TouchArea {
+        enabled: !root.heading;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+        double-clicked => { root.double-clicked(); }
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down && event.button == PointerEventButton.right {
+                root.context-clicked((self.absolute-position.x + self.mouse-x) / 1px, (self.absolute-position.y + self.mouse-y) / 1px);
+            }
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 8px;
+
+        for column in [
+            { id: "name", label: "Name", value: root.item.filename, size: 0px },
+            { id: "size", label: "Size", value: root.item.size-text, size: 72px },
+            { id: "progress", label: "Progress", value: root.item.progress-label, size: 76px },
+            { id: "speed", label: "Speed", value: root.item.speed-text, size: 81px },
+            { id: "eta", label: "ETA", value: root.item.eta-text, size: 56px },
+            { id: "status", label: "Status", value: root.item.status, size: 65px },
+            { id: "category", label: "Category", value: root.item.category-name, size: 75px },
+            { id: "date", label: "Added", value: root.item.added-text, size: 50px },
+        ] : Rectangle {
+            min-width: column.id == "name" ? 87px : column.size;
+            max-width: column.id == "name" ? 10000px : column.size;
+            horizontal-stretch: column.id == "name" ? 1 : 0;
+            HorizontalLayout {
+                spacing: 2px;
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.heading ? column.label : column.value;
+                    font-size: 11px;
+                    font-weight: root.heading || column.id == "name" ? 650 : 400;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    color: root.heading && column.id == root.sort-column ? Theme.accent
+                        : column.id == "name" ? Theme.text-1 : Theme.text-2;
+                }
+                if root.heading && column.id == root.sort-column : Image {
+                    width: 10px;
+                    height: 10px;
+                    y: (parent.height - self.height) / 2;
+                    source: root.sort-ascending ? @image-url("icons/chevron-up.svg") : @image-url("icons/chevron-down.svg");
+                    colorize: Theme.accent;
+                }
+            }
+            if root.heading : TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.sort(column.id); }
+            }
+        }
+    }
+
+    Rectangle {
+        y: parent.height - 1px;
+        width: parent.width;
+        height: 1px;
+        background: Theme.border;
+    }
+    if !root.heading && root.item.selected : Rectangle {
+        width: 2px;
+        height: parent.height;
+        background: Theme.accent;
+    }
+}
+
+export component DualSpeedGraph inherits Rectangle {
+    in property <SpeedGraphModel> graph;
+    min-height: 142px;
+    border-radius: Theme.radius-md;
+    background: Theme.bg-elevated;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    for line in 5 : Rectangle {
+        x: 10px;
+        y: 10px + (parent.height - 20px) * line / 4;
+        width: parent.width - 20px;
+        height: 1px;
+        background: Theme.border;
+    }
+    for line in 7 : Rectangle {
+        x: 10px + (parent.width - 20px) * line / 6;
+        y: 10px;
+        width: 1px;
+        height: parent.height - 20px;
+        background: Theme.border;
+    }
+    Rectangle {
+        x: 10px;
+        y: 10px;
+        width: parent.width - 20px;
+        height: parent.height - 20px;
+        for layer in [
+            { path: root.graph.down-fill, fill: #378AFF29, stroke: #00000000 },
+            { path: root.graph.up-fill, fill: #21B89C2E, stroke: #00000000 },
+            { path: root.graph.down-line, fill: #00000000, stroke: #378AFF },
+            { path: root.graph.up-line, fill: #00000000, stroke: #21B89C },
+        ] : Path {
+            width: parent.width;
+            height: parent.height;
+            viewbox-width: 320;
+            viewbox-height: 120;
+            commands: layer.path;
+            fill: layer.fill;
+            stroke: layer.stroke;
+            stroke-width: 1.75px;
         }
     }
 }

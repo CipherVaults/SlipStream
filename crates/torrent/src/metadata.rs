@@ -227,7 +227,9 @@ fn parse_metadata(
 }
 
 fn tracker_text(value: &Value) -> Option<&str> {
-    string(value).ok().filter(|url| allowed_tracker_url(url))
+    string(value)
+        .ok()
+        .filter(|url| allowed_tracker_url(url, false))
 }
 
 fn v1_files(

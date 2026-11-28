@@ -2,7 +2,11 @@ use crate::TorrentError;
 use slipstream_protocol::{
     is_private_or_loopback_ip, sanitize_filename, validate_magnet_uri, UrlSecurityError,
 };
-use std::{collections::BTreeSet, net::IpAddr, time::Duration};
+use std::{
+    collections::{BTreeSet, HashSet},
+    net::IpAddr,
+    time::Duration,
+};
 use tokio::{net::lookup_host, time::timeout};
 use url::{Host, Url};
 
@@ -47,11 +51,16 @@ impl ParsedMagnet {
 
     pub(crate) async fn resolve_trackers(
         &self,
+        extra_trackers: &[String],
         udp_only: bool,
         allow_loopback: bool,
     ) -> Vec<String> {
         let mut urls = Vec::new();
-        for tracker in &self.trackers {
+        let mut seen = HashSet::new();
+        for tracker in self.trackers.iter().chain(extra_trackers) {
+            if !seen.insert(tracker) {
+                continue;
+            }
             if let Some(url) = resolve_tracker(tracker, udp_only, allow_loopback)
                 .await
                 .filter(|url| !urls.contains(url))
@@ -124,8 +133,29 @@ pub(crate) fn parse_magnet_uri_with_loopback(
     Ok(magnet)
 }
 
-pub(crate) fn allowed_tracker_url(raw: &str) -> bool {
-    tracker_url(raw, false).is_some()
+pub(crate) fn allowed_tracker_url(raw: &str, allow_loopback: bool) -> bool {
+    tracker_url(raw, allow_loopback).is_some()
+}
+
+pub(crate) fn validated_tracker_urls(
+    urls: &[String],
+    allow_loopback: bool,
+) -> Result<Vec<String>, TorrentError> {
+    let mut seen = HashSet::new();
+    let mut trackers = Vec::new();
+    for url in urls
+        .iter()
+        .map(|url| url.trim())
+        .filter(|url| !url.is_empty())
+    {
+        if !allowed_tracker_url(url, allow_loopback) {
+            return Err(TorrentError::InvalidState("invalid tracker URL".into()));
+        }
+        if seen.insert(url) {
+            trackers.push(url.to_owned());
+        }
+    }
+    Ok(trackers)
 }
 
 fn tracker_url(raw: &str, allow_loopback: bool) -> Option<Url> {

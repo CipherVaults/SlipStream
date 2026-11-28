@@ -22,9 +22,10 @@ use windows_sys::Win32::{
         BCRYPT_SHA256_ALG_HANDLE,
     },
     Storage::FileSystem::{
-        FileDispositionInfo, GetFinalPathNameByHandleW, SetFileInformationByHandle, DELETE,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileDispositionInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+        SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
     },
 };
 
@@ -32,12 +33,23 @@ pub(crate) fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
-fn reparse(metadata: &fs::Metadata) -> bool {
+pub(crate) fn reparse(metadata: &fs::Metadata) -> bool {
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 pub(crate) fn local_drive_path(path: &Path) -> io::Result<PathBuf> {
     use std::path::Component;
+    let raw = path
+        .as_os_str()
+        .to_str()
+        .ok_or_else(|| invalid("expected a Unicode local drive path"))?;
+    if raw.chars().any(char::is_control)
+        || raw
+            .split(['/', '\\'])
+            .any(|part| matches!(part, "." | ".."))
+    {
+        return Err(invalid("path contains traversal or control characters"));
+    }
     let mut components = path.components();
     let drive = match (components.next(), components.next()) {
         (Some(Component::Prefix(prefix)), Some(Component::RootDir)) => match prefix.kind() {
@@ -380,8 +392,10 @@ fn opened_file_path(file: &File) -> io::Result<OsString> {
     if !metadata.is_file() || reparse(&metadata) {
         return Err(invalid("expected a regular non-reparse file"));
     }
-    // Check the path of the opened handle to catch a parent replaced between
-    // validation and open. Deletion and hashing both use this same handle.
+    final_handle_path(file)
+}
+
+pub(crate) fn final_handle_path(file: &File) -> io::Result<OsString> {
     let handle = file.as_raw_handle();
     let needed = unsafe { GetFinalPathNameByHandleW(handle, null_mut(), 0, 0) };
     if needed == 0 {
@@ -393,6 +407,111 @@ fn opened_file_path(file: &File) -> io::Result<OsString> {
         return Err(io::Error::last_os_error());
     }
     Ok(OsString::from_wide(&buffer[..written as usize]))
+}
+
+pub(crate) fn verify_handle_path(file: &File, expected: &Path) -> io::Result<PathBuf> {
+    let actual = local_drive_path(Path::new(&final_handle_path(file)?))?;
+    let expected = local_drive_path(expected)?;
+    if !actual
+        .as_os_str()
+        .eq_ignore_ascii_case(expected.as_os_str())
+    {
+        return Err(invalid("path changed during open"));
+    }
+    Ok(actual)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FileIdentity(u32, u64);
+
+pub(crate) fn file_identity(file: &File) -> io::Result<(FileIdentity, u32)> {
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((
+        FileIdentity(
+            info.dwVolumeSerialNumber,
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        ),
+        info.nNumberOfLinks,
+    ))
+}
+
+pub(crate) fn open_local_file(path: &Path, delete_access: bool) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    if delete_access {
+        options.access_mode(windows_sys::Win32::Foundation::GENERIC_READ | DELETE);
+    } else {
+        options.read(true);
+    }
+    let file = options
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || reparse(&metadata) {
+        return Err(invalid("expected a regular non-reparse file"));
+    }
+    verify_handle_path(&file, path)?;
+    Ok(file)
+}
+
+pub(crate) fn reject_existing_links(path: &Path) -> io::Result<PathBuf> {
+    let path = local_drive_path(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("expected a file path"))?;
+    validate_existing_ancestors(parent)?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if !metadata.is_file() || reparse(&metadata) => {
+            return Err(invalid("expected a regular non-reparse file"));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(path)
+}
+
+pub(crate) fn open_unlinked_local_file(path: &Path) -> io::Result<File> {
+    let file = open_local_file(path, false)?;
+    if file_identity(&file)?.1 != 1 {
+        return Err(invalid("expected a file without hard links"));
+    }
+    Ok(file)
+}
+
+pub(crate) fn open_local_directory(path: &Path) -> io::Result<File> {
+    let directory = OpenOptions::new()
+        .read(true)
+        // Keep the directory from being renamed while allowing child
+        // creation and the filesystem's destination open during publication.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    let metadata = directory.metadata()?;
+    if reparse(&metadata) || !metadata.is_dir() {
+        return Err(invalid("expected a regular non-reparse directory"));
+    }
+    verify_handle_path(&directory, path)?;
+    Ok(directory)
+}
+
+pub(crate) fn delete_open_file(file: &File) -> io::Result<()> {
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -435,19 +554,8 @@ pub(crate) fn delete_files(root: &Path, paths: &[String]) -> io::Result<()> {
             Err(error) => return Err(error),
         }
     }
-    let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
     for file in handles {
-        let ok = unsafe {
-            SetFileInformationByHandle(
-                file.as_raw_handle(),
-                FileDispositionInfo,
-                (&raw const disposition).cast(),
-                size_of::<FILE_DISPOSITION_INFO>() as u32,
-            )
-        };
-        if ok == 0 {
-            return Err(io::Error::last_os_error());
-        }
+        delete_open_file(&file)?;
     }
     Ok(())
 }

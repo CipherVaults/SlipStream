@@ -1,7 +1,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use slipstream_desktop_lib::{
-    local_picker_pipe_name, set_initial_picker_source, shell, LOCAL_PICKER_TOKEN_FILE,
+    local_picker_pipe_name, set_initial_picker_source, set_start_minimized, shell, DaemonOptions,
+    LOCAL_PICKER_TOKEN_FILE,
 };
 use slipstream_native_host::{pipe::PipeClient, security::default_pipe_name, token::SessionToken};
 use slipstream_protocol::{NativeBridgeRequest, NativeBridgeResponse};
@@ -21,6 +22,7 @@ fn main() {
 
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let demo_mode = args.iter().any(|arg| arg == "--demo");
+    set_start_minimized(args.iter().any(|arg| arg == "--minimized"));
     let source = (!demo_mode)
         .then(|| {
             args.iter()
@@ -34,7 +36,11 @@ fn main() {
         }
     }
     set_initial_picker_source(source.clone());
-    if let Err(err) = shell::run_app(demo_mode) {
+    let options = DaemonOptions {
+        allow_power_actions: true,
+        ..DaemonOptions::default()
+    };
+    if let Err(err) = shell::run_app_with_options(demo_mode, options) {
         // Another launch may have claimed the pipe while this one was starting.
         if source
             .as_deref()
@@ -55,6 +61,9 @@ fn is_magnet_source(source: &str) -> bool {
 
 fn picker_source(arg: &str) -> Option<String> {
     let source = arg.trim();
+    if source == "--minimized" {
+        return None;
+    }
     if is_magnet_source(source) {
         return Some(source.to_owned());
     }
@@ -110,4 +119,32 @@ fn handoff_picker(source: &str, retry: bool) -> bool {
         .await
         .unwrap_or(false)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minimized_flag_stays_out_of_torrent_picker_sources() {
+        assert_eq!(picker_source("--minimized"), None);
+        let magnet = "magnet:?xt=urn:btih:abababababababababababababababababababab";
+        assert_eq!(
+            ["--minimized", magnet]
+                .into_iter()
+                .find_map(picker_source)
+                .as_deref(),
+            Some(magnet)
+        );
+        let local = ["--minimized", "example.TORRENT"]
+            .into_iter()
+            .find_map(picker_source)
+            .unwrap();
+        assert!(Path::new(&local).is_absolute());
+        assert!(Path::new(&local).ends_with("example.TORRENT"));
+        set_start_minimized(true);
+        assert!(slipstream_desktop_lib::start_minimized());
+        set_start_minimized(false);
+        assert!(!slipstream_desktop_lib::start_minimized());
+    }
 }

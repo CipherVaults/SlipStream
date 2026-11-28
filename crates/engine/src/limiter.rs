@@ -53,26 +53,25 @@ impl Limiter {
         self.changed.send_replace(());
     }
 
-    /// Debit both limits together so one bucket cannot accumulate a burst while
-    /// the other holds a reservation. Callers request at most 16 KiB at a time.
-    pub(crate) async fn acquire(&self, transfer: &Self, bytes: usize) {
+    /// Debit all limits together so no bucket holds a reservation while another
+    /// refills. Callers request at most 16 KiB at a time.
+    pub(crate) async fn acquire(&self, queue: &Self, transfer: &Self, bytes: usize) {
         let mut global_change = self.changed.subscribe();
+        let mut queue_change = queue.changed.subscribe();
         let mut transfer_change = transfer.changed.subscribe();
         let bytes = bytes as f64;
         loop {
             let delay = {
-                let mut global = self.bucket.lock().unwrap();
-                let mut local = transfer.bucket.lock().unwrap();
-                global.refill();
-                local.refill();
-                let wait = |bucket: &Bucket| {
-                    bucket
-                        .rate
-                        .map_or(0.0, |rate| (bytes - bucket.tokens).max(0.0) / rate as f64)
-                };
-                let delay = wait(&global).max(wait(&local));
+                let mut buckets = [self, queue, transfer].map(|limit| limit.bucket.lock().unwrap());
+                let mut delay = 0.0_f64;
+                for bucket in &mut buckets {
+                    bucket.refill();
+                    if let Some(rate) = bucket.rate {
+                        delay = delay.max((bytes - bucket.tokens) / rate as f64);
+                    }
+                }
                 if delay == 0.0 {
-                    for bucket in [&mut global, &mut local] {
+                    for mut bucket in buckets {
                         if bucket.rate.is_some() {
                             bucket.tokens -= bytes;
                         }
@@ -84,6 +83,7 @@ impl Limiter {
             tokio::select! {
                 _ = sleep(Duration::from_secs_f64(delay)) => {}
                 _ = global_change.changed() => {}
+                _ = queue_change.changed() => {}
                 _ = transfer_change.changed() => {}
             }
         }
@@ -97,11 +97,18 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn combined_limits_charge_at_the_slower_rate_with_a_bounded_burst() {
         const KIB: u64 = 1024;
-        let global = Limiter::new(Some(128 * KIB));
+        let global = Limiter::new(Some(256 * KIB));
+        let queue = Limiter::new(Some(128 * KIB));
         let transfer = Limiter::new(Some(256 * KIB));
+        let other_transfer = Limiter::new(Some(256 * KIB));
         let start = Instant::now();
-        for _ in 0..16 {
-            global.acquire(&transfer, 16 * KIB as usize).await;
+        for i in 0..16 {
+            let local = if i % 2 == 0 {
+                &transfer
+            } else {
+                &other_transfer
+            };
+            global.acquire(&queue, local, 16 * KIB as usize).await;
         }
         let elapsed = start.elapsed();
         assert!(elapsed >= Duration::from_secs(2));
@@ -109,14 +116,14 @@ mod tests {
 
         transfer.set(Some(64 * KIB));
         let start = Instant::now();
-        global.acquire(&transfer, 16 * KIB as usize).await;
+        global.acquire(&queue, &transfer, 16 * KIB as usize).await;
         assert_eq!(start.elapsed(), Duration::from_millis(250));
 
         sleep(Duration::from_secs(10)).await;
         let start = Instant::now();
-        global.acquire(&transfer, 16 * KIB as usize).await;
+        global.acquire(&queue, &transfer, 16 * KIB as usize).await;
         assert_eq!(start.elapsed(), Duration::ZERO);
-        global.acquire(&transfer, 16 * KIB as usize).await;
+        global.acquire(&queue, &transfer, 16 * KIB as usize).await;
         assert_eq!(start.elapsed(), Duration::from_millis(250));
     }
 }

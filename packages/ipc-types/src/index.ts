@@ -59,6 +59,8 @@ export interface TransferSnapshot {
   speed_limit_bps?: number | null;
   connect_rtt_ms?: number | null;
   description?: string | null;
+  category_id?: string | null;
+  tags?: string[];
   created_at: string;
   updated_at: string;
 }
@@ -85,6 +87,8 @@ export interface AddHttpDownloadRequest {
   expected_size_bytes?: number | null;
   start_paused?: boolean;
   overwrite_existing?: boolean;
+  mirror_urls?: string[];
+  auto_discover_checksum?: boolean;
 }
 
 export type AudioPreset = "mp3_320" | "m4a_aac" | "opus" | "flac" | "wav";
@@ -160,6 +164,10 @@ export interface AddMediaDownloadRequest {
   selected_entries?: SelectedPlaylistEntry[] | null;
   playlist_folder_name?: string | null;
   headers?: Record<string, string>;
+  clip_start_seconds?: number | null;
+  clip_end_seconds?: number | null;
+  split_chapters?: boolean;
+  sponsorblock_categories?: string[];
 }
 
 export interface TorrentFileEntry {
@@ -264,6 +272,183 @@ export interface TransferCompletionOptions {
   open_folder_on_complete: boolean;
 }
 
+export type PostQueueAction = "none" | "notify" | "sleep" | "shutdown";
+
+export type ScheduleMode = "disabled" | "off_peak_window" | "snail_window";
+
+export interface ScheduleSettings {
+  mode: ScheduleMode;
+  start_minute_of_day: number;
+  end_minute_of_day: number;
+  weekdays_only: boolean;
+  window_speed_limit_bps: number | null;
+  post_window_pause: boolean;
+  stop_torrents_at_end: boolean;
+}
+
+export interface BandwidthGuardSettings {
+  enabled: boolean;
+  throttle_on_fullscreen: boolean;
+  watched_processes: string[];
+  guard_speed_limit_bps: number;
+  pause_instead_of_throttle: boolean;
+}
+
+export interface DownloadQueueSpec {
+  id: string;
+  name: string;
+  max_concurrent: number;
+  speed_limit_bps: number | null;
+  post_action: PostQueueAction;
+  paused: boolean;
+}
+
+export interface WatchFolderRule {
+  id: string;
+  folder: string;
+  target_save_dir: string | null;
+  queue_id: string | null;
+  category_id: string | null;
+  enabled: boolean;
+  delete_torrent_after_add: boolean;
+  start_paused: boolean;
+}
+
+export interface AutoExtractSettings {
+  enabled: boolean;
+  create_subfolder: boolean;
+  delete_archive_after_extract: boolean;
+  overwrite_existing: boolean;
+}
+
+export interface TorrentNetworkSettings {
+  listen_port_start: number;
+  listen_port_end: number;
+  enable_dht: boolean;
+  enable_upnp: boolean;
+  global_upload_limit_bps: number | null;
+  socks5_proxy_url: string | null;
+  blocklist_path: string | null;
+  vpn_kill_switch_enabled: boolean;
+  vpn_adapter_name: string | null;
+}
+
+export interface TorrentSeedingSettings {
+  max_seed_ratio_hundredths: number | null;
+  max_seed_minutes: number | null;
+  stop_seeding_on_limit: boolean;
+}
+
+export interface RssFeedRule {
+  id: string;
+  name: string;
+  feed_url: string;
+  include_pattern: string;
+  exclude_pattern: string;
+  save_dir: string | null;
+  poll_interval_minutes: number;
+  enabled: boolean;
+  auto_start: boolean;
+  last_checked_at: string | null;
+  last_error: string | null;
+}
+
+export interface CreateTorrentRequest {
+  source_path: string;
+  output_path: string;
+  trackers: string[];
+  piece_length_kib: number;
+  private: boolean;
+  comment: string | null;
+}
+
+export interface CreateTorrentResult {
+  output_path: string;
+  info_hash: string;
+  total_bytes: number;
+  piece_count: number;
+  file_count: number;
+}
+
+export interface AutomationStatus {
+  alt_speed_active: boolean;
+  effective_speed_limit_bps: number | null;
+  schedule_window_active: boolean;
+  guard_active: boolean;
+  guard_reason: string | null;
+  active_queue_actions: number;
+  vpn_kill_switch_active?: boolean;
+  vpn_adapter_connected?: boolean;
+  vpn_adapter_name?: string | null;
+  rss_feeds_enabled?: number;
+  rss_matches_added?: number;
+}
+
+export type ProxyMode = "direct" | "system" | "manual";
+
+export interface ProxySettings {
+  mode: ProxyMode;
+  url: string | null;
+  username: string | null;
+  has_password: boolean;
+  bypass_hosts: string[];
+  apply_to_media: boolean;
+}
+
+export type SiteAuthScheme = "basic" | "bearer";
+
+export interface SiteLoginEntry {
+  id: string;
+  host_pattern: string;
+  username: string;
+  has_password: boolean;
+  auth_scheme: SiteAuthScheme;
+  enabled: boolean;
+}
+
+export interface CookiePassThroughSettings {
+  enabled: boolean;
+  browser: string;
+  allowed_hosts: string[];
+}
+
+export interface MediaPowerSettings {
+  sponsorblock_remove: string[];
+  embed_chapters: boolean;
+  split_chapters: boolean;
+  embed_thumbnail: boolean;
+  embed_metadata: boolean;
+  filename_template: string;
+}
+
+export interface SiteGrabRequest {
+  url: string;
+  max_depth: number;
+  same_origin_only: boolean;
+  extensions: string[];
+  include_pattern: string;
+  exclude_pattern: string;
+}
+
+export interface SiteGrabItem {
+  url: string;
+  filename: string;
+  kind: string;
+  source_page: string;
+}
+
+export interface SiteGrabResult {
+  scanned_pages: number;
+  items: SiteGrabItem[];
+}
+
+export interface MetalinkFileEntry {
+  filename: string;
+  size_bytes: number | null;
+  sha256: string | null;
+  mirrors: string[];
+}
+
 export interface AppSettings {
   theme: ThemeMode;
   accent: AccentMode;
@@ -281,6 +466,36 @@ export interface AppSettings {
   show_progress_dialog?: boolean;
   show_complete_dialog?: boolean;
   categories?: DownloadCategory[];
+  launch_on_startup?: boolean;
+  launch_minimized?: boolean;
+  notify_on_complete?: boolean;
+  sound_on_complete?: boolean;
+  show_drop_basket?: boolean;
+  compact_table_view?: boolean;
+  sort_column?: string;
+  sort_ascending?: boolean;
+  alt_speed_enabled?: boolean;
+  alt_speed_limit_bps?: number | null;
+  schedule?: ScheduleSettings;
+  bandwidth_guard?: BandwidthGuardSettings;
+  queues?: DownloadQueueSpec[];
+  watch_folders?: WatchFolderRule[];
+  auto_extract?: AutoExtractSettings;
+  torrent_network?: TorrentNetworkSettings;
+  torrent_seeding?: TorrentSeedingSettings;
+  rss_feeds?: RssFeedRule[];
+  proxy?: ProxySettings;
+  site_logins?: SiteLoginEntry[];
+  cookie_passthrough?: CookiePassThroughSettings;
+  media_power?: MediaPowerSettings;
+  auto_discover_checksums?: boolean;
+}
+
+export interface SettingsBackupBundle {
+  schema_version: number;
+  exported_at_epoch_ms: number;
+  app_version: string;
+  settings: AppSettings;
 }
 
 export type NativeBridgeRequest =

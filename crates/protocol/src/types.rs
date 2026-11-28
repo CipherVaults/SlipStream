@@ -95,6 +95,10 @@ pub struct TransferSnapshot {
     pub connect_rtt_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -110,7 +114,7 @@ pub struct TelemetryBatch {
     pub timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AddHttpDownloadRequest {
     pub url: String,
     pub filename: Option<String>,
@@ -126,6 +130,10 @@ pub struct AddHttpDownloadRequest {
     pub start_paused: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub overwrite_existing: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirror_urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_discover_checksum: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,7 +289,7 @@ pub struct SelectedPlaylistEntry {
     pub url: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AddMediaDownloadRequest {
     pub url: String,
     pub format_id: Option<String>,
@@ -303,6 +311,14 @@ pub struct AddMediaDownloadRequest {
     pub playlist_folder_name: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_start_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_end_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub split_chapters: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sponsorblock_categories: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -382,9 +398,10 @@ pub enum AccentMode {
     Mono,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PostQueueAction {
+    #[default]
     None,
     Notify,
     Sleep,
@@ -531,7 +548,154 @@ fn default_show_dialog() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn default_sort_column() -> String {
+    "date".to_owned()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogEntry {
+    pub timestamp: DateTime<Utc>,
+    pub level: String,
+    pub category: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpeedSample {
+    pub timestamp_ms: i64,
+    pub down_bps: u64,
+    pub up_bps: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyMode {
+    #[default]
+    Direct,
+    System,
+    Manual,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProxySettings {
+    pub mode: ProxyMode,
+    pub url: Option<String>,
+    pub username: Option<String>,
+    pub has_password: bool,
+    pub bypass_hosts: Vec<String>,
+    pub apply_to_media: bool,
+}
+
+impl Default for ProxySettings {
+    fn default() -> Self {
+        Self {
+            mode: ProxyMode::Direct,
+            url: None,
+            username: None,
+            has_password: false,
+            bypass_hosts: Vec::new(),
+            apply_to_media: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SiteAuthScheme {
+    #[default]
+    Basic,
+    Bearer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteLoginEntry {
+    pub id: String,
+    pub host_pattern: String,
+    pub username: String,
+    #[serde(default)]
+    pub has_password: bool,
+    #[serde(default)]
+    pub auth_scheme: SiteAuthScheme,
+    #[serde(default = "default_show_dialog")]
+    pub enabled: bool,
+}
+
+impl Default for SiteLoginEntry {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            host_pattern: String::new(),
+            username: String::new(),
+            has_password: false,
+            auth_scheme: SiteAuthScheme::default(),
+            enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CookiePassThroughSettings {
+    pub enabled: bool,
+    pub browser: String,
+    pub allowed_hosts: Vec<String>,
+}
+
+impl Default for CookiePassThroughSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            browser: "chrome".into(),
+            allowed_hosts: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MediaPowerSettings {
+    pub sponsorblock_remove: Vec<String>,
+    pub embed_chapters: bool,
+    pub split_chapters: bool,
+    pub embed_thumbnail: bool,
+    pub embed_metadata: bool,
+    pub filename_template: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteGrabRequest {
+    pub url: String,
+    pub max_depth: u8,
+    pub same_origin_only: bool,
+    pub extensions: Vec<String>,
+    pub include_pattern: String,
+    pub exclude_pattern: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteGrabItem {
+    pub url: String,
+    pub filename: String,
+    pub kind: String,
+    pub source_page: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteGrabResult {
+    pub scanned_pages: usize,
+    pub items: Vec<SiteGrabItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetalinkFileEntry {
+    pub filename: String,
+    pub size_bytes: Option<u64>,
+    pub sha256: Option<String>,
+    pub mirrors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppSettings {
     pub theme: ThemeMode,
     pub accent: AccentMode,
@@ -554,6 +718,52 @@ pub struct AppSettings {
     pub show_complete_dialog: bool,
     #[serde(default = "default_download_categories")]
     pub categories: Vec<DownloadCategory>,
+    #[serde(default)]
+    pub launch_on_startup: bool,
+    #[serde(default)]
+    pub launch_minimized: bool,
+    #[serde(default = "default_show_dialog")]
+    pub notify_on_complete: bool,
+    #[serde(default)]
+    pub sound_on_complete: bool,
+    #[serde(default)]
+    pub show_drop_basket: bool,
+    #[serde(default)]
+    pub compact_table_view: bool,
+    #[serde(default = "default_sort_column")]
+    pub sort_column: String,
+    #[serde(default)]
+    pub sort_ascending: bool,
+    #[serde(default)]
+    pub alt_speed_enabled: bool,
+    #[serde(default = "default_alt_speed_limit_bps")]
+    pub alt_speed_limit_bps: Option<u64>,
+    #[serde(default)]
+    pub schedule: ScheduleSettings,
+    #[serde(default)]
+    pub bandwidth_guard: BandwidthGuardSettings,
+    #[serde(default = "default_download_queues")]
+    pub queues: Vec<DownloadQueueSpec>,
+    #[serde(default)]
+    pub watch_folders: Vec<WatchFolderRule>,
+    #[serde(default)]
+    pub auto_extract: AutoExtractSettings,
+    #[serde(default)]
+    pub torrent_network: TorrentNetworkSettings,
+    #[serde(default)]
+    pub torrent_seeding: TorrentSeedingSettings,
+    #[serde(default)]
+    pub rss_feeds: Vec<RssFeedRule>,
+    #[serde(default)]
+    pub proxy: ProxySettings,
+    #[serde(default)]
+    pub site_logins: Vec<SiteLoginEntry>,
+    #[serde(default)]
+    pub cookie_passthrough: CookiePassThroughSettings,
+    #[serde(default)]
+    pub media_power: MediaPowerSettings,
+    #[serde(default = "default_show_dialog")]
+    pub auto_discover_checksums: bool,
 }
 
 impl Default for AppSettings {
@@ -575,8 +785,353 @@ impl Default for AppSettings {
             show_progress_dialog: default_show_dialog(),
             show_complete_dialog: default_show_dialog(),
             categories: default_download_categories(),
+            launch_on_startup: false,
+            launch_minimized: false,
+            notify_on_complete: true,
+            sound_on_complete: false,
+            show_drop_basket: false,
+            compact_table_view: false,
+            sort_column: default_sort_column(),
+            sort_ascending: false,
+            alt_speed_enabled: false,
+            alt_speed_limit_bps: default_alt_speed_limit_bps(),
+            schedule: ScheduleSettings::default(),
+            bandwidth_guard: BandwidthGuardSettings::default(),
+            queues: default_download_queues(),
+            watch_folders: Vec::new(),
+            auto_extract: AutoExtractSettings::default(),
+            torrent_network: TorrentNetworkSettings::default(),
+            torrent_seeding: TorrentSeedingSettings::default(),
+            rss_feeds: Vec::new(),
+            proxy: ProxySettings::default(),
+            site_logins: Vec::new(),
+            cookie_passthrough: CookiePassThroughSettings::default(),
+            media_power: MediaPowerSettings::default(),
+            auto_discover_checksums: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleMode {
+    #[default]
+    Disabled,
+    OffPeakWindow,
+    SnailWindow,
+}
+
+fn default_schedule_start_minute() -> u16 {
+    22 * 60
+}
+
+fn default_schedule_end_minute() -> u16 {
+    7 * 60
+}
+
+pub fn default_alt_speed_limit_bps() -> Option<u64> {
+    Some(512 * 1024)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleSettings {
+    #[serde(default)]
+    pub mode: ScheduleMode,
+    #[serde(default = "default_schedule_start_minute")]
+    pub start_minute_of_day: u16,
+    #[serde(default = "default_schedule_end_minute")]
+    pub end_minute_of_day: u16,
+    #[serde(default)]
+    pub weekdays_only: bool,
+    #[serde(default = "default_alt_speed_limit_bps")]
+    pub window_speed_limit_bps: Option<u64>,
+    #[serde(default)]
+    pub post_window_pause: bool,
+    #[serde(default)]
+    pub stop_torrents_at_end: bool,
+}
+
+impl Default for ScheduleSettings {
+    fn default() -> Self {
+        Self {
+            mode: ScheduleMode::Disabled,
+            start_minute_of_day: default_schedule_start_minute(),
+            end_minute_of_day: default_schedule_end_minute(),
+            weekdays_only: false,
+            window_speed_limit_bps: default_alt_speed_limit_bps(),
+            post_window_pause: false,
+            stop_torrents_at_end: false,
+        }
+    }
+}
+
+fn default_guard_processes() -> Vec<String> {
+    [
+        "zoom.exe",
+        "teams.exe",
+        "ms-teams.exe",
+        "discord.exe",
+        "obs64.exe",
+        "valorant.exe",
+        "cs2.exe",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn default_guard_speed_limit_bps() -> u64 {
+    256 * 1024
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BandwidthGuardSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_show_dialog")]
+    pub throttle_on_fullscreen: bool,
+    #[serde(default = "default_guard_processes")]
+    pub watched_processes: Vec<String>,
+    #[serde(default = "default_guard_speed_limit_bps")]
+    pub guard_speed_limit_bps: u64,
+    #[serde(default)]
+    pub pause_instead_of_throttle: bool,
+}
+
+impl Default for BandwidthGuardSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            throttle_on_fullscreen: true,
+            watched_processes: default_guard_processes(),
+            guard_speed_limit_bps: default_guard_speed_limit_bps(),
+            pause_instead_of_throttle: false,
+        }
+    }
+}
+
+fn default_queue_concurrency() -> usize {
+    2
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DownloadQueueSpec {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_queue_concurrency")]
+    pub max_concurrent: usize,
+    #[serde(default)]
+    pub speed_limit_bps: Option<u64>,
+    #[serde(default)]
+    pub post_action: PostQueueAction,
+    #[serde(default)]
+    pub paused: bool,
+}
+
+pub fn default_download_queues() -> Vec<DownloadQueueSpec> {
+    vec![
+        DownloadQueueSpec {
+            id: "default".into(),
+            name: "Main Queue".into(),
+            max_concurrent: 3,
+            speed_limit_bps: None,
+            post_action: PostQueueAction::None,
+            paused: false,
+        },
+        DownloadQueueSpec {
+            id: "bulk".into(),
+            name: "Bulk / Night Queue".into(),
+            max_concurrent: 2,
+            speed_limit_bps: None,
+            post_action: PostQueueAction::None,
+            paused: false,
+        },
+    ]
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchFolderRule {
+    pub id: String,
+    pub folder: String,
+    #[serde(default)]
+    pub target_save_dir: Option<String>,
+    #[serde(default)]
+    pub queue_id: Option<String>,
+    #[serde(default)]
+    pub category_id: Option<String>,
+    #[serde(default = "default_show_dialog")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub delete_torrent_after_add: bool,
+    #[serde(default)]
+    pub start_paused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoExtractSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_show_dialog")]
+    pub create_subfolder: bool,
+    #[serde(default)]
+    pub delete_archive_after_extract: bool,
+    #[serde(default)]
+    pub overwrite_existing: bool,
+}
+
+impl Default for AutoExtractSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            create_subfolder: true,
+            delete_archive_after_extract: false,
+            overwrite_existing: false,
+        }
+    }
+}
+
+fn default_listen_port_start() -> u16 {
+    6881
+}
+
+fn default_listen_port_end() -> u16 {
+    6891
+}
+
+fn default_rss_poll_interval_minutes() -> u16 {
+    30
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TorrentNetworkSettings {
+    #[serde(default = "default_listen_port_start")]
+    pub listen_port_start: u16,
+    #[serde(default = "default_listen_port_end")]
+    pub listen_port_end: u16,
+    #[serde(default = "default_show_dialog")]
+    pub enable_dht: bool,
+    #[serde(default)]
+    pub enable_upnp: bool,
+    #[serde(default)]
+    pub global_upload_limit_bps: Option<u64>,
+    #[serde(default)]
+    pub socks5_proxy_url: Option<String>,
+    #[serde(default)]
+    pub blocklist_path: Option<String>,
+    #[serde(default)]
+    pub vpn_kill_switch_enabled: bool,
+    #[serde(default)]
+    pub vpn_adapter_name: Option<String>,
+}
+
+impl Default for TorrentNetworkSettings {
+    fn default() -> Self {
+        Self {
+            listen_port_start: default_listen_port_start(),
+            listen_port_end: default_listen_port_end(),
+            enable_dht: true,
+            enable_upnp: false,
+            global_upload_limit_bps: None,
+            socks5_proxy_url: None,
+            blocklist_path: None,
+            vpn_kill_switch_enabled: false,
+            vpn_adapter_name: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TorrentSeedingSettings {
+    #[serde(default)]
+    pub max_seed_ratio_hundredths: Option<u32>,
+    #[serde(default)]
+    pub max_seed_minutes: Option<u32>,
+    #[serde(default = "default_show_dialog")]
+    pub stop_seeding_on_limit: bool,
+}
+
+impl Default for TorrentSeedingSettings {
+    fn default() -> Self {
+        Self {
+            max_seed_ratio_hundredths: None,
+            max_seed_minutes: None,
+            stop_seeding_on_limit: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RssFeedRule {
+    pub id: String,
+    pub name: String,
+    pub feed_url: String,
+    #[serde(default)]
+    pub include_pattern: String,
+    #[serde(default)]
+    pub exclude_pattern: String,
+    #[serde(default)]
+    pub save_dir: Option<String>,
+    #[serde(default = "default_rss_poll_interval_minutes")]
+    pub poll_interval_minutes: u16,
+    #[serde(default = "default_show_dialog")]
+    pub enabled: bool,
+    #[serde(default = "default_show_dialog")]
+    pub auto_start: bool,
+    #[serde(default)]
+    pub last_checked_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateTorrentRequest {
+    pub source_path: String,
+    pub output_path: String,
+    #[serde(default)]
+    pub trackers: Vec<String>,
+    #[serde(default)]
+    pub piece_length_kib: u32,
+    #[serde(default)]
+    pub private: bool,
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateTorrentResult {
+    pub output_path: String,
+    pub info_hash: String,
+    pub total_bytes: u64,
+    pub piece_count: usize,
+    pub file_count: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutomationStatus {
+    pub alt_speed_active: bool,
+    pub effective_speed_limit_bps: Option<u64>,
+    pub schedule_window_active: bool,
+    pub guard_active: bool,
+    pub guard_reason: Option<String>,
+    pub active_queue_actions: usize,
+    #[serde(default)]
+    pub vpn_kill_switch_active: bool,
+    #[serde(default)]
+    pub vpn_adapter_connected: bool,
+    #[serde(default)]
+    pub vpn_adapter_name: Option<String>,
+    #[serde(default)]
+    pub rss_feeds_enabled: u32,
+    #[serde(default)]
+    pub rss_matches_added: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsBackupBundle {
+    pub schema_version: u32,
+    pub exported_at_epoch_ms: i64,
+    pub app_version: String,
+    pub settings: AppSettings,
 }
 
 /// Requests sent from the Browser Native Messaging host over the authenticated Named Pipe.
@@ -810,6 +1365,50 @@ mod media_wire_tests {
     }
 
     #[test]
+    fn v3_transfer_metadata_and_settings_default_and_round_trip() {
+        let ui_segments = [0.0_f32; UI_SEGMENT_COUNT];
+        let mut wire = json!({
+            "id": "transfer", "kind": "http", "status": "queued", "filename": "archive.zip",
+            "source_url": "https://example.com/archive.zip", "source_domain": "example.com",
+            "save_dir": "Downloads", "total_bytes": null, "downloaded_bytes": 0, "uploaded_bytes": 0,
+            "download_speed_bps": 0, "upload_speed_bps": 0, "eta_seconds": null,
+            "active_connections": 0, "active_peers": 0, "protocol_label": "HTTPS",
+            "format_tags": [], "ui_segments": ui_segments, "segments": [],
+            "sha256_verified": null, "resumable": false, "queue_id": "default",
+            "error_message": null, "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+        });
+        let legacy: TransferSnapshot = serde_json::from_value(wire.clone()).unwrap();
+        assert!(legacy.category_id.is_none());
+        assert!(legacy.tags.is_empty());
+        assert_eq!(to_value(legacy).unwrap(), wire);
+
+        wire["category_id"] = json!("compressed");
+        wire["tags"] = json!(["work", "backup"]);
+        let decoded: TransferSnapshot = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(decoded.category_id.as_deref(), Some("compressed"));
+        assert_eq!(decoded.tags, vec!["work", "backup"]);
+        assert_eq!(to_value(decoded).unwrap(), wire);
+
+        let legacy_settings: AppSettings = serde_json::from_str(
+            r#"{
+            "theme":"dark","accent":"blue","default_download_dir":"Downloads",
+            "default_connections":16,"global_speed_limit_bps":null,"max_concurrent_downloads":4,
+            "auto_defender_scan":true,"close_to_tray_hibernate":true,"monitor_clipboard":false,
+            "ytdlp_path":null,"ffmpeg_path":null
+        }"#,
+        )
+        .unwrap();
+        assert!(!legacy_settings.launch_on_startup);
+        assert!(!legacy_settings.launch_minimized);
+        assert!(legacy_settings.notify_on_complete);
+        assert!(!legacy_settings.sound_on_complete);
+        assert!(!legacy_settings.show_drop_basket);
+        assert!(!legacy_settings.compact_table_view);
+        assert_eq!(legacy_settings.sort_column, "date");
+        assert!(!legacy_settings.sort_ascending);
+    }
+
+    #[test]
     fn selected_playlist_entries_accept_index_only_wire_data() {
         for wire in [
             json!({"index": 8, "title": "Video 8"}),
@@ -851,5 +1450,146 @@ mod media_wire_tests {
                 if headers.get("Referer").is_some_and(|value| value == "https://example.com/")
         ));
         assert_eq!(to_value(decoded).unwrap(), wire);
+    }
+
+    #[test]
+    fn phase2_automation_settings_default_and_round_trip() {
+        let legacy: AppSettings = serde_json::from_str(
+            r#"{
+            "theme":"dark","accent":"blue","default_download_dir":"Downloads",
+            "default_connections":16,"global_speed_limit_bps":null,"max_concurrent_downloads":4,
+            "auto_defender_scan":true,"close_to_tray_hibernate":true,"monitor_clipboard":false,
+            "ytdlp_path":null,"ffmpeg_path":null
+        }"#,
+        )
+        .unwrap();
+        assert!(!legacy.alt_speed_enabled);
+        assert_eq!(legacy.alt_speed_limit_bps, Some(512 * 1024));
+        assert_eq!(legacy.schedule.mode, ScheduleMode::Disabled);
+        assert_eq!(legacy.schedule.start_minute_of_day, 22 * 60);
+        assert_eq!(legacy.schedule.end_minute_of_day, 7 * 60);
+        assert!(!legacy.bandwidth_guard.enabled);
+        assert!(legacy.bandwidth_guard.throttle_on_fullscreen);
+        assert_eq!(legacy.queues.len(), 2);
+        assert_eq!(legacy.queues[0].id, "default");
+        assert_eq!(legacy.queues[1].id, "bulk");
+        assert!(legacy.watch_folders.is_empty());
+        assert!(!legacy.auto_extract.enabled);
+        assert!(legacy.auto_extract.create_subfolder);
+
+        let bundle = SettingsBackupBundle {
+            schema_version: 1,
+            exported_at_epoch_ms: 1_795_800_000_000,
+            app_version: "3.0.0-dev".into(),
+            settings: AppSettings::default(),
+        };
+        let encoded = serde_json::to_string(&bundle).unwrap();
+        let decoded: SettingsBackupBundle = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, bundle);
+    }
+
+    #[test]
+    fn phase4_network_media_settings_default_and_round_trip() {
+        let defaults = AppSettings::default();
+        let mut legacy = serde_json::to_value(&defaults).unwrap();
+        for field in [
+            "proxy",
+            "site_logins",
+            "cookie_passthrough",
+            "media_power",
+            "auto_discover_checksums",
+        ] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        assert_eq!(
+            serde_json::from_value::<AppSettings>(legacy).unwrap(),
+            defaults
+        );
+        assert_eq!(defaults.proxy.mode, ProxyMode::Direct);
+        assert!(defaults.proxy.apply_to_media);
+        assert_eq!(defaults.cookie_passthrough.browser, "chrome");
+        assert!(defaults.auto_discover_checksums);
+
+        let mut settings = defaults;
+        settings.proxy.mode = ProxyMode::Manual;
+        settings.proxy.url = Some("http://proxy.example:8080".into());
+        settings
+            .cookie_passthrough
+            .allowed_hosts
+            .push("*.example.org".into());
+        settings
+            .media_power
+            .sponsorblock_remove
+            .push("intro".into());
+        settings.site_logins.push(
+            serde_json::from_str(r#"{"id":"one","host_pattern":"example.org","username":"user"}"#)
+                .unwrap(),
+        );
+        assert_eq!(settings.site_logins[0].auth_scheme, SiteAuthScheme::Basic);
+        assert!(settings.site_logins[0].enabled);
+        assert_eq!(
+            serde_json::from_str::<AppSettings>(&serde_json::to_string(&settings).unwrap())
+                .unwrap(),
+            settings
+        );
+    }
+
+    #[test]
+    fn phase3_bittorrent_settings_default_and_round_trip() {
+        let legacy: AppSettings = serde_json::from_str(
+            r#"{
+            "theme":"dark","accent":"blue","default_download_dir":"Downloads",
+            "default_connections":16,"global_speed_limit_bps":null,"max_concurrent_downloads":4,
+            "auto_defender_scan":true,"close_to_tray_hibernate":true,"monitor_clipboard":false,
+            "ytdlp_path":null,"ffmpeg_path":null
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.torrent_network, TorrentNetworkSettings::default());
+        assert_eq!(legacy.torrent_network.listen_port_start, 6881);
+        assert_eq!(legacy.torrent_network.listen_port_end, 6891);
+        assert!(legacy.torrent_network.enable_dht);
+        assert!(!legacy.torrent_network.enable_upnp);
+        assert!(!legacy.torrent_network.vpn_kill_switch_enabled);
+        assert_eq!(legacy.torrent_seeding, TorrentSeedingSettings::default());
+        assert!(legacy.torrent_seeding.stop_seeding_on_limit);
+        assert!(legacy.rss_feeds.is_empty());
+
+        let mut custom = AppSettings::default();
+        custom.torrent_network.listen_port_start = 51413;
+        custom.torrent_network.listen_port_end = 51420;
+        custom.torrent_network.enable_upnp = true;
+        custom.torrent_network.global_upload_limit_bps = Some(256 * 1024);
+        custom.torrent_network.socks5_proxy_url = Some("socks5h://127.0.0.1:1080".into());
+        custom.torrent_network.blocklist_path = Some(r"C:\blocklists\ip.p2p".into());
+        custom.torrent_network.vpn_kill_switch_enabled = true;
+        custom.torrent_network.vpn_adapter_name = Some("WireGuard Tunnel".into());
+        custom.torrent_seeding.max_seed_ratio_hundredths = Some(200);
+        custom.torrent_seeding.max_seed_minutes = Some(1440);
+        custom.torrent_seeding.stop_seeding_on_limit = false;
+        custom.rss_feeds.push(RssFeedRule {
+            id: "linux-isos".into(),
+            name: "Ubuntu".into(),
+            feed_url: "https://example.org/rss.xml".into(),
+            include_pattern: "*desktop*amd64*".into(),
+            exclude_pattern: "*beta*".into(),
+            save_dir: Some(r"C:\Downloads\ISOs".into()),
+            poll_interval_minutes: 15,
+            enabled: true,
+            auto_start: true,
+            last_checked_at: None,
+            last_error: None,
+        });
+
+        let encoded = serde_json::to_string(&custom).unwrap();
+        let decoded: AppSettings = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, custom);
+
+        let status_legacy: AutomationStatus = serde_json::from_str(
+            r#"{"alt_speed_active":false,"effective_speed_limit_bps":null,"schedule_window_active":false,"guard_active":false,"guard_reason":null,"active_queue_actions":0}"#,
+        )
+        .unwrap();
+        assert!(!status_legacy.vpn_kill_switch_active);
+        assert_eq!(status_legacy.rss_matches_added, 0);
     }
 }

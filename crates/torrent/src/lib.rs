@@ -1,5 +1,6 @@
 pub mod bencode;
 pub mod bitmap;
+pub mod creator;
 pub mod error;
 pub mod magnet;
 pub mod manager;
@@ -8,6 +9,7 @@ pub mod storage;
 
 pub use bitmap::PieceBitmap;
 pub use bytes::Bytes;
+pub use creator::create_v1_torrent;
 pub use error::TorrentError;
 pub use magnet::{parse_magnet_uri, ParsedMagnet};
 pub use manager::{TorrentAddOptions, TorrentManager, TorrentManagerConfig, TorrentStatsReport};

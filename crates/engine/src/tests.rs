@@ -9,6 +9,189 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};
 
+#[tokio::test]
+async fn phase4_mirrors_fail_over_without_cross_origin_credentials() {
+    let primary = Server::new(|_| Reply::empty("404 Not Found")).await;
+    let forbidden = Server::new(|_| Reply::empty("403 Forbidden")).await;
+    let unavailable = Server::new(|_| Reply::empty("503 Service Unavailable")).await;
+    let data = payload(2 * CHUNK, 42);
+    let mirror_data = data.clone();
+    let mirror =
+        Server::new(move |request| Reply::resource(request, &mirror_data, "\"mirror\"")).await;
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    let mut request = request(primary.url("/primary"), Some("mirror.bin"), 2);
+    request.mirror_urls = vec![
+        forbidden.url("/forbidden"),
+        unavailable.url("/unavailable"),
+        mirror.url("/file"),
+    ];
+    request
+        .headers
+        .insert("Authorization".into(), "Bearer only-primary".into());
+    request
+        .headers
+        .insert("Cookie".into(), "session=only-primary".into());
+    request
+        .headers
+        .insert("X-Api-Key".into(), "only-primary".into());
+    request.expected_size_bytes = Some(data.len() as u64);
+    request.expected_sha256 = Some(hex::encode(Sha256::digest(&*data)));
+    let id = engine.add_http_download(request).await.unwrap();
+    wait_for(&engine, &id, |snapshot| {
+        snapshot.status == TransferStatus::Completed
+    })
+    .await;
+    dir.assert_output("mirror.bin", &data).await;
+    assert!(primary
+        .requests()
+        .iter()
+        .any(|request| request.header("Authorization").is_some()));
+    for server in [&forbidden, &unavailable, &mirror] {
+        let requests = server.requests();
+        assert!(!requests.is_empty());
+        assert!(requests.iter().all(|request| {
+            ["Authorization", "Cookie", "X-Api-Key"]
+                .into_iter()
+                .all(|name| request.header(name).is_none())
+        }));
+    }
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn phase4_sqlite_mirror_urls_round_trip_and_default_for_legacy_rows() {
+    let dir = TestDir::new().await;
+    let config = dir.config();
+    let engine = DownloadEngine::new(config.clone()).await.unwrap();
+    let mut transfer = request("https://example.org/file".into(), Some("file"), 1);
+    transfer.start_paused = true;
+    let mirror = "https://mirror.example.org/file";
+    transfer.mirror_urls = vec![mirror.into()];
+    let id = engine.add_http_download(transfer).await.unwrap();
+    engine.shutdown().await.unwrap();
+    let db = Database::open(&config.db_path).unwrap();
+    assert_eq!(db.transfers().unwrap()[0].0.mirror_urls, [mirror]);
+    drop(db);
+
+    let db = rusqlite::Connection::open(&config.db_path).unwrap();
+    let json: String = db
+        .query_row("SELECT record FROM transfers WHERE id = ?1", [&id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let mut json: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let fields = json.as_object_mut().unwrap();
+    fields.remove("mirror_urls");
+    fields.remove("representation_source");
+    fields.remove("expected_size_bytes");
+    db.execute(
+        "UPDATE transfers SET record = ?1 WHERE id = ?2",
+        [json.to_string(), id],
+    )
+    .unwrap();
+    drop(db);
+    let db = Database::open(&config.db_path).unwrap();
+    assert!(db.transfers().unwrap()[0].0.mirror_urls.is_empty());
+}
+
+#[tokio::test]
+async fn phase4_proxy_configuration_applies_authentication_and_bypass() {
+    let data = payload(CHUNK, 55);
+    let proxied_data = data.clone();
+    let proxy =
+        Server::new(move |request| Reply::resource(request, &proxied_data, "\"proxied\"")).await;
+    let bypass_data = data.clone();
+    let origin =
+        Server::new(move |request| Reply::resource(request, &bypass_data, "\"direct\"")).await;
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    engine
+        .set_proxy_config(EngineProxyConfig::Manual {
+            url: proxy.url.clone(),
+            username: Some("u".into()),
+            password: Some("p".into()),
+            bypass_hosts: vec!["127.0.0.1".into()],
+        })
+        .unwrap();
+    for (url, name) in [
+        ("http://example.invalid/file".into(), "proxied.bin"),
+        (origin.url("/file"), "direct.bin"),
+    ] {
+        let id = engine
+            .add_http_download(request(url, Some(name), 1))
+            .await
+            .unwrap();
+        wait_for(&engine, &id, |snapshot| {
+            snapshot.status == TransferStatus::Completed
+        })
+        .await;
+        dir.assert_output(name, &data).await;
+    }
+    let requests = proxy.requests();
+    assert!(!requests.is_empty());
+    assert!(requests.iter().all(|request| {
+        request.path == "http://example.invalid/file"
+            && request.header("Proxy-Authorization") == Some("Basic dTpw")
+    }));
+    assert!(origin
+        .requests()
+        .iter()
+        .all(|request| request.header("Proxy-Authorization").is_none()));
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn phase4_private_proxy_hostname_does_not_allow_bypassed_connections() {
+    let data = payload(CHUNK, 77);
+    let data_for_proxy = data.clone();
+    let proxy =
+        Server::new(move |request| Reply::resource(request, &data_for_proxy, "\"proxy\"")).await;
+    let proxy_url = proxy.url.replace("127.0.0.1", "localhost");
+    let dir = TestDir::new().await;
+    let mut config = dir.config();
+    config.allow_loopback = false;
+    let engine = DownloadEngine::new_with_proxy(
+        config,
+        EngineProxyConfig::Manual {
+            url: proxy_url.clone(),
+            username: None,
+            password: None,
+            bypass_hosts: vec!["localhost".into()],
+        },
+    )
+    .await
+    .unwrap();
+    let id = engine
+        .add_http_download(request(
+            "http://example.invalid/file".into(),
+            Some("proxied.bin"),
+            1,
+        ))
+        .await
+        .unwrap();
+    completed(&engine, &id).await;
+    dir.assert_output("proxied.bin", &data).await;
+    let proxied_requests = proxy.requests().len();
+    assert!(proxied_requests > 0);
+
+    let id = engine
+        .add_http_download(request(
+            format!("{proxy_url}/blocked"),
+            Some("blocked.bin"),
+            1,
+        ))
+        .await
+        .unwrap();
+    let snapshot = failed(&engine, &id).await;
+    assert!(snapshot
+        .error_message
+        .unwrap()
+        .contains("blocked connection"));
+    assert_eq!(proxy.requests().len(), proxied_requests);
+    engine.shutdown().await.unwrap();
+}
+
 const KIB: usize = 1024;
 const CHUNK: usize = 16 * KIB;
 const WAIT: Duration = Duration::from_secs(20);
@@ -312,6 +495,7 @@ fn request(url: String, filename: Option<&str>, connections: u8) -> AddHttpDownl
         expected_size_bytes: None,
         start_paused: false,
         overwrite_existing: false,
+        ..AddHttpDownloadRequest::default()
     }
 }
 
@@ -1287,6 +1471,7 @@ async fn queue_caps_promote_waiters_and_emit_post_actions() {
             id: "work".into(),
             max_concurrent_downloads: 1,
             post_action: PostQueueAction::Shutdown,
+            ..QueueConfig::default()
         })
         .await
         .unwrap();
@@ -1487,6 +1672,124 @@ async fn backs_down_when_more_than_two_connections_are_rejected() {
         .filter(|req| req.method == "GET")
         .all(|req| req.range().is_some()));
     dir.assert_output("backdown.bin", &data).await;
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn backs_down_and_completes_when_server_rejects_extra_connections_with_http_460() {
+    let data = payload(512 * KIB, 29);
+    let source = Arc::clone(&data);
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let rejected = Arc::new(AtomicUsize::new(0));
+    let rejections = Arc::clone(&rejected);
+    let server = Server::new(move |req| {
+        if req.method == "HEAD" {
+            return Reply::resource(req, &source, "\"limit-460\"");
+        }
+        let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+            rejections.fetch_add(1, Ordering::SeqCst);
+            return Reply::empty("460 Connection Limit Exceeded");
+        };
+        let mut reply = Reply::resource(req, &source, "\"limit-460\"");
+        reply.connection_slot = Some(slot);
+        reply.initial_delay = Duration::from_millis(60);
+        reply
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    let id = engine
+        .add_http_download(request(server.url("/limit460.bin"), None, 16))
+        .await
+        .unwrap();
+    let done = completed(&engine, &id).await;
+    assert!(rejected.load(Ordering::SeqCst) > 0);
+    assert!(done
+        .segments
+        .iter()
+        .all(|segment| segment.state == SegmentState::Completed));
+    dir.assert_output("limit460.bin", &data).await;
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn backs_down_on_custom_status_learns_host_cap_and_surfaces_404_on_dead_link() {
+    let data = payload(512 * KIB, 31);
+    let source = Arc::clone(&data);
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let rejected = Arc::new(AtomicUsize::new(0));
+    let rejections = Arc::clone(&rejected);
+    let server = Server::new(move |req| {
+        if req.path == "/dead.bin" {
+            return Reply::empty("404 Not Found");
+        }
+        if req.method == "HEAD" {
+            return Reply::resource(req, &source, "\"custom-cap\"");
+        }
+        let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+            rejections.fetch_add(1, Ordering::SeqCst);
+            return Reply::empty("477 Custom Limit");
+        };
+        let mut reply = Reply::resource(req, &source, "\"custom-cap\"");
+        reply.connection_slot = Some(slot);
+        reply.initial_delay = Duration::from_millis(50);
+        reply
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    let first = engine
+        .add_http_download(request(server.url("/first.bin"), None, 16))
+        .await
+        .unwrap();
+    let _ = completed(&engine, &first).await;
+    assert!(rejected.load(Ordering::SeqCst) > 0);
+    dir.assert_output("first.bin", &data).await;
+
+    let before_second = rejected.load(Ordering::SeqCst);
+    let second = engine
+        .add_http_download(request(server.url("/second.bin"), None, 16))
+        .await
+        .unwrap();
+    let _ = completed(&engine, &second).await;
+    assert_eq!(
+        rejected.load(Ordering::SeqCst),
+        before_second,
+        "learned host cap should prevent blasting 16 workers on the next download"
+    );
+    dir.assert_output("second.bin", &data).await;
+
+    let dead = engine
+        .add_http_download(request(server.url("/dead.bin"), None, 4))
+        .await
+        .unwrap();
+    let failed_snapshot = failed(&engine, &dead).await;
+    assert!(failed_snapshot
+        .error_message
+        .as_deref()
+        .is_some_and(|msg| msg.contains("404")));
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn single_worker_falls_back_to_full_get_on_http_460_range_rejection() {
+    let data = payload(64 * KIB, 37);
+    let source = Arc::clone(&data);
+    let server = Server::new(move |req| {
+        if req.range().is_some() {
+            return Reply::empty("460 Connection Limit Exceeded");
+        }
+        Reply::resource(req, &source, "\"range-460\"")
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let engine = DownloadEngine::new(dir.config()).await.unwrap();
+    let id = engine
+        .add_http_download(request(server.url("/single460.bin"), None, 1))
+        .await
+        .unwrap();
+    let _ = completed(&engine, &id).await;
+    dir.assert_output("single460.bin", &data).await;
     engine.shutdown().await.unwrap();
 }
 
@@ -1989,7 +2292,7 @@ async fn compressed_members_require_clean_http_eof() {
         reply
     })
     .await;
-    let http = Http::new(true, Duration::from_secs(5)).unwrap();
+    let http = Http::new(true, Duration::from_secs(5), &EngineProxyConfig::Direct).unwrap();
     for coding in ["deflate", "br"] {
         for (case, kind) in [
             ("truncated", io::ErrorKind::UnexpectedEof),
@@ -2438,4 +2741,92 @@ fn chained_singleton_wildcards_respect_group_cap_and_inplace_expansion() {
     let many_singletons = "[1-1]".repeat(40);
     let abuse = format!("https://example.com/[1-10000]/{many_singletons}");
     assert!(expand_wildcard_url(&abuse).is_err());
+}
+
+#[tokio::test]
+async fn pause_resume_and_remove_queue_persist_and_reassign_transfers() {
+    let data = payload(512 * KIB, 19);
+    let server = Server::new(move |req| {
+        Reply::resource(req, &data, "\"queue-ops\"").with_delay(Duration::from_millis(12))
+    })
+    .await;
+    let dir = TestDir::new().await;
+    let config = dir.config();
+    let engine = DownloadEngine::new(config.clone()).await.unwrap();
+    engine
+        .set_queue_config(QueueConfig {
+            id: "night".into(),
+            max_concurrent_downloads: 1,
+            ..QueueConfig::default()
+        })
+        .await
+        .unwrap();
+
+    let mut req_a = request(server.url("/night-a.bin"), None, 1);
+    req_a.queue_id = Some("night".into());
+    let mut req_b = request(server.url("/night-b.bin"), None, 1);
+    req_b.queue_id = Some("night".into());
+    let a = engine.add_http_download(req_a).await.unwrap();
+    wait_for(&engine, &a, |s| s.status == TransferStatus::Active).await;
+    let b = engine.add_http_download(req_b).await.unwrap();
+    assert_eq!(engine.snapshot(&b).unwrap().status, TransferStatus::Queued);
+    assert!(engine
+        .assign_queue_batch(&[b.clone(), a.clone()], DEFAULT_QUEUE)
+        .is_err());
+    assert!(engine
+        .assign_queue_batch(&[b.clone(), "missing".into()], DEFAULT_QUEUE)
+        .is_err());
+    assert_eq!(engine.snapshot(&b).unwrap().queue_id, "night");
+
+    engine.pause_queue("night").await.unwrap();
+    wait_for(&engine, &a, |s| s.status == TransferStatus::Paused).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(engine.snapshot(&b).unwrap().status, TransferStatus::Queued);
+    assert!(
+        engine
+            .queue_configs()
+            .into_iter()
+            .find(|q| q.id == "night")
+            .unwrap()
+            .paused
+    );
+
+    engine.resume_queue("night").await.unwrap();
+    completed(&engine, &a).await;
+    completed(&engine, &b).await;
+
+    assert!(engine.remove_queue(DEFAULT_QUEUE).await.is_err());
+
+    engine
+        .set_queue_config(QueueConfig {
+            id: "custom".into(),
+            max_concurrent_downloads: 1,
+            paused: true,
+            ..QueueConfig::default()
+        })
+        .await
+        .unwrap();
+    let mut req_c = request(server.url("/custom.bin"), None, 1);
+    req_c.queue_id = Some("custom".into());
+    req_c.start_paused = true;
+    let c = engine.add_http_download(req_c).await.unwrap();
+    assert_eq!(engine.snapshot(&c).unwrap().queue_id, "custom");
+
+    assert_eq!(
+        engine
+            .assign_queue_batch(&[c.clone(), c.clone()], "night")
+            .unwrap(),
+        1
+    );
+    assert_eq!(engine.snapshot(&c).unwrap().queue_id, "night");
+    engine.assign_queue(&c, "custom").await.unwrap();
+    engine.remove_queue("custom").await.unwrap();
+    assert_eq!(engine.snapshot(&c).unwrap().queue_id, DEFAULT_QUEUE);
+    assert!(!engine.queue_configs().iter().any(|q| q.id == "custom"));
+    engine.shutdown().await.unwrap();
+
+    let reopened = DownloadEngine::new(config).await.unwrap();
+    assert_eq!(reopened.snapshot(&c).unwrap().queue_id, DEFAULT_QUEUE);
+    assert!(!reopened.queue_configs().iter().any(|q| q.id == "custom"));
+    reopened.shutdown().await.unwrap();
 }

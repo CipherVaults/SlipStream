@@ -26,6 +26,8 @@ pub struct ProbeOptions {
     pub playlist: bool,
     pub cache_dir: Option<PathBuf>,
     pub headers: HashMap<String, String>,
+    pub proxy: Option<String>,
+    pub cookies_from_browser: Option<String>,
 }
 
 // Keep the preview comfortably below the native IPC frame limit. The count
@@ -55,6 +57,12 @@ pub async fn probe_url_with_binary(
 ) -> Result<MediaProbeResult, MediaError> {
     let effective_headers = ensure_default_user_agent(&options.headers);
     let mut builder = BuildYtDlpArgs::probe(options.playlist).headers(&effective_headers)?;
+    if let Some(proxy) = &options.proxy {
+        builder = builder.proxy(proxy)?;
+    }
+    if let Some(browser) = &options.cookies_from_browser {
+        builder = builder.cookies_from_browser(browser)?;
+    }
     if let Some(dir) = &options.cache_dir {
         builder = builder.cache_dir(dir)?;
     }
@@ -70,9 +78,16 @@ pub async fn probe_url_with_binary(
         )
     };
     let output = match run_probe(builder.clone().build(url)?).await {
-        Err(err) if is_http_403_error(&err) => run_probe(builder.force_ipv4().build(url)?).await?,
-        result => result?,
-    };
+        Err(err) if is_http_403_error(&err) => run_probe(builder.force_ipv4().build(url)?).await,
+        result => result,
+    }
+    .map_err(|error| {
+        crate::args::protect_ytdlp_error(
+            error,
+            options.proxy.as_deref(),
+            options.cookies_from_browser.as_deref(),
+        )
+    })?;
     let json = std::str::from_utf8(&output).map_err(|_| MediaError::InvalidToolOutput {
         tool: "yt-dlp",
         kind: "UTF-8 JSON",

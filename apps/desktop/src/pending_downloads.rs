@@ -158,6 +158,7 @@ mod tests {
                 expected_size_bytes: None,
                 start_paused: false,
                 overwrite_existing: false,
+                ..AddHttpDownloadRequest::default()
             },
             preview: PendingDownloadPreview {
                 pending_id: id.into(),

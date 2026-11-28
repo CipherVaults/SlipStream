@@ -317,6 +317,7 @@ fn base_req(url: String) -> AddHttpDownloadRequest {
         expected_size_bytes: None,
         start_paused: false,
         overwrite_existing: false,
+        ..AddHttpDownloadRequest::default()
     }
 }
 

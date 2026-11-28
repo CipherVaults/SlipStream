@@ -2,6 +2,27 @@
 
 All notable changes to **SlipStream** are documented in this file following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [3.0.0] - 2026-11-28
+
+### Added
+
+- **Power-User Daily Driver & HTTP/HTTPS Resilience (`crates/engine`, `apps/desktop`):**
+  - Added full-transfer Cards and Compact Table views, right-click multi-select bulk actions, live Drop Basket, batch URL wildcard importer (up to `10,000` URLs), configurable category/tag rules, dual-axis download/upload throughput sparklines, and status toast notifications.
+  - Hardened universal HTTP/HTTPS resilience across redirect/mirror origin validation, adaptive per-IP connection backdown, non-standard server status tolerance, and transient failure retry/resume recovery.
+- **Automation, Named Queues, Safe Auto-Extract & Watch Folders (`apps/desktop`):**
+  - Added off-peak / Snail Mode speed scheduling, **Gaming / Process Guard** throttling (`zoom.exe`, `teams.exe`, `discord.exe`, plus custom lists & fullscreen checks), named queues with per-queue concurrency and post-queue actions (`Notify`, `Sleep`, `Shutdown`), safe zip/`tar.gz` auto-extraction (`Zone.Identifier` propagation and traversal/junction/zip-bomb guards), `.torrent` watch-folder scanning, and redacted JSON settings backup/restore.
+- **Power-User BitTorrent Suite (`crates/torrent`, `crates/protocol`, `apps/desktop`):**
+  - Added a live Windows VPN adapter watchdog & kill-switch (pausing/resuming only daemon-managed torrents cleanly), global upload speed caps, SOCKS5 proxy support, inclusive seed ratio/time limits, folder-grouped hierarchical torrent file tree, **Force Recheck**, **Move Storage**, **Create `.torrent`**, tracker management & force reannounce, listening port ranges / UPnP / IP blocklist support, and regex/wildcard RSS Auto-Downloader with duplicate GUID/infohash suppression.
+- **Network Privacy Vault, Multi-Mirror Failover, Metalink, Site Grabber & Media Power Tools (`apps/desktop`, `crates/engine`, `crates/media`):**
+  - Added Win32 DPAPI-encrypted secret storage (`vault.dat`) for HTTP(S) proxy credentials and origin-scoped HTTPS `SiteLoginEntry` Basic/Bearer headers (excluded from SQLite persistence and settings backups), `Direct` / Windows `System` / `Manual` HTTP(S) proxy modes, and per-host browser cookie pass-through for `yt-dlp`.
+  - Added pure-Rust Metalink v3/v4 parsing, multi-mirror HTTP failover with strict origin-isolated credentials, same-origin `SHA256SUMS`/`.sha256` auto-checksum discovery (skipped when paused and timeout-bounded for active queues), bounded HTML **Site Grabber** (`max_depth <= 2`, SSRF loopback guards), and **Media Power Tools** (SponsorBlock removal, chapter embed/split, thumbnail embed, clip time ranges, and sanitized output templates).
+  - Updated executable/installer **Publisher** metadata to **CipherVaults** with author/copyright credits attributed to **Mohamed Sayed**.
+
+### Fixed
+
+- Isolated `--proxy` and `--cookies-from-browser` into `PRIVILEGED_YTDLP_FLAGS` in `crates/media/src/args.rs` so `validate_ytdlp_flag` continues rejecting unvalidated raw flags while `BuildYtDlpArgs::proxy` and `BuildYtDlpArgs::cookies_from_browser` accept validated values only.
+- Fixed Slint UI sizing in **Settings → Network** and **Site Grabber** overlays (`Clear` proxy button spacing, full chapter checkbox labels, expanded modal viewport height, and fixed `Page URL` vertical layout stretch).
+
 ## [2.1.0] - 2026-11-27
 
 ### Added

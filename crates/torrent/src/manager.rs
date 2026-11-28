@@ -1,10 +1,11 @@
+mod relocation;
 mod telemetry;
 
 use crate::{
     error::session_error,
-    magnet::parse_magnet_uri_with_loopback,
+    magnet::{parse_magnet_uri_with_loopback, validated_tracker_urls},
     parse_torrent_bytes,
-    storage::{is_link, reject_existing_links, validate_output, SharedBitmap},
+    storage::{is_link, reject_existing_links, validate_local_path, validate_output, SharedBitmap},
     ConfinedStorageFactory, ParsedMagnet, PieceBitmap, TorrentError, TorrentMetadata,
     MAX_TORRENT_BYTES,
 };
@@ -15,11 +16,12 @@ use librqbit::{
     ManagedTorrent, Session, SessionOptions,
 };
 use slipstream_protocol::{
-    AddTorrentRequest, PathSecurityError, TorrentFileEntry, TorrentPeerSummary,
+    safe_join_under, AddTorrentRequest, PathSecurityError, TorrentFileEntry, TorrentPeerSummary,
     TorrentPreviewResult, TransferSnapshot,
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    fs,
     net::{Ipv4Addr, SocketAddr},
     num::NonZeroU32,
     ops::Range,
@@ -37,6 +39,7 @@ use tokio::{
     time,
 };
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 pub use telemetry::TorrentStatsReport;
 
@@ -53,6 +56,8 @@ pub struct TorrentManagerConfig {
     pub global_upload_limit_bps: Option<u64>,
     pub default_sequential: bool,
     pub enable_trackers: bool,
+    pub socks_proxy_url: Option<String>,
+    pub blocklist_url: Option<String>,
     /// Permit loopback tracker addresses for local tests.
     pub allow_loopback: bool,
     pub magnet_metadata_timeout: Duration,
@@ -69,6 +74,8 @@ impl Default for TorrentManagerConfig {
             global_upload_limit_bps: None,
             default_sequential: false,
             enable_trackers: true,
+            socks_proxy_url: None,
+            blocklist_url: None,
             allow_loopback: false,
             magnet_metadata_timeout: Duration::from_secs(120),
         }
@@ -105,7 +112,6 @@ struct ManagerInner {
 struct Entry {
     id: String,
     source: String,
-    save_dir: PathBuf,
     magnet: Option<ParsedMagnet>,
     created_at: DateTime<Utc>,
     operation: AsyncMutex<()>,
@@ -114,6 +120,7 @@ struct Entry {
 }
 
 struct EntryState {
+    save_dir: PathBuf,
     options: TorrentAddOptions,
     metadata: Option<Arc<TorrentMetadata>>,
     bytes: Option<Bytes>,
@@ -121,6 +128,9 @@ struct EntryState {
     resolution: Option<(CancellationToken, JoinHandle<()>)>,
     error: Option<String>,
     bitmap_synced: bool,
+    completed_at: Option<DateTime<Utc>>,
+    reset_completion_after_recheck: bool,
+    extra_trackers: Vec<String>,
     previous_uploads: u64,
     seen_peers: u32,
     peer_rate_samples: HashMap<String, (u64, Instant)>,
@@ -131,6 +141,8 @@ impl TorrentManager {
     pub async fn new(mut config: TorrentManagerConfig) -> Result<Self, TorrentError> {
         config.default_save_dir = std::path::absolute(&config.default_save_dir)?;
         validate_output(&config.default_save_dir, &config.default_save_dir)?;
+        config.socks_proxy_url = validate_socks_proxy(config.socks_proxy_url.as_deref())?;
+        config.blocklist_url = validate_blocklist(config.blocklist_url.as_deref())?;
         let ratelimits = limits(
             config.global_download_limit_bps,
             config.global_upload_limit_bps,
@@ -158,22 +170,36 @@ impl TorrentManager {
                 } else {
                     config.listen_port_range.clone()
                 };
-                let result = Session::new_with_opts(
+                let attempt = stop.child_token();
+                let cancel_attempt = attempt.clone().drop_guard();
+                let start = Session::new_with_opts(
                     config.default_save_dir.clone(),
                     SessionOptions {
                         disable_dht: !config.enable_dht,
                         disable_dht_persistence: true,
                         listen_port_range,
                         enable_upnp_port_forwarding: config.enable_upnp,
+                        socks_proxy_url: config.socks_proxy_url.clone(),
+                        blocklist_url: config.blocklist_url.clone(),
                         ratelimits,
-                        cancellation_token: Some(stop.child_token()),
+                        cancellation_token: Some(attempt),
                         ..Default::default()
                     },
-                )
-                .await;
+                );
+                let result = if config.blocklist_url.is_some() {
+                    // librqbit 8.1.1 panics if it cannot read or decompress the blocklist.
+                    tokio::spawn(start).await.map_err(|error| {
+                        TorrentError::Session(format!("could not load local blocklist: {error}"))
+                    })?
+                } else {
+                    start.await
+                };
                 attempts -= 1;
                 match result {
-                    Ok(session) => break session,
+                    Ok(session) => {
+                        cancel_attempt.disarm();
+                        break session;
+                    }
                     Err(error) if attempts == 0 => return Err(session_error(error)),
                     Err(_) => continue,
                 }
@@ -251,7 +277,7 @@ impl TorrentManager {
             validate_magnet_hashes(magnet, &metadata)?;
         }
         let trackers = magnet.as_ref().map_or_else(
-            || torrent_trackers(Some(&metadata), None),
+            || torrent_trackers(Some(&metadata), None, &[]),
             |magnet| magnet.trackers.clone(),
         );
         let name = metadata
@@ -295,7 +321,7 @@ impl TorrentManager {
         let deadline = time::Instant::now() + self.inner.config.magnet_metadata_timeout;
         // librqbit's internal HTTP client follows redirects and buffers the entire tracker
         // response. Automatic previews use only validated UDP endpoints and DHT.
-        let trackers = time::timeout_at(deadline, self.inner.magnet_trackers(&magnet, true))
+        let trackers = time::timeout_at(deadline, self.inner.magnet_trackers(&magnet, &[], true))
             .await
             .map_err(|_| TorrentError::Session("magnet metadata resolution timed out".into()))?;
         let uri = magnet.v1_uri(&trackers).ok_or_else(unsupported_v2)?;
@@ -315,7 +341,11 @@ impl TorrentManager {
                 ..Default::default()
             }),
         );
-        let resolved = resolved_magnet(time::timeout_at(deadline, resolve).await)?;
+        let response = time::timeout_at(deadline, resolve)
+            .await
+            .map_err(resolution_timeout)?
+            .map_err(session_error)?;
+        let resolved = resolved_magnet(response)?;
         let metadata = crate::metadata::parse_wire_metadata(&resolved.torrent_bytes, save_dir)?;
         let seen_peers = u32::try_from(resolved.seen_peers.len()).unwrap_or(u32::MAX);
         Ok((metadata, Some(magnet), resolved.torrent_bytes, seen_peers))
@@ -344,9 +374,10 @@ impl TorrentManager {
             validate_magnet_hashes(&magnet, &metadata)?;
             if self.inner.config.enable_trackers {
                 // Restore vetted magnet trackers for the explicit download after a UDP/DHT preview.
-                let trackers = self.inner.magnet_trackers(&magnet, false).await;
-                metadata.announce = trackers.first().cloned();
-                metadata.announce_list = vec![trackers];
+                let trackers = self.inner.magnet_trackers(&magnet, &[], false).await;
+                metadata.announce = None;
+                metadata.announce_list.clear();
+                merge_metadata_trackers(&mut metadata, &trackers);
             }
             if options.selected_file_indices.is_none() {
                 options
@@ -366,7 +397,7 @@ impl TorrentManager {
         self.inner.insert(&entry)?;
         if let Err(error) = self
             .inner
-            .attach(&entry, bytes, Arc::new(metadata), false)
+            .attach(&entry, bytes, Arc::new(metadata), false, None)
             .await
         {
             self.inner.entries.write().unwrap().remove(&id);
@@ -502,13 +533,124 @@ impl TorrentManager {
                 state.bytes.clone().zip(state.metadata.clone())
             };
             if let Some((bytes, metadata)) = retry {
-                self.inner.attach(&entry, bytes, metadata, true).await?;
+                self.inner.reattach(&entry, bytes, metadata).await?;
             } else {
                 self.inner.start_resolution(&entry);
             }
         }
         entry.state.lock().unwrap().updated_at = Utc::now();
         Ok(())
+    }
+
+    pub async fn force_recheck(&self, id: &str) -> Result<(), TorrentError> {
+        let _running = self.inner.running().await?;
+        let entry = self.inner.entry(id)?;
+        let _operation = entry.operation.lock().await;
+        self.inner.check_entry(&entry)?;
+        entry.cancel_resolution().await;
+        let handle = entry.state.lock().unwrap().handle.clone();
+        if let Some(handle) = handle {
+            self.inner
+                .detach(&entry, &handle, time::Instant::now() + RATE_LIMIT_WAIT)
+                .await?;
+        }
+        let manifest = {
+            let mut state = entry.state.lock().unwrap();
+            state.bitmap_synced = false;
+            entry.bitmap.write().unwrap().set_bits(&[]);
+            state.error = None;
+            state.reset_completion_after_recheck = true;
+            state.updated_at = Utc::now();
+            state.bytes.clone().zip(state.metadata.clone())
+        };
+        if let Some((bytes, metadata)) = manifest {
+            self.inner.reattach(&entry, bytes, metadata).await?;
+        } else {
+            self.inner.start_resolution(&entry);
+        }
+        Ok(())
+    }
+
+    pub async fn add_trackers(&self, id: &str, urls: Vec<String>) -> Result<(), TorrentError> {
+        let urls = validated_tracker_urls(&urls, self.inner.config.allow_loopback)?;
+        let _running = self.inner.running().await?;
+        let entry = self.inner.entry(id)?;
+        let _operation = entry.operation.lock().await;
+        self.inner.check_entry(&entry)?;
+        let (handle, new_trackers) = {
+            let state = entry.state.lock().unwrap();
+            let existing = tracker_urls(
+                state.metadata.as_deref(),
+                entry.magnet.as_ref(),
+                &state.extra_trackers,
+            )
+            .collect::<HashSet<_>>();
+            let new_trackers: Vec<_> = urls
+                .into_iter()
+                .filter(|url| !existing.contains(url))
+                .collect();
+            (state.handle.clone(), new_trackers)
+        };
+        if new_trackers.is_empty() {
+            return Ok(());
+        }
+        if let Some(handle) = &handle {
+            self.inner
+                .detach(&entry, handle, time::Instant::now() + RATE_LIMIT_WAIT)
+                .await?;
+        }
+        let manifest = {
+            let mut state = entry.state.lock().unwrap();
+            if let Some(metadata) = &mut state.metadata {
+                merge_metadata_trackers(Arc::make_mut(metadata), &new_trackers);
+            }
+            state.extra_trackers.extend(new_trackers);
+            state.updated_at = Utc::now();
+            state.bytes.clone().zip(state.metadata.clone())
+        };
+        if let Some((bytes, metadata)) = manifest {
+            if handle.is_some() {
+                self.inner.reattach(&entry, bytes, metadata).await?;
+            }
+        } else {
+            entry.cancel_resolution().await;
+            self.inner.start_resolution(&entry);
+        }
+        Ok(())
+    }
+
+    pub async fn reannounce(&self, id: &str) -> Result<(), TorrentError> {
+        let _running = self.inner.running().await?;
+        let entry = self.inner.entry(id)?;
+        let _operation = entry.operation.lock().await;
+        self.inner.check_entry(&entry)?;
+        let attached = {
+            let state = entry.state.lock().unwrap();
+            if state.options.start_paused {
+                return Ok(());
+            }
+            state
+                .handle
+                .clone()
+                .zip(state.bytes.clone().zip(state.metadata.clone()))
+        };
+        if let Some((handle, (bytes, metadata))) = attached {
+            self.inner
+                .detach(&entry, &handle, time::Instant::now() + RATE_LIMIT_WAIT)
+                .await?;
+            self.inner.reattach(&entry, bytes, metadata).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn move_storage(&self, id: &str, new_save_dir: &Path) -> Result<(), TorrentError> {
+        let inner = self.inner.clone();
+        let id = id.to_owned();
+        let new_save_dir = new_save_dir.to_owned();
+        // Keep the operation lock through the filesystem transaction even if the caller cancels.
+        tokio::spawn(async move { inner.move_storage(&id, &new_save_dir).await })
+            .await
+            .map_err(|error| TorrentError::Session(format!("storage move task failed: {error}")))?
     }
 
     pub async fn remove(&self, id: &str, delete_files: bool) -> Result<(), TorrentError> {
@@ -544,9 +686,12 @@ impl TorrentManager {
             }
         }
         if delete_files {
-            let metadata = entry.state.lock().unwrap().metadata.clone();
+            let (save_dir, metadata) = {
+                let state = entry.state.lock().unwrap();
+                (state.save_dir.clone(), state.metadata.clone())
+            };
             if let Some(metadata) = metadata {
-                if let Err(error) = cleanup_deleted_files(&entry.save_dir, &metadata) {
+                if let Err(error) = cleanup_deleted_files(&save_dir, &metadata) {
                     entry.set_error(&error);
                     return Err(error);
                 }
@@ -582,7 +727,41 @@ impl TorrentManager {
         down_bps: Option<u64>,
         up_bps: Option<u64>,
     ) -> Result<(), TorrentError> {
-        let rates = limits(down_bps, up_bps)?;
+        self.update_torrent_rate_limits(id, Some(down_bps), Some(up_bps))
+            .await
+    }
+
+    pub async fn set_torrent_download_limit(
+        &self,
+        id: &str,
+        down_bps: Option<u64>,
+    ) -> Result<(), TorrentError> {
+        self.update_torrent_rate_limits(id, Some(down_bps), None)
+            .await
+    }
+
+    pub async fn set_torrent_upload_limit(
+        &self,
+        id: &str,
+        up_bps: Option<u64>,
+    ) -> Result<(), TorrentError> {
+        self.update_torrent_rate_limits(id, None, Some(up_bps))
+            .await
+    }
+
+    pub fn torrent_upload_limit(&self, id: &str) -> Result<Option<u64>, TorrentError> {
+        let entry = self.inner.entry(id)?;
+        let limit = entry.state.lock().unwrap().options.upload_limit_bps;
+        Ok(limit)
+    }
+
+    async fn update_torrent_rate_limits(
+        &self,
+        id: &str,
+        down_bps: Option<Option<u64>>,
+        up_bps: Option<Option<u64>>,
+    ) -> Result<(), TorrentError> {
+        limits(down_bps.flatten(), up_bps.flatten())?;
         let deadline = time::Instant::now() + RATE_LIMIT_WAIT;
         let busy = |_| TorrentError::InvalidState("torrent is busy; try again shortly".into());
         let _running = time::timeout_at(deadline, self.inner.running())
@@ -593,7 +772,7 @@ impl TorrentManager {
             .await
             .map_err(busy)?;
         self.inner.check_entry(&entry)?;
-        let (handle, manifest, previous) = {
+        let (handle, manifest, previous, rates) = {
             let state = entry.state.lock().unwrap();
             let previous = limits(
                 state.options.download_limit_bps,
@@ -603,31 +782,17 @@ impl TorrentManager {
                 state.handle.clone(),
                 state.bytes.clone().zip(state.metadata.clone()),
                 previous,
+                limits(
+                    down_bps.unwrap_or(state.options.download_limit_bps),
+                    up_bps.unwrap_or(state.options.upload_limit_bps),
+                )?,
             )
         };
         if rates == previous {
             return Ok(());
         }
         if let Some(handle) = &handle {
-            if time::timeout_at(deadline, handle.wait_until_initialized())
-                .await
-                .is_err()
-            {
-                return Err(TorrentError::InvalidState(
-                    "torrent is still initializing; try again shortly".into(),
-                ));
-            }
-            let live = handle.live();
-            self.inner
-                .session
-                .delete(TorrentIdOrHash::Id(handle.id()), false)
-                .await
-                .map_err(session_error)?;
-            let mut state = entry.state.lock().unwrap();
-            state.handle = None;
-            state.previous_uploads = state
-                .previous_uploads
-                .saturating_add(live.map_or(0, |live| live.get_uploaded_bytes()));
+            self.inner.detach(&entry, handle, deadline).await?;
         }
         {
             let mut state = entry.state.lock().unwrap();
@@ -636,10 +801,7 @@ impl TorrentManager {
             state.updated_at = Utc::now();
         }
         if let Some((bytes, metadata)) = manifest {
-            if let Err(error) = self.inner.attach(&entry, bytes, metadata, true).await {
-                entry.set_error(&error);
-                return Err(error);
-            }
+            self.inner.reattach(&entry, bytes, metadata).await?;
         }
         Ok(())
     }
@@ -811,14 +973,138 @@ impl ManagerInner {
         Ok(output)
     }
 
+    async fn detach(
+        &self,
+        entry: &Entry,
+        handle: &ManagedTorrent,
+        deadline: time::Instant,
+    ) -> Result<(), TorrentError> {
+        if time::timeout_at(deadline, handle.wait_until_initialized())
+            .await
+            .is_err()
+        {
+            return Err(TorrentError::InvalidState(
+                "torrent is still initializing; try again shortly".into(),
+            ));
+        }
+        let live = handle.live();
+        let id = TorrentIdOrHash::Id(handle.id());
+        let result = self.session.delete(id, false).await.map_err(session_error);
+        if result.is_ok() || self.session.get(id).is_none() {
+            let mut state = entry.state.lock().unwrap();
+            state.handle = None;
+            state.previous_uploads = state
+                .previous_uploads
+                .saturating_add(live.map_or(0, |live| live.get_uploaded_bytes()));
+            state.peer_rate_samples.clear();
+            state.updated_at = Utc::now();
+        }
+        if let Err(error) = &result {
+            entry.set_error(error);
+        }
+        result
+    }
+
+    async fn reattach(
+        &self,
+        entry: &Entry,
+        bytes: Bytes,
+        metadata: Arc<TorrentMetadata>,
+    ) -> Result<(), TorrentError> {
+        let result = self.attach(entry, bytes, metadata, true, None).await;
+        if let Err(error) = &result {
+            entry.set_error(error);
+        }
+        result
+    }
+
+    async fn move_storage(&self, id: &str, new_save_dir: &Path) -> Result<(), TorrentError> {
+        let _running = self.running().await?;
+        let entry = self.entry(id)?;
+        let _operation = entry.operation.lock().await;
+        self.check_entry(&entry)?;
+        let target_dir = self.save_dir(Some(new_save_dir))?;
+        let (old_dir, handle, manifest) = {
+            let state = entry.state.lock().unwrap();
+            if state.save_dir == target_dir {
+                return Ok(());
+            }
+            (
+                state.save_dir.clone(),
+                state.handle.clone(),
+                state.bytes.clone().zip(state.metadata.clone()),
+            )
+        };
+        fs::create_dir_all(&target_dir)?;
+        reject_existing_links(&target_dir)?;
+        let Some((bytes, metadata)) = manifest else {
+            let mut state = entry.state.lock().unwrap();
+            state.save_dir = target_dir;
+            state.updated_at = Utc::now();
+            return Ok(());
+        };
+        let target_paths = metadata
+            .file_specs
+            .iter()
+            .map(|spec| safe_join_under(&target_dir, &spec.relative_path))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(handle) = handle {
+            self.detach(&entry, &handle, time::Instant::now() + RATE_LIMIT_WAIT)
+                .await?;
+        }
+        let moved = tokio::task::spawn_blocking({
+            let metadata = metadata.clone();
+            let target_dir = target_dir.clone();
+            move || {
+                let relocation =
+                    relocation::move_files(old_dir, target_dir, &metadata, &target_paths)?;
+                Ok::<_, TorrentError>((relocation, target_paths))
+            }
+        })
+        .await
+        .map_err(|error| TorrentError::Session(format!("file move task failed: {error}")))
+        .and_then(|result| result);
+        let (relocation, target_paths) = match moved {
+            Ok(moved) => moved,
+            Err(error) => {
+                entry.set_error(&error);
+                return Err(error);
+            }
+        };
+        let mut metadata = metadata;
+        Arc::make_mut(&mut metadata).resolved_paths = target_paths;
+        if let Err(error) = self
+            .attach(&entry, bytes, metadata, true, Some(target_dir))
+            .await
+        {
+            let error = tokio::task::spawn_blocking(move || relocation.rollback(error))
+                .await
+                .unwrap_or_else(|error| {
+                    TorrentError::Session(format!("storage rollback task failed: {error}"))
+                });
+            entry.set_error(&error);
+            return Err(error);
+        }
+        relocation.cleanup();
+        Ok(())
+    }
+
     async fn attach(
         &self,
         entry: &Entry,
         bytes: Bytes,
         metadata: Arc<TorrentMetadata>,
         reuse_files: bool,
+        save_dir: Option<PathBuf>,
     ) -> Result<(), TorrentError> {
-        let options = entry.state.lock().unwrap().options.clone();
+        let (options, save_dir, extra_trackers) = {
+            let state = entry.state.lock().unwrap();
+            (
+                state.options.clone(),
+                save_dir.unwrap_or_else(|| state.save_dir.clone()),
+                state.extra_trackers.clone(),
+            )
+        };
         if metadata.info_hash_v1.map(hex::encode).as_deref() != Some(&entry.id) {
             return Err(TorrentError::Metadata(
                 "resolved metadata does not match the BTv1 info hash".into(),
@@ -828,10 +1114,23 @@ impl ManagerInner {
         if let Some(indices) = &options.selected_file_indices {
             validate_selection(&metadata, indices)?;
         }
-        let engine_bytes = engine_manifest(&bytes, &metadata, self.config.enable_trackers)?;
+        let vetted_tiers;
+        let engine_trackers = if !self.config.enable_trackers {
+            None
+        } else if let Some(magnet) = entry.magnet.as_ref().filter(|_| reuse_files) {
+            // Initial magnet metadata already carries vetted trackers. Recheck the current list on reattach.
+            vetted_tiers = [self.magnet_trackers(magnet, &extra_trackers, false).await];
+            Some((vetted_tiers[0].first(), vetted_tiers.as_slice()))
+        } else {
+            Some((
+                metadata.announce.as_ref(),
+                metadata.announce_list.as_slice(),
+            ))
+        };
+        let engine_bytes = engine_manifest(&bytes, engine_trackers)?;
         let factory = ConfinedStorageFactory::new(
             &self.config.default_save_dir,
-            &entry.save_dir,
+            &save_dir,
             entry.bitmap.clone(),
             entry.magnet.is_some(),
         );
@@ -859,6 +1158,7 @@ impl ManagerInner {
             ));
         };
         let mut state = entry.state.lock().unwrap();
+        state.save_dir = save_dir;
         state.bytes = Some(bytes);
         state.metadata = Some(metadata);
         state.handle = Some(handle);
@@ -875,13 +1175,16 @@ impl ManagerInner {
         let Some(magnet) = &entry.magnet else {
             return;
         };
-        let use_trackers = self.config.enable_trackers && !magnet.trackers.is_empty();
+        let use_trackers = self.config.enable_trackers
+            && (!magnet.trackers.is_empty() || !state.extra_trackers.is_empty());
         if state.options.start_paused
             || (!self.config.enable_dht && !use_trackers && state.options.initial_peers.is_empty())
         {
             return;
         }
         let magnet = magnet.clone();
+        let extra_trackers = state.extra_trackers.clone();
+        let save_dir = state.save_dir.clone();
         let initial_peers = state.options.initial_peers.clone();
         let token = self.stop.child_token();
         let cancel = token.clone();
@@ -889,20 +1192,23 @@ impl ManagerInner {
         let entry = entry.clone();
         let task = tokio::spawn(async move {
             let resolve = async {
-                let trackers = manager.magnet_trackers(&magnet, false).await;
+                let trackers = manager
+                    .magnet_trackers(&magnet, &extra_trackers, false)
+                    .await;
                 let uri = magnet.v1_uri(&trackers).ok_or_else(unsupported_v2)?;
-                manager
+                let response = manager
                     .session
                     .add_torrent(
                         AddTorrent::from_url(uri),
                         Some(AddTorrentOptions {
                             list_only: true,
                             initial_peers: Some(initial_peers),
-                            output_folder: Some(entry.save_dir.to_string_lossy().into_owned()),
+                            output_folder: Some(save_dir.to_string_lossy().into_owned()),
                             ..Default::default()
                         }),
                     )
-                    .await
+                    .await?;
+                Ok::<_, anyhow::Error>((response, trackers))
             };
             let result = tokio::select! {
                 biased;
@@ -914,7 +1220,15 @@ impl ManagerInner {
                 () = cancel.cancelled() => return,
                 guard = entry.operation.lock() => guard,
             };
-            if let Err(error) = manager.finish_resolution(&entry, result).await {
+            let result = async {
+                let (response, trackers) =
+                    result.map_err(resolution_timeout)?.map_err(session_error)?;
+                manager
+                    .finish_resolution(&entry, resolved_magnet(response)?, &trackers)
+                    .await
+            }
+            .await;
+            if let Err(error) = result {
                 tracing::debug!(id = %entry.id, %error, "magnet resolution failed");
                 entry.set_error(&error);
             }
@@ -922,10 +1236,15 @@ impl ManagerInner {
         state.resolution = Some((token, task));
     }
 
-    async fn magnet_trackers(&self, magnet: &ParsedMagnet, udp_only: bool) -> Vec<String> {
+    async fn magnet_trackers(
+        &self,
+        magnet: &ParsedMagnet,
+        extra_trackers: &[String],
+        udp_only: bool,
+    ) -> Vec<String> {
         if self.config.enable_trackers {
             magnet
-                .resolve_trackers(udp_only, self.config.allow_loopback)
+                .resolve_trackers(extra_trackers, udp_only, self.config.allow_loopback)
                 .await
         } else {
             Vec::new()
@@ -935,15 +1254,19 @@ impl ManagerInner {
     async fn finish_resolution(
         &self,
         entry: &Entry,
-        result: Result<anyhow::Result<AddTorrentResponse>, time::error::Elapsed>,
+        resolved: librqbit::ListOnlyResponse,
+        trackers: &[String],
     ) -> Result<(), TorrentError> {
-        let resolved = resolved_magnet(result)?;
-        let metadata = Arc::new(crate::metadata::parse_wire_metadata(
-            &resolved.torrent_bytes,
-            &entry.save_dir,
-        )?);
+        let save_dir = entry.state.lock().unwrap().save_dir.clone();
+        let mut metadata =
+            crate::metadata::parse_wire_metadata(&resolved.torrent_bytes, &save_dir)?;
         if let Some(magnet) = &entry.magnet {
             validate_magnet_hashes(magnet, &metadata)?;
+        }
+        if self.config.enable_trackers {
+            metadata.announce = None;
+            metadata.announce_list.clear();
+            merge_metadata_trackers(&mut metadata, trackers);
         }
         {
             let mut state = entry.state.lock().unwrap();
@@ -952,8 +1275,14 @@ impl ManagerInner {
             peers.sort_unstable();
             peers.dedup();
         }
-        self.attach(entry, resolved.torrent_bytes, metadata, false)
-            .await
+        self.attach(
+            entry,
+            resolved.torrent_bytes,
+            Arc::new(metadata),
+            false,
+            None,
+        )
+        .await
     }
 
     async fn pause_handle_and_record(
@@ -1080,12 +1409,12 @@ impl Entry {
         Self {
             id,
             source,
-            save_dir,
             magnet,
             created_at,
             operation: AsyncMutex::new(()),
             bitmap: Arc::new(RwLock::new(PieceBitmap::new(0, 0, 0))),
             state: Mutex::new(EntryState {
+                save_dir,
                 options,
                 metadata: None,
                 bytes: None,
@@ -1093,6 +1422,9 @@ impl Entry {
                 resolution: None,
                 error: None,
                 bitmap_synced: false,
+                completed_at: None,
+                reset_completion_after_recheck: false,
+                extra_trackers: Vec::new(),
                 previous_uploads: 0,
                 seen_peers: 0,
                 peer_rate_samples: HashMap::new(),
@@ -1132,12 +1464,13 @@ fn is_magnet_source(source: &str) -> bool {
         .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("magnet"))
 }
 
+fn resolution_timeout(_: time::error::Elapsed) -> TorrentError {
+    TorrentError::Session("magnet metadata resolution timed out".into())
+}
+
 fn resolved_magnet(
-    result: Result<anyhow::Result<AddTorrentResponse>, time::error::Elapsed>,
+    response: AddTorrentResponse,
 ) -> Result<librqbit::ListOnlyResponse, TorrentError> {
-    let response = result
-        .map_err(|_| TorrentError::Session("magnet metadata resolution timed out".into()))?
-        .map_err(session_error)?;
     match response {
         AddTorrentResponse::ListOnly(resolved) => Ok(resolved),
         _ => Err(TorrentError::InvalidState(
@@ -1172,8 +1505,21 @@ fn validate_magnet_hashes(
 fn torrent_trackers(
     metadata: Option<&TorrentMetadata>,
     magnet: Option<&ParsedMagnet>,
+    extra_trackers: &[String],
 ) -> Vec<String> {
     let mut seen = HashSet::new();
+    tracker_urls(metadata, magnet, extra_trackers)
+        .filter(|tracker| seen.insert(tracker.as_str()))
+        .take(64)
+        .cloned()
+        .collect()
+}
+
+fn tracker_urls<'a>(
+    metadata: Option<&'a TorrentMetadata>,
+    magnet: Option<&'a ParsedMagnet>,
+    extra_trackers: &'a [String],
+) -> impl Iterator<Item = &'a String> {
     metadata
         .into_iter()
         .flat_map(|metadata| {
@@ -1183,35 +1529,59 @@ fn torrent_trackers(
                 .chain(metadata.announce_list.iter().flatten())
         })
         .chain(magnet.into_iter().flat_map(|magnet| &magnet.trackers))
-        .filter(|tracker| seen.insert(tracker.as_str()))
-        .take(64)
+        .chain(extra_trackers)
+}
+
+fn merge_metadata_trackers(metadata: &mut TorrentMetadata, urls: &[String]) {
+    let mut seen: HashSet<_> = tracker_urls(Some(metadata), None, &[]).collect();
+    let added: Vec<_> = urls
+        .iter()
+        .filter(|url| seen.insert(url))
         .cloned()
-        .collect()
+        .collect();
+    if !added.is_empty() {
+        metadata.announce_list.push(added);
+        if metadata.announce.is_none() {
+            metadata.announce = metadata.announce_list.iter().flatten().next().cloned();
+        }
+    }
 }
 
 fn engine_manifest(
     bytes: &[u8],
-    metadata: &TorrentMetadata,
-    enable_trackers: bool,
+    trackers: Option<(Option<&String>, &[Vec<String>])>,
 ) -> Result<Bytes, TorrentError> {
     use crate::bencode::{decode_with_info, encode, BencodeValue as Value};
 
     let (root, info) = decode_with_info(bytes)?;
     let mut output = b"d".to_vec();
-    if enable_trackers {
+    if let Some((announce, announce_list)) = trackers {
         let tracker = |url: &String| Value::Bytes(url.as_bytes().to_vec());
-        if let Some(url) = &metadata.announce {
+        if let Some(url) = announce {
             output.extend_from_slice(b"8:announce");
             output.extend(encode(&tracker(url)));
         }
-        if !metadata.announce_list.is_empty() {
-            let tiers = metadata
-                .announce_list
+        if !announce_list.is_empty() {
+            let mut seen = HashSet::new();
+            let mut tiers: Vec<_> = announce_list
                 .iter()
-                .map(|tier| Value::List(tier.iter().map(tracker).collect()))
+                .map(|tier| {
+                    tier.iter()
+                        .filter(|url| seen.insert(url.as_str()))
+                        .map(tracker)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|tier| !tier.is_empty())
+                .map(Value::List)
                 .collect();
-            output.extend_from_slice(b"13:announce-list");
-            output.extend(encode(&Value::List(tiers)));
+            // librqbit reads announce-list in preference to announce.
+            if let Some(url) = announce.filter(|url| !seen.contains(url.as_str())) {
+                tiers.insert(0, Value::List(vec![tracker(url)]));
+            }
+            if !tiers.is_empty() {
+                output.extend_from_slice(b"13:announce-list");
+                output.extend(encode(&Value::List(tiers)));
+            }
         }
     }
     // Keep the exact info bytes for the hash and retain hybrid piece layers.
@@ -1227,6 +1597,65 @@ fn engine_manifest(
     }
     output.push(b'e');
     Ok(output.into())
+}
+
+fn validate_socks_proxy(raw: Option<&str>) -> Result<Option<String>, TorrentError> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let invalid = || TorrentError::InvalidState("invalid SOCKS proxy URL".into());
+    let mut url = Url::parse(raw).map_err(|_| invalid())?;
+    if raw.chars().any(char::is_control)
+        || !matches!(url.scheme(), "socks5" | "socks5h")
+        || url.host_str().is_none_or(str::is_empty)
+        || url.port().is_none_or(|port| port == 0)
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    // librqbit 8.1.1's peer connector accepts only the socks5 spelling.
+    if url.scheme() == "socks5h" {
+        url.set_scheme("socks5").map_err(|()| invalid())?;
+    }
+    Ok(Some(url.into()))
+}
+
+fn validate_blocklist(raw: Option<&str>) -> Result<Option<String>, TorrentError> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let invalid = || {
+        TorrentError::InvalidState(
+            "blocklist URL must name a regular local file via file://".into(),
+        )
+    };
+    let (scheme, suffix) = raw.split_once("://").ok_or_else(invalid)?;
+    if !scheme.eq_ignore_ascii_case("file")
+        || raw.chars().any(char::is_control)
+        || suffix.contains('\\')
+        // The URL parser removes literal and percent-encoded dot segments.
+        || suffix.to_ascii_lowercase().replace("%2e", ".").split('/').any(|part| part == "..")
+    {
+        return Err(invalid());
+    }
+    let url = Url::parse(raw).map_err(|_| invalid())?;
+    if url.host_str().is_some() || url.query().is_some() || url.fragment().is_some() {
+        return Err(invalid());
+    }
+    let path = url.to_file_path().map_err(|()| invalid())?;
+    validate_local_path(&path).map_err(|_| invalid())?;
+    if !path.is_absolute() {
+        return Err(invalid());
+    }
+    reject_existing_links(&path).map_err(|_| invalid())?;
+    let metadata = fs::symlink_metadata(&path).map_err(|_| invalid())?;
+    if is_link(&metadata) || !metadata.is_file() {
+        return Err(invalid());
+    }
+    Url::from_file_path(path.components().collect::<PathBuf>())
+        .map(|url| Some(url.into()))
+        .map_err(|()| invalid())
 }
 
 fn limits(down: Option<u64>, up: Option<u64>) -> Result<LimitsConfig, TorrentError> {
@@ -1354,7 +1783,7 @@ async fn read_torrent_file(path: &Path) -> Result<Vec<u8>, TorrentError> {
 }
 
 fn cleanup_deleted_files(save_dir: &Path, metadata: &TorrentMetadata) -> Result<(), TorrentError> {
-    let mut dirs = HashSet::new();
+    let mut paths = Vec::new();
     for (file, path) in metadata.file_specs.iter().zip(&metadata.resolved_paths) {
         if file.is_padding {
             continue;
@@ -1374,22 +1803,27 @@ fn cleanup_deleted_files(save_dir: &Path, metadata: &TorrentMetadata) -> Result<
                 )));
             }
         }
-        let mut parent = path.parent();
-        while let Some(dir) = parent {
-            if dir == save_dir || !dir.starts_with(save_dir) {
-                break;
-            }
-            dirs.insert(dir.to_path_buf());
-            parent = dir.parent();
-        }
+        paths.push(path.as_path());
     }
+    cleanup_empty_dirs(save_dir, paths)
+}
+
+fn cleanup_empty_dirs<'a>(
+    save_dir: &Path,
+    paths: impl IntoIterator<Item = &'a Path>,
+) -> Result<(), TorrentError> {
+    let dirs: HashSet<_> = paths
+        .into_iter()
+        .flat_map(|path| path.ancestors().skip(1))
+        .filter(|dir| *dir != save_dir && dir.starts_with(save_dir))
+        .collect();
     let mut dirs: Vec<_> = dirs.into_iter().collect();
     dirs.sort_by_key(|dir| std::cmp::Reverse(dir.as_os_str().len()));
     for dir in dirs {
-        validate_output(save_dir, &dir)?;
-        match std::fs::symlink_metadata(&dir) {
+        validate_output(save_dir, dir)?;
+        match std::fs::symlink_metadata(dir) {
             Ok(meta) if !is_link(&meta) && meta.is_dir() => {
-                let _ = std::fs::remove_dir(&dir);
+                let _ = std::fs::remove_dir(dir);
             }
             _ => {}
         }

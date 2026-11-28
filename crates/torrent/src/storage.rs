@@ -14,6 +14,9 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+#[cfg(windows)]
+mod archive_storage;
+
 pub(crate) type SharedBitmap = Arc<RwLock<PieceBitmap>>;
 
 /// Pairs librqbit's output folder with the path checked by the storage wrapper.
@@ -23,6 +26,8 @@ pub struct ConfinedStorageFactory {
     output: PathBuf,
     bitmap: SharedBitmap,
     from_v1_wire: bool,
+    #[cfg(windows)]
+    overwrite: bool,
 }
 
 impl ConfinedStorageFactory {
@@ -37,6 +42,8 @@ impl ConfinedStorageFactory {
             output: output.to_owned(),
             bitmap,
             from_v1_wire,
+            #[cfg(windows)]
+            overwrite: false,
         }
     }
 
@@ -49,7 +56,13 @@ impl ConfinedStorageFactory {
         // same explicit folder to both sides so automatic subfolders are bypassed.
         options.output_folder = Some(path_text(&self.output)?.to_owned());
         options.sub_folder = None;
-        options.storage_factory = Some(self.boxed());
+        let factory = self;
+        #[cfg(windows)]
+        let factory = Self {
+            overwrite: options.overwrite,
+            ..factory
+        };
+        options.storage_factory = Some(factory.boxed());
         Ok(options)
     }
 }
@@ -62,6 +75,20 @@ impl StorageFactory for ConfinedStorageFactory {
         shared: &ManagedTorrentShared,
         metadata: &TorrentMetadata,
     ) -> anyhow::Result<Self::Storage> {
+        #[cfg(windows)]
+        let archive_storage = metadata.file_infos.iter().any(|file| {
+            !file.attrs.padding && archive_storage::is_archive(&file.relative_filename)
+        });
+        #[cfg(windows)]
+        if archive_storage {
+            return Ok(ConfinedTorrentStorage {
+                inner: Box::new(archive_storage::ArchiveStorage::new(
+                    self.output.clone(),
+                    self.overwrite,
+                )),
+                factory: self.clone(),
+            });
+        }
         Ok(ConfinedTorrentStorage {
             inner: Box::new(FilesystemStorageFactory::default().create(shared, metadata)?),
             factory: self.clone(),
@@ -172,6 +199,56 @@ impl TorrentStorage for ConfinedTorrentStorage {
 pub(crate) fn path_text(path: &Path) -> Result<&str, TorrentError> {
     path.to_str()
         .ok_or_else(|| PathSecurityError::InvalidCharacter.into())
+}
+
+pub(crate) fn open_regular_file(path: &Path) -> Result<fs::File, TorrentError> {
+    reject_existing_links(path)?;
+    if !fs::symlink_metadata(path)?.is_file() {
+        return Err(TorrentError::InvalidState("expected a regular file".into()));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if is_link(&metadata) || !metadata.is_file() {
+        return Err(PathSecurityError::EscapesBaseDir.into());
+    }
+    Ok(file)
+}
+
+pub(crate) fn validate_local_path(path: &Path) -> Result<(), TorrentError> {
+    let raw = path_text(path)?;
+    if raw.trim().is_empty() {
+        return Err(PathSecurityError::Empty.into());
+    }
+    if raw.chars().any(char::is_control) {
+        return Err(PathSecurityError::InvalidCharacter.into());
+    }
+    let separators = ['/', '\\'];
+    if raw.starts_with(separators) && raw[1..].starts_with(separators) {
+        return Err(PathSecurityError::EscapesBaseDir.into());
+    }
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix)
+                if !matches!(prefix.kind(), std::path::Prefix::Disk(_)) || !path.is_absolute() =>
+            {
+                return Err(PathSecurityError::EscapesBaseDir.into());
+            }
+            Component::ParentDir => return Err(PathSecurityError::Traversal.into()),
+            Component::Normal(part) if path_text(Path::new(part))?.contains(':') => {
+                return Err(PathSecurityError::NtfsAlternateDataStream.into());
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_output(base: &Path, output: &Path) -> Result<(), TorrentError> {

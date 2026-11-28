@@ -1,26 +1,37 @@
 use crate::{
+    automation::{compute_effective_decision, scan_watch_folders, WatchFolderTracker},
+    extractor::{extract_archive_after_open, is_supported_archive},
     media_jobs::{MediaJob, MediaJobEvent, MediaJobRunOptions, PlaylistJobMeta, ScanRequest},
     paths::{
-        build_defender_scan_args, decode_sha256, delete_files, ensure_playlist_subfolder,
-        ensure_safe_directory, ensure_safe_tree, hash_file, local_drive_path, media_title_stem,
-        reveal_action, validate_existing_ancestors, with_completed_file, write_zone_identifier,
-        RevealAction,
+        build_defender_scan_args, canonical_directory, confined_target, decode_sha256,
+        delete_files, ensure_playlist_subfolder, ensure_safe_directory, ensure_safe_tree,
+        hash_file, local_drive_path, media_title_stem, open_local_file, reparse, reveal_action,
+        validate_existing_ancestors, with_completed_file, write_zone_identifier, RevealAction,
     },
     pending_downloads::{
         PendingConfirmation, PendingDownloads, PendingHttpEntry, ScrubbedRequest,
         PENDING_UNAVAILABLE,
     },
+    rss::{self, RssSeenStore},
     settings::{
-        category_id, match_category_for_filename, normalize, normalize_categories, read_json,
-        resolve_category_dir, torrent_rate, write_json_atomically, SETTINGS_FILE,
+        category_id, host_pattern_matches, match_category_for_filename, normalize,
+        normalize_blocklist_path, normalize_categories, normalize_rate, read_json,
+        resolve_category_dir, torrent_rate, write_atomically, write_json_atomically, SETTINGS_FILE,
     },
     tools::{
         defender_executable, discover_ytdlp_for_probe, explorer_executable, toolchain_status,
         ToolchainCache, ToolchainStatus,
     },
+    vault::{proxy_secret_key, site_login_secret_key, SecretVault},
 };
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use chrono::{DateTime, Datelike, Timelike, Utc};
+use futures_util::{stream, StreamExt};
+use reqwest::header::HeaderValue;
 use serde::{Deserialize, Serialize};
-use slipstream_engine::{DownloadEngine, EngineConfig, EngineEvent, ExtendedHttpOptions};
+use slipstream_engine::{
+    DownloadEngine, EngineConfig, EngineEvent, EngineProxyConfig, ExtendedHttpOptions, QueueConfig,
+};
 use slipstream_media::{
     args::{canonical_media_headers, validate_playlist_items},
     probe::{MAX_PLAYLIST_PREVIEW_ENTRIES, MAX_PLAYLIST_TITLE_CHARS},
@@ -34,25 +45,29 @@ use slipstream_native_host::{
 use slipstream_protocol::{
     is_private_or_loopback_ip, sanitize_filename, validate_http_url, validate_magnet_uri,
     AddHttpDownloadRequest, AddMediaDownloadRequest, AddTorrentRequest, AppSettings,
-    ConfirmPendingDownloadRequest, DownloadCategory, MediaProbeResult, NativeBridgeRequest,
-    NativeBridgeResponse, PendingDownloadPreview, RefreshDownloadUrlRequest, SelectedPlaylistEntry,
-    TelemetryBatch, TorrentFileEntry, TorrentPeerSummary, TorrentPreviewResult,
-    TransferCompletionOptions, TransferSnapshot, TransferStatus, UpdateMode,
-    MAX_NATIVE_MESSAGE_BYTES,
+    AutomationStatus, ConfirmPendingDownloadRequest, CreateTorrentRequest, CreateTorrentResult,
+    DownloadCategory, DownloadQueueSpec, LogEntry, MediaProbeResult, MetalinkFileEntry,
+    NativeBridgeRequest, NativeBridgeResponse, PendingDownloadPreview, PostQueueAction, ProxyMode,
+    RefreshDownloadUrlRequest, RssFeedRule, SelectedPlaylistEntry, SettingsBackupBundle,
+    SiteAuthScheme, SiteGrabRequest, SiteGrabResult, SiteLoginEntry, TelemetryBatch,
+    TorrentFileEntry, TorrentNetworkSettings, TorrentPeerSummary, TorrentPreviewResult,
+    TorrentSeedingSettings, TransferCompletionOptions, TransferKind, TransferSnapshot,
+    TransferStatus, UpdateMode, MAX_NATIVE_MESSAGE_BYTES,
 };
 use slipstream_torrent::{
     Bytes, CancellationToken, TorrentAddOptions, TorrentManager, TorrentManagerConfig,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fmt::Display,
+    fmt::{Display, Write},
     future::{pending, Future},
-    os::windows::{fs::MetadataExt, process::CommandExt},
+    io::Read,
+    os::windows::{ffi::OsStrExt, fs::MetadataExt, process::CommandExt},
     path::{Path, PathBuf},
     pin::Pin,
     process::{Command as StdCommand, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, RwLock, Weak,
     },
     time::Duration,
@@ -73,7 +88,12 @@ use windows_sys::Win32::{
 };
 
 type Result<T> = std::result::Result<T, String>;
+
+const MAX_BACKUP_BYTES: usize = 2 * 1024 * 1024;
 const DISMISSED_FILE: &str = "dismissed-http.json";
+const TRANSFER_META_FILE: &str = "transfer_meta.json";
+const LOG_CAPACITY: usize = 500;
+const MAX_IMPORT_URLS: usize = 500;
 const TELEMETRY_INTERVAL: Duration = Duration::from_millis(250);
 const TORRENT_PREVIEW_TTL: Duration = Duration::from_secs(600);
 const TORRENT_PREVIEW_CAPACITY: usize = 8;
@@ -85,6 +105,8 @@ const PROBE_CACHE_CAPACITY: usize = 128;
 const MAX_SELECTED_ENTRIES: usize = 512;
 const MAX_BATCH_URLS: usize = 512;
 const MAX_CONCURRENT_PROBES: usize = 4;
+const VPN_TRAFFIC_BLOCKED: &str =
+    "VPN kill switch blocked torrent traffic. Connect the configured VPN adapter to continue.";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpenPickerEvent {
@@ -124,14 +146,51 @@ pub trait UiBridge: Send + Sync + 'static {
 pub struct DaemonOptions {
     pub pipe_name: Option<String>,
     pub allow_loopback: bool,
+    pub allow_power_actions: bool,
     pub registry_base_key: Option<String>,
     pub resource_dir: Option<PathBuf>,
     pub torrent: TorrentManagerConfig,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct BatchAddSummary {
+    pub added: usize,
+    pub skipped: usize,
+    pub errors: Vec<String>,
+}
+
+impl BatchAddSummary {
+    fn skip_with_error(&mut self, line: usize, error: &str) {
+        self.skipped += 1;
+        if self.errors.len() < 10 {
+            self.errors
+                .push(format!("Line {line}: {}", log_text(error, 512)));
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionAlert {
+    pub transfer_id: String,
+    pub title: String,
+    pub filename: String,
+    pub save_dir: String,
+    pub kind: TransferKind,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct TransferMetadata {
+    category_id: Option<String>,
+    tags: Vec<String>,
+}
+
 struct TorrentSession {
     manager: Arc<TorrentManager>,
     base: PathBuf,
+    config: TorrentManagerConfig,
+    network: TorrentNetworkSettings,
+    stopped: bool,
 }
 
 #[derive(Default)]
@@ -236,6 +295,8 @@ type PendingMediaJob = (Arc<MediaJob>, Option<Arc<MediaProbeResult>>);
 
 pub struct AppState {
     data_dir: PathBuf,
+    vault: Mutex<SecretVault>,
+    manage_startup: bool,
     registry_base_key: String,
     resource_dir: Option<PathBuf>,
     allow_loopback: bool,
@@ -253,7 +314,10 @@ pub struct AppState {
     pending_downloads: Mutex<PendingDownloads>,
     pending_changed: Notify,
     completion_options: Mutex<HashMap<String, TransferCompletionOptions>>,
+    completion_alerts: broadcast::Sender<CompletionAlert>,
     settings: RwLock<AppSettings>,
+    transfer_meta: RwLock<HashMap<String, TransferMetadata>>,
+    logs: Arc<Mutex<VecDeque<LogEntry>>>,
     dismissed_http: RwLock<HashSet<String>>,
     verified: RwLock<HashMap<String, bool>>,
     operations: AsyncMutex<()>,
@@ -262,18 +326,45 @@ pub struct AppState {
     torrent_changed: Notify,
     torrent_previews: Mutex<HashMap<String, (Instant, Bytes, String)>>,
     torrent_completions: Mutex<HashSet<String>>,
+    torrent_announced: Mutex<HashSet<String>>,
+    torrent_failures: Mutex<HashSet<String>>,
     torrent_completed_files: Mutex<HashMap<String, TorrentCompletedFiles>>,
     scans: mpsc::Sender<ScanRequest>,
     stop: watch::Sender<bool>,
     tasks: AsyncMutex<Option<Vec<JoinHandle<()>>>>,
     startup_update_checked: AtomicBool,
     quitting: AtomicBool,
+    automation_status: RwLock<AutomationStatus>,
+    automation_lock: AsyncMutex<()>,
+    settings_revision: AtomicU64,
+    last_effective_limits: Mutex<Option<(Option<u64>, Option<u64>)>>,
+    schedule_torrent_paused_ids: Mutex<HashSet<String>>,
+    automation_stops_torrents: AtomicBool,
+    allow_power_actions: bool,
+    active_extractions: Arc<AtomicUsize>,
+    auto_paused_ids: Mutex<HashSet<String>>,
+    last_decision_paused: AtomicBool,
+    vpn_paused_torrents: Mutex<HashSet<String>>,
+    vpn_kill_switch_active: AtomicBool,
+    rss_matches_added: AtomicU64,
+    last_rss_poll: Mutex<HashMap<String, DateTime<Utc>>>,
+    rss_seen: AsyncMutex<RssSeenStore>,
+    rss_client: rss::FeedHttpClient,
 }
 
 #[derive(Default)]
 struct TorrentCompletedFiles {
     marked: HashSet<String>,
     scanned: HashSet<String>,
+    extraction_started: HashSet<String>,
+}
+
+struct ActiveExtraction(Arc<AtomicUsize>);
+
+impl Drop for ActiveExtraction {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn message(error: impl Display) -> String {
@@ -290,6 +381,166 @@ fn active(status: TransferStatus) -> bool {
     )
 }
 
+fn seed_limit_reached(settings: &TorrentSeedingSettings, ratio: f64, seconds: u64) -> bool {
+    settings.stop_seeding_on_limit
+        && (settings
+            .max_seed_ratio_hundredths
+            .is_some_and(|cap| ratio * 100.0 >= f64::from(cap))
+            || settings
+                .max_seed_minutes
+                .is_some_and(|cap| seconds >= u64::from(cap) * 60))
+}
+
+async fn vpn_adapter_connected(name: Option<String>) -> bool {
+    let Some(name) = name.filter(|name| !name.trim().is_empty()) else {
+        return false;
+    };
+    tokio::task::spawn_blocking(move || crate::win32::is_network_adapter_up(&name))
+        .await
+        .unwrap_or(false)
+}
+
+fn log_text(text: &str, max_chars: usize) -> String {
+    text.chars()
+        .take(max_chars)
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+fn push_log(logs: &Mutex<VecDeque<LogEntry>>, level: &str, category: &str, message: String) {
+    let mut logs = logs.lock().unwrap();
+    if logs.len() == LOG_CAPACITY {
+        logs.pop_front();
+    }
+    logs.push_back(LogEntry {
+        timestamp: chrono::Utc::now(),
+        level: log_text(level, 32),
+        category: log_text(category, 64),
+        message: log_text(&message, 512),
+    });
+}
+
+fn sanitize_transfer_tags(tags: Vec<String>) -> Vec<String> {
+    let mut sanitized = Vec::new();
+    for tag in tags {
+        let clean: String = tag
+            .chars()
+            .filter(|ch| !ch.is_control() && !matches!(ch, '\u{2028}' | '\u{2029}'))
+            .collect();
+        let tag: String = clean.trim().chars().take(24).collect();
+        let tag = tag.trim_end();
+        if !tag.is_empty() && !sanitized.iter().any(|existing| existing == tag) {
+            sanitized.push(tag.to_owned());
+            if sanitized.len() == 8 {
+                break;
+            }
+        }
+    }
+    sanitized
+}
+
+fn apply_transfer_metadata(
+    snapshot: &mut TransferSnapshot,
+    settings: &AppSettings,
+    metadata: &HashMap<String, TransferMetadata>,
+) {
+    let entry = metadata.get(&snapshot.id);
+    snapshot.category_id = Some(
+        entry
+            .and_then(|meta| meta.category_id.clone())
+            .unwrap_or_else(|| {
+                match_category_for_filename(settings, &snapshot.filename)
+                    .id
+                    .clone()
+            }),
+    );
+    snapshot.tags = entry.map_or_else(Vec::new, |meta| meta.tags.clone());
+}
+
+fn unique_ids(ids: &[String]) -> impl Iterator<Item = &String> {
+    let mut seen = HashSet::new();
+    ids.iter().filter(move |id| seen.insert(id.as_str()))
+}
+
+async fn run_bulk(ids: &[String], mut operation: impl AsyncFnMut(&str) -> Result<()>) -> usize {
+    let mut succeeded = 0;
+    for id in unique_ids(ids) {
+        succeeded += usize::from(operation(id).await.is_ok());
+    }
+    succeeded
+}
+
+fn batch_url_lines(raw_text: &str) -> impl Iterator<Item = (usize, &str)> {
+    let mut in_block = false;
+    let mut block_has_url = false;
+    raw_text
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .enumerate()
+        .filter_map(move |(i, raw)| {
+            let line = raw.trim();
+            match line {
+                "<" => {
+                    in_block = true;
+                    block_has_url = false;
+                    return None;
+                }
+                ">" => {
+                    in_block = false;
+                    return None;
+                }
+                "" => return None,
+                _ => {}
+            }
+            if line.starts_with('#')
+                || line.split_once(':').is_some_and(|(prefix, _)| {
+                    prefix.eq_ignore_ascii_case("cookie")
+                        || prefix.eq_ignore_ascii_case("referer")
+                        || prefix.eq_ignore_ascii_case("referrer")
+                })
+                || (in_block && block_has_url)
+            {
+                return None;
+            }
+            block_has_url = true;
+            Some((i + 1, line))
+        })
+}
+
+async fn export_text(out_path: &str, contents: String) -> Result<()> {
+    if out_path
+        .split(['/', '\\'])
+        .any(|part| matches!(part, "." | ".."))
+    {
+        return Err("Export path must not contain traversal".into());
+    }
+    let target = local_drive_path(Path::new(out_path)).map_err(message)?;
+    tokio::task::spawn_blocking(move || {
+        let parent = target
+            .parent()
+            .ok_or("Export requires a parent directory")?;
+        let name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("Export requires a filename")?;
+        let parent = canonical_directory(parent).map_err(message)?;
+        if let Some(existing) = confined_target(&parent, name).map_err(message)? {
+            if !existing.is_file() || existing.parent() != Some(parent.as_path()) {
+                return Err("Export destination must be a regular file".into());
+            }
+        }
+        write_atomically(&parent.join(name), contents.as_bytes()).map_err(message)
+    })
+    .await
+    .map_err(message)?
+}
+
 impl AppState {
     pub async fn start(
         data_dir: PathBuf,
@@ -298,10 +549,42 @@ impl AppState {
     ) -> Result<Arc<Self>> {
         let data_dir = std::path::absolute(data_dir).map_err(message)?;
         std::fs::create_dir_all(&data_dir).map_err(message)?;
+        let manage_startup = cfg!(not(test))
+            && !options.allow_loopback
+            && options.pipe_name.is_none()
+            && options.registry_base_key.is_none()
+            && std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .and_then(|path| canonical_directory(&path.join("SlipStream")).ok())
+                .is_some_and(|production| {
+                    canonical_directory(&data_dir).is_ok_and(|dir| dir == production)
+                });
         let mut settings: AppSettings =
             read_json(&data_dir.join(SETTINGS_FILE)).map_err(message)?;
+        if let Err(error) =
+            normalize_blocklist_path(settings.torrent_network.blocklist_path.as_deref())
+        {
+            tracing::warn!(%error, "ignoring invalid torrent blocklist path at startup");
+            settings.torrent_network.blocklist_path = None;
+        }
         normalize(&mut settings, &data_dir).map_err(message)?;
-        let dismissed_http = read_json(&data_dir.join(DISMISSED_FILE)).map_err(message)?;
+        let vault = SecretVault::load(&data_dir).unwrap_or_else(|error| {
+            tracing::warn!(%error, "could not load local secret vault");
+            SecretVault::default()
+        });
+        sync_secret_flags(&mut settings, &vault);
+        let proxy = http_proxy_config(&vault, &settings)?;
+        let rss_client = rss::feed_http_client(options.allow_loopback)?;
+        let rss_seen = RssSeenStore::load(&data_dir).unwrap_or_else(|error| {
+            tracing::warn!(%error, "could not load RSS history");
+            RssSeenStore::default()
+        });
+        let dismissed_http: HashSet<String> =
+            read_json(&data_dir.join(DISMISSED_FILE)).map_err(message)?;
+        let meta_path = data_dir.join(TRANSFER_META_FILE);
+        let mut transfer_meta: HashMap<String, TransferMetadata> =
+            read_json(&meta_path).map_err(message)?;
         let pipe_name = options
             .pipe_name
             .map_or_else(default_pipe_name, Ok)
@@ -326,16 +609,26 @@ impl AppState {
             }
         });
         options.torrent.allow_loopback |= options.allow_loopback;
-        let torrent = TorrentSession::new(&options.torrent, &settings).await?;
-        let engine = match DownloadEngine::new(EngineConfig {
-            db_path: data_dir.join("slipstream.sqlite"),
-            default_download_dir: PathBuf::from(&settings.default_download_dir),
-            default_connections: settings.default_connections,
-            max_concurrent_downloads: usize::from(settings.max_concurrent_downloads),
-            global_speed_limit_bps: settings.global_speed_limit_bps,
-            allow_loopback: options.allow_loopback,
-            ..EngineConfig::default()
-        })
+        let torrent = match TorrentSession::new(&options.torrent, &settings).await {
+            Ok(torrent) => torrent,
+            Err(error) => {
+                stop.send_replace(true);
+                let _ = local_picker_task.await;
+                return Err(error);
+            }
+        };
+        let engine = match DownloadEngine::new_with_proxy(
+            EngineConfig {
+                db_path: data_dir.join("slipstream.sqlite"),
+                default_download_dir: PathBuf::from(&settings.default_download_dir),
+                default_connections: settings.default_connections,
+                max_concurrent_downloads: usize::from(settings.max_concurrent_downloads),
+                global_speed_limit_bps: settings.global_speed_limit_bps,
+                allow_loopback: options.allow_loopback,
+                ..EngineConfig::default()
+            },
+            proxy,
+        )
         .await
         {
             Ok(engine) => engine,
@@ -345,12 +638,30 @@ impl AppState {
             }
         };
         let http_events = engine.subscribe_events();
-        let scanned_http = engine
-            .snapshots()
-            .into_iter()
+        let http_snapshots = engine.snapshots();
+        let scanned_http = http_snapshots
+            .iter()
             .filter(|snapshot| snapshot.status == TransferStatus::Completed)
-            .map(|snapshot| snapshot.id)
+            .map(|snapshot| snapshot.id.clone())
             .collect();
+        if !transfer_meta.is_empty() {
+            let live_ids: HashSet<_> = http_snapshots
+                .into_iter()
+                .filter(|snapshot| !dismissed_http.contains(&snapshot.id))
+                .chain(torrent.manager.list_snapshots())
+                .map(|snapshot| snapshot.id)
+                .collect();
+            let count = transfer_meta.len();
+            transfer_meta.retain(|id, meta| {
+                meta.tags = sanitize_transfer_tags(std::mem::take(&mut meta.tags));
+                live_ids.contains(id)
+            });
+            if count != transfer_meta.len() {
+                if let Err(error) = write_json_atomically(&meta_path, &transfer_meta) {
+                    tracing::warn!(%error, "could not prune transfer metadata");
+                }
+            }
+        }
         let (scans, scan_requests) = mpsc::channel(DEFENDER_SCAN_QUEUE_CAPACITY);
         let (media_finished, media_events) = mpsc::unbounded_channel();
         let ready = ui.has_main_window();
@@ -359,6 +670,8 @@ impl AppState {
             .unwrap_or_else(|| DEFAULT_BASE_KEY.to_owned());
         let state = Arc::new(Self {
             data_dir,
+            vault: Mutex::new(vault),
+            manage_startup,
             registry_base_key,
             resource_dir: options.resource_dir,
             allow_loopback: options.allow_loopback,
@@ -376,7 +689,10 @@ impl AppState {
             pending_downloads: Mutex::default(),
             pending_changed: Notify::new(),
             completion_options: Mutex::default(),
+            completion_alerts: broadcast::channel(128).0,
             settings: RwLock::new(settings),
+            transfer_meta: RwLock::new(transfer_meta),
+            logs: Arc::default(),
             dismissed_http: RwLock::new(dismissed_http),
             verified: RwLock::default(),
             operations: AsyncMutex::new(()),
@@ -388,14 +704,39 @@ impl AppState {
             torrent_changed: Notify::new(),
             torrent_previews: Mutex::default(),
             torrent_completions: Mutex::default(),
+            torrent_announced: Mutex::default(),
+            torrent_failures: Mutex::default(),
             torrent_completed_files: Mutex::default(),
             scans,
             stop,
             tasks: AsyncMutex::new(Some(Vec::new())),
             startup_update_checked: AtomicBool::new(false),
             quitting: AtomicBool::new(false),
+            automation_status: RwLock::default(),
+            automation_lock: AsyncMutex::new(()),
+            settings_revision: AtomicU64::new(0),
+            last_effective_limits: Mutex::default(),
+            schedule_torrent_paused_ids: Mutex::default(),
+            automation_stops_torrents: AtomicBool::new(false),
+            allow_power_actions: cfg!(not(test)) && options.allow_power_actions,
+            active_extractions: Arc::default(),
+            auto_paused_ids: Mutex::default(),
+            last_decision_paused: AtomicBool::new(false),
+            vpn_paused_torrents: Mutex::default(),
+            vpn_kill_switch_active: AtomicBool::new(false),
+            rss_matches_added: AtomicU64::new(0),
+            last_rss_poll: Mutex::default(),
+            rss_seen: AsyncMutex::new(rss_seen),
+            rss_client,
         });
+        let weak = Arc::downgrade(&state);
+        state
+            .engine
+            .set_site_authorization_provider(move |url| weak.upgrade()?.site_authorization(url));
+        state.sync_queues_to_engine(&state.settings().queues)?;
+        state.evaluate_and_apply_automation(0).await;
         let runtime = Arc::downgrade(&state);
+        let pipe_logs = state.logs.clone();
         let stopped = state.stop.subscribe();
         let tasks = vec![
             tokio::spawn(async move {
@@ -404,6 +745,12 @@ impl AppState {
                     .await
                 {
                     tracing::error!(%error, "named pipe server stopped");
+                    push_log(
+                        &pipe_logs,
+                        "error",
+                        "pipe",
+                        format!("Named pipe server stopped: {error}"),
+                    );
                 }
             }),
             local_picker_task,
@@ -428,6 +775,11 @@ impl AppState {
                 state.stop.subscribe(),
                 media_events,
             )),
+            tokio::spawn(run_automation_loop(
+                Arc::downgrade(&state),
+                state.stop.subscribe(),
+            )),
+            tokio::spawn(run_rss_loop(Arc::downgrade(&state), state.stop.subscribe())),
         ];
         *state.tasks.lock().await = Some(tasks);
         if let Some(source) = crate::take_initial_picker_source() {
@@ -481,10 +833,182 @@ impl AppState {
         self.settings.read().unwrap().clone()
     }
 
-    pub async fn save_settings(&self, mut settings: AppSettings) -> Result<()> {
+    pub fn log_event(&self, level: &str, category: &str, message: impl Into<String>) {
+        push_log(&self.logs, level, category, message.into());
+    }
+
+    pub fn get_logs(&self) -> Vec<LogEntry> {
+        self.logs.lock().unwrap().iter().cloned().collect()
+    }
+
+    pub fn clear_logs(&self) {
+        self.logs.lock().unwrap().clear();
+    }
+
+    pub async fn export_logs(&self, out_path: &str) -> Result<usize> {
+        let logs = self.get_logs();
+        let mut text = String::new();
+        for entry in &logs {
+            writeln!(
+                text,
+                "{} [{}] [{}] {}",
+                entry.timestamp.to_rfc3339(),
+                entry.level,
+                entry.category,
+                entry.message
+            )
+            .unwrap();
+        }
+        export_text(out_path, text).await?;
+        Ok(logs.len())
+    }
+
+    pub fn subscribe_completion_alerts(&self) -> broadcast::Receiver<CompletionAlert> {
+        self.completion_alerts.subscribe()
+    }
+
+    pub async fn save_settings(&self, settings: AppSettings) -> Result<()> {
         let _operation = self.operation().await?;
+        self.save_settings_locked(settings).await
+    }
+
+    pub(crate) async fn update_settings(&self, edit: impl FnOnce(&mut AppSettings)) -> Result<()> {
+        let _operation = self.operation().await?;
+        let mut settings = self.settings();
+        edit(&mut settings);
+        self.save_settings_locked(settings).await
+    }
+
+    pub async fn set_proxy_password(&self, password: Option<String>) -> Result<()> {
+        self.update_settings_with_proxy_password(Some(password), |_| {})
+            .await
+    }
+
+    pub(crate) async fn update_settings_with_proxy_password(
+        &self,
+        password: Option<Option<String>>,
+        edit: impl FnOnce(&mut AppSettings),
+    ) -> Result<()> {
+        let _operation = self.operation().await?;
+        let previous = self.settings();
+        let mut settings = previous.clone();
+        edit(&mut settings);
+        match password {
+            Some(password) => {
+                let previous_proxy = http_proxy_config(&self.vault.lock().unwrap(), &previous)?;
+                self.save_settings_with_vault(settings, Some(previous_proxy), |vault| {
+                    if let Some(password) = password {
+                        vault.set_secret(&self.data_dir, proxy_secret_key(), &password)
+                    } else {
+                        vault.delete_secret(&self.data_dir, proxy_secret_key())
+                    }
+                })
+                .await
+            }
+            None => self.save_settings_locked(settings).await,
+        }
+    }
+
+    pub async fn upsert_site_login(
+        &self,
+        mut entry: SiteLoginEntry,
+        password: Option<String>,
+    ) -> Result<()> {
+        let _operation = self.operation().await?;
+        entry.id = category_id(&entry.id);
+        if entry.id.is_empty() {
+            entry.id = Uuid::new_v4().to_string();
+        }
+        if password
+            .as_deref()
+            .is_some_and(|password| site_auth_header(&entry, password).is_none())
+        {
+            return Err("Invalid site login password or token".into());
+        }
+        let key = site_login_secret_key(&entry.id);
+        let mut settings = self.settings();
+        if let Some(existing) = settings
+            .site_logins
+            .iter_mut()
+            .find(|existing| existing.id == entry.id)
+        {
+            *existing = entry;
+        } else {
+            settings.site_logins.push(entry);
+        }
+        if let Some(password) = password {
+            self.save_settings_with_vault(settings, None, |vault| {
+                vault.set_secret(&self.data_dir, &key, &password)
+            })
+            .await
+        } else {
+            self.save_settings_locked(settings).await
+        }
+    }
+
+    pub async fn delete_site_login(&self, id: &str) -> Result<()> {
+        let _operation = self.operation().await?;
+        let id = category_id(id);
+        let mut settings = self.settings();
+        settings.site_logins.retain(|entry| entry.id != id);
+        self.save_settings_with_vault(settings, None, |vault| {
+            vault.delete_secret(&self.data_dir, &site_login_secret_key(&id))
+        })
+        .await
+    }
+
+    async fn save_settings_with_vault(
+        &self,
+        mut settings: AppSettings,
+        previous_proxy: Option<EngineProxyConfig>,
+        edit: impl FnOnce(&mut SecretVault) -> std::io::Result<()>,
+    ) -> Result<()> {
         normalize(&mut settings, &self.data_dir).map_err(message)?;
-        self.apply_settings(settings).await?;
+        let previous = {
+            let mut vault = self.vault.lock().unwrap();
+            let previous = vault.clone();
+            edit(&mut vault).map_err(message)?;
+            sync_secret_flags(&mut settings, &vault);
+            previous
+        };
+        let result = self
+            .save_normalized_settings(settings, previous_proxy)
+            .await;
+        if result.is_err() {
+            let mut vault = self.vault.lock().unwrap();
+            if let Err(error) = vault.restore(&self.data_dir, previous) {
+                tracing::warn!(%error, "could not restore local secret vault");
+            }
+        } else {
+            self.ui.emit_settings_changed();
+        }
+        result
+    }
+
+    async fn save_settings_locked(&self, mut settings: AppSettings) -> Result<()> {
+        normalize(&mut settings, &self.data_dir).map_err(message)?;
+        sync_secret_flags(&mut settings, &self.vault.lock().unwrap());
+        self.save_normalized_settings(settings, None).await
+    }
+
+    async fn save_normalized_settings(
+        &self,
+        settings: AppSettings,
+        previous_proxy: Option<EngineProxyConfig>,
+    ) -> Result<()> {
+        let startup = (settings.launch_on_startup, settings.launch_minimized);
+        self.apply_settings_with_proxy(settings, previous_proxy)
+            .await?;
+        if self.manage_startup {
+            if let Err(error) = crate::win32::set_launch_on_startup(startup.0, startup.1) {
+                tracing::warn!(%error, "could not update Windows startup settings");
+                self.log_event(
+                    "warn",
+                    "settings",
+                    format!("Windows startup update failed: {error}"),
+                );
+            }
+        }
         self.invalidate_toolchain_cache().await;
         Ok(())
     }
@@ -497,48 +1021,707 @@ impl AppState {
     pub async fn set_speed_limit(&self, limit_bps: Option<u64>) -> Result<()> {
         let _operation = self.operation().await?;
         let mut settings = self.settings();
-        settings.global_speed_limit_bps = limit_bps.filter(|&rate| rate != 0);
+        settings.global_speed_limit_bps = normalize_rate(limit_bps);
         self.apply_settings(settings).await
     }
 
     async fn apply_settings(&self, settings: AppSettings) -> Result<()> {
-        let mut torrent = self.torrent.write().await;
-        let new_base = Path::new(&settings.default_download_dir);
-        let replacement = if torrent.base != new_base && torrent.manager.list_snapshots().is_empty()
-        {
-            Some(TorrentSession::new(&self.torrent_config, &settings).await?)
+        self.apply_settings_with_proxy(settings, None).await
+    }
+
+    async fn apply_settings_with_proxy(
+        &self,
+        settings: AppSettings,
+        previous_proxy: Option<EngineProxyConfig>,
+    ) -> Result<()> {
+        let previous = self.settings();
+        let proxy_change = if previous_proxy.is_some() || settings.proxy != previous.proxy {
+            let vault = self.vault.lock().unwrap();
+            let rollback =
+                previous_proxy.map_or_else(|| http_proxy_config(&vault, &previous), Ok)?;
+            Some((http_proxy_config(&vault, &settings)?, rollback))
         } else {
             None
         };
-        if let Err(error) = write_json_atomically(&self.data_dir.join(SETTINGS_FILE), &settings) {
-            if let Some(session) = replacement {
-                session.manager.shutdown().await;
-            }
-            return Err(message(error));
+        let network = &settings.torrent_network;
+        let blocklist_changed = network.blocklist_path != previous.torrent_network.blocklist_path;
+        let mut torrent = self.torrent.write().await;
+        let previous_config = torrent.config.clone();
+        let previous_network = torrent.network.clone();
+        let needs_replacement = torrent.needs_reconfigure(&settings);
+        let replaced = needs_replacement && torrent.manager.list_snapshots().is_empty();
+        if replaced {
+            self.replace_torrent_session(&mut torrent, &settings, blocklist_changed)
+                .await?;
+        } else if blocklist_changed {
+            blocklist_url(network.blocklist_path.as_deref())?;
         }
-        self.engine
-            .set_global_speed_limit(settings.global_speed_limit_bps)
-            .await
-            .map_err(message)?;
+        let persist = (|| {
+            if let Some((proxy, _)) = &proxy_change {
+                self.engine
+                    .set_proxy_config(proxy.clone())
+                    .map_err(message)?;
+            }
+            self.persist_settings_and_queues(&settings)
+        })();
+        if let Err(error) = persist {
+            if let Some((_, rollback)) = proxy_change {
+                if let Err(error) = self.engine.set_proxy_config(rollback) {
+                    tracing::warn!(%error, "could not restore HTTP proxy configuration");
+                }
+            }
+            if replaced {
+                torrent
+                    .replace(previous_config, &previous_network)
+                    .await
+                    .map_err(|rollback| {
+                        format!("{error}. Could not restore torrent session: {rollback}")
+                    })?;
+            }
+            return Err(error);
+        }
         self.engine
             .set_max_concurrent_downloads(usize::from(settings.max_concurrent_downloads))
             .await
             .map_err(message)?;
-        if let Some(replacement) = replacement {
-            let previous = std::mem::replace(&mut *torrent, replacement);
-            previous.manager.shutdown().await;
-        } else {
-            torrent
-                .manager
-                .set_global_rate_limits(
-                    torrent_rate(settings.global_speed_limit_bps),
-                    self.torrent_config.global_upload_limit_bps,
-                )
-                .map_err(message)?;
+        if needs_replacement && !replaced {
+            self.log_event(
+                "info",
+                "torrent",
+                "Torrent session settings will apply when the torrent list is empty",
+            );
         }
+        drop(torrent);
         *self.settings.write().unwrap() = settings;
+        let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
+        self.evaluate_and_apply_automation(revision).await;
         let _ = self.media_finished.send(MediaJobEvent::QueueChanged(None));
+        self.log_event("info", "settings", "Settings updated");
         Ok(())
+    }
+
+    async fn replace_torrent_session(
+        &self,
+        torrent: &mut TorrentSession,
+        settings: &AppSettings,
+        strict_blocklist: bool,
+    ) -> Result<()> {
+        let mut config =
+            TorrentSession::configured(&self.torrent_config, settings, strict_blocklist)?;
+        if let Some((effective, _)) = *self.last_effective_limits.lock().unwrap() {
+            config.global_download_limit_bps = torrent_rate(effective);
+        }
+        torrent.replace(config, &settings.torrent_network).await
+    }
+
+    async fn refresh_torrent_session(&self, settings: &AppSettings) -> Result<()> {
+        let mut torrent = self.torrent.write().await;
+        if torrent.needs_reconfigure(settings) && torrent.manager.list_snapshots().is_empty() {
+            self.replace_torrent_session(&mut torrent, settings, false)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub fn automation_status(&self) -> AutomationStatus {
+        let mut status = self.automation_status.read().unwrap().clone();
+        status.rss_matches_added = self.rss_matches_added.load(Ordering::SeqCst);
+        status
+    }
+
+    pub async fn toggle_alt_speed(&self) -> Result<bool> {
+        let _operation = self.operation().await?;
+        let mut settings = self.settings();
+        settings.alt_speed_enabled = !settings.alt_speed_enabled;
+        let enabled = settings.alt_speed_enabled;
+        self.apply_settings(settings).await?;
+        self.log_event(
+            "info",
+            "automation",
+            if enabled {
+                "Snail / Alt Speed enabled"
+            } else {
+                "Snail / Alt Speed disabled"
+            },
+        );
+        Ok(enabled)
+    }
+
+    pub async fn set_transfers_queue(&self, ids: &[String], queue_id: &str) -> Result<usize> {
+        let _operation = self.operation().await?;
+        let settings = self.settings();
+        if !settings.queues.iter().any(|q| q.id == queue_id) {
+            return Err(format!("Unknown queue '{queue_id}'"));
+        }
+        if ids.is_empty() {
+            return Err("Select at least one HTTP transfer to assign to a queue".into());
+        }
+        let torrent = self.torrent.read().await;
+        for id in ids {
+            if self.http_snapshot(id).is_none() {
+                if self.media_job(id).is_some() || torrent.manager.snapshot(id).is_ok() {
+                    return Err(
+                        "Queue assignment supports HTTP transfers only. No transfers were moved."
+                            .into(),
+                    );
+                }
+                return Err(format!("Transfer '{id}' was not found"));
+            }
+        }
+        self.engine
+            .assign_queue_batch(ids, queue_id)
+            .map_err(message)
+    }
+
+    pub async fn start_queue(&self, queue_id: &str) -> Result<()> {
+        self.set_queue_paused(queue_id, false).await
+    }
+
+    pub async fn pause_queue(&self, queue_id: &str) -> Result<()> {
+        self.set_queue_paused(queue_id, true).await
+    }
+
+    async fn set_queue_paused(&self, queue_id: &str, paused: bool) -> Result<()> {
+        let _operation = self.operation().await?;
+        let mut settings = self.settings();
+        let queue = settings
+            .queues
+            .iter_mut()
+            .find(|q| q.id == queue_id)
+            .ok_or_else(|| format!("Unknown queue '{queue_id}'"))?;
+        queue.paused = paused;
+        self.persist_settings_and_queues(&settings)?;
+        *self.settings.write().unwrap() = settings;
+        self.settings_revision.fetch_add(1, Ordering::SeqCst);
+        self.log_event(
+            "info",
+            "queue",
+            format!(
+                "Queue {state} ({queue_id})",
+                state = if paused { "paused" } else { "resumed" }
+            ),
+        );
+        Ok(())
+    }
+
+    fn persist_settings_and_queues(&self, settings: &AppSettings) -> Result<()> {
+        let path = self.data_dir.join(SETTINGS_FILE);
+        let previous = self.settings();
+        write_json_atomically(&path, settings).map_err(message)?;
+        if let Err(error) = self.sync_queues_to_engine(&settings.queues) {
+            return match write_json_atomically(&path, &previous) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(format!(
+                    "{error}. Could not restore the previous settings file: {rollback}"
+                )),
+            };
+        }
+        Ok(())
+    }
+
+    pub async fn export_settings_backup(&self, path: &Path) -> Result<()> {
+        let _operation = self.operation().await?;
+        if path
+            .to_string_lossy()
+            .split(['/', '\\'])
+            .any(|part| matches!(part, "." | ".."))
+        {
+            return Err("Backup path must not contain traversal".into());
+        }
+        let target = local_drive_path(path).map_err(message)?;
+        let mut settings = self.settings();
+        settings.ytdlp_path = None;
+        settings.ffmpeg_path = None;
+        settings.proxy.has_password = false;
+        for entry in &mut settings.site_logins {
+            entry.has_password = false;
+        }
+        settings.cookie_passthrough.enabled = false;
+        settings.torrent_network.blocklist_path = None;
+        settings.torrent_network.socks5_proxy_url = settings
+            .torrent_network
+            .socks5_proxy_url
+            .as_deref()
+            .and_then(|raw| {
+                let mut url = Url::parse(raw).ok()?;
+                url.set_password(None).ok()?;
+                url.set_username("").ok()?;
+                Some(url.into())
+            });
+        let bundle = SettingsBackupBundle {
+            schema_version: 1,
+            exported_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            settings,
+        };
+        let payload = serde_json::to_vec(&bundle).map_err(message)?;
+        if payload.len() > MAX_BACKUP_BYTES {
+            return Err("Settings backup exceeds maximum size (2 MiB)".into());
+        }
+        tokio::task::spawn_blocking(move || {
+            let parent = target
+                .parent()
+                .ok_or("Backup requires a parent directory")?;
+            let name = target
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("Backup requires a filename")?;
+            validate_existing_ancestors(parent).map_err(message)?;
+            let parent = canonical_directory(parent).map_err(message)?;
+            if let Some(existing) = confined_target(&parent, name).map_err(message)? {
+                let meta = std::fs::symlink_metadata(&existing).map_err(message)?;
+                if reparse(&meta) || !meta.is_file() || existing.parent() != Some(parent.as_path())
+                {
+                    return Err("Backup destination must be a regular local file".into());
+                }
+            }
+            write_atomically(&parent.join(name), &payload).map_err(message)
+        })
+        .await
+        .map_err(message)?
+    }
+
+    pub async fn import_settings_backup(&self, path: &Path) -> Result<AppSettings> {
+        if path
+            .to_string_lossy()
+            .split(['/', '\\'])
+            .any(|part| matches!(part, "." | ".."))
+        {
+            return Err("Backup path must not contain traversal".into());
+        }
+        let clean = local_drive_path(path).map_err(message)?;
+        let mut settings = tokio::task::spawn_blocking(move || -> Result<AppSettings> {
+            let parent = clean
+                .parent()
+                .ok_or("Backup path requires a parent directory")?;
+            let canonical = canonical_directory(parent).map_err(message)?;
+            let expected = canonical.join(clean.file_name().ok_or("Backup requires a filename")?);
+            let file = open_local_file(&expected, false).map_err(message)?;
+            crate::paths::verify_handle_path(&file, &clean).map_err(message)?;
+            let mut bytes = Vec::new();
+            file.take((MAX_BACKUP_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .map_err(message)?;
+            if bytes.len() > MAX_BACKUP_BYTES {
+                return Err("Settings backup exceeds maximum size (2 MiB)".into());
+            }
+            let bundle: SettingsBackupBundle = serde_json::from_slice(&bytes).map_err(message)?;
+            if bundle.schema_version != 1 {
+                return Err(format!(
+                    "Unsupported backup schema version {}",
+                    bundle.schema_version
+                ));
+            }
+            Ok(bundle.settings)
+        })
+        .await
+        .map_err(message)??;
+        let _operation = self.operation().await?;
+        let current = self.settings();
+        settings.ytdlp_path = current.ytdlp_path;
+        settings.ffmpeg_path = current.ffmpeg_path;
+        settings.torrent_network.blocklist_path = current.torrent_network.blocklist_path;
+        settings.cookie_passthrough.enabled = false;
+        crate::settings::normalize_phase4_network_and_media(&mut settings).map_err(message)?;
+        {
+            let vault = self.vault.lock().unwrap();
+            if vault.has_secret(proxy_secret_key()) {
+                // A portable file cannot change the endpoint that receives a saved password.
+                settings.proxy.url = current.proxy.url;
+                settings.proxy.username = current.proxy.username;
+                if settings.proxy.url.is_none() && settings.proxy.mode == ProxyMode::Manual {
+                    settings.proxy.mode = current.proxy.mode;
+                }
+            }
+            for entry in &mut settings.site_logins {
+                if vault.has_secret(&site_login_secret_key(&entry.id))
+                    && !current.site_logins.iter().any(|local| {
+                        local.id == entry.id
+                            && local.host_pattern == entry.host_pattern
+                            && local.auth_scheme == entry.auth_scheme
+                            && local.username == entry.username
+                    })
+                {
+                    entry.id = Uuid::new_v4().to_string();
+                }
+            }
+        }
+        self.save_settings_locked(settings).await?;
+        Ok(self.settings())
+    }
+
+    fn sync_queues_to_engine(&self, queues: &[DownloadQueueSpec]) -> Result<()> {
+        let configs = queues
+            .iter()
+            .map(|spec| QueueConfig {
+                id: spec.id.clone(),
+                max_concurrent_downloads: spec.max_concurrent.max(1),
+                post_action: spec.post_action,
+                paused: spec.paused,
+                speed_limit_bps: spec.speed_limit_bps,
+            })
+            .collect();
+        self.engine.sync_queue_configs(configs).map_err(message)
+    }
+
+    // Callers serialize with transfer and settings operations so a manual
+    // pause cannot race with automation taking or releasing pause ownership.
+    async fn evaluate_and_apply_automation(&self, revision: u64) {
+        let _automation = self.automation_lock.lock().await;
+        if self.settings_revision.load(Ordering::SeqCst) != revision {
+            return;
+        }
+        let settings = self.settings();
+        let now = chrono::Local::now();
+        let minute_of_day = (now.hour() * 60 + now.minute()) as u16;
+        let (fullscreen_active, matched_proc) = if settings.bandwidth_guard.enabled {
+            let watched = settings.bandwidth_guard.watched_processes.clone();
+            tokio::task::spawn_blocking(move || {
+                (
+                    crate::win32::is_fullscreen_app_active(),
+                    crate::win32::find_running_watched_process(&watched),
+                )
+            })
+            .await
+            .unwrap_or((false, None))
+        } else {
+            (false, None)
+        };
+        let active_queue_actions = settings
+            .queues
+            .iter()
+            .filter(|q| q.post_action != PostQueueAction::None)
+            .count();
+        let mut decision = compute_effective_decision(
+            &settings,
+            minute_of_day,
+            now.weekday(),
+            fullscreen_active,
+            matched_proc.as_deref(),
+            active_queue_actions,
+        );
+
+        let network = &settings.torrent_network;
+        let effective = decision.status.effective_speed_limit_bps;
+        let upload = network.global_upload_limit_bps;
+        let last_effective = *self.last_effective_limits.lock().unwrap();
+        if last_effective != Some((effective, upload)) {
+            let http = self.engine.set_global_speed_limit(effective).await;
+            let mut session = self.torrent.write().await;
+            let torrent = session
+                .manager
+                .set_global_rate_limits(torrent_rate(effective), upload);
+            if torrent.is_ok() {
+                session.config.global_download_limit_bps = torrent_rate(effective);
+                session.config.global_upload_limit_bps = upload;
+            }
+            match (http, torrent) {
+                (Ok(()), Ok(())) => {
+                    *self.last_effective_limits.lock().unwrap() = Some((effective, upload));
+                }
+                (http, torrent) => {
+                    tracing::debug!(?http, ?torrent, "could not update effective speed limit")
+                }
+            }
+        }
+
+        let connected = vpn_adapter_connected(network.vpn_adapter_name.clone()).await;
+        let vpn_blocked = network.vpn_kill_switch_enabled && !connected;
+        if self
+            .vpn_kill_switch_active
+            .swap(vpn_blocked, Ordering::SeqCst)
+            != vpn_blocked
+        {
+            let event = if vpn_blocked {
+                VPN_TRAFFIC_BLOCKED
+            } else {
+                "VPN kill switch released its torrent traffic block"
+            };
+            self.log_event("info", "torrent", event);
+        }
+        decision.status.vpn_kill_switch_active = vpn_blocked;
+        decision.status.vpn_adapter_connected = connected;
+        decision
+            .status
+            .vpn_adapter_name
+            .clone_from(&network.vpn_adapter_name);
+        decision.status.rss_feeds_enabled = settings
+            .rss_feeds
+            .iter()
+            .filter(|rule| rule.enabled)
+            .count() as u32;
+
+        let pause_all = decision.should_pause_transfers;
+        self.last_decision_paused.store(pause_all, Ordering::SeqCst);
+        self.automation_stops_torrents
+            .store(decision.stop_torrents, Ordering::SeqCst);
+        self.engine.set_scheduling_paused(pause_all);
+        let mut snapshots = self.engine.snapshots();
+        snapshots.extend(
+            self.media
+                .read()
+                .unwrap()
+                .values()
+                .map(|job| job.snapshot()),
+        );
+        let manager = self.torrent.read().await.manager.clone();
+        snapshots.extend(manager.list_snapshots());
+        let live: HashSet<_> = snapshots
+            .iter()
+            .map(|snapshot| snapshot.id.as_str())
+            .collect();
+        for owners in [
+            &self.auto_paused_ids,
+            &self.schedule_torrent_paused_ids,
+            &self.vpn_paused_torrents,
+        ] {
+            owners
+                .lock()
+                .unwrap()
+                .retain(|id| live.contains(id.as_str()));
+        }
+
+        let mut paused = 0;
+        let mut resumed = 0;
+        for snapshot in snapshots {
+            let id = &snapshot.id;
+            let is_torrent = snapshot.kind == TransferKind::Torrent;
+            if is_torrent
+                && snapshot.status == TransferStatus::Seeding
+                && manager.stats(id).is_ok_and(|report| {
+                    seed_limit_reached(
+                        &settings.torrent_seeding,
+                        report.ratio,
+                        report.seeding_seconds,
+                    )
+                })
+                && manager.pause(id).await.is_ok()
+            {
+                self.clear_automation_pause(id);
+                self.log_event("info", "torrent", format!("Paused at seeding limit ({id})"));
+                continue;
+            }
+            let stop_torrent = decision.stop_torrents && is_torrent;
+            let vpn_pause = vpn_blocked && is_torrent;
+            if pause_all || stop_torrent || vpn_pause {
+                // Media queue dispatch is gated separately. Preserve queued jobs
+                // and playlist order while the running media job is stopped.
+                if (active(snapshot.status)
+                    || (snapshot.status == TransferStatus::Queued
+                        && snapshot.kind != TransferKind::Media))
+                    && self.pause_transfer_inner(id).await.is_ok()
+                {
+                    let owner = if vpn_pause {
+                        &self.vpn_paused_torrents
+                    } else if stop_torrent {
+                        &self.schedule_torrent_paused_ids
+                    } else {
+                        &self.auto_paused_ids
+                    };
+                    owner.lock().unwrap().insert(id.clone());
+                    paused += usize::from(!vpn_pause);
+                }
+            } else if self.automation_owns_pause(id)
+                && (snapshot.status != TransferStatus::Paused
+                    || self.resume_transfer_inner(id).await.is_ok())
+            {
+                self.clear_automation_pause(id);
+                resumed += usize::from(snapshot.status == TransferStatus::Paused);
+            }
+        }
+        if !pause_all {
+            let _ = self.media_finished.send(MediaJobEvent::QueueChanged(None));
+        }
+        if paused > 0 {
+            self.log_event(
+                "info",
+                "automation",
+                format!("Paused {paused} transfers by schedule or bandwidth guard"),
+            );
+        }
+        if resumed > 0 {
+            self.log_event(
+                "info",
+                "automation",
+                format!("Resumed {resumed} transfers after automation pause ended"),
+            );
+        }
+        *self.automation_status.write().unwrap() = decision.status;
+    }
+
+    async fn check_torrent_network(&self) -> Result<()> {
+        let network = self.settings.read().unwrap().torrent_network.clone();
+        if network.vpn_kill_switch_enabled
+            && (self.vpn_kill_switch_active.load(Ordering::SeqCst)
+                || !vpn_adapter_connected(network.vpn_adapter_name).await)
+        {
+            return Err(VPN_TRAFFIC_BLOCKED.into());
+        }
+        Ok(())
+    }
+
+    fn automation_owns_pause(&self, id: &str) -> bool {
+        self.auto_paused_ids.lock().unwrap().contains(id)
+            || self
+                .schedule_torrent_paused_ids
+                .lock()
+                .unwrap()
+                .contains(id)
+            || self.vpn_paused_torrents.lock().unwrap().contains(id)
+    }
+
+    fn clear_automation_pause(&self, id: &str) {
+        self.auto_paused_ids.lock().unwrap().remove(id);
+        self.schedule_torrent_paused_ids.lock().unwrap().remove(id);
+        self.vpn_paused_torrents.lock().unwrap().remove(id);
+    }
+
+    fn record_torrent_automation_pause(&self, id: &str) -> bool {
+        let owner = if self.automation_stops_torrents.load(Ordering::SeqCst) {
+            &self.schedule_torrent_paused_ids
+        } else if self.last_decision_paused.load(Ordering::SeqCst) {
+            &self.auto_paused_ids
+        } else {
+            return false;
+        };
+        owner.lock().unwrap().insert(id.to_owned());
+        true
+    }
+
+    fn maybe_auto_extract(&self, kind: TransferKind, candidate: PathBuf, id: &str) {
+        let mut settings = self.settings.read().unwrap().auto_extract.clone();
+        if !settings.enabled || !is_supported_archive(&candidate) {
+            return;
+        }
+        if kind == TransferKind::Torrent {
+            settings.delete_archive_after_extract = false;
+            // A different archive member may also be a file the torrent seeds.
+            settings.overwrite_existing = false;
+        }
+        let logs = self.logs.clone();
+        let id = id.to_owned();
+        let filename = candidate
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let http = (kind == TransferKind::Http).then(|| self.engine.clone());
+        self.active_extractions.fetch_add(1, Ordering::SeqCst);
+        let extraction = ActiveExtraction(self.active_extractions.clone());
+        tokio::spawn(async move {
+            let outputs = if let Some(engine) = http {
+                let guard = engine.lock_outputs().await;
+                if !engine.snapshot(&id).is_ok_and(|item| {
+                    item.status == TransferStatus::Completed && !item.output_superseded
+                }) {
+                    return;
+                }
+                Some(guard)
+            } else {
+                None
+            };
+            tokio::task::spawn_blocking(move || {
+                let _extraction = extraction;
+                match extract_archive_after_open(&candidate, &settings, || drop(outputs)) {
+                    Ok(summary) => push_log(
+                        &logs,
+                        "info",
+                        "extract",
+                        format!(
+                            "Extracted {} files from '{}' ({}) into {}",
+                            summary.files_extracted,
+                            filename,
+                            id,
+                            summary.destination_dir.display()
+                        ),
+                    ),
+                    Err(error) => push_log(
+                        &logs,
+                        "warn",
+                        "extract",
+                        format!("Auto-extract skipped for '{filename}': {error}"),
+                    ),
+                }
+            })
+            .await
+            .ok();
+        });
+    }
+
+    async fn on_queue_drained(&self, queue_id: &str) {
+        let Ok(_operation) = self.operation().await else {
+            return;
+        };
+        let Some(action) = self
+            .settings
+            .read()
+            .unwrap()
+            .queues
+            .iter()
+            .find(|q| q.id == queue_id)
+            .map(|q| q.post_action)
+        else {
+            return;
+        };
+        if action == PostQueueAction::None {
+            return;
+        }
+        self.log_event(
+            "info",
+            "queue",
+            format!("Queue '{queue_id}' drained (action: {action:?})"),
+        );
+        match action {
+            PostQueueAction::None => {}
+            PostQueueAction::Notify => {
+                if self.ui.supports_dialogs() {
+                    let _ = self.ui.show_main_window().await;
+                }
+            }
+            PostQueueAction::Sleep | PostQueueAction::Shutdown if self.allow_power_actions => {
+                let busy = |status| active(status) || status == TransferStatus::Queued;
+                if self.active_extractions.load(Ordering::SeqCst) > 0
+                    || self
+                        .engine
+                        .snapshots()
+                        .into_iter()
+                        .any(|item| busy(item.status))
+                    || self
+                        .media
+                        .read()
+                        .unwrap()
+                        .values()
+                        .any(|job| busy(job.status()))
+                    || self
+                        .torrent
+                        .read()
+                        .await
+                        .manager
+                        .list_snapshots()
+                        .into_iter()
+                        .any(|item| busy(item.status))
+                {
+                    self.log_event(
+                        "info",
+                        "queue",
+                        "Skipped power action because transfers or extractions remain active",
+                    );
+                    return;
+                }
+                if let Err(error) =
+                    tokio::task::spawn_blocking(move || crate::win32::execute_power_action(action))
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()))
+                {
+                    self.log_event(
+                        "warn",
+                        "queue",
+                        format!("Post-queue action failed: {error}"),
+                    );
+                }
+            }
+            PostQueueAction::Sleep | PostQueueAction::Shutdown => {}
+        }
     }
 
     pub async fn snapshot(&self) -> TelemetryBatch {
@@ -570,7 +1753,10 @@ impl AppState {
         batch.active_count = 0;
         batch.active_threads = 0;
         let playlists = self.playlists.lock().unwrap();
+        let settings = self.settings.read().unwrap();
+        let metadata = self.transfer_meta.read().unwrap();
         for transfer in &mut batch.transfers {
+            apply_transfer_metadata(transfer, &settings, &metadata);
             transfer.playlist_paused = transfer
                 .playlist_id
                 .as_ref()
@@ -617,6 +1803,229 @@ impl AppState {
         .await
     }
 
+    fn site_authorization(&self, url: &Url) -> Option<HeaderValue> {
+        if url.scheme() != "https" {
+            return None;
+        }
+        let host = url.host_str()?;
+        let settings = self.settings.read().unwrap();
+        let vault = self.vault.lock().unwrap();
+        settings
+            .site_logins
+            .iter()
+            .filter(|entry| {
+                entry.enabled
+                    && entry.has_password
+                    && host_pattern_matches(&entry.host_pattern, host)
+            })
+            .find_map(|entry| {
+                let secret = read_vault_secret(&vault, &site_login_secret_key(&entry.id))?;
+                site_auth_header(entry, &secret)
+            })
+    }
+
+    pub async fn parse_metalink_file(&self, path: &Path) -> Result<Vec<MetalinkFileEntry>> {
+        let path = path.to_path_buf();
+        let allow_loopback = self.allow_loopback;
+        tokio::task::spawn_blocking(move || {
+            crate::metalink::parse_metalink_file(&path, allow_loopback)
+        })
+        .await
+        .map_err(message)?
+    }
+
+    pub async fn enqueue_metalink_entries(
+        &self,
+        entries: Vec<MetalinkFileEntry>,
+        save_dir: Option<String>,
+        queue_id: Option<String>,
+    ) -> Result<Vec<String>> {
+        let mut ids = Vec::new();
+        for entry in entries {
+            let mut seen = HashSet::new();
+            let filtered_mirrors: Vec<url::Url> = entry
+                .mirrors
+                .iter()
+                .filter_map(|raw| {
+                    let mut url = rss::checked_url(raw, self.allow_loopback).ok()?;
+                    url.set_fragment(None);
+                    seen.insert(url.clone()).then_some(url)
+                })
+                .collect();
+            let mirrors = stream::iter(filtered_mirrors)
+                .map(|url| async move {
+                    rss::check_http_host(&url, self.allow_loopback).await.ok()?;
+                    Some(String::from(url))
+                })
+                .buffered(8)
+                .filter_map(std::future::ready)
+                .take(9)
+                .collect::<Vec<_>>()
+                .await;
+            let mut mirrors = mirrors.into_iter();
+            let Some(url) = mirrors.next() else { continue };
+            let id = self
+                .add_http_download(AddHttpDownloadRequest {
+                    url,
+                    filename: Some(entry.filename.clone()),
+                    save_dir: save_dir.clone(),
+                    queue_id: queue_id.clone(),
+                    expected_sha256: entry.sha256,
+                    expected_size_bytes: entry.size_bytes,
+                    mirror_urls: mirrors.collect(),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Queued {} Metalink files before {} failed: {error}",
+                        ids.len(),
+                        entry.filename
+                    )
+                })?;
+            ids.push(id);
+        }
+        if ids.is_empty() {
+            return Err("Metalink contains no files with usable HTTP mirrors".into());
+        }
+        Ok(ids)
+    }
+
+    pub async fn grab_site_urls(&self, request: SiteGrabRequest) -> Result<SiteGrabResult> {
+        tokio::select! {
+            _ = stopped_signal(self.stop.subscribe()) => Err("SlipStream is shutting down".into()),
+            result = crate::grabber::grab_site(&self.rss_client, &request, self.allow_loopback) => result,
+        }
+    }
+
+    pub async fn add_batch_urls(
+        &self,
+        raw_text: &str,
+        save_dir: Option<String>,
+        category_id: Option<String>,
+        start_paused: bool,
+    ) -> Result<BatchAddSummary> {
+        self.validate_transfer_category(category_id.as_deref())?;
+        let save_dir = save_dir.filter(|path| !path.trim().is_empty()).or_else(|| {
+            category_id.as_deref().map(|id| {
+                resolve_category_dir(&self.settings(), id)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        });
+        let mut summary = BatchAddSummary::default();
+        let mut seen = HashSet::new();
+        let mut added = Vec::new();
+        let mut reported_cap = false;
+        for (line, raw) in batch_url_lines(raw_text) {
+            let magnet = is_magnet_source(raw);
+            let url = if magnet {
+                validate_magnet_uri(raw)
+                    .map_err(message)
+                    .and_then(|_| Url::parse(raw).map_err(message))
+            } else {
+                validate_media_url(raw, self.allow_loopback)
+            };
+            let url = match url {
+                Ok(mut url) => {
+                    url.set_fragment(None);
+                    String::from(url)
+                }
+                Err(error) => {
+                    summary.skip_with_error(line, &error);
+                    continue;
+                }
+            };
+            if seen.contains(&url) {
+                summary.skipped += 1;
+                continue;
+            }
+            if seen.len() == MAX_IMPORT_URLS {
+                if reported_cap {
+                    summary.skipped += 1;
+                } else {
+                    summary.skip_with_error(line, "Batch import is limited to 500 URLs");
+                    reported_cap = true;
+                }
+                continue;
+            }
+            seen.insert(url.clone());
+            let result = if magnet {
+                self.add_torrent_with_preview(
+                    AddTorrentRequest {
+                        source: url,
+                        save_dir: save_dir.clone(),
+                        selected_file_indices: None,
+                        sequential: false,
+                        start_paused,
+                    },
+                    None,
+                )
+                .await
+            } else {
+                self.add_http_download(AddHttpDownloadRequest {
+                    url,
+                    filename: None,
+                    save_dir: save_dir.clone(),
+                    max_connections: None,
+                    queue_id: None,
+                    headers: HashMap::new(),
+                    referrer: None,
+                    expected_sha256: None,
+                    expected_size_bytes: None,
+                    start_paused,
+                    overwrite_existing: false,
+                    ..AddHttpDownloadRequest::default()
+                })
+                .await
+            };
+            match result {
+                Ok(id) => added.push(id),
+                Err(error) => summary.skip_with_error(line, &error),
+            }
+        }
+        summary.added = added.len();
+        self.log_event(
+            "info",
+            "batch",
+            format!(
+                "Batch import: {} added, {} skipped",
+                summary.added, summary.skipped
+            ),
+        );
+        if category_id.is_some() && !added.is_empty() {
+            self.set_transfers_category(&added, category_id)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Imported {} transfers but could not save their category: {error}",
+                        summary.added
+                    )
+                })?;
+        }
+        Ok(summary)
+    }
+
+    pub async fn export_transfer_urls(&self, ids: &[String], out_path: &str) -> Result<usize> {
+        let mut seen = HashSet::new();
+        let mut text = String::new();
+        for id in unique_ids(ids) {
+            let Ok(snapshot) = self.transfer_snapshot(id).await else {
+                continue;
+            };
+            let source = snapshot.source_url.trim();
+            if !source.chars().any(char::is_control)
+                && Url::parse(source)
+                    .is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "magnet"))
+                && seen.insert(source.to_owned())
+            {
+                writeln!(text, "{source}").unwrap();
+            }
+        }
+        export_text(out_path, text).await?;
+        Ok(seen.len())
+    }
+
     async fn enqueue_http(
         &self,
         mut scrubbed: ScrubbedRequest,
@@ -636,6 +2045,22 @@ impl AppState {
             .max_connections
             .get_or_insert(settings.default_connections);
         let start_paused = request.start_paused || options.start_paused;
+        if !start_paused
+            && (settings.auto_discover_checksums || request.auto_discover_checksum)
+            && request.expected_sha256.is_none()
+        {
+            request.expected_sha256 = tokio::time::timeout(
+                Duration::from_secs(3),
+                crate::checksum_discovery::discover_sha256(
+                    &self.rss_client,
+                    &request.url,
+                    self.allow_loopback,
+                ),
+            )
+            .await
+            .ok()
+            .flatten();
+        }
         let id = self
             .engine
             .add_http_download_with_options(
@@ -644,6 +2069,7 @@ impl AppState {
             )
             .await
             .map_err(message)?;
+        self.log_event("info", "http", format!("Download added ({id})"));
         if !start_paused {
             self.open_progress_if_enabled(&id, settings);
         }
@@ -790,6 +2216,15 @@ impl AppState {
             .await?;
         drop(self.take_pending_download(pending_id)?);
         self.ui.close_confirm_dialog(pending_id);
+        if let Err(error) = self.update_transfer_meta(std::slice::from_ref(&id), |meta| {
+            meta.category_id = Some(confirmation.category_id.clone());
+        }) {
+            self.log_event(
+                "warn",
+                "metadata",
+                format!("Could not save the download category: {error}"),
+            );
+        }
         if confirmation.remember_category_path {
             settings.categories[category].save_dir = Some(directory);
             if let Err(error) = self.persist_categories(&settings) {
@@ -826,6 +2261,7 @@ impl AppState {
             ) {
                 self.engine.resume_transfer(&id).await.map_err(message)?;
                 self.verified.write().unwrap().remove(&id);
+                self.log_event("info", "http", format!("Transfer resumed ({id})"));
             }
             self.ui.open_progress_dialog(&id)?;
         }
@@ -840,6 +2276,7 @@ impl AppState {
             .categories
             .clone_from(&settings.categories);
         self.ui.emit_settings_changed();
+        self.log_event("info", "settings", "Download categories updated");
         Ok(())
     }
 
@@ -873,6 +2310,73 @@ impl AppState {
         Ok(settings.categories.pop().expect("new download category"))
     }
 
+    fn update_transfer_meta(
+        &self,
+        ids: &[String],
+        update: impl Fn(&mut TransferMetadata),
+    ) -> Result<()> {
+        let mut current = self.transfer_meta.write().unwrap();
+        let mut next = current.clone();
+        for id in ids {
+            let entry = next.entry(id.clone()).or_default();
+            update(entry);
+            if entry.category_id.is_none() && entry.tags.is_empty() {
+                next.remove(id);
+            }
+        }
+        if next != *current {
+            write_json_atomically(&self.data_dir.join(TRANSFER_META_FILE), &next)
+                .map_err(message)?;
+            *current = next;
+        }
+        Ok(())
+    }
+
+    async fn existing_transfer_ids(&self, ids: &[String]) -> Vec<String> {
+        let mut existing = Vec::new();
+        for id in unique_ids(ids) {
+            if self.transfer_snapshot(id).await.is_ok() {
+                existing.push(id.clone());
+            }
+        }
+        existing
+    }
+
+    fn validate_transfer_category(&self, category_id: Option<&str>) -> Result<()> {
+        if category_id.is_some_and(|id| {
+            !self
+                .settings
+                .read()
+                .unwrap()
+                .categories
+                .iter()
+                .any(|category| category.id == id)
+        }) {
+            return Err("Download category not found.".into());
+        }
+        Ok(())
+    }
+
+    pub async fn set_transfers_category(
+        &self,
+        ids: &[String],
+        category_id: Option<String>,
+    ) -> Result<usize> {
+        let _operation = self.operation().await?;
+        self.validate_transfer_category(category_id.as_deref())?;
+        let existing = self.existing_transfer_ids(ids).await;
+        self.update_transfer_meta(&existing, |meta| meta.category_id.clone_from(&category_id))?;
+        Ok(existing.len())
+    }
+
+    pub async fn set_transfers_tags(&self, ids: &[String], tags: Vec<String>) -> Result<usize> {
+        let _operation = self.operation().await?;
+        let tags = sanitize_transfer_tags(tags);
+        let existing = self.existing_transfer_ids(ids).await;
+        self.update_transfer_meta(&existing, |meta| meta.tags.clone_from(&tags))?;
+        Ok(existing.len())
+    }
+
     pub async fn set_transfer_speed_limit(&self, id: &str, limit_bps: Option<u64>) -> Result<()> {
         let operation = self.operation().await?;
         if self.http_snapshot(id).is_some() {
@@ -885,13 +2389,19 @@ impl AppState {
         let manager = self.torrent.read().await.manager.clone();
         drop(operation);
         manager
-            .set_torrent_rate_limits(id, limit_bps, None)
+            .set_torrent_download_limit(id, limit_bps)
             .await
             .map_err(message)
     }
 
     pub async fn get_transfer_snapshot(&self, id: &str) -> Result<TransferSnapshot> {
-        self.transfer_snapshot(id).await
+        let mut snapshot = self.transfer_snapshot(id).await?;
+        apply_transfer_metadata(
+            &mut snapshot,
+            &self.settings.read().unwrap(),
+            &self.transfer_meta.read().unwrap(),
+        );
+        Ok(snapshot)
     }
 
     async fn transfer_snapshot(&self, id: &str) -> Result<TransferSnapshot> {
@@ -958,10 +2468,35 @@ impl AppState {
         }
     }
 
-    async fn on_transfer_completed(&self, id: &str) {
+    fn announce_completion(&self, snapshot: &TransferSnapshot) {
+        self.log_event(
+            "info",
+            "transfer",
+            format!("Download completed ({})", snapshot.id),
+        );
+        let _ = self.completion_alerts.send(CompletionAlert {
+            transfer_id: snapshot.id.clone(),
+            title: snapshot.filename.clone(),
+            filename: snapshot.filename.clone(),
+            save_dir: snapshot.save_dir.clone(),
+            kind: snapshot.kind,
+        });
+    }
+
+    async fn on_transfer_completed(&self, snapshot: &TransferSnapshot) {
+        self.announce_completion(snapshot);
+        if snapshot.kind == TransferKind::Http && !snapshot.output_superseded {
+            if let Ok(path) = slipstream_protocol::safe_join_under(
+                Path::new(&snapshot.save_dir),
+                &snapshot.filename,
+            ) {
+                self.maybe_auto_extract(snapshot.kind, path, &snapshot.id);
+            }
+        }
         if !self.ui.supports_dialogs() {
             return;
         }
+        let id = &snapshot.id;
         let options = self.completion_options(id);
         if options.auto_close_progress {
             self.ui.close_progress_dialog(id);
@@ -1000,7 +2535,9 @@ impl AppState {
         playlist: Option<bool>,
         headers: &HashMap<String, String>,
     ) -> Result<MediaProbeResult> {
-        let url = validate_media_url(url, self.allow_loopback)?;
+        let url = validate_media_url(url, self.allow_loopback).inspect_err(|_| {
+            self.log_event("warn", "media", "Media probe rejected the URL");
+        })?;
         let playlist = playlist.unwrap_or_else(|| is_pure_playlist_url(&url));
         let key = ProbeKey::from_probe_headers(url.as_str(), playlist, headers);
         Ok((*self.probe_media_shared(key).await?).clone())
@@ -1029,24 +2566,34 @@ impl AppState {
                 let toolchain_cache = self.toolchain_cache.clone();
                 let probe_cache = self.probe_cache.clone();
                 let probe_permits = self.probe_permits.clone();
+                let logs = self.logs.clone();
                 let settings = self.settings();
                 let resource_dir = self.resource_dir.clone();
+                let vault = self.vault.lock().unwrap().clone();
                 let cache_dir = self.ytdlp_cache_path();
                 let allow_loopback = self.allow_loopback;
                 // Own the probe independently of the first caller's lifetime.
                 tokio::spawn(async move {
+                    push_log(&logs, "info", "media", "Media probe started".into());
                     let result = tokio::select! {
                         biased;
                         _ = stopped_signal(stopped) => Err("SlipStream is shutting down".into()),
                         result = async {
                             let _permit = probe_permits.acquire().await.map_err(message)?;
-                            run_media_probe(&toolchain_cache, settings, resource_dir, &key.url, allow_loopback, ProbeOptions {
+                            let url = validate_media_url(&key.url, allow_loopback)?;
+                            let (proxy, cookies_from_browser) = media_network_options(&settings, &vault, &url)?;
+                            run_media_probe(&toolchain_cache, settings, resource_dir, url, allow_loopback, ProbeOptions {
                                 playlist: key.playlist,
                                 cache_dir: Some(cache_dir),
                                 headers: key.headers.iter().cloned().collect(),
+                                proxy,
+                                cookies_from_browser,
                             }).await
                         } => result.map(Arc::new),
                     };
+                    if result.is_err() {
+                        push_log(&logs, "warn", "media", "Media probe failed".into());
+                    }
                     let mut cache = probe_cache.lock().unwrap();
                     if cache
                         .in_flight
@@ -1118,8 +2665,10 @@ impl AppState {
         self.media.write().unwrap().insert(id.clone(), job.clone());
         if let Err(error) = self.start_media_job(&job, None).await {
             self.media.write().unwrap().remove(&id);
+            self.log_event("error", "media", format!("Download failed to start ({id})"));
             return Err(error);
         }
+        self.log_event("info", "media", format!("Download added ({id})"));
         self.open_progress_if_enabled(&id, &settings);
         Ok(id)
     }
@@ -1330,7 +2879,19 @@ impl AppState {
             for id in playlist.job_ids {
                 media.remove(&id);
             }
+            self.log_event(
+                "error",
+                "media",
+                format!("Playlist failed to start ({playlist_id})"),
+            );
             return Err(error);
+        }
+        for job in &jobs {
+            self.log_event(
+                "info",
+                "media",
+                format!("Download added ({})", job.snapshot().id),
+            );
         }
         Ok(first_id)
     }
@@ -1363,7 +2924,10 @@ impl AppState {
             if queue.iter().any(|(queued, _)| Arc::ptr_eq(queued, job)) {
                 return Ok(());
             }
-            if !queue.is_empty() || !self.media_slot_available() {
+            if self.last_decision_paused.load(Ordering::SeqCst)
+                || !queue.is_empty()
+                || !self.media_slot_available()
+            {
                 job.queue_for_start()?;
                 queue.push_back((job.clone(), pre_probe));
                 let _ = self.media_finished.send(MediaJobEvent::QueueChanged(None));
@@ -1374,14 +2938,20 @@ impl AppState {
     }
 
     async fn drain_media_queue(&self) {
-        while self.media_slot_available() {
+        while !self.last_decision_paused.load(Ordering::SeqCst) && self.media_slot_available() {
             let next = self.media_queue.lock().unwrap().pop_front();
             let Some((job, pre_probe)) = next else { return };
             if let Err(error) = self.launch_media_job(&job, pre_probe).await {
                 job.fail_queued_start(error);
+                let snapshot = job.snapshot();
+                self.log_event(
+                    "error",
+                    "media",
+                    format!("Download failed to start ({})", snapshot.id),
+                );
                 let _ = self
                     .media_finished
-                    .send(MediaJobEvent::QueueChanged(job.snapshot().playlist_id));
+                    .send(MediaJobEvent::QueueChanged(snapshot.playlist_id));
             }
         }
     }
@@ -1397,14 +2967,26 @@ impl AppState {
         let pre_probe = pre_probe.or_else(|| self.probe_cache.lock().unwrap().get(&key));
         let url = validate_media_url(&request.url, self.allow_loopback)?;
         ensure_public_media_host(&url, self.allow_loopback).await?;
+        let settings = self.settings();
+        let (proxy, cookies_from_browser) =
+            media_network_options(&settings, &self.vault.lock().unwrap(), &url)?;
+        let power = settings.media_power.clone();
         job.start(MediaJobRunOptions {
-            settings: self.settings(),
+            settings,
             resource_dir: self.resource_dir.clone(),
             toolchain_cache: self.toolchain_cache.clone(),
             download: DownloadOptions {
                 playlist,
                 pre_probe: pre_probe.map(|probe| (*probe).clone()),
                 cache_dir: Some(self.ytdlp_cache_path()),
+                proxy,
+                cookies_from_browser,
+                sponsorblock_remove: power.sponsorblock_remove,
+                embed_chapters: power.embed_chapters,
+                split_chapters: power.split_chapters,
+                embed_thumbnail: power.embed_thumbnail,
+                embed_metadata: power.embed_metadata,
+                filename_template: power.filename_template,
                 ..DownloadOptions::default()
             },
             scans: self.scans.clone(),
@@ -1419,6 +3001,14 @@ impl AppState {
         save_dir: Option<&str>,
         cancel: CancellationToken,
     ) -> Result<TorrentPreviewResult> {
+        if source
+            .trim()
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("magnet:"))
+        {
+            self.check_torrent_network().await?;
+        }
+        self.log_event("info", "torrent", "Torrent preview started");
         let settings = self.settings();
         let source = source.trim();
         let (manager, save_dir) = {
@@ -1434,6 +3024,7 @@ impl AppState {
         let (mut preview, bytes) = manager
             .preview_source(source, save_dir.as_deref(), cancel)
             .await
+            .inspect_err(|_| self.log_event("warn", "torrent", "Torrent preview failed"))
             .map_err(message)?;
         if let Some(bytes) = bytes {
             let token = Uuid::new_v4().to_string();
@@ -1453,6 +3044,7 @@ impl AppState {
             previews.insert(token.clone(), (now, bytes, torrent_source_key(source)));
             preview.preview_token = Some(token);
         }
+        self.log_event("info", "torrent", "Torrent preview ready");
         Ok(preview)
     }
 
@@ -1466,7 +3058,7 @@ impl AppState {
         preview_token: Option<String>,
     ) -> Result<String> {
         let _operation = self.operation().await?;
-        let settings = self.settings();
+        self.check_torrent_network().await?;
         request.source = request.source.trim().to_owned();
         let bytes = if let Some(token) = preview_token {
             let mut previews = self.torrent_previews.lock().unwrap();
@@ -1487,16 +3079,17 @@ impl AppState {
         } else {
             None
         };
-        {
-            let mut torrent = self.torrent.write().await;
-            if torrent.base != Path::new(&settings.default_download_dir)
-                && torrent.manager.list_snapshots().is_empty()
-            {
-                let replacement = TorrentSession::new(&self.torrent_config, &settings).await?;
-                let previous = std::mem::replace(&mut *torrent, replacement);
-                previous.manager.shutdown().await;
-            }
-        }
+        self.add_torrent_locked(request, bytes).await
+    }
+
+    async fn add_torrent_locked(
+        &self,
+        mut request: AddTorrentRequest,
+        bytes: Option<Bytes>,
+    ) -> Result<String> {
+        let settings = self.settings();
+        self.refresh_torrent_session(&settings).await?;
+        self.check_torrent_network().await?;
         let torrent = self.torrent.read().await;
         let requested = request
             .save_dir
@@ -1505,6 +3098,10 @@ impl AppState {
         request.save_dir = torrent
             .save_dir_override(Path::new(requested))
             .map(|path| path.to_string_lossy().into_owned());
+        let pause_by_automation = !request.start_paused
+            && (self.automation_stops_torrents.load(Ordering::SeqCst)
+                || self.last_decision_paused.load(Ordering::SeqCst));
+        request.start_paused |= pause_by_automation;
         let start_paused = request.start_paused;
         let id = match bytes {
             Some(bytes) => {
@@ -1526,8 +3123,12 @@ impl AppState {
             None => torrent.manager.add_torrent(request).await,
         };
         let id = id.map_err(message)?;
+        if pause_by_automation {
+            self.record_torrent_automation_pause(&id);
+        }
         self.torrent_completions.lock().unwrap().insert(id.clone());
         self.torrent_changed.notify_one();
+        self.log_event("info", "torrent", format!("Download added ({id})"));
         if !start_paused {
             self.open_progress_if_enabled(&id, &settings);
         }
@@ -1566,15 +3167,279 @@ impl AppState {
         Ok(())
     }
 
+    pub async fn force_recheck_torrent(&self, id: &str) -> Result<()> {
+        let _operation = self.operation().await?;
+        self.check_torrent_network().await?;
+        self.torrent
+            .read()
+            .await
+            .manager
+            .force_recheck(id)
+            .await
+            .map_err(message)?;
+        self.verified.write().unwrap().remove(id);
+        self.torrent_completions
+            .lock()
+            .unwrap()
+            .insert(id.to_owned());
+        self.torrent_changed.notify_one();
+        Ok(())
+    }
+
+    pub async fn move_torrent_storage(&self, id: &str, new_dir: &Path) -> Result<()> {
+        let _operation = self.operation().await?;
+        self.check_torrent_network().await?;
+        self.torrent
+            .read()
+            .await
+            .manager
+            .move_storage(id, new_dir)
+            .await
+            .map_err(message)?;
+        self.verified.write().unwrap().remove(id);
+        self.torrent_completed_files.lock().unwrap().remove(id);
+        self.torrent_changed.notify_one();
+        Ok(())
+    }
+
+    pub async fn add_torrent_trackers(&self, id: &str, urls: Vec<String>) -> Result<()> {
+        let _operation = self.operation().await?;
+        self.check_torrent_network().await?;
+        self.torrent
+            .read()
+            .await
+            .manager
+            .add_trackers(id, urls)
+            .await
+            .map_err(message)
+    }
+
+    pub async fn reannounce_torrent(&self, id: &str) -> Result<()> {
+        let _operation = self.operation().await?;
+        self.check_torrent_network().await?;
+        self.torrent
+            .read()
+            .await
+            .manager
+            .reannounce(id)
+            .await
+            .map_err(message)
+    }
+
+    pub async fn set_torrent_upload_limit(&self, id: &str, up_bps: Option<u64>) -> Result<()> {
+        let _operation = self.operation().await?;
+        self.torrent
+            .read()
+            .await
+            .manager
+            .set_torrent_upload_limit(id, up_bps)
+            .await
+            .map_err(message)
+    }
+
+    pub(crate) async fn torrent_upload_limit(&self, id: &str) -> Result<Option<u64>> {
+        self.torrent
+            .read()
+            .await
+            .manager
+            .torrent_upload_limit(id)
+            .map_err(message)
+    }
+
+    pub async fn create_torrent_file(
+        &self,
+        req: CreateTorrentRequest,
+    ) -> Result<CreateTorrentResult> {
+        drop(self.operation().await?);
+        tokio::task::spawn_blocking(move || slipstream_torrent::create_v1_torrent(&req))
+            .await
+            .map_err(message)?
+            .map_err(message)
+    }
+
+    pub async fn list_network_adapters(&self) -> Vec<String> {
+        tokio::task::spawn_blocking(crate::win32::list_active_network_adapters)
+            .await
+            .unwrap_or_default()
+    }
+
+    pub async fn poll_rss_feeds_now(&self) -> Result<usize> {
+        self.poll_rss_feeds(true).await
+    }
+
+    async fn poll_rss_feeds(&self, force: bool) -> Result<usize> {
+        let mut seen = self.rss_seen.lock().await;
+        let now = Utc::now();
+        let rules: Vec<_> = {
+            let settings = self.settings();
+            let mut last_poll = self.last_rss_poll.lock().unwrap();
+            last_poll.retain(|id, _| settings.rss_feeds.iter().any(|rule| &rule.id == id));
+            settings
+                .rss_feeds
+                .into_iter()
+                .filter(|rule| {
+                    rule.enabled
+                        && (force
+                            || last_poll
+                                .get(&rule.id)
+                                .copied()
+                                .or(rule.last_checked_at)
+                                .is_none_or(|last| {
+                                    now < last
+                                        || now - last
+                                            >= chrono::Duration::minutes(i64::from(
+                                                rule.poll_interval_minutes,
+                                            ))
+                                }))
+                })
+                .collect()
+        };
+        if force || !rules.is_empty() {
+            self.check_torrent_network().await?;
+        }
+        let mut added = 0;
+        for rule in rules {
+            self.check_torrent_network().await?;
+            let poll_started = Utc::now();
+            let stopped = stopped_signal(self.stop.subscribe());
+            let fetched = tokio::select! {
+                biased;
+                () = stopped => return Ok(added),
+                result = rss::fetch_feed_items(&self.rss_client, &rule.feed_url, self.allow_loopback) => result,
+            };
+            let mut error = None;
+            match fetched {
+                Ok(items) => {
+                    for item in items {
+                        if seen.contains(&rule.id, &item.item_key)
+                            || !rss::wildcard_matches(&rule.include_pattern, &item.title)
+                            || (!rule.exclude_pattern.is_empty()
+                                && rss::wildcard_matches(&rule.exclude_pattern, &item.title))
+                        {
+                            continue;
+                        }
+                        match self.add_rss_item(&rule, &item.torrent_or_magnet_url).await {
+                            Ok(true) => {
+                                seen.mark_seen(&rule.id, &item.item_key);
+                                self.rss_matches_added.fetch_add(1, Ordering::SeqCst);
+                                added += 1;
+                            }
+                            Ok(false) => break,
+                            Err(reason) if reason == VPN_TRAFFIC_BLOCKED => {
+                                error = Some(reason);
+                                break;
+                            }
+                            Err(reason) => {
+                                error.get_or_insert(reason);
+                            }
+                        }
+                    }
+                }
+                Err(reason) => error = Some(reason),
+            }
+            seen.save(&self.data_dir).map_err(message)?;
+            self.finish_rss_poll(&rule, poll_started, error.as_deref())
+                .await?;
+            if error.as_deref() == Some(VPN_TRAFFIC_BLOCKED) {
+                return Err(VPN_TRAFFIC_BLOCKED.into());
+            }
+        }
+        Ok(added)
+    }
+
+    async fn add_rss_item(&self, rule: &RssFeedRule, source: &str) -> Result<bool> {
+        self.check_torrent_network().await?;
+        let staged = if source.starts_with("magnet:") {
+            None
+        } else {
+            tokio::select! {
+                biased;
+                () = stopped_signal(self.stop.subscribe()) => return Ok(false),
+                result = rss::stage_torrent(&self.rss_client, source, &self.data_dir, self.allow_loopback) => Some(result?),
+            }
+        };
+        let _operation = self.operation().await?;
+        let settings = self.settings();
+        if !settings.rss_feeds.iter().any(|current| current == rule) {
+            return Ok(false);
+        }
+        let save_dir = if let Some(raw) = &rule.save_dir {
+            let base =
+                local_drive_path(Path::new(&settings.default_download_dir)).map_err(message)?;
+            let target = local_drive_path(Path::new(raw)).map_err(message)?;
+            if !target.starts_with(base) {
+                return Err(
+                    "RSS save directory must be inside the default download directory".into(),
+                );
+            }
+            validate_existing_ancestors(&target).map_err(message)?;
+            Some(target.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+        self.add_torrent_locked(
+            AddTorrentRequest {
+                source: source.to_owned(),
+                save_dir,
+                selected_file_indices: None,
+                sequential: false,
+                start_paused: !rule.auto_start,
+            },
+            staged,
+        )
+        .await?;
+        Ok(true)
+    }
+
+    async fn finish_rss_poll(
+        &self,
+        rule: &RssFeedRule,
+        checked_at: DateTime<Utc>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let _operation = self.operation().await?;
+        let mut settings = self.settings();
+        let Some(current) = settings
+            .rss_feeds
+            .iter_mut()
+            .find(|current| *current == rule)
+        else {
+            return Ok(());
+        };
+        current.last_checked_at = Some(checked_at);
+        current.last_error = error.map(|reason| log_text(reason, 512));
+        write_json_atomically(&self.data_dir.join(SETTINGS_FILE), &settings).map_err(message)?;
+        *self.settings.write().unwrap() = settings;
+        self.last_rss_poll
+            .lock()
+            .unwrap()
+            .insert(rule.id.clone(), checked_at);
+        self.ui.emit_settings_changed();
+        if let Some(error) = error {
+            self.log_event(
+                "warn",
+                "rss",
+                format!("Feed '{}' reported an error: {error}", rule.name),
+            );
+        }
+        Ok(())
+    }
+
     pub async fn pause_transfer(&self, id: &str) -> Result<()> {
         let _operation = self.operation().await?;
+        self.pause_transfer_inner(id).await?;
+        self.clear_automation_pause(id);
+        self.log_event("info", "transfer", format!("Transfer paused ({id})"));
+        Ok(())
+    }
+
+    async fn pause_transfer_inner(&self, id: &str) -> Result<()> {
         if self.http_snapshot(id).is_some() {
-            self.engine.pause_transfer(id).await.map_err(message)
+            self.engine.pause_transfer(id).await.map_err(message)?;
         } else if let Some(job) = self.media_job(id) {
             self.remove_queued_media_job(&job);
             job.stop(TransferStatus::Paused).await?;
             let _ = self.media_finished.send(MediaJobEvent::QueueChanged(None));
-            Ok(())
         } else {
             self.torrent
                 .read()
@@ -1582,12 +3447,28 @@ impl AppState {
                 .manager
                 .pause(id)
                 .await
-                .map_err(message)
+                .map_err(message)?;
         }
+        Ok(())
     }
 
     pub async fn resume_transfer(&self, id: &str) -> Result<()> {
         let _operation = self.operation().await?;
+        let torrent = self.torrent.read().await.manager.snapshot(id);
+        if let Ok(snapshot) = torrent {
+            self.check_torrent_network().await?;
+            if snapshot.status == TransferStatus::Paused && self.record_torrent_automation_pause(id)
+            {
+                return Ok(());
+            }
+        }
+        self.resume_transfer_inner(id).await?;
+        self.clear_automation_pause(id);
+        self.log_event("info", "transfer", format!("Transfer resumed ({id})"));
+        Ok(())
+    }
+
+    async fn resume_transfer_inner(&self, id: &str) -> Result<()> {
         if self.http_snapshot(id).is_some() {
             self.engine.resume_transfer(id).await.map_err(message)?;
         } else if let Some(job) = self.media_job(id) {
@@ -1602,7 +3483,8 @@ impl AppState {
                     return Err("the playlist is paused or already has a running transfer".into());
                 }
                 if snapshot.status == TransferStatus::Queued {
-                    return self.advance_playlist(playlist_id, true).await;
+                    self.advance_playlist(playlist_id, true).await?;
+                    return Ok(());
                 }
             }
             self.start_media_job(&job, None).await?;
@@ -1617,6 +3499,72 @@ impl AppState {
         }
         self.verified.write().unwrap().remove(id);
         Ok(())
+    }
+
+    pub async fn bulk_pause(&self, ids: &[String]) -> usize {
+        run_bulk(ids, async |id| self.pause_transfer(id).await).await
+    }
+
+    pub async fn bulk_resume(&self, ids: &[String]) -> usize {
+        run_bulk(ids, async |id| self.resume_transfer(id).await).await
+    }
+
+    pub async fn bulk_stop(&self, ids: &[String]) -> usize {
+        run_bulk(ids, async |id| self.stop_transfer(id).await).await
+    }
+
+    async fn stop_transfer(&self, id: &str) -> Result<()> {
+        let _operation = self.operation().await?;
+        let snapshot = self.transfer_snapshot(id).await?;
+        match snapshot.kind {
+            TransferKind::Http => self.engine.cancel_transfer(id).await.map_err(message)?,
+            TransferKind::Media => {
+                let job = self.media_job(id).ok_or("Media transfer not found")?;
+                if snapshot.status == TransferStatus::Completed {
+                    return Err("Transfer has already finished".into());
+                }
+                self.remove_queued_media_job(&job);
+                job.stop(TransferStatus::Canceled).await?;
+                let _ = self
+                    .media_finished
+                    .send(MediaJobEvent::QueueChanged(snapshot.playlist_id));
+            }
+            // Pausing detaches torrent activity while retaining its resumable entry.
+            TransferKind::Torrent => self
+                .torrent
+                .read()
+                .await
+                .manager
+                .pause(id)
+                .await
+                .map_err(message)?,
+        }
+        self.clear_automation_pause(id);
+        self.log_event("info", "transfer", format!("Transfer stopped ({id})"));
+        Ok(())
+    }
+
+    pub async fn bulk_remove(&self, ids: &[String], delete_files: bool) -> usize {
+        run_bulk(ids, async |id| self.cancel_transfer(id, delete_files).await).await
+    }
+
+    pub async fn bulk_set_speed_limit(
+        &self,
+        ids: &[String],
+        limit_bps: Option<u64>,
+    ) -> Result<usize> {
+        let mut updated = 0;
+        for id in unique_ids(ids) {
+            if self
+                .transfer_snapshot(id)
+                .await
+                .is_ok_and(|snapshot| snapshot.kind != TransferKind::Media)
+            {
+                self.set_transfer_speed_limit(id, limit_bps).await?;
+                updated += 1;
+            }
+        }
+        Ok(updated)
     }
 
     pub async fn change_all(&self, pause: bool) {
@@ -1696,6 +3644,7 @@ impl AppState {
             .unwrap()
             .paused = true;
         for job in &jobs {
+            self.clear_automation_pause(&job.snapshot().id);
             self.remove_queued_media_job(job);
         }
         if let Some(job) = jobs.iter().find(|job| active(job.status())) {
@@ -1706,6 +3655,7 @@ impl AppState {
             }
         }
         let _ = self.media_finished.send(MediaJobEvent::QueueChanged(None));
+        self.log_event("info", "media", format!("Playlist paused ({playlist_id})"));
         Ok(())
     }
 
@@ -1717,7 +3667,9 @@ impl AppState {
             .get_mut(playlist_id)
             .ok_or("playlist was not found")?
             .paused = false;
-        self.advance_playlist(playlist_id, true).await
+        self.advance_playlist(playlist_id, true).await?;
+        self.log_event("info", "media", format!("Playlist resumed ({playlist_id})"));
+        Ok(())
     }
 
     pub fn reveal_playlist_folder(&self, playlist_id: &str) -> Result<()> {
@@ -1801,10 +3753,30 @@ impl AppState {
                 .await
                 .map_err(message)?;
             self.torrent_completions.lock().unwrap().remove(id);
+            self.torrent_announced.lock().unwrap().remove(id);
+            self.torrent_failures.lock().unwrap().remove(id);
             self.torrent_completed_files.lock().unwrap().remove(id);
         }
+        self.clear_automation_pause(id);
         self.verified.write().unwrap().remove(id);
         self.completion_options.lock().unwrap().remove(id);
+        let mut metadata = self.transfer_meta.write().unwrap();
+        if metadata.remove(id).is_some() {
+            if let Err(error) =
+                write_json_atomically(&self.data_dir.join(TRANSFER_META_FILE), &*metadata)
+            {
+                self.log_event(
+                    "warn",
+                    "metadata",
+                    format!("Could not prune transfer metadata: {error}"),
+                );
+            }
+        }
+        self.log_event(
+            "info",
+            "transfer",
+            format!("Transfer canceled and removed ({id})"),
+        );
         Ok(())
     }
 
@@ -2073,9 +4045,16 @@ impl AppState {
         let _operation = self.operation().await?;
         let settings = self.settings();
         let save_dir = http_save_directory(None, &settings).await?;
+        let count = urls.len();
         self.engine
             .add_http_batch(urls, referrer, save_dir, settings.default_connections)
-            .map_err(message)
+            .map_err(message)?;
+        self.log_event(
+            "info",
+            "http",
+            format!("Browser batch added {count} downloads"),
+        );
+        Ok(())
     }
 
     async fn native_request(&self, request: NativeBridgeRequest) -> Result<NativeBridgeResponse> {
@@ -2173,18 +4152,112 @@ impl AppState {
 
 impl TorrentSession {
     async fn new(config: &TorrentManagerConfig, settings: &AppSettings) -> Result<Self> {
-        let base = PathBuf::from(&settings.default_download_dir);
-        let manager = TorrentManager::new(TorrentManagerConfig {
-            default_save_dir: base.clone(),
+        let mut config = Self::configured(config, settings, false)?;
+        let network = &settings.torrent_network;
+        match Self::start(config.clone(), network).await {
+            Err(error) if config.blocklist_url.is_some() => {
+                tracing::warn!(%error, "could not start torrent session with local blocklist");
+                config.blocklist_url = None;
+                Self::start(config, network).await
+            }
+            result => result,
+        }
+    }
+
+    fn configured(
+        config: &TorrentManagerConfig,
+        settings: &AppSettings,
+        strict_blocklist: bool,
+    ) -> Result<TorrentManagerConfig> {
+        let network = &settings.torrent_network;
+        // librqbit 8 uses an exclusive u16 range. Its API cannot represent port
+        // 65535 as an endpoint that the session can actually bind.
+        let listen_port_range = if network.listen_port_start == 0 {
+            None
+        } else if network.listen_port_start == u16::MAX {
+            return Err("The torrent engine cannot listen on port 65535 alone".into());
+        } else {
+            Some(network.listen_port_start..network.listen_port_end.saturating_add(1))
+        };
+        let blocklist_url = match blocklist_url(network.blocklist_path.as_deref()) {
+            Err(error) if !strict_blocklist => {
+                tracing::warn!(%error, "ignoring unavailable torrent blocklist");
+                None
+            }
+            result => result?,
+        };
+        Ok(TorrentManagerConfig {
+            default_save_dir: PathBuf::from(&settings.default_download_dir),
+            listen_port_range,
+            enable_dht: network.enable_dht,
+            enable_upnp: network.enable_upnp,
             global_download_limit_bps: torrent_rate(settings.global_speed_limit_bps),
+            global_upload_limit_bps: network.global_upload_limit_bps,
+            socks_proxy_url: network.socks5_proxy_url.clone(),
+            blocklist_url,
             ..config.clone()
         })
-        .await
-        .map_err(message)?;
+    }
+
+    async fn start(config: TorrentManagerConfig, network: &TorrentNetworkSettings) -> Result<Self> {
+        let manager = TorrentManager::new(config.clone()).await.map_err(message)?;
         Ok(Self {
             manager: Arc::new(manager),
-            base,
+            base: config.default_save_dir.clone(),
+            config,
+            network: network.clone(),
+            stopped: false,
         })
+    }
+
+    fn needs_reconfigure(&self, settings: &AppSettings) -> bool {
+        let current = &self.network;
+        let next = &settings.torrent_network;
+        self.stopped
+            || self.base != Path::new(&settings.default_download_dir)
+            || current.listen_port_start != next.listen_port_start
+            || current.listen_port_end != next.listen_port_end
+            || current.enable_dht != next.enable_dht
+            || current.enable_upnp != next.enable_upnp
+            || current.socks5_proxy_url != next.socks5_proxy_url
+            || current.blocklist_path != next.blocklist_path
+    }
+
+    async fn replace(
+        &mut self,
+        config: TorrentManagerConfig,
+        network: &TorrentNetworkSettings,
+    ) -> Result<()> {
+        if !self.stopped
+            && self.manager.listen_port().is_some_and(|port| {
+                config
+                    .listen_port_range
+                    .as_ref()
+                    .is_some_and(|range| range.contains(&port))
+            })
+        {
+            self.stopped = true;
+            self.manager.shutdown().await;
+        }
+        match Self::start(config, network).await {
+            Ok(replacement) => {
+                let previous = std::mem::replace(self, replacement);
+                if !previous.stopped {
+                    previous.manager.shutdown().await;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if self.stopped {
+                    *self = Self::start(self.config.clone(), &self.network)
+                        .await
+                        .map_err(|restore| {
+                            format!("{error}. Could not restore torrent session: {restore}")
+                        })?;
+                }
+                Err(error)
+            }
+        }
     }
 
     fn canonical_base(&self) -> PathBuf {
@@ -2200,6 +4273,30 @@ impl TorrentSession {
     }
 }
 
+fn blocklist_url(raw: Option<&str>) -> Result<Option<String>> {
+    let Some(raw) = raw else { return Ok(None) };
+    let path = local_drive_path(Path::new(raw)).map_err(message)?;
+    let drive = path
+        .ancestors()
+        .last()
+        .ok_or("Blocklist requires a local drive")?;
+    let drive: Vec<_> = drive.as_os_str().encode_wide().chain([0]).collect();
+    // DRIVE_REMOTE from GetDriveTypeW. A mapped share can have a drive letter.
+    if unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(drive.as_ptr()) } == 4 {
+        return Err("Blocklist must be on a local drive".into());
+    }
+    let parent = path.parent().ok_or("Blocklist requires a file path")?;
+    validate_existing_ancestors(parent).map_err(message)?;
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|error| format!("Could not read the blocklist: {error}"))?;
+    if !metadata.is_file() || reparse(&metadata) {
+        return Err("Blocklist must be a regular local file".into());
+    }
+    Url::from_file_path(path)
+        .map(|url| Some(url.into()))
+        .map_err(|()| "Could not convert the blocklist path to a file URL".into())
+}
+
 struct NativeHandler(Weak<AppState>);
 
 impl PipeRequestHandler for NativeHandler {
@@ -2207,10 +4304,10 @@ impl PipeRequestHandler for NativeHandler {
         let Some(state) = self.0.upgrade() else {
             return error_response("daemon_stopped", "SlipStream has stopped");
         };
-        state
-            .native_request(request)
-            .await
-            .unwrap_or_else(|error| error_response("request_failed", &error))
+        state.native_request(request).await.unwrap_or_else(|error| {
+            state.log_event("warn", "pipe", "Authenticated native request failed");
+            error_response("request_failed", &error)
+        })
     }
 }
 
@@ -2478,15 +4575,107 @@ fn playlist_ranges(items: &str) -> Result<Vec<std::ops::RangeInclusive<u32>>> {
         .collect()
 }
 
+fn sync_secret_flags(settings: &mut AppSettings, vault: &SecretVault) {
+    settings.proxy.has_password = vault.has_secret(proxy_secret_key());
+    for entry in &mut settings.site_logins {
+        entry.has_password = vault.has_secret(&site_login_secret_key(&entry.id));
+    }
+}
+
+fn read_vault_secret(vault: &SecretVault, key: &str) -> Option<String> {
+    vault.get_secret(key).unwrap_or_else(|error| {
+        tracing::warn!(%error, "could not decrypt local vault secret");
+        None
+    })
+}
+
+fn site_auth_header(entry: &SiteLoginEntry, secret: &str) -> Option<HeaderValue> {
+    let raw = match entry.auth_scheme {
+        SiteAuthScheme::Basic => format!(
+            "Basic {}",
+            STANDARD.encode(format!("{}:{secret}", entry.username))
+        ),
+        SiteAuthScheme::Bearer => format!("Bearer {secret}"),
+    };
+    let mut header = HeaderValue::from_str(&raw).ok()?;
+    header.set_sensitive(true);
+    Some(header)
+}
+
+fn http_proxy_config(vault: &SecretVault, settings: &AppSettings) -> Result<EngineProxyConfig> {
+    let proxy = &settings.proxy;
+    Ok(match proxy.mode {
+        ProxyMode::Direct => EngineProxyConfig::Direct,
+        ProxyMode::System => EngineProxyConfig::System,
+        ProxyMode::Manual => EngineProxyConfig::Manual {
+            url: proxy.url.clone().ok_or("manual proxy requires a URL")?,
+            username: proxy.username.clone(),
+            password: proxy_password(vault, settings),
+            bypass_hosts: proxy.bypass_hosts.clone(),
+        },
+    })
+}
+
+fn proxy_password(vault: &SecretVault, settings: &AppSettings) -> Option<String> {
+    if settings.proxy.has_password && settings.proxy.username.is_some() {
+        read_vault_secret(vault, proxy_secret_key())
+    } else {
+        None
+    }
+}
+
+fn media_network_options(
+    settings: &AppSettings,
+    vault: &SecretVault,
+    target: &Url,
+) -> Result<(Option<String>, Option<String>)> {
+    let host = target.host_str().unwrap_or_default();
+    let proxy = &settings.proxy;
+    let bypass = proxy
+        .bypass_hosts
+        .iter()
+        .any(|pattern| match pattern.as_str() {
+            "*" => true,
+            "<local>" => !host.contains(['.', ':']),
+            _ => host_pattern_matches(pattern, host),
+        });
+    let proxy_url = if proxy.apply_to_media && proxy.mode == ProxyMode::Manual && !bypass {
+        let mut url = slipstream_protocol::validate_http_proxy_url(
+            proxy.url.as_deref().ok_or("manual proxy requires a URL")?,
+        )
+        .map_err(|_| "invalid HTTP proxy URL")?;
+        if let Some(username) = &proxy.username {
+            url.set_username(username)
+                .map_err(|_| "invalid proxy username")?;
+        }
+        if let Some(password) = proxy_password(vault, settings) {
+            url.set_password(Some(&password))
+                .map_err(|_| "invalid proxy credentials")?;
+        }
+        Some(url.into())
+    } else if proxy.apply_to_media && proxy.mode == ProxyMode::System {
+        slipstream_engine::system_http_proxy_for(target).map_err(message)?
+    } else {
+        None
+    };
+    let cookies = &settings.cookie_passthrough;
+    let browser = (cookies.enabled
+        && cookies
+            .allowed_hosts
+            .iter()
+            .any(|pattern| host_pattern_matches(pattern, host)))
+    .then(|| cookies.browser.clone());
+    Ok((proxy_url, browser))
+}
+
 async fn run_media_probe(
     toolchain_cache: &ToolchainCache,
     settings: AppSettings,
     resource_dir: Option<PathBuf>,
-    url: &str,
+    url: Url,
     allow_loopback: bool,
     mut options: ProbeOptions,
 ) -> Result<MediaProbeResult> {
-    let url = validate_media_url(url, allow_loopback)?;
     let binary = discover_ytdlp_for_probe(toolchain_cache, settings, resource_dir).await?;
     if let Some(cache_dir) = options.cache_dir.take() {
         options.cache_dir = Some(
@@ -2570,8 +4759,15 @@ async fn watch_media_jobs(
                 let id = match event {
                     MediaJobEvent::QueueChanged(id) => id,
                     MediaJobEvent::Finished { transfer_id, playlist_id } => {
-                        if state.media_job(&transfer_id).is_some_and(|job| job.status() == TransferStatus::Completed) {
-                            state.on_transfer_completed(&transfer_id).await;
+                        if let Some(job) = state.media_job(&transfer_id) {
+                            let snapshot = job.snapshot();
+                            match snapshot.status {
+                                TransferStatus::Completed => state.on_transfer_completed(&snapshot).await,
+                                TransferStatus::Failed => state.log_event(
+                                    "error", "media", format!("Download failed ({transfer_id})"),
+                                ),
+                                _ => {}
+                            }
                         }
                         playlist_id
                     }
@@ -2657,6 +4853,14 @@ async fn watch_completions(
                 Ok(EngineEvent::StatusChanged { transfer_id, status: TransferStatus::Completed }) => {
                     state.http_snapshot(&transfer_id).into_iter().collect::<Vec<_>>()
                 }
+                Ok(EngineEvent::StatusChanged { transfer_id, status: TransferStatus::Failed }) => {
+                    state.log_event("error", "http", format!("Download failed ({transfer_id})"));
+                    continue;
+                }
+                Ok(EngineEvent::QueueDrained { queue_id, .. }) => {
+                    state.on_queue_drained(&queue_id).await;
+                    continue;
+                }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     state.engine.snapshots().into_iter().filter(|s| s.status == TransferStatus::Completed).collect()
                 }
@@ -2673,15 +4877,15 @@ async fn watch_completions(
                 &mut pending_http,
                 snapshot,
             );
-            if state.ui.supports_dialogs() && announced_http.insert(id.clone()) {
+            if !announced_http.contains(&id) {
                 let Ok(_operation) = state.operation().await else {
                     return;
                 };
-                if state
-                    .http_snapshot(&id)
-                    .is_some_and(|snapshot| !snapshot.output_superseded)
-                {
-                    state.on_transfer_completed(&id).await;
+                if let Some(snapshot) = state.http_snapshot(&id).filter(|snapshot| {
+                    snapshot.status == TransferStatus::Completed && !snapshot.output_superseded
+                }) {
+                    announced_http.insert(id);
+                    state.on_transfer_completed(&snapshot).await;
                 }
             }
         }
@@ -2759,13 +4963,27 @@ async fn scan_torrent_completions(state: &AppState, scans: &mpsc::Sender<ScanReq
         let torrent = state.torrent.read().await;
         let mut pending = state.torrent_completions.lock().unwrap();
         let mut completed_files = state.torrent_completed_files.lock().unwrap();
+        let mut announced = state.torrent_announced.lock().unwrap();
+        let mut failures = state.torrent_failures.lock().unwrap();
         pending.retain(|id| {
             let Ok(report) = torrent.manager.stats(id) else {
                 completed_files.remove(id);
+                announced.remove(id);
+                failures.remove(id);
                 return false;
             };
+            if report.snapshot.status == TransferStatus::Failed {
+                if failures.insert(id.clone()) {
+                    state.log_event("error", "torrent", format!("Download failed ({id})"));
+                }
+                return true;
+            }
+            failures.remove(id);
             if !report.finished {
                 return true;
+            }
+            if announced.insert(id.clone()) {
+                state.announce_completion(&report.snapshot);
             }
             let Ok(files) = torrent.manager.list_files(id) else {
                 return false;
@@ -2781,6 +4999,13 @@ async fn scan_torrent_completions(state: &AppState, scans: &mpsc::Sender<ScanReq
             {
                 if !recorded.marked.contains(&path) {
                     to_mark.push(path.clone());
+                }
+                if recorded.extraction_started.insert(path.clone()) {
+                    if let Ok(candidate) = slipstream_protocol::safe_join_under(
+                        Path::new(&report.snapshot.save_dir), &path,
+                    ) {
+                        state.maybe_auto_extract(TransferKind::Torrent, candidate, id);
+                    }
                 }
                 if auto_scan && !recorded.scanned.contains(&path) {
                     to_scan.push(path);
@@ -2921,9 +5146,140 @@ async fn scan_completed(
     }
 }
 
+async fn run_automation_loop(state: Weak<AppState>, stop: watch::Receiver<bool>) {
+    let stopped = stopped_signal(stop);
+    tokio::pin!(stopped);
+    let tracker = Arc::new(Mutex::new(WatchFolderTracker::default()));
+    let mut tick: u64 = 0;
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut stopped => return,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        tick = tick.wrapping_add(1);
+        if tick.is_multiple_of(5) {
+            let revision = state.settings_revision.load(Ordering::SeqCst);
+            let Ok(_operation) = state.operation().await else {
+                return;
+            };
+            state.evaluate_and_apply_automation(revision).await;
+            if let Err(error) = state.refresh_torrent_session(&state.settings()).await {
+                tracing::debug!(%error, "could not apply deferred torrent session settings");
+            }
+        }
+        if tick.is_multiple_of(3) {
+            let revision = state.settings_revision.load(Ordering::SeqCst);
+            let rules = state.settings.read().unwrap().watch_folders.clone();
+            if rules.is_empty() || state.vpn_kill_switch_active.load(Ordering::SeqCst) {
+                continue;
+            }
+            let tracker_ref = tracker.clone();
+            let candidates = tokio::task::spawn_blocking(move || {
+                let mut guard = tracker_ref.lock().unwrap();
+                scan_watch_folders(&rules, &mut guard)
+            })
+            .await
+            .unwrap_or_default();
+            for candidate in candidates {
+                let path = candidate.torrent_path;
+                let Some(mut captured) = tracker.lock().unwrap().take_captured(&path) else {
+                    continue;
+                };
+                let request = AddTorrentRequest {
+                    source: path.to_string_lossy().into_owned(),
+                    save_dir: candidate.target_save_dir.clone(),
+                    selected_file_indices: None,
+                    sequential: false,
+                    start_paused: candidate.start_paused,
+                };
+                let result = {
+                    let Ok(_operation) = state.operation().await else {
+                        return;
+                    };
+                    if state.settings_revision.load(Ordering::SeqCst) != revision {
+                        break;
+                    }
+                    let bytes = Bytes::from(std::mem::take(&mut captured.bytes));
+                    state.add_torrent_locked(request, Some(bytes)).await
+                };
+                match result {
+                    Ok(id) => {
+                        tracker.lock().unwrap().mark_added(
+                            path.clone(),
+                            captured.size,
+                            captured.modified,
+                        );
+                        if let Some(category_id) = candidate.category_id {
+                            let _ = state
+                                .set_transfers_category(
+                                    std::slice::from_ref(&id),
+                                    Some(category_id),
+                                )
+                                .await;
+                        }
+                        if candidate.delete_torrent_after_add {
+                            let delete_path = path.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                captured.delete_after_add(&delete_path)
+                            })
+                            .await
+                            {
+                                Ok(Ok(())) => tracker.lock().unwrap().forget(&path),
+                                Ok(Err(error)) => {
+                                    tracing::debug!(%error, "could not delete the added watch file")
+                                }
+                                Err(error) => {
+                                    tracing::debug!(%error, "watch file cleanup worker failed")
+                                }
+                            }
+                        }
+                        state.log_event(
+                            "info",
+                            "watch",
+                            format!("Added torrent from watch folder: {}", path.display()),
+                        );
+                    }
+                    Err(error) => {
+                        tracker.lock().unwrap().record_failure(&path);
+                        state.log_event(
+                            "warn",
+                            "watch",
+                            format!("Watch folder skipped '{}': {error}", path.display()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn run_rss_loop(state: Weak<AppState>, stop: watch::Receiver<bool>) {
+    let stopped = stopped_signal(stop);
+    tokio::pin!(stopped);
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut stopped => return,
+            () = tokio::time::sleep(Duration::from_secs(15)) => {}
+        }
+        let Some(state) = state.upgrade() else { return };
+        if state.vpn_kill_switch_active.load(Ordering::SeqCst) {
+            continue;
+        }
+        if let Err(error) = state.poll_rss_feeds(false).await {
+            tracing::debug!(%error, "RSS polling did not finish");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest;
     use slipstream_torrent::TorrentAddOptions;
     use std::os::windows::fs::OpenOptionsExt;
     use tokio::{
@@ -2934,6 +5290,66 @@ mod tests {
     use windows_sys::Win32::System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER};
 
     struct TestDir(PathBuf);
+
+    #[tokio::test]
+    async fn completed_torrent_archive_extracts_without_interrupting_seeding() {
+        use std::io::{Cursor, Write as _};
+
+        let temp = TestDir::new();
+        let state = start_test_daemon(&temp.0).await;
+        let mut settings = state.settings();
+        settings.auto_extract = slipstream_protocol::AutoExtractSettings {
+            enabled: true,
+            create_subfolder: true,
+            delete_archive_after_extract: true,
+            overwrite_existing: true,
+        };
+        let downloads = PathBuf::from(&settings.default_download_dir);
+        state.save_settings(settings).await.unwrap();
+
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        zip.start_file("readme.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"torrent archive").unwrap();
+        let bytes = zip.finish().unwrap().into_inner();
+        let manifest =
+            slipstream_torrent::build_v1_single_file_torrent("bundle.zip", &bytes, 16 * 1024)
+                .unwrap();
+        let archive = downloads.join("bundle.zip");
+        std::fs::write(&archive, &bytes).unwrap();
+        let manager = state.torrent.read().await.manager.clone();
+        let id = manager
+            .add_torrent_bytes(
+                &manifest,
+                TorrentAddOptions {
+                    overwrite: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        manager
+            .wait_until_completed(&id, Duration::from_secs(10))
+            .await
+            .unwrap();
+        state.torrent_completions.lock().unwrap().insert(id.clone());
+        scan_torrent_completions(&state, &state.scans).await;
+        let destination = downloads.join("bundle").join("readme.txt");
+        timeout(Duration::from_secs(5), async {
+            while !destination.is_file() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(destination).unwrap(), b"torrent archive");
+        assert_eq!(std::fs::read(archive).unwrap(), bytes);
+        assert_eq!(
+            manager.snapshot(&id).unwrap().status,
+            TransferStatus::Seeding
+        );
+        state.shutdown().await.unwrap();
+    }
 
     impl TestDir {
         fn new() -> Self {
@@ -2991,6 +5407,12 @@ mod tests {
         let settings = AppSettings {
             default_download_dir: directory.join("Downloads").to_string_lossy().into_owned(),
             auto_defender_scan: false,
+            torrent_network: TorrentNetworkSettings {
+                listen_port_start: 0,
+                listen_port_end: 0,
+                enable_dht: false,
+                ..Default::default()
+            },
             ..AppSettings::default()
         };
         write_json_atomically(&directory.join(SETTINGS_FILE), &settings).unwrap();
@@ -3014,6 +5436,416 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    fn test_magnet(digit: char, start_paused: bool) -> AddTorrentRequest {
+        AddTorrentRequest {
+            source: format!("magnet:?xt=urn:btih:{}", digit.to_string().repeat(40)),
+            save_dir: None,
+            selected_file_indices: None,
+            sequential: false,
+            start_paused,
+        }
+    }
+
+    #[tokio::test]
+    async fn vpn_blocks_adds_and_resumes_and_releases_only_its_own_pauses() {
+        let dir = TestDir::new();
+        let state = start_test_daemon(&dir.0).await;
+        let active = state.add_torrent(test_magnet('a', false)).await.unwrap();
+        let manual = state.add_torrent(test_magnet('b', true)).await.unwrap();
+        let mut settings = state.settings();
+        let missing = "__impossible_vpn_adapter_99999__";
+        settings.torrent_network.vpn_kill_switch_enabled = true;
+        settings.torrent_network.vpn_adapter_name = Some(missing.into());
+        state.save_settings(settings).await.unwrap();
+
+        let status = state.automation_status();
+        assert!(status.vpn_kill_switch_active);
+        assert!(!status.vpn_adapter_connected);
+        assert_eq!(status.vpn_adapter_name.as_deref(), Some(missing));
+        assert_eq!(
+            *state.vpn_paused_torrents.lock().unwrap(),
+            HashSet::from([active.clone()])
+        );
+        assert_eq!(
+            state.get_transfer_snapshot(&active).await.unwrap().status,
+            TransferStatus::Paused
+        );
+
+        let result = state.add_torrent(test_magnet('c', true)).await;
+        assert_eq!(result.unwrap_err(), VPN_TRAFFIC_BLOCKED);
+        assert_eq!(
+            state
+                .add_torrent_with_preview(test_magnet('d', false), Some("expired".into()))
+                .await
+                .unwrap_err(),
+            VPN_TRAFFIC_BLOCKED,
+        );
+        assert_eq!(
+            state.resume_transfer(&manual).await.unwrap_err(),
+            VPN_TRAFFIC_BLOCKED
+        );
+        assert_eq!(
+            state.poll_rss_feeds_now().await.unwrap_err(),
+            VPN_TRAFFIC_BLOCKED
+        );
+        // A newly disconnected adapter must still block traffic before the next tick.
+        state.vpn_kill_switch_active.store(false, Ordering::SeqCst);
+        assert_eq!(
+            state.resume_transfer(&manual).await.unwrap_err(),
+            VPN_TRAFFIC_BLOCKED
+        );
+
+        let mut settings = state.settings();
+        settings.torrent_network.vpn_kill_switch_enabled = false;
+        state.save_settings(settings).await.unwrap();
+        assert!(!state.automation_status().vpn_kill_switch_active);
+        assert_eq!(
+            state.get_transfer_snapshot(&active).await.unwrap().status,
+            TransferStatus::Probing
+        );
+        assert_eq!(
+            state.get_transfer_snapshot(&manual).await.unwrap().status,
+            TransferStatus::Paused
+        );
+        state.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn seeding_limits_are_inclusive_and_either_limit_stops_seeding() {
+        let mut settings = TorrentSeedingSettings {
+            max_seed_ratio_hundredths: Some(150),
+            max_seed_minutes: Some(2),
+            ..Default::default()
+        };
+        assert!(!seed_limit_reached(&settings, 1.49, 119));
+        assert!(seed_limit_reached(&settings, 1.5, 0));
+        assert!(seed_limit_reached(&settings, 0.0, 120));
+        settings.stop_seeding_on_limit = false;
+        assert!(!seed_limit_reached(&settings, 2.0, 200));
+        assert!(!seed_limit_reached(
+            &TorrentSeedingSettings::default(),
+            100.0,
+            u64::MAX
+        ));
+    }
+
+    #[tokio::test]
+    async fn seeding_ratio_pauses_a_live_seed_after_a_local_peer_downloads() {
+        let dir = TestDir::new();
+        let state = start_test_daemon(&dir.0).await;
+        let mut settings = state.settings();
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = socket.local_addr().unwrap();
+        drop(socket);
+        settings.torrent_network.listen_port_start = peer.port();
+        settings.torrent_network.listen_port_end = peer.port();
+        let downloads = PathBuf::from(&settings.default_download_dir);
+        state.save_settings(settings).await.unwrap();
+        let payload = vec![24; 16 * 1024];
+        std::fs::write(downloads.join("payload.bin"), &payload).unwrap();
+        let manifest =
+            slipstream_torrent::build_v1_single_file_torrent("payload.bin", &payload, 16 * 1024)
+                .unwrap();
+        let seed = state.torrent.read().await.manager.clone();
+        let id = seed
+            .add_torrent_bytes(
+                &manifest,
+                TorrentAddOptions {
+                    overwrite: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        seed.wait_until_completed(&id, Duration::from_secs(10))
+            .await
+            .unwrap();
+        let leech = TorrentManager::new(TorrentManagerConfig {
+            default_save_dir: dir.0.join("leech"),
+            enable_dht: false,
+            enable_trackers: false,
+            listen_port_range: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let downloaded = leech
+            .add_torrent_bytes(
+                &manifest,
+                TorrentAddOptions {
+                    initial_peers: vec![peer],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        leech
+            .wait_until_completed(&downloaded, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(seed.stats(&id).unwrap().ratio >= 1.0);
+
+        let mut settings = state.settings();
+        settings.torrent_seeding.max_seed_ratio_hundredths = Some(100);
+        state.save_settings(settings).await.unwrap();
+        assert_eq!(seed.snapshot(&id).unwrap().status, TransferStatus::Paused);
+        assert!(!state.automation_owns_pause(&id));
+        leech.shutdown().await;
+        state.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_torrent_file_round_trips_and_upload_limit_preserves_download_limit() {
+        let dir = TestDir::new();
+        let state = start_test_daemon(&dir.0).await;
+        let source = dir.0.join("source.bin");
+        let output = dir.0.join("source.torrent");
+        let payload = b"created through the daemon";
+        std::fs::write(&source, payload).unwrap();
+        let created = state
+            .create_torrent_file(CreateTorrentRequest {
+                source_path: source.to_string_lossy().into_owned(),
+                output_path: output.to_string_lossy().into_owned(),
+                trackers: Vec::new(),
+                piece_length_kib: 16,
+                private: true,
+                comment: Some("round trip".to_owned()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(created.total_bytes, payload.len() as u64);
+        assert_eq!((created.file_count, created.piece_count), (1, 1));
+        let mut request = test_magnet('a', true);
+        request.source = output.to_string_lossy().into_owned();
+        let id = state.add_torrent(request).await.unwrap();
+        assert_eq!(id, created.info_hash);
+        state
+            .set_transfer_speed_limit(&id, Some(64 * 1024))
+            .await
+            .unwrap();
+        state
+            .set_torrent_upload_limit(&id, Some(32 * 1024))
+            .await
+            .unwrap();
+        let snapshot = state.get_transfer_snapshot(&id).await.unwrap();
+        assert_eq!(snapshot.speed_limit_bps, Some(64 * 1024));
+        state.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn backup_redacts_proxy_credentials_and_keeps_the_local_blocklist_on_import() {
+        let dir = TestDir::new();
+        let state = start_test_daemon(&dir.0).await;
+        let blocklist = dir.0.join("local blocklist.p2p");
+        std::fs::write(&blocklist, "local:192.0.2.1-192.0.2.1\n").unwrap();
+        let proxy = "socks5://proxy-user:proxy-password@127.0.0.1:1080";
+        let mut settings = state.settings();
+        settings.torrent_network.blocklist_path = Some(blocklist.to_string_lossy().into_owned());
+        settings.torrent_network.socks5_proxy_url = Some(proxy.into());
+        state.save_settings(settings).await.unwrap();
+        let path = dir.0.join("backup.json");
+        state.export_settings_backup(&path).await.unwrap();
+        let backup = std::fs::read_to_string(&path).unwrap();
+        assert!(!backup.contains("proxy-user"));
+        assert!(!backup.contains("proxy-password"));
+        let mut bundle: SettingsBackupBundle = serde_json::from_str(&backup).unwrap();
+        assert_eq!(bundle.settings.torrent_network.blocklist_path, None);
+        assert_eq!(
+            bundle.settings.torrent_network.socks5_proxy_url.as_deref(),
+            Some("socks5://127.0.0.1:1080")
+        );
+        bundle.settings.torrent_network.blocklist_path =
+            Some(r"\\example.org\remote\blocklist.txt".into());
+        write_json_atomically(&path, &bundle).unwrap();
+        let imported = state.import_settings_backup(&path).await.unwrap();
+        assert_eq!(
+            imported.torrent_network.blocklist_path,
+            Some(blocklist.to_string_lossy().into_owned())
+        );
+        assert!(state
+            .torrent
+            .read()
+            .await
+            .config
+            .blocklist_url
+            .as_deref()
+            .unwrap()
+            .starts_with("file:///"));
+        state.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn network_transport_changes_wait_for_an_empty_session_and_upload_limit_is_live() {
+        let dir = TestDir::new();
+        let state = start_test_daemon(&dir.0).await;
+        let original = state.torrent.read().await.manager.clone();
+        let id = state.add_torrent(test_magnet('a', true)).await.unwrap();
+        let mut settings = state.settings();
+        settings.torrent_network.global_upload_limit_bps = Some(128 * 1024);
+        state.save_settings(settings.clone()).await.unwrap();
+        {
+            let session = state.torrent.read().await;
+            assert!(Arc::ptr_eq(&session.manager, &original));
+            assert_eq!(session.config.global_upload_limit_bps, Some(128 * 1024));
+        }
+        let port = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        settings.torrent_network.listen_port_start = port;
+        settings.torrent_network.listen_port_end = port;
+        state.save_settings(settings).await.unwrap();
+        assert!(Arc::ptr_eq(&state.torrent.read().await.manager, &original));
+        state.cancel_transfer(&id, false).await.unwrap();
+        let operation = state.operation().await.unwrap();
+        state
+            .refresh_torrent_session(&state.settings())
+            .await
+            .unwrap();
+        {
+            let session = state.torrent.read().await;
+            assert!(!Arc::ptr_eq(&session.manager, &original));
+            assert_eq!(session.manager.listen_port(), Some(port));
+            assert_eq!(session.config.global_upload_limit_bps, Some(128 * 1024));
+        }
+        drop(operation);
+        state.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rss_poll_enqueues_matching_magnets_and_staged_torrents_once() {
+        let dir = TestDir::new();
+        let state = start_test_daemon(&dir.0).await;
+        let save_dir = Path::new(&state.settings().default_download_dir).join("rss");
+        let manifest =
+            slipstream_torrent::build_v1_single_file_torrent("feed.bin", b"payload", 16 * 1024)
+                .unwrap();
+        let metadata = slipstream_torrent::parse_torrent_bytes(&manifest, &save_dir).unwrap();
+        let file_hash = hex::encode(metadata.info_hash_v1.unwrap());
+        let magnet = test_magnet('e', false);
+        let xml = format!(
+            r#"<rss><channel>
+            <item><title>Stable ISO</title><guid>magnet</guid><link>{}</link></item>
+            <item><title>Stable ISO file</title><guid>manifest</guid><enclosure type="application/x-bittorrent" url="/download.torrent"/></item>
+            <item><title>Beta ISO</title><guid>skip</guid><link>{}</link></item>
+        </channel></rss>"#,
+            magnet.source,
+            test_magnet('b', false).source
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let feed_url = format!("http://{}/feed", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for expected in ["/feed", "/download.torrent", "/feed"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                }
+                assert!(request.starts_with(format!("GET {expected} ").as_bytes()));
+                let bytes = if expected == "/feed" {
+                    xml.as_bytes()
+                } else {
+                    &manifest
+                };
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                );
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                socket.write_all(bytes).await.unwrap();
+            }
+        });
+        // Production settings reject loopback feeds. Install the fixture only
+        // in the isolated daemon that was started with its test loopback option.
+        state.settings.write().unwrap().rss_feeds.push(RssFeedRule {
+            id: "local-feed".into(),
+            name: "Test feed".into(),
+            feed_url,
+            include_pattern: "*iso*".into(),
+            exclude_pattern: "beta".into(),
+            save_dir: Some(save_dir.to_string_lossy().into_owned()),
+            poll_interval_minutes: 5,
+            enabled: true,
+            auto_start: false,
+            last_checked_at: None,
+            last_error: None,
+        });
+        assert_eq!(state.poll_rss_feeds_now().await.unwrap(), 2);
+        assert_eq!(state.automation_status().rss_matches_added, 2);
+        assert_eq!(state.poll_rss_feeds(false).await.unwrap(), 0);
+        assert_eq!(state.poll_rss_feeds_now().await.unwrap(), 0);
+        let snapshots = state.torrent.read().await.manager.list_snapshots();
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots
+            .iter()
+            .all(|snapshot| snapshot.status == TransferStatus::Paused
+                && Path::new(&snapshot.save_dir) == save_dir));
+        assert!(snapshots.iter().any(|snapshot| snapshot.id == file_hash));
+        let stored: AppSettings = read_json(&dir.0.join(SETTINGS_FILE)).unwrap();
+        assert!(stored.rss_feeds[0].last_checked_at.is_some());
+        assert_eq!(stored.rss_feeds[0].last_error, None);
+        let seen = RssSeenStore::load(&dir.0).unwrap();
+        assert!(seen.contains(
+            "local-feed",
+            &hex::encode(sha2::Sha256::digest(b"manifest"))
+        ));
+        server.await.unwrap();
+        state.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_import_caps_distinct_urls_and_bounds_error_samples() {
+        let temp = TestDir::new();
+        let state = start_test_daemon(&temp.0).await;
+        let mut lines = "file:///C:/private.txt\n".repeat(12);
+        for index in 0..503 {
+            writeln!(lines, "http://127.0.0.1/file-{index}.txt").unwrap();
+        }
+        let result = state
+            .add_batch_urls(&lines, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(result.added, 500);
+        assert_eq!(result.skipped, 15);
+        assert_eq!(result.errors.len(), 10);
+        let transfers = state.snapshot().await.transfers;
+        assert_eq!(transfers.len(), 500);
+        assert!(transfers
+            .iter()
+            .all(|row| row.status == TransferStatus::Paused));
+        assert!(!transfers.iter().any(|row| row.filename == "file-500.txt"));
+        state.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn logs_keep_the_latest_500_sanitized_entries() {
+        let temp = TestDir::new();
+        let state = start_test_daemon(&temp.0).await;
+        for i in 0..502 {
+            state.log_event("info\n", "test\t", format!("{i}\r\n\0{}", "雪".repeat(520)));
+        }
+        let logs = state.get_logs();
+        assert_eq!(logs.len(), 500);
+        assert!(logs[0].message.starts_with("2   "));
+        let last = logs.last().unwrap();
+        assert_eq!(last.level, "info ");
+        assert_eq!(last.category, "test ");
+        assert!(last.message.starts_with("501   "));
+        assert_eq!(last.message.chars().count(), 512);
+        assert!(last.message.chars().all(|ch| !ch.is_control()));
+        let path = temp.0.join("diagnostics.log");
+        assert_eq!(
+            state.export_logs(path.to_str().unwrap()).await.unwrap(),
+            500
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), 500);
+        state.clear_logs();
+        assert!(state.get_logs().is_empty());
+        state.shutdown().await.unwrap();
     }
 
     fn media_request() -> AddMediaDownloadRequest {
@@ -3189,6 +6021,7 @@ mod tests {
                 expected_size_bytes: None,
                 start_paused: false,
                 overwrite_existing: false,
+                ..AddHttpDownloadRequest::default()
             })
             .await
             .unwrap();
@@ -3458,6 +6291,12 @@ mod tests {
         let settings = AppSettings {
             default_download_dir: downloads.to_string_lossy().into_owned(),
             auto_defender_scan: true,
+            torrent_network: TorrentNetworkSettings {
+                listen_port_start: 0,
+                listen_port_end: 0,
+                enable_dht: false,
+                ..Default::default()
+            },
             ..AppSettings::default()
         };
         std::fs::write(
@@ -3516,6 +6355,7 @@ mod tests {
                 allow_loopback: true,
                 registry_base_key: Some(reg.0.clone()),
                 resource_dir: None,
+                allow_power_actions: false,
                 torrent: TorrentManagerConfig {
                     enable_dht: false,
                     enable_trackers: false,
@@ -3527,6 +6367,7 @@ mod tests {
         .await
         .unwrap();
 
+        let mut alerts = state.subscribe_completion_alerts();
         let http_id = state
             .add_http_download(AddHttpDownloadRequest {
                 url,
@@ -3540,6 +6381,7 @@ mod tests {
                 expected_size_bytes: None,
                 start_paused: false,
                 overwrite_existing: false,
+                ..AddHttpDownloadRequest::default()
             })
             .await
             .unwrap();
@@ -3555,6 +6397,12 @@ mod tests {
         })
         .await
         .unwrap();
+        let alert = timeout(Duration::from_secs(10), alerts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(alert.transfer_id, http_id);
+        assert_eq!(alert.kind, TransferKind::Http);
 
         std::fs::write(downloads.join("torrent.bin"), b"test").unwrap();
         let mut manifest =
@@ -3608,6 +6456,9 @@ mod tests {
         assert!(pending_http.contains_key(&http_id));
 
         scan_torrent_completions(&state, &tx).await;
+        let alert = alerts.try_recv().unwrap();
+        assert_eq!(alert.transfer_id, torrent_id);
+        assert_eq!(alert.kind, TransferKind::Torrent);
         assert!(state
             .torrent_completions
             .lock()
@@ -3622,6 +6473,7 @@ mod tests {
         drop(locked_stream);
 
         scan_torrent_completions(&state, &tx).await;
+        assert!(alerts.try_recv().is_err());
         assert!(state
             .torrent_completions
             .lock()
@@ -3658,6 +6510,223 @@ mod tests {
             .unwrap()
             .get(&torrent_id)
             .is_some_and(|files| files.scanned.contains("torrent.bin")));
+
+        server.abort();
+        state.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn phase4_vault_logins_cookie_scope_and_backup_redaction() {
+        let dir = TestDir::new();
+        let state = start_test_daemon(&dir.0).await;
+
+        let mut settings = state.settings();
+        settings.proxy = slipstream_protocol::ProxySettings {
+            mode: slipstream_protocol::ProxyMode::Manual,
+            url: Some("http://127.0.0.1:8888".into()),
+            username: Some("proxy-user".into()),
+            has_password: false,
+            bypass_hosts: vec!["bypass.local".into()],
+            apply_to_media: true,
+        };
+        settings.cookie_passthrough = slipstream_protocol::CookiePassThroughSettings {
+            enabled: true,
+            browser: "chrome".into(),
+            allowed_hosts: vec!["video.example.com".into()],
+        };
+        state.save_settings(settings).await.unwrap();
+
+        state
+            .set_proxy_password(Some("top-secret-proxy".into()))
+            .await
+            .unwrap();
+        assert!(state.settings().proxy.has_password);
+
+        state
+            .upsert_site_login(
+                slipstream_protocol::SiteLoginEntry {
+                    id: "cdn-login".into(),
+                    host_pattern: "cdn.example.com".into(),
+                    username: "alice".into(),
+                    has_password: false,
+                    auth_scheme: slipstream_protocol::SiteAuthScheme::Basic,
+                    enabled: true,
+                },
+                Some("site-secret".into()),
+            )
+            .await
+            .unwrap();
+        assert!(state
+            .settings()
+            .site_logins
+            .iter()
+            .any(|item| item.id == "cdn-login" && item.has_password));
+
+        let current_settings = state.settings();
+        let empty_vault = SecretVault::default();
+
+        let (proxy_arg, cookies_arg) = media_network_options(
+            &current_settings,
+            &empty_vault,
+            &url::Url::parse("https://video.example.com/watch").unwrap(),
+        )
+        .unwrap();
+        assert!(proxy_arg
+            .as_deref()
+            .is_some_and(|value| value.contains("proxy-user")));
+        assert_eq!(cookies_arg.as_deref(), Some("chrome"));
+
+        let (other_proxy, other_cookies) = media_network_options(
+            &current_settings,
+            &empty_vault,
+            &url::Url::parse("https://other.example.net/watch").unwrap(),
+        )
+        .unwrap();
+        assert!(other_proxy.is_some());
+        assert_eq!(other_cookies, None);
+
+        let (bypass_proxy, _) = media_network_options(
+            &current_settings,
+            &empty_vault,
+            &url::Url::parse("http://bypass.local/clip").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(bypass_proxy, None);
+
+        let backup_path = dir.0.join("phase4-backup.json");
+        state.export_settings_backup(&backup_path).await.unwrap();
+        let backup_json = std::fs::read_to_string(&backup_path).unwrap();
+        assert!(!backup_json.contains("top-secret-proxy"));
+        assert!(!backup_json.contains("site-secret"));
+        let bundle: SettingsBackupBundle = serde_json::from_str(&backup_json).unwrap();
+        assert!(!bundle.settings.proxy.has_password);
+        assert!(!bundle.settings.cookie_passthrough.enabled);
+        assert!(bundle
+            .settings
+            .site_logins
+            .iter()
+            .all(|item| !item.has_password));
+
+        let fresh_dir = TestDir::new();
+        let fresh_state = start_test_daemon(&fresh_dir.0).await;
+        let imported = fresh_state
+            .import_settings_backup(&backup_path)
+            .await
+            .unwrap();
+        assert!(!imported.proxy.has_password);
+        assert!(!imported.cookie_passthrough.enabled);
+        assert!(imported.site_logins.iter().all(|item| !item.has_password));
+        fresh_state.shutdown().await.unwrap();
+
+        state.set_proxy_password(None).await.unwrap();
+        assert!(!state.settings().proxy.has_password);
+
+        state.delete_site_login("cdn-login").await.unwrap();
+        assert!(state
+            .settings()
+            .site_logins
+            .iter()
+            .all(|item| item.id != "cdn-login"));
+
+        state.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn phase4_grabber_blocks_loopback_and_metalink_round_trips() {
+        let payload = b"metalink-payload";
+        let digest = sha2::Sha256::digest(payload);
+        let sha_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = socket.read(&mut buf).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.write_all(payload).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let blocked_dir = TestDir::new();
+        let blocked_state = AppState::start(
+            blocked_dir.0.clone(),
+            Arc::new(NullUi),
+            DaemonOptions {
+                pipe_name: Some(format!(
+                    r"\\.\pipe\SlipStream.DaemonUnitTest.{}",
+                    Uuid::new_v4()
+                )),
+                allow_loopback: false,
+                torrent: TorrentManagerConfig {
+                    enable_dht: false,
+                    enable_trackers: false,
+                    listen_port_range: None,
+                    ..TorrentManagerConfig::default()
+                },
+                ..DaemonOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let grab_err = blocked_state
+            .grab_site_urls(slipstream_protocol::SiteGrabRequest {
+                url: format!("http://127.0.0.1:{}/index.html", addr.port()),
+                max_depth: 1,
+                same_origin_only: true,
+                extensions: Vec::new(),
+                include_pattern: String::new(),
+                exclude_pattern: String::new(),
+            })
+            .await;
+        assert!(grab_err.is_err());
+        blocked_state.shutdown().await.unwrap();
+
+        let dir = TestDir::new();
+        let state = start_test_daemon(&dir.0).await;
+        let meta_path = dir.0.join("sample.meta4");
+        let meta_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<metalink xmlns="urn:ietf:params:xml:ns:metalink">
+  <file name="payload.bin">
+    <size>{}</size>
+    <hash type="sha-256">{sha_hex}</hash>
+    <url priority="1">http://127.0.0.1:{}/payload.bin</url>
+  </file>
+</metalink>"#,
+            payload.len(),
+            addr.port()
+        );
+        std::fs::write(&meta_path, meta_xml).unwrap();
+
+        let entries = state.parse_metalink_file(&meta_path).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].filename, "payload.bin");
+        assert_eq!(entries[0].sha256.as_deref(), Some(sha_hex.as_str()));
+        assert_eq!(entries[0].mirrors.len(), 1);
+
+        let ids = state
+            .enqueue_metalink_entries(entries, None, None)
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        assert!(state
+            .snapshot()
+            .await
+            .transfers
+            .iter()
+            .any(|item| item.id == ids[0] && item.filename == "payload.bin"));
 
         server.abort();
         state.shutdown().await.unwrap();

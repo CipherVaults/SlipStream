@@ -4,6 +4,7 @@ mod download;
 mod http;
 mod limiter;
 mod output;
+mod proxy;
 mod storage;
 #[cfg(test)]
 mod tests;
@@ -11,6 +12,7 @@ mod wildcard;
 
 pub use http::validate_redirect_target;
 pub use output::numbered_filename;
+pub use proxy::{system_http_proxy_for, EngineProxyConfig};
 pub use slipstream_protocol::{
     AddHttpDownloadRequest, PostQueueAction, RefreshDownloadUrlRequest, SegmentSnapshot,
     SegmentState, TelemetryBatch, TransferSnapshot, TransferStatus,
@@ -28,15 +30,18 @@ use slipstream_protocol::{
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 use storage::{Database, Record, Segments};
 use tokio::sync::{broadcast, watch, Mutex as AsyncMutex, Notify, OwnedMutexGuard};
 use tokio::task::{Id, JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior};
+use url::Url;
 use uuid::Uuid;
 
-const DEFAULT_QUEUE: &str = "default";
+type SiteAuthorization = dyn Fn(&Url) -> Option<reqwest::header::HeaderValue> + Send + Sync;
+
+pub const DEFAULT_QUEUE: &str = "default";
 const TELEMETRY_PERIOD: Duration = Duration::from_millis(50);
 
 pub type Result<T> = std::result::Result<T, EngineError>;
@@ -57,7 +62,7 @@ pub enum EngineError {
     Task(#[from] tokio::task::JoinError),
     #[error(transparent)]
     Http(reqwest::Error),
-    #[error("HTTP {status}")]
+    #[error("HTTP {}", format_http_status(*.status))]
     Status {
         status: reqwest::StatusCode,
         retry_after: Option<Duration>,
@@ -83,6 +88,24 @@ pub enum EngineError {
     Closed,
 }
 
+fn format_http_status(status: reqwest::StatusCode) -> String {
+    match status.as_u16() {
+        460 => "460 Connection Limit Exceeded".to_owned(),
+        509 => "509 Bandwidth Limit Exceeded".to_owned(),
+        520 => "520 Web Server Returned an Unknown Error".to_owned(),
+        521 => "521 Web Server Is Down".to_owned(),
+        522 => "522 Connection Timed Out".to_owned(),
+        523 => "523 Origin Is Unreachable".to_owned(),
+        524 => "524 A Timeout Occurred".to_owned(),
+        525 => "525 SSL Handshake Failed".to_owned(),
+        526 => "526 Invalid SSL Certificate".to_owned(),
+        _ if status.canonical_reason().is_none() => {
+            format!("{} Server Rejected Request", status.as_u16())
+        }
+        _ => status.to_string(),
+    }
+}
+
 impl EngineError {
     fn is_transient(&self) -> bool {
         match self {
@@ -94,7 +117,8 @@ impl EngineError {
                     || error.is_request()
             }
             Self::Status { status, .. } => {
-                status.is_server_error() || matches!(status.as_u16(), 408 | 429)
+                status.is_server_error()
+                    || matches!(status.as_u16(), 408 | 421 | 425 | 429 | 460..=499)
             }
             Self::Io(error) => error.kind() == std::io::ErrorKind::UnexpectedEof,
             _ => false,
@@ -135,11 +159,15 @@ impl Default for EngineConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueueConfig {
     pub id: String,
     pub max_concurrent_downloads: usize,
     pub post_action: PostQueueAction,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub speed_limit_bps: Option<u64>,
 }
 
 impl Default for QueueConfig {
@@ -148,6 +176,8 @@ impl Default for QueueConfig {
             id: DEFAULT_QUEUE.into(),
             max_concurrent_downloads: 4,
             post_action: PostQueueAction::None,
+            paused: false,
+            speed_limit_bps: None,
         }
     }
 }
@@ -197,23 +227,27 @@ impl Drop for Runtime {
 }
 
 pub(crate) struct Inner {
+    site_authorization: RwLock<Option<Arc<SiteAuthorization>>>,
     config: EngineConfig,
-    http: Http,
+    http: RwLock<Arc<Http>>,
     global_limiter: Limiter,
     events: broadcast::Sender<EngineEvent>,
     telemetry: broadcast::Sender<TelemetryBatch>,
     wake: Notify,
     outputs: Arc<AsyncMutex<()>>,
     state: Mutex<State>,
+    host_connection_caps: Mutex<HashMap<String, (usize, Instant)>>,
 }
 
 struct State {
     database: Option<Database>,
     jobs: HashMap<String, Job>,
     queues: HashMap<String, QueueConfig>,
+    queue_limiters: HashMap<String, Arc<Limiter>>,
     armed_queues: HashSet<String>,
     running: HashMap<String, RunControl>,
     concurrency: usize,
+    scheduling_paused: bool,
     closing: bool,
 }
 
@@ -232,6 +266,16 @@ pub(crate) struct Job {
 }
 
 impl State {
+    fn update_queue_limiter(&mut self, config: &QueueConfig) {
+        let limiter = self
+            .queue_limiters
+            .entry(config.id.clone())
+            .or_insert_with(|| Arc::new(Limiter::new(config.speed_limit_bps)));
+        if limiter.rate() != config.speed_limit_bps.filter(|&rate| rate > 0) {
+            limiter.set(config.speed_limit_bps);
+        }
+    }
+
     fn open(&self) -> Result<()> {
         if self.closing {
             return Err(EngineError::Closed);
@@ -260,7 +304,11 @@ impl State {
 
 impl DownloadEngine {
     pub async fn new(config: EngineConfig) -> Result<Self> {
-        let http = Http::new(config.allow_loopback, config.request_timeout)?;
+        Self::new_with_proxy(config, EngineProxyConfig::default()).await
+    }
+
+    pub async fn new_with_proxy(config: EngineConfig, proxy: EngineProxyConfig) -> Result<Self> {
+        let http = Http::new(config.allow_loopback, config.request_timeout, &proxy)?;
         let path = config.db_path.clone();
         let (database, queues, jobs) = tokio::task::spawn_blocking(move || {
             let mut db = Database::open(&path)?;
@@ -273,6 +321,11 @@ impl DownloadEngine {
             let mut jobs = HashMap::new();
             let mut recovered = Vec::new();
             for (mut record, mut segments) in db.transfers()? {
+                if !queues.contains_key(&record.queue_id) {
+                    record.queue_id = DEFAULT_QUEUE.into();
+                    record.queue_paused = false;
+                    db.save_record(&record)?;
+                }
                 if matches!(
                     record.status,
                     TransferStatus::Active | TransferStatus::Probing
@@ -294,8 +347,13 @@ impl DownloadEngine {
                     let prev_headers = !record.headers.is_empty();
                     let prev_referrer = record.referrer.is_some();
                     let prev_url = record.source_url.clone();
+                    let prev_mirrors = record.mirror_urls.clone();
                     scrub_record_credentials(&mut record);
-                    if prev_headers || prev_referrer || record.source_url != prev_url {
+                    if prev_headers
+                        || prev_referrer
+                        || record.source_url != prev_url
+                        || record.mirror_urls != prev_mirrors
+                    {
                         db.save_record(&record)?;
                     }
                 }
@@ -322,8 +380,13 @@ impl DownloadEngine {
             .filter(|job| is_queued_work(job.record.status))
             .map(|job| job.record.queue_id.clone())
             .collect();
+        let queue_limiters = queues
+            .iter()
+            .map(|(id, queue)| (id.clone(), Arc::new(Limiter::new(queue.speed_limit_bps))))
+            .collect();
         let inner = Arc::new(Inner {
-            http,
+            site_authorization: RwLock::default(),
+            http: RwLock::new(Arc::new(http)),
             global_limiter: Limiter::new(config.global_speed_limit_bps),
             events: broadcast::channel(256).0,
             telemetry: broadcast::channel(32).0,
@@ -333,11 +396,14 @@ impl DownloadEngine {
                 database: Some(database),
                 jobs,
                 queues,
+                queue_limiters,
                 armed_queues,
                 running: HashMap::new(),
                 concurrency: config.max_concurrent_downloads.max(1),
+                scheduling_paused: false,
                 closing: false,
             }),
+            host_connection_caps: Mutex::new(HashMap::new()),
             config,
         });
         let supervisor = tokio::spawn(Arc::clone(&inner).supervise());
@@ -348,6 +414,25 @@ impl DownloadEngine {
             }),
             inner,
         })
+    }
+
+    pub fn set_proxy_config(&self, config: EngineProxyConfig) -> Result<()> {
+        let http = Http::new(
+            self.inner.config.allow_loopback,
+            self.inner.config.request_timeout,
+            &config,
+        )?;
+        *self.inner.http.write().unwrap() = Arc::new(http);
+        Ok(())
+    }
+
+    /// Resolve managed authorization when a primary or mirror source is used.
+    /// These headers are scoped to the attempt and never written to the database.
+    pub fn set_site_authorization_provider(
+        &self,
+        provider: impl Fn(&Url) -> Option<reqwest::header::HeaderValue> + Send + Sync + 'static,
+    ) {
+        *self.inner.site_authorization.write().unwrap() = Some(Arc::new(provider));
     }
 
     pub async fn add_http_download(&self, request: AddHttpDownloadRequest) -> Result<String> {
@@ -395,6 +480,14 @@ impl DownloadEngine {
         &self,
         request: &AddHttpDownloadRequest,
     ) -> Result<(Source, String)> {
+        if request.mirror_urls.len() > 8 {
+            return Err(EngineError::InvalidRequest(
+                "at most 8 mirrors are supported".into(),
+            ));
+        }
+        for mirror in &request.mirror_urls {
+            http::validate_download_url(mirror, self.inner.config.allow_loopback)?;
+        }
         let source = Source::new(
             &request.url,
             &request.headers,
@@ -433,6 +526,7 @@ impl DownloadEngine {
                         expected_size_bytes: None,
                         start_paused: false,
                         overwrite_existing: false,
+                        ..AddHttpDownloadRequest::default()
                     },
                     ExtendedHttpOptions::default(),
                 )
@@ -481,6 +575,9 @@ impl DownloadEngine {
             use_server_filename: request.filename.is_none(),
             source_domain: source.url.host_str().unwrap_or_default().to_owned(),
             source_url: source.url.to_string(),
+            mirror_urls: request.mirror_urls,
+            representation_source: 0,
+            expected_size_bytes: request.expected_size_bytes,
             duplicate_url_digest: None,
             save_dir,
             headers: request.headers,
@@ -504,6 +601,7 @@ impl DownloadEngine {
                 .clamp(1, 32),
             protocol: String::new(),
             queue_id,
+            queue_paused: false,
             error: None,
             sha256_verified: None,
             commit_digest: None,
@@ -620,34 +718,314 @@ impl DownloadEngine {
         let mut state = self.inner.lock();
         state.open()?;
         state.db()?.save_queue(&config)?;
+        state.update_queue_limiter(&config);
         state.queues.insert(config.id.clone(), config);
         self.inner.wake.notify_one();
         Ok(())
     }
 
-    pub async fn assign_queue(&self, id: &str, queue_id: &str) -> Result<()> {
+    /// Reconcile the configured queues as one transaction before changing
+    /// scheduler state or interrupting any running transfer.
+    pub fn sync_queue_configs(&self, configs: Vec<QueueConfig>) -> Result<()> {
+        let mut queues = HashMap::new();
+        for mut config in configs {
+            if config.id.trim().is_empty() || queues.contains_key(&config.id) {
+                return Err(EngineError::InvalidRequest(
+                    "empty or duplicate queue ID".into(),
+                ));
+            }
+            config.max_concurrent_downloads = config.max_concurrent_downloads.max(1);
+            queues.insert(config.id.clone(), config);
+        }
+        if !queues.contains_key(DEFAULT_QUEUE) {
+            return Err(EngineError::InvalidRequest("missing default queue".into()));
+        }
+        let mut state = self.inner.lock();
+        state.open()?;
+        if state.queues == queues {
+            return Ok(());
+        }
+        let removed: Vec<_> = state
+            .queues
+            .keys()
+            .filter(|id| !queues.contains_key(*id))
+            .cloned()
+            .collect();
+        let mut updated = Vec::new();
+        let mut stop = Vec::new();
+        for job in state.jobs.values() {
+            let current = &job.record;
+            let mut record = current.clone();
+            let running = state.running.get(&record.id);
+            match queues.get(&record.queue_id) {
+                None => {
+                    record.queue_id = DEFAULT_QUEUE.into();
+                    record.queue_paused = false;
+                    if running.is_some_and(|run| run.desired != Some(TransferStatus::Canceled)) {
+                        stop.push((record.id.clone(), TransferStatus::Paused));
+                    }
+                }
+                Some(queue) if queue.paused && running.is_some_and(|run| run.desired.is_none()) => {
+                    record.queue_paused = true;
+                    stop.push((record.id.clone(), TransferStatus::Paused));
+                }
+                Some(queue) if !queue.paused && record.queue_paused => {
+                    record.queue_paused = false;
+                    if running.is_some_and(|run| run.desired == Some(TransferStatus::Paused)) {
+                        stop.push((record.id.clone(), TransferStatus::Queued));
+                    } else if running.is_none() && record.status == TransferStatus::Paused {
+                        record.set_status(TransferStatus::Queued);
+                    }
+                }
+                _ => continue,
+            }
+            record.updated_at = Utc::now();
+            updated.push(record);
+        }
+        state
+            .database
+            .as_mut()
+            .ok_or(EngineError::Closed)?
+            .sync_queues(&queues, &removed, &updated)?;
+        for id in removed {
+            state.queue_limiters.remove(&id);
+            state.armed_queues.remove(&id);
+        }
+        for config in queues.values() {
+            state.update_queue_limiter(config);
+        }
+        state.queues = queues;
+        for record in updated {
+            let id = record.id.clone();
+            if is_queued_work(record.status) {
+                state.armed_queues.insert(record.queue_id.clone());
+            }
+            let job = state.jobs.get_mut(&id).unwrap();
+            let changed = job.record.status != record.status;
+            let status = record.status;
+            job.record = record;
+            if changed {
+                self.inner.status(&id, status);
+            }
+        }
+        for (id, desired) in stop {
+            let run = state.running.get_mut(&id).unwrap();
+            run.desired = Some(desired);
+            run.stop.send_replace(true);
+        }
+        self.inner.wake.notify_one();
+        Ok(())
+    }
+
+    pub async fn pause_queue(&self, queue_id: &str) -> Result<()> {
+        let running_ids: Vec<String> = {
+            let mut state = self.inner.lock();
+            state.open()?;
+            let mut cfg = state
+                .queues
+                .get(queue_id)
+                .cloned()
+                .ok_or_else(|| EngineError::NotFound(queue_id.into()))?;
+            cfg.paused = true;
+            state.db()?.save_queue(&cfg)?;
+            state.queues.insert(queue_id.into(), cfg);
+            state
+                .running
+                .keys()
+                .filter(|id| state.jobs[*id].record.queue_id == queue_id)
+                .cloned()
+                .collect()
+        };
+        for id in running_ids {
+            match self.pause_transfer(&id).await {
+                Ok(()) | Err(EngineError::InvalidState(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn resume_queue(&self, queue_id: &str) -> Result<()> {
+        let mut state = self.inner.lock();
+        state.open()?;
+        let mut cfg = state
+            .queues
+            .get(queue_id)
+            .cloned()
+            .ok_or_else(|| EngineError::NotFound(queue_id.into()))?;
+        cfg.paused = false;
+        let now = Utc::now();
+        let mut updated = Vec::new();
+        for job in state.jobs.values() {
+            if job.record.queue_id == queue_id && job.record.status == TransferStatus::Paused {
+                let mut record = job.record.clone();
+                record.set_status(TransferStatus::Queued);
+                record.updated_at = now;
+                updated.push(record);
+            }
+        }
+        let has_queued_work = state
+            .jobs
+            .values()
+            .any(|job| job.record.queue_id == queue_id && is_queued_work(job.record.status));
+        {
+            let db = state.database.as_mut().ok_or(EngineError::Closed)?;
+            db.save_queue(&cfg)?;
+            if !updated.is_empty() {
+                db.save_records(&updated)?;
+            }
+        }
+        state.queues.insert(queue_id.into(), cfg);
+        for record in updated {
+            let id = record.id.clone();
+            if let Some(job) = state.jobs.get_mut(&id) {
+                job.record = record;
+            }
+            self.inner.status(&id, TransferStatus::Queued);
+        }
+        if has_queued_work {
+            state.armed_queues.insert(queue_id.into());
+        }
+        self.inner.wake.notify_one();
+        Ok(())
+    }
+
+    pub async fn remove_queue(&self, queue_id: &str) -> Result<()> {
+        if queue_id == DEFAULT_QUEUE {
+            return Err(EngineError::InvalidRequest(
+                "cannot remove the default queue".into(),
+            ));
+        }
+        let running_ids: Vec<String> = {
+            let mut state = self.inner.lock();
+            state.open()?;
+            let mut cfg = state
+                .queues
+                .get(queue_id)
+                .cloned()
+                .ok_or_else(|| EngineError::NotFound(queue_id.into()))?;
+            cfg.paused = true;
+            state.db()?.save_queue(&cfg)?;
+            state.queues.insert(queue_id.into(), cfg);
+            state
+                .running
+                .keys()
+                .filter(|id| state.jobs[*id].record.queue_id == queue_id)
+                .cloned()
+                .collect()
+        };
+        for id in running_ids {
+            match self.pause_transfer(&id).await {
+                Ok(()) | Err(EngineError::InvalidState(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
         let mut state = self.inner.lock();
         state.open()?;
         if !state.queues.contains_key(queue_id) {
             return Err(EngineError::NotFound(queue_id.into()));
         }
-        if state.running.contains_key(id) {
-            return Err(EngineError::InvalidState(
-                "pause the transfer before reassigning its queue",
-            ));
+        let now = Utc::now();
+        let mut updated = Vec::new();
+        let mut arm_default = false;
+        for job in state.jobs.values() {
+            if job.record.queue_id == queue_id {
+                let mut record = job.record.clone();
+                record.queue_id = DEFAULT_QUEUE.into();
+                record.updated_at = now;
+                if is_queued_work(record.status) {
+                    arm_default = true;
+                }
+                updated.push(record);
+            }
         }
-        let (db, job) = state.job_mut(id)?;
-        let mut record = job.record.clone();
-        record.queue_id = queue_id.into();
-        record.updated_at = Utc::now();
-        db.save_record(&record)?;
-        let armed = is_queued_work(record.status);
-        job.record = record;
-        if armed {
-            state.armed_queues.insert(queue_id.into());
+        {
+            let db = state.database.as_mut().ok_or(EngineError::Closed)?;
+            db.remove_queue(queue_id, &updated)?;
+        }
+        for record in updated {
+            let id = record.id.clone();
+            if let Some(job) = state.jobs.get_mut(&id) {
+                job.record = record;
+            }
+        }
+        state.queues.remove(queue_id);
+        state.queue_limiters.remove(queue_id);
+        state.armed_queues.remove(queue_id);
+        if arm_default {
+            state.armed_queues.insert(DEFAULT_QUEUE.into());
         }
         self.inner.wake.notify_one();
         Ok(())
+    }
+
+    pub async fn assign_queue(&self, id: &str, queue_id: &str) -> Result<()> {
+        self.assign_queue_batch(&[id.to_owned()], queue_id)?;
+        Ok(())
+    }
+
+    pub fn assign_queue_batch(&self, ids: &[String], queue_id: &str) -> Result<usize> {
+        let mut state = self.inner.lock();
+        state.open()?;
+        if !state.queues.contains_key(queue_id) {
+            return Err(EngineError::NotFound(queue_id.into()));
+        }
+        let mut seen = HashSet::new();
+        let now = Utc::now();
+        let mut updated = Vec::new();
+        let mut previous_queues = HashSet::new();
+        for id in ids.iter().filter(|id| seen.insert(*id)) {
+            if state.running.contains_key(id) {
+                return Err(EngineError::InvalidState(
+                    "pause the transfer before reassigning its queue",
+                ));
+            }
+            let mut record = state.job(id)?.record.clone();
+            if is_queued_work(record.status) {
+                previous_queues.insert(record.queue_id.clone());
+            }
+            if record.queue_id != queue_id {
+                record.queue_paused = false;
+                record.queue_id = queue_id.into();
+            }
+            record.updated_at = now;
+            updated.push(record);
+        }
+        let count = updated.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        state
+            .database
+            .as_mut()
+            .ok_or(EngineError::Closed)?
+            .save_records(&updated)?;
+        for record in updated {
+            if is_queued_work(record.status) {
+                state.armed_queues.insert(queue_id.into());
+            }
+            let id = record.id.clone();
+            state.jobs.get_mut(&id).unwrap().record = record;
+        }
+        let occupied: HashSet<_> = state
+            .jobs
+            .values()
+            .filter(|job| is_queued_work(job.record.status))
+            .map(|job| job.record.queue_id.clone())
+            .collect();
+        for previous in previous_queues.difference(&occupied) {
+            state.armed_queues.remove(previous);
+        }
+        self.inner.wake.notify_one();
+        Ok(count)
+    }
+
+    pub fn set_scheduling_paused(&self, paused: bool) {
+        let mut state = self.inner.lock();
+        if state.scheduling_paused != paused {
+            state.scheduling_paused = paused;
+            self.inner.wake.notify_one();
+        }
     }
 
     pub async fn set_max_concurrent_downloads(&self, maximum: usize) -> Result<()> {
@@ -661,7 +1039,9 @@ impl DownloadEngine {
     pub async fn set_global_speed_limit(&self, bps: Option<u64>) -> Result<()> {
         let state = self.inner.lock();
         state.open()?;
-        self.inner.global_limiter.set(bps);
+        if self.inner.global_limiter.rate() != bps.filter(|&rate| rate > 0) {
+            self.inner.global_limiter.set(bps);
+        }
         Ok(())
     }
 
@@ -754,6 +1134,13 @@ impl DownloadEngine {
             let mut state = self.inner.lock();
             state.open()?;
             let current = state.job(id)?.record.status;
+            if state.job(id)?.record.queue_paused {
+                let (db, job) = state.job_mut(id)?;
+                let mut record = job.record.clone();
+                record.queue_paused = false;
+                db.save_record(&record)?;
+                job.record = record;
+            }
             if current == target {
                 return Ok(());
             }
@@ -972,6 +1359,13 @@ fn scrub_record_credentials(record: &mut Record) {
             url.into()
         },
     );
+    for mirror in &mut record.mirror_urls {
+        if let Ok(mut url) = validate_http_url(mirror) {
+            url.set_query(None);
+            url.set_fragment(None);
+            *mirror = url.into();
+        }
+    }
 }
 
 impl Inner {
@@ -984,6 +1378,46 @@ impl Inner {
             transfer_id: id.to_owned(),
             status,
         });
+    }
+
+    fn learned_host_cap(&self, host: &str) -> Option<usize> {
+        let key = host.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            return None;
+        }
+        const HOST_CAP_TTL: Duration = Duration::from_secs(15 * 60);
+        let now = Instant::now();
+        let mut caps = self.host_connection_caps.lock().unwrap();
+        caps.retain(|_, (_, recorded_at)| now.duration_since(*recorded_at) < HOST_CAP_TTL);
+        caps.get(&key).map(|(cap, _)| (*cap).max(1))
+    }
+
+    fn record_host_cap(&self, host: &str, cap: usize) {
+        let key = host.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            return;
+        }
+        const MAX_HOST_CAPS: usize = 128;
+        const HOST_CAP_TTL: Duration = Duration::from_secs(15 * 60);
+        let now = Instant::now();
+        let clamped = cap.max(1);
+        let mut caps = self.host_connection_caps.lock().unwrap();
+        caps.retain(|_, (_, recorded_at)| now.duration_since(*recorded_at) < HOST_CAP_TTL);
+        if let Some((existing, recorded_at)) = caps.get_mut(&key) {
+            *existing = (*existing).min(clamped);
+            *recorded_at = now;
+            return;
+        }
+        if caps.len() >= MAX_HOST_CAPS {
+            if let Some(oldest) = caps
+                .iter()
+                .min_by_key(|(_, (_, recorded_at))| *recorded_at)
+                .map(|(k, _)| k.clone())
+            {
+                caps.remove(&oldest);
+            }
+        }
+        caps.insert(key, (clamped, now));
     }
 
     fn request_shutdown(&self) {
@@ -1048,15 +1482,21 @@ impl Inner {
         let mut candidates: Vec<_> = state
             .jobs
             .values()
-            .filter(|job| job.record.status == TransferStatus::Queued)
+            .filter(|job| {
+                job.record.status == TransferStatus::Queued
+                    && !state.running.contains_key(&job.record.id)
+            })
             .map(|job| (job.record.created_at, job.record.id.clone()))
             .collect();
         candidates.sort();
         for (_, id) in candidates {
-            if runs.len() >= state.concurrency {
+            if state.scheduling_paused || runs.len() >= state.concurrency {
                 break;
             }
             let queue = state.jobs[&id].record.queue_id.clone();
+            if state.queues.get(&queue).is_some_and(|cfg| cfg.paused) {
+                continue;
+            }
             let occupied = occupancy.entry(queue.clone()).or_default();
             if *occupied >= state.queues[&queue].max_concurrent_downloads {
                 continue;
@@ -1263,6 +1703,8 @@ impl Job {
             speed_limit_bps: record.speed_limit_bps,
             connect_rtt_ms: self.connect_rtt_ms,
             description: record.description.clone(),
+            category_id: None,
+            tags: Vec::new(),
             created_at: record.created_at,
             updated_at: record.updated_at,
         }

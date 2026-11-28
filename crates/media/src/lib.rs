@@ -11,8 +11,8 @@ mod test_support;
 pub use args::{BuildFfmpegArgs, BuildYtDlpArgs};
 pub use error::MediaError;
 pub use pipeline::{
-    DownloadOptions, DownloadOutcome, DownloadProgress, FfmpegProgress, LocalMediaOptions,
-    MediaMetadata, MediaPipeline, MediaProgressEvent, SubtitleInput,
+    format_media_filename, DownloadOptions, DownloadOutcome, DownloadProgress, FfmpegProgress,
+    LocalMediaOptions, MediaMetadata, MediaPipeline, MediaProgressEvent, SubtitleInput,
 };
 pub use probe::{
     audio_preset_recommendations, parse_ytdlp_probe_json, pick_format_option, probe_url,

@@ -216,6 +216,55 @@ pub struct DownloadOptions {
     pub metadata: MediaMetadata,
     pub pre_probe: Option<MediaProbeResult>,
     pub cache_dir: Option<PathBuf>,
+    pub proxy: Option<String>,
+    pub cookies_from_browser: Option<String>,
+    pub sponsorblock_remove: Vec<String>,
+    pub embed_chapters: bool,
+    pub split_chapters: bool,
+    pub embed_thumbnail: bool,
+    pub embed_metadata: bool,
+    pub clip_range: Option<(u64, u64)>,
+    pub filename_template: String,
+}
+
+/// Expand literal metadata placeholders into a safe filename stem.
+pub fn format_media_filename(
+    template: &str,
+    title: &str,
+    uploader: Option<&str>,
+    date: Option<&str>,
+    id: Option<&str>,
+    index: Option<u32>,
+) -> String {
+    let index = index.map(|index| index.to_string());
+    let template = if template.is_empty() {
+        "{title}"
+    } else {
+        template
+    };
+    let mut rendered = String::new();
+    let mut rest = template;
+    while let Some((prefix, after_open)) = rest.split_once('{') {
+        rendered.push_str(prefix);
+        let Some((field, tail)) = after_open.split_once('}') else {
+            rest = &rest[prefix.len()..];
+            break;
+        };
+        match field {
+            "title" => rendered.push_str(title),
+            "uploader" => rendered.push_str(uploader.unwrap_or_default()),
+            "date" => rendered.push_str(date.unwrap_or_default()),
+            "id" => rendered.push_str(id.unwrap_or_default()),
+            "index" => rendered.push_str(index.as_deref().unwrap_or_default()),
+            _ => rendered.push_str(&rest[prefix.len()..prefix.len() + field.len() + 2]),
+        }
+        rest = tail;
+    }
+    rendered.push_str(rest);
+    sanitize_title_to_filename(&rendered, "tmp")
+        .ok()
+        .and_then(|filename| filename.strip_suffix(".tmp").map(str::to_owned))
+        .unwrap_or_else(|| "download".into())
 }
 
 #[derive(Debug)]
@@ -375,6 +424,43 @@ impl MediaPipeline {
         if let Some(dir) = &options.cache_dir {
             builder = builder.cache_dir(dir)?;
         }
+        if let Some(proxy) = &options.proxy {
+            builder = builder.proxy(proxy)?;
+        }
+        if let Some(browser) = &options.cookies_from_browser {
+            builder = builder.cookies_from_browser(browser)?;
+        }
+        let categories = if request.sponsorblock_categories.is_empty() {
+            &options.sponsorblock_remove
+        } else {
+            &request.sponsorblock_categories
+        };
+        builder = builder.sponsorblock_remove(categories)?;
+        if options.embed_chapters {
+            builder = builder.embed_chapters();
+        }
+        if options.split_chapters || request.split_chapters {
+            builder = builder.split_chapters(playlist);
+        }
+        if options.embed_thumbnail {
+            builder = builder.embed_thumbnail();
+        }
+        if options.embed_metadata {
+            builder = builder.add_metadata();
+        }
+        let clip = match (request.clip_start_seconds, request.clip_end_seconds) {
+            (Some(start), Some(end)) => Some((start, end)),
+            (None, None) => options.clip_range,
+            _ => {
+                return Err(MediaError::argument(
+                    "clip range",
+                    "start and end are required",
+                ))
+            }
+        };
+        if let Some((start, end)) = clip {
+            builder = builder.download_sections(start, end)?;
+        }
         if let Some(format) = request
             .format_id
             .as_deref()
@@ -414,6 +500,8 @@ impl MediaPipeline {
                         playlist,
                         cache_dir: options.cache_dir.clone(),
                         headers: request.headers.clone(),
+                        proxy: options.proxy.clone(),
+                        cookies_from_browser: options.cookies_from_browser.clone(),
                     },
                 )
                 .await?
@@ -450,6 +538,13 @@ impl MediaPipeline {
                 }
                 result => result,
             };
+        let download = download.map_err(|error| {
+            crate::args::protect_ytdlp_error(
+                error,
+                options.proxy.as_deref(),
+                options.cookies_from_browser.as_deref(),
+            )
+        });
         let download = match download {
             Err(MediaError::ToolFailed { status, .. })
                 if playlist && matches!(status.code(), Some(1 | 101)) =>
@@ -472,8 +567,11 @@ impl MediaPipeline {
         if let Err(error) = download {
             tracing::warn!(%error, items = media.len(), "continuing with downloaded playlist items");
         }
-        let numbered = (playlist && !named_single_item) || media.len() > 1;
-        let media_count = media.len();
+        let media_count = media
+            .keys()
+            .filter(|&&(_, _, chapter)| chapter == 0)
+            .count();
+        let numbered = (playlist && !named_single_item) || media_count > 1;
         // Some extractors omit unavailable entries from the flat probe. Only
         // use its titles when every downloaded index aligns with the full list.
         let titles_aligned = playlist
@@ -481,14 +579,16 @@ impl MediaPipeline {
             && selected_count == Some(media_count as u64)
             && media
                 .keys()
-                .map(|&(_, index)| index)
+                .filter(|&&(_, _, chapter)| chapter == 0)
+                .map(|&(_, index, _)| index)
                 .eq(1..=media.len() as u64);
         let mut ready = Vec::with_capacity(media.len());
         let mut indices = HashSet::new();
         let mut first_processing_error = None;
         let mut missing_subtitles = 0;
-        for ((ordinal, index), mut item) in media {
-            let duplicate = (!indices.insert(index)).then_some(ordinal);
+        let mut published_items = 0;
+        for ((ordinal, index, chapter), mut item) in media {
+            let duplicate = (chapter == 0 && !indices.insert(index)).then_some(ordinal);
             let input = item.media.take().ok_or(MediaError::NoMedia)?;
             let mut local_options = LocalMediaOptions {
                 normalize_audio: request.normalize_audio,
@@ -496,7 +596,11 @@ impl MediaPipeline {
                 ..LocalMediaOptions::default()
             };
             let mut missing_requested_subtitle = false;
-            for lang in &request.embed_subtitles_langs {
+            for lang in request
+                .embed_subtitles_langs
+                .iter()
+                .filter(|_| chapter == 0)
+            {
                 if let Some(path) = item.subtitles.get(lang) {
                     local_options.subtitles.push(SubtitleInput {
                         path: path.clone(),
@@ -508,7 +612,7 @@ impl MediaPipeline {
                     missing_requested_subtitle = true;
                 }
             }
-            if options.embed_cover_art {
+            if options.embed_cover_art && chapter == 0 {
                 local_options.cover_art = item.cover;
                 if !playlist && local_options.cover_art.is_none() {
                     return Err(MediaError::InvalidToolOutput {
@@ -544,7 +648,7 @@ impl MediaPipeline {
             }
             let staged = if let Some(conversion) = conversion {
                 let mut output = stage.path.join(format!(
-                    "output-{ordinal}-{index}.{}",
+                    "output-{ordinal}-{index}-{chapter}.{}",
                     container_extension(conversion.container())
                 ));
                 let mut result = self
@@ -587,14 +691,35 @@ impl MediaPipeline {
                 .flatten()
                 .filter(|title| !title.is_empty())
                 .unwrap_or(&probe.title);
-            let name = download_filename(
-                filename.as_deref(),
-                title,
-                &extension(&staged),
-                numbered.then_some((index, duplicate)),
-            )?;
+            let templated;
+            let title = if !options.filename_template.is_empty() && filename.is_none() {
+                templated = format_media_filename(
+                    &options.filename_template,
+                    title,
+                    None,
+                    None,
+                    None,
+                    playlist.then(|| u32::try_from(index).ok()).flatten(),
+                );
+                &templated
+            } else {
+                title
+            };
+            let ext = extension(&staged);
+            let name = if chapter == 0 {
+                download_filename(
+                    filename.as_deref(),
+                    title,
+                    &ext,
+                    numbered.then_some((index, duplicate)),
+                )?
+            } else {
+                let part = format!("{index:06}-{ordinal:06}-chapter-{chapter:06}.{ext}");
+                sanitize_title_to_filename(filename.as_deref().unwrap_or(title), &part)?
+            };
             let destination = destination(&save_dir, &name).await?;
             ready.push((staged, destination));
+            published_items += usize::from(chapter == 0);
             missing_subtitles += usize::from(missing_requested_subtitle);
         }
         if ready.is_empty() {
@@ -609,7 +734,7 @@ impl MediaPipeline {
                 None
             };
             playlist_completion_notice(
-                paths.len(),
+                published_items,
                 expected,
                 download_failed || first_processing_error.is_some(),
                 missing_subtitles,
@@ -1658,9 +1783,10 @@ impl Stage {
         Ok(())
     }
 
-    // Keys are (download ordinal, original playlist index). Single-video
-    // stages use one number for both.
-    async fn downloaded_items(&self) -> Result<BTreeMap<(u64, u64), DownloadedItem>, MediaError> {
+    // Keys are (download ordinal, playlist index, chapter), with zero for the main file.
+    async fn downloaded_items(
+        &self,
+    ) -> Result<BTreeMap<(u64, u64, u64), DownloadedItem>, MediaError> {
         self.check().await?;
         let mut entries = fs::read_dir(&self.path)
             .await
@@ -1679,6 +1805,13 @@ impl Stage {
             else {
                 continue;
             };
+            let (stem, chapter) = match stem.split_once("-chapter-") {
+                Some((stem, chapter)) => match stage_number(chapter) {
+                    Some(chapter) => (stem, chapter),
+                    None => continue,
+                },
+                None => (stem, 0),
+            };
             let (index, ordinal) = stem.split_once('-').unwrap_or((stem, stem));
             let (Some(index), Some(ordinal)) = (stage_number(index), stage_number(ordinal)) else {
                 continue;
@@ -1694,7 +1827,7 @@ impl Stage {
                 continue;
             }
             validate_safe_filename_component(name)?;
-            let key = (ordinal, index);
+            let key = (ordinal, index, chapter);
             let path = entry.path();
             match suffix {
                 "jpg" | "jpeg" | "png" | "webp" => {
@@ -1823,6 +1956,31 @@ impl Drop for Stage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase4_formats_safe_media_filename_stems() {
+        assert_eq!(
+            format_media_filename(
+                "{index} - {title} - {uploader} [{date} {id}]",
+                "A/B",
+                Some("name:one"),
+                Some("20261128"),
+                Some("abc"),
+                Some(2)
+            ),
+            "2 - A_B - name_one [20261128 abc]"
+        );
+        assert_eq!(
+            format_media_filename("", "CON", None, None, None, None),
+            "_CON"
+        );
+        assert_eq!(
+            format_media_filename("{title}-{id}", "{id}", None, None, Some("actual"), None),
+            "{id}-actual"
+        );
+        let stem = format_media_filename("{title}", &"é".repeat(200), None, None, None, None);
+        validate_safe_filename_component(&stem).unwrap();
+    }
     use crate::{parse_ytdlp_probe_json, test_support::RetryTool, ToolchainConfig};
 
     #[tokio::test]
@@ -1914,9 +2072,12 @@ mod tests {
             fs::write(stage.path.join(name), bytes).await.unwrap();
         }
         let items = stage.downloaded_items().await.unwrap();
-        assert_eq!(items.keys().copied().collect::<Vec<_>>(), [(1, 1), (2, 1)]);
+        assert_eq!(
+            items.keys().copied().collect::<Vec<_>>(),
+            [(1, 1, 0), (2, 1, 0)]
+        );
         for ((ordinal, index), expected) in [((1, 1), "first"), ((2, 1), "second")] {
-            let item = &items[&(ordinal, index)];
+            let item = &items[&(ordinal, index, 0)];
             assert_eq!(
                 fs::read_to_string(item.media.as_ref().unwrap())
                     .await
@@ -1929,8 +2090,8 @@ mod tests {
             );
             assert_eq!(item.subtitles.len(), 1);
         }
-        assert!(items[&(1, 1)].cover.is_none());
-        assert!(items[&(2, 1)].cover.is_some());
+        assert!(items[&(1, 1, 0)].cover.is_none());
+        assert!(items[&(2, 1, 0)].cover.is_some());
         assert_eq!(
             download_filename(None, "Playlist", "mp4", Some((1, Some(2)))).unwrap(),
             "Playlist-000001-000002.mp4"

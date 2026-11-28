@@ -151,6 +151,7 @@ async fn check_playlist_recovery(root: &Path, ffmpeg: &ResolvedBinary, ffprobe: 
             selected_entries: None,
             playlist_folder_name: None,
             headers: Default::default(),
+            ..AddMediaDownloadRequest::default()
         };
         let outcome = pipeline
             .download_with_summary(&request, &DownloadOptions::default(), None)
@@ -212,6 +213,7 @@ async fn fast_probe_and_single_video_download_reuse_matching_probe() {
         selected_entries: None,
         playlist_folder_name: None,
         headers: [("user-agent".into(), "SlipStream Test".into())].into(),
+        ..AddMediaDownloadRequest::default()
     };
     let mut cached = probe_url_with_binary(
         &binary,
@@ -968,6 +970,7 @@ async fn real_ytdlp_probe_and_download_loopback() {
         selected_entries: None,
         playlist_folder_name: None,
         headers: Default::default(),
+        ..AddMediaDownloadRequest::default()
     };
     let (download, events) = tokio::join!(
         async {

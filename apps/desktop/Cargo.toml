@@ -36,6 +36,7 @@ minisign = "0.10.0"
 minisign-verify = "0.3.0"
 muda = "0.20"
 png = "0.18"
+quick-xml = "0.41"
 raw-window-handle = "0.6"
 reqwest.workspace = true
 semver = "1"
@@ -43,6 +44,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 slint = "=1.19.1"
+tempfile = "3"
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -53,15 +55,21 @@ uuid.workspace = true
 windows-sys = { workspace = true, features = [
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
     "Win32_System_Ioctl",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    "Win32_System_Power",
     "Win32_System_Registry",
+    "Win32_System_Shutdown",
     "Win32_System_SystemServices",
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -69,6 +77,10 @@ windows-sys = { workspace = true, features = [
     "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
 ] }
+flate2 = "1.1"
+tar = "0.4"
+zip = { version = "9.8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+sevenz-rust = { version = "0.6", default-features = false }
 
 [build-dependencies]
 slint-build = "=1.19.1"

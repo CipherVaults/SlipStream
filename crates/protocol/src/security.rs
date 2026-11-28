@@ -70,7 +70,19 @@ fn is_windows_forbidden_char(ch: char) -> bool {
 
 fn is_reserved_windows_device(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or("");
-    let upper = stem.trim().to_ascii_uppercase();
+    let mut upper = stem.trim().to_ascii_uppercase();
+    if let Some(digit) = match upper.chars().last() {
+        Some('\u{00B9}') => Some('1'),
+        Some('\u{00B2}') => Some('2'),
+        Some('\u{00B3}') => Some('3'),
+        _ => None,
+    } {
+        upper.pop();
+        if upper.ends_with('\u{00C2}') {
+            upper.pop();
+        }
+        upper.push(digit);
+    }
     WINDOWS_RESERVED_STEMS.contains(&upper.as_str())
 }
 
@@ -251,6 +263,26 @@ pub fn validate_http_url(raw: &str) -> Result<Url, UrlSecurityError> {
     }
 }
 
+/// Validates a proxy endpoint before configuring a client or sidecar.
+pub fn validate_http_proxy_url(raw: &str) -> Result<Url, UrlSecurityError> {
+    let Some((scheme, authority)) = raw.trim().split_once("://") else {
+        return Err(UrlSecurityError::InvalidFormat);
+    };
+    if !["http", "https"]
+        .iter()
+        .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
+        || authority.starts_with(['/', '\\'])
+        || raw.trim().chars().any(char::is_whitespace)
+    {
+        return Err(UrlSecurityError::InvalidFormat);
+    }
+    let url = validate_http_url(raw)?;
+    if url.port() == Some(0) || url.query().is_some() || url.fragment().is_some() {
+        return Err(UrlSecurityError::InvalidFormat);
+    }
+    Ok(url)
+}
+
 /// Returns true if an IP address belongs to loopback, link-local, RFC1918 private, CGNAT,
 /// documentation, multicast, unspecified, or IPv4-mapped equivalents (SSRF defense).
 pub fn is_private_or_loopback_ip(ip: IpAddr) -> bool {
@@ -378,6 +410,20 @@ mod tests {
                 "expected sanitize_filename to reject {case:?}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_superscript_windows_device_names() {
+        for digit in ['\u{00B9}', '\u{00B2}', '\u{00B3}'] {
+            for prefix in ["com", "LPT", "com\u{00C2}", "LPT\u{00C2}"] {
+                let name = format!("{prefix}{digit}.zip");
+                assert_eq!(
+                    validate_safe_filename_component(&name),
+                    Err(PathSecurityError::ReservedDeviceName)
+                );
+            }
+        }
+        assert!(validate_safe_filename_component("report\u{00B9}.zip").is_ok());
     }
 
     #[test]

@@ -13,6 +13,10 @@ use std::{
     time::Duration,
 };
 use tempfile::tempdir;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::TcpListener,
+};
 
 const PIECE: usize = 16 * 1024;
 const WAIT: Duration = Duration::from_secs(15);
@@ -25,6 +29,440 @@ fn local_config(path: &Path) -> TorrentManagerConfig {
         listen_port_range: None,
         ..Default::default()
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn force_recheck_verifies_existing_pieces_and_resets_completion_after_corruption() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("payload.bin");
+    let mut payload = vec![1; PIECE];
+    payload.extend(vec![2; PIECE]);
+    fs::write(&path, &payload).unwrap();
+    let manifest = build_v1_single_file_torrent("payload.bin", &payload, PIECE as u32).unwrap();
+    let manager = TorrentManager::new(local_config(dir.path())).await.unwrap();
+    let id = manager
+        .add_torrent_bytes(
+            &manifest,
+            TorrentAddOptions {
+                overwrite: true,
+                start_paused: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    manager.wait_until_completed(&id, WAIT).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let elapsed = manager.stats(&id).unwrap().seeding_seconds;
+    assert!(elapsed >= 1);
+    manager.force_recheck(&id).await.unwrap();
+    manager.wait_until_completed(&id, WAIT).await.unwrap();
+    assert!(manager.stats(&id).unwrap().seeding_seconds >= elapsed);
+
+    let mut corrupt = payload.clone();
+    corrupt[PIECE..].fill(3);
+    fs::write(&path, &corrupt).unwrap();
+    manager.force_recheck(&id).await.unwrap();
+    manager.wait_until_initialized(&id, WAIT).await.unwrap();
+    let report = manager.stats(&id).unwrap();
+    assert_eq!(report.snapshot.status, TransferStatus::Paused);
+    assert!(!report.finished);
+    assert_eq!(report.completed_pieces, 1);
+    assert_eq!(report.seeding_seconds, 0);
+    assert_eq!(fs::read(&path).unwrap(), corrupt);
+
+    fs::write(&path, &payload).unwrap();
+    manager.force_recheck(&id).await.unwrap();
+    manager.wait_until_completed(&id, WAIT).await.unwrap();
+    assert_eq!(manager.stats(&id).unwrap().seeding_seconds, 0);
+    manager.shutdown().await;
+}
+
+async fn expect_announce(listener: &TcpListener, peers: &[u8]) {
+    tokio::time::timeout(WAIT, async {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = BufReader::new(stream);
+        let mut line = String::new();
+        stream.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("GET /announce?"), "{line}");
+        assert!(line.contains("event=started"), "{line}");
+        loop {
+            line.clear();
+            if stream.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                break;
+            }
+        }
+        let body = bencode::encode(&V::Dict(std::collections::BTreeMap::from([
+            (b"complete".to_vec(), V::Int(i64::from(!peers.is_empty()))),
+            (b"incomplete".to_vec(), V::Int(0)),
+            (b"interval".to_vec(), V::Int(3600)),
+            (b"peers".to_vec(), V::Bytes(peers.to_vec())),
+        ])));
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let stream = stream.get_mut();
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+    })
+    .await
+    .expect("expected a tracker announce");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_trackers_preserves_pause_and_reannounce_contacts_the_tracker_again() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let tracker = format!("http://{}/announce", listener.local_addr().unwrap());
+    let dir = tempdir().unwrap();
+    let payload = vec![9; PIECE];
+    fs::write(dir.path().join("tracker.bin"), &payload).unwrap();
+    let manifest = build_v1_single_file_torrent("tracker.bin", &payload, PIECE as u32).unwrap();
+    let manager = TorrentManager::new(TorrentManagerConfig {
+        enable_trackers: true,
+        allow_loopback: true,
+        ..local_config(dir.path())
+    })
+    .await
+    .unwrap();
+    let id = manager
+        .add_torrent_bytes(
+            &manifest,
+            TorrentAddOptions {
+                overwrite: true,
+                start_paused: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        manager
+            .add_trackers(&id, vec![tracker.clone(), "file:///tracker".into()])
+            .await,
+        Err(TorrentError::InvalidState(_))
+    ));
+    assert!(manager.peer_summary(&id).unwrap().trackers.is_empty());
+    manager
+        .add_trackers(
+            &id,
+            vec![format!(" {tracker} "), String::new(), tracker.clone()],
+        )
+        .await
+        .unwrap();
+    manager.wait_until_completed(&id, WAIT).await.unwrap();
+    assert_eq!(manager.peer_summary(&id).unwrap().trackers, [tracker]);
+    assert_eq!(
+        manager.snapshot(&id).unwrap().status,
+        TransferStatus::Paused
+    );
+    manager.reannounce(&id).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), listener.accept())
+            .await
+            .is_err()
+    );
+
+    manager.resume(&id).await.unwrap();
+    expect_announce(&listener, &[]).await;
+    manager.reannounce(&id).await.unwrap();
+    expect_announce(&listener, &[]).await;
+    manager.wait_until_completed(&id, WAIT).await.unwrap();
+    assert_eq!(
+        manager.snapshot(&id).unwrap().status,
+        TransferStatus::Seeding
+    );
+    assert_eq!(fs::read(dir.path().join("tracker.bin")).unwrap(), payload);
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adding_a_tracker_resolves_a_magnet_into_its_new_save_dir() {
+    let seed_dir = tempdir().unwrap();
+    let leech_dir = tempdir().unwrap();
+    let payload = b"payload from a tracker-discovered peer";
+    fs::write(seed_dir.path().join("tracker-seed.bin"), payload).unwrap();
+    let manifest = build_v1_single_file_torrent("tracker-seed.bin", payload, PIECE as u32).unwrap();
+    let seed = TorrentManager::new(TorrentManagerConfig {
+        listen_port_range: Some(0..1),
+        ..local_config(seed_dir.path())
+    })
+    .await
+    .unwrap();
+    let hash = seed
+        .add_torrent_bytes(
+            &manifest,
+            TorrentAddOptions {
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    seed.wait_until_completed(&hash, WAIT).await.unwrap();
+    let port = seed.listen_port().unwrap().to_be_bytes();
+    let tracker_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let tracker = format!("http://{}/announce", tracker_listener.local_addr().unwrap());
+    let leech = TorrentManager::new(TorrentManagerConfig {
+        allow_loopback: true,
+        enable_trackers: true,
+        ..local_config(leech_dir.path())
+    })
+    .await
+    .unwrap();
+    let id = leech
+        .add_magnet(
+            &format!("magnet:?xt=urn:btih:{hash}"),
+            TorrentAddOptions::default(),
+        )
+        .await
+        .unwrap();
+    leech.move_storage(&id, Path::new("magnet")).await.unwrap();
+    leech
+        .add_trackers(&id, vec![tracker.clone()])
+        .await
+        .unwrap();
+    expect_announce(&tracker_listener, &[127, 0, 0, 1, port[0], port[1]]).await;
+    // Metadata resolution consumes the first announce. Registration announces
+    // again, and must be able to download using the peer it already discovered.
+    expect_announce(&tracker_listener, &[]).await;
+    leech.wait_until_completed(&id, WAIT).await.unwrap();
+    assert_eq!(leech.peer_summary(&id).unwrap().trackers, [tracker]);
+    assert_eq!(
+        fs::read(leech_dir.path().join("magnet/tracker-seed.bin")).unwrap(),
+        payload
+    );
+    assert!(!leech_dir.path().join("tracker-seed.bin").exists());
+    tokio::join!(leech.shutdown(), seed.shutdown());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn move_storage_rolls_back_on_collision_then_moves_payload_and_updates_removal_paths() {
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let source = dir.path().join("old");
+    let target = dir.path().join("new");
+    let files = [
+        ("nested/a.bin", &b"first"[..]),
+        ("nested/b.bin", &b"second"[..]),
+    ];
+    fs::create_dir_all(source.join("nested")).unwrap();
+    fs::create_dir_all(target.join("nested")).unwrap();
+    for (path, bytes) in files {
+        fs::write(source.join(path), bytes).unwrap();
+    }
+    let manifest = build_v1_multi_file_torrent("payloads", &files, PIECE as u32).unwrap();
+    let manager = TorrentManager::new(local_config(dir.path())).await.unwrap();
+    let id = manager
+        .add_torrent_bytes(
+            &manifest,
+            TorrentAddOptions {
+                save_dir: Some(source.clone()),
+                start_paused: true,
+                overwrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    manager.wait_until_completed(&id, WAIT).await.unwrap();
+    for bad in [outside.path(), Path::new("../escape")] {
+        assert!(matches!(
+            manager.move_storage(&id, bad).await,
+            Err(TorrentError::PathSecurity(_))
+        ));
+    }
+
+    let collision = target.join(files[1].0);
+    fs::write(&collision, b"unrelated").unwrap();
+    assert!(matches!(manager.move_storage(&id, &target).await,
+        Err(TorrentError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists));
+    assert_eq!(Path::new(&manager.snapshot(&id).unwrap().save_dir), source);
+    assert_eq!(fs::read(source.join(files[0].0)).unwrap(), files[0].1);
+    assert_eq!(fs::read(source.join(files[1].0)).unwrap(), files[1].1);
+    assert_eq!(fs::read(&collision).unwrap(), b"unrelated");
+    assert!(!target.join(files[0].0).exists());
+
+    fs::remove_file(collision).unwrap();
+    manager.move_storage(&id, Path::new("new")).await.unwrap();
+    manager.move_storage(&id, &target).await.unwrap();
+    manager.wait_until_completed(&id, WAIT).await.unwrap();
+    let report = manager.stats(&id).unwrap();
+    assert_eq!(report.snapshot.status, TransferStatus::Paused);
+    assert_eq!(Path::new(&report.snapshot.save_dir), target);
+    assert!(!source.join("nested").exists());
+    for (path, bytes) in files {
+        assert_eq!(fs::read(target.join(path)).unwrap(), bytes);
+    }
+    manager.remove(&id, true).await.unwrap();
+    assert!(!target.join("nested").exists());
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn unresolved_magnet_tracks_new_save_dir_and_extra_trackers() {
+    let dir = tempdir().unwrap();
+    let manager = TorrentManager::new(local_config(dir.path())).await.unwrap();
+    let original = "https://tracker.example/announce";
+    let first = "udp://tracker-one.example:6969/announce";
+    let second = "https://tracker-two.example/announce";
+    let id = manager
+        .add_magnet(
+            &format!("magnet:?xt=urn:btih:{}&tr={original}", "ab".repeat(20)),
+            TorrentAddOptions {
+                start_paused: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    manager
+        .add_trackers(
+            &id,
+            vec![first.into(), original.into(), first.into(), second.into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        manager.peer_summary(&id).unwrap().trackers,
+        [original, first, second]
+    );
+    manager.force_recheck(&id).await.unwrap();
+    manager.move_storage(&id, Path::new("moved")).await.unwrap();
+    let snapshot = manager.snapshot(&id).unwrap();
+    assert_eq!(snapshot.status, TransferStatus::Paused);
+    assert_eq!(Path::new(&snapshot.save_dir), dir.path().join("moved"));
+    assert!(dir.path().join("moved").is_dir());
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn validates_socks_proxy_url_before_creating_the_session() {
+    let dir = tempdir().unwrap();
+    let mut config = local_config(dir.path());
+    for proxy in [
+        "http://proxy.example:1080",
+        "socks5:/",
+        "socks5://:1080",
+        "socks5://proxy.example",
+        "socks5://proxy.example:0",
+        "socks5://proxy.example:65536",
+        "socks5://proxy.example:1080?query",
+        "socks5h://proxy.example:1080#fragment",
+    ] {
+        config.socks_proxy_url = Some(proxy.into());
+        assert!(
+            matches!(
+                TorrentManager::new(config.clone()).await,
+                Err(TorrentError::InvalidState(_))
+            ),
+            "{proxy}"
+        );
+    }
+    for proxy in [
+        "   ",
+        " socks5://user:pass@127.0.0.1:1080 ",
+        " socks5h://127.0.0.1:1080 ",
+    ] {
+        config.socks_proxy_url = Some(proxy.into());
+        let manager = TorrentManager::new(config.clone()).await.unwrap();
+        manager.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_blocklist_blocks_peer_connections_and_rejects_nonlocal_urls() {
+    use url::Url;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("block list.txt");
+    fs::write(&path, b"local:127.0.0.1-127.0.0.1\n").unwrap();
+    let file_url = Url::from_file_path(&path).unwrap();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let peer = listener.local_addr().unwrap();
+    let mut config = local_config(dir.path());
+    for invalid in [
+        format!("http://{peer}/blocklist"),
+        "https://example.test/blocklist".into(),
+        "file://server/share/blocklist.txt".into(),
+        path.to_string_lossy().into_owned(),
+        Url::from_directory_path(dir.path()).unwrap().to_string(),
+        Url::from_file_path(dir.path().join("missing.txt"))
+            .unwrap()
+            .to_string(),
+        file_url
+            .as_str()
+            .replace("block%20list.txt", "sub/%2e%2E/block%20list.txt"),
+    ] {
+        config.blocklist_url = Some(invalid.clone());
+        assert!(
+            matches!(
+                TorrentManager::new(config.clone()).await,
+                Err(TorrentError::InvalidState(_))
+            ),
+            "{invalid}"
+        );
+    }
+    #[cfg(windows)]
+    {
+        let junction = dir.path().join("linked");
+        let outside = tempdir().unwrap();
+        fs::write(
+            outside.path().join("list.txt"),
+            b"local:127.0.0.1-127.0.0.1\n",
+        )
+        .unwrap();
+        create_junction(&junction, outside.path());
+        config.blocklist_url = Some(
+            Url::from_file_path(junction.join("list.txt"))
+                .unwrap()
+                .into(),
+        );
+        assert!(matches!(
+            TorrentManager::new(config.clone()).await,
+            Err(TorrentError::InvalidState(_))
+        ));
+        fs::remove_dir(junction).unwrap();
+    }
+    let malformed = dir.path().join("malformed.txt");
+    fs::write(&malformed, b"x").unwrap();
+    config.blocklist_url = Some(Url::from_file_path(malformed).unwrap().into());
+    assert!(matches!(
+        TorrentManager::new(config.clone()).await,
+        Err(TorrentError::Session(message)) if message.contains("could not load local blocklist")
+    ));
+    let manifest = build_v1_single_file_torrent("blocked.bin", b"payload", PIECE as u32).unwrap();
+    config.blocklist_url = Some(format!(" {file_url} "));
+    let blocked = TorrentManager::new(config).await.unwrap();
+    let options = TorrentAddOptions {
+        initial_peers: vec![peer],
+        ..Default::default()
+    };
+    let id = blocked
+        .add_torrent_bytes(&manifest, options.clone())
+        .await
+        .unwrap();
+    blocked.wait_until_initialized(&id, WAIT).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(400), listener.accept())
+            .await
+            .is_err()
+    );
+    blocked.shutdown().await;
+
+    let unblocked_dir = tempdir().unwrap();
+    let unblocked = TorrentManager::new(local_config(unblocked_dir.path()))
+        .await
+        .unwrap();
+    unblocked
+        .add_torrent_bytes(&manifest, options)
+        .await
+        .unwrap();
+    let _connection = tokio::time::timeout(WAIT, listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    unblocked.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -581,7 +1019,7 @@ async fn real_tcp_transfer_and_magnet_selection() {
     let files = [
         ("東京 (4K)/part one.bin", vec![30u8; 4 * PIECE]),
         (
-            "مجلد/صور 🚀/part two.bin",
+            "مجلد/صور 🚀/part two.zip",
             (0..(19 * PIECE + 137)).map(|i| (i % 251) as u8).collect(),
         ),
     ];

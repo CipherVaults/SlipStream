@@ -6,34 +6,46 @@ use crate::{
     updater::{self, friendly_updater_error},
     view_model::{
         self, classify_icon_kind, compute_nav_counts, demo_telemetry_batch, format_bytes,
-        format_duration, format_eta, format_speed, format_transfer_percent, is_torrent_input,
-        looks_like_direct_file_url, looks_like_http_url, matches_filter,
-        pair_video_with_best_audio, parse_speed_limit_bps, parse_speed_limit_slider_mbps,
+        format_duration, format_eta, format_minute_of_day, format_speed, format_transfer_percent,
+        is_torrent_input, looks_like_direct_file_url, looks_like_http_url, matches_filter,
+        pair_video_with_best_audio, parse_minute_of_day, parse_speed_limit_bps,
+        parse_speed_limit_slider_mbps, post_action_from_index, post_action_label,
         should_clear_seeded_headers, url_origin, video_format_options, NavFilter,
     },
-    win32, AppState, BrowserCardModel, CompletedRowModel, ConnectionRowModel, DaemonOptions,
-    DownloadCompleteWindow, DownloadConfirmWindow, DownloadProgressWindow, FormatOptionModel,
-    InspectorModel, MainWindow, OpenPickerEvent, PaletteActionModel, PlaylistGroupModel,
-    PlaylistItemModel, SegmentTileModel, SubtitleItemModel, Theme, ToolchainStatus,
-    TorrentFileRowModel, TorrentPeerRowModel, TorrentPreviewFileModel, TransferRowModel, UiBridge,
+    win32, AppState, BrowserCardModel, CategoryNavModel, CompletionAlert, CompletionBannerWindow,
+    ConnectionRowModel, DaemonOptions, DownloadCompleteWindow, DownloadConfirmWindow,
+    DownloadProgressWindow, DropBasketWindow, FormatOptionModel, InspectorModel, LogEntryModel,
+    MainWindow, OpenPickerEvent, PaletteActionModel, PlaylistGroupModel, PlaylistItemModel,
+    QueueItem, RssFeedRuleItem, SegmentTileModel, SiteGrabItemRow, SiteLoginItem, SpeedGraphModel,
+    SubtitleItemModel, TagChipModel, Theme, ToolchainStatus, TorrentFileRowModel,
+    TorrentPeerRowModel, TorrentPreviewFileModel, TransferRowModel, UiBridge, WatchFolderItem,
 };
-use i_slint_backend_winit::{winit::window::ResizeDirection, WinitWindowAccessor};
-use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use i_slint_backend_winit::{
+    winit::{event::WindowEvent, window::ResizeDirection},
+    EventResult, WinitWindowAccessor,
+};
+use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
+use slint::{
+    ComponentHandle, FilterModel, Model, ModelRc, SharedString, Timer, TimerMode, VecModel,
+};
 use slipstream_protocol::{
-    AccentMode, AddHttpDownloadRequest, AddMediaDownloadRequest, AddTorrentRequest, AppSettings,
-    AudioPreset, BrowserKind, ConfirmPendingDownloadRequest, MediaContainer, MediaFormatOption,
-    MediaProbeResult, PendingDownloadPreview, RefreshDownloadUrlRequest, SegmentState,
-    SelectedPlaylistEntry, TelemetryBatch, ThemeMode, ToolSource, TorrentFileEntry,
-    TorrentPeerSummary, TorrentPreviewResult, TransferCompletionOptions, TransferKind,
-    TransferSnapshot, TransferStatus, UpdateMode, UpdateProgress, UpdateProgressStage,
+    default_download_queues, AccentMode, AddHttpDownloadRequest, AddMediaDownloadRequest,
+    AddTorrentRequest, AppSettings, AudioPreset, BrowserKind, ConfirmPendingDownloadRequest,
+    CreateTorrentRequest, DownloadCategory, DownloadQueueSpec, LogEntry, MediaContainer,
+    MediaFormatOption, MediaProbeResult, PendingDownloadPreview, ProxyMode,
+    RefreshDownloadUrlRequest, RssFeedRule, ScheduleMode, SegmentState, SelectedPlaylistEntry,
+    SiteAuthScheme, SiteGrabRequest, SiteLoginEntry, SpeedSample, TelemetryBatch, ThemeMode,
+    ToolSource, TorrentFileEntry, TorrentPeerSummary, TorrentPreviewResult,
+    TransferCompletionOptions, TransferKind, TransferSnapshot, TransferStatus, UpdateMode,
+    UpdateProgress, UpdateProgressStage, WatchFolderRule,
 };
 use slipstream_torrent::{parse_magnet_uri, CancellationToken};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
+    io::{self, Read},
     path::{Path, PathBuf},
     pin::Pin,
     rc::Rc,
@@ -45,8 +57,53 @@ use std::{
 };
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-const MAX_SPEED_SAMPLES: usize = 28;
+const MAX_SPEED_SAMPLES: usize = 7_200;
+const SPARKLINE_SAMPLES: usize = 28;
+const MAX_TEXT_IMPORT_BYTES: u64 = 2 * 1024 * 1024;
 const APP_ICON_PNG: &[u8] = include_bytes!("../icons/icon.png");
+const CUSTOM_VPN_ADAPTER: &str = "Custom adapter";
+const NETWORK_COOKIE_BROWSERS: [&str; 4] = ["chrome", "edge", "brave", "firefox"];
+
+fn optional_text(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    (!raw.is_empty()).then(|| raw.to_owned())
+}
+
+fn format_upload_kib(rate_bps: Option<u64>) -> SharedString {
+    rate_bps
+        .map(|rate| (rate / 1024).max(1).to_string())
+        .unwrap_or_default()
+        .into()
+}
+
+fn parse_upload_kib(raw: &str) -> Result<Option<u64>, &'static str> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let rate = raw
+        .parse::<u64>()
+        .ok()
+        .and_then(|kib| kib.checked_mul(1024))
+        .filter(|&bps| bps <= u64::from(u32::MAX))
+        .ok_or("Enter a whole upload limit in KiB/s, or leave it blank for unlimited.")?;
+    Ok((rate != 0).then_some(rate))
+}
+
+#[derive(Clone, Copy)]
+enum CreateTorrentPicker {
+    SourceFile,
+    SourceFolder,
+    Output,
+}
+
+enum TorrentPowerAction {
+    Recheck,
+    MoveStorage,
+    AddTracker(String),
+    Reannounce,
+    UploadLimit(Option<u64>),
+}
 
 pub fn default_data_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
@@ -64,9 +121,15 @@ pub fn default_resource_dir() -> Option<PathBuf> {
 
 #[derive(Default)]
 struct SharedBridgeSlots {
-    pending_batch: Mutex<Option<TelemetryBatch>>,
+    pending_telemetry: Mutex<PendingTelemetry>,
     telemetry_scheduled: AtomicBool,
     app: Mutex<Option<Arc<AppState>>>,
+}
+
+#[derive(Default)]
+struct PendingTelemetry {
+    batch: Option<TelemetryBatch>,
+    speeds: VecDeque<SpeedSample>,
 }
 
 pub struct NativeUi {
@@ -94,13 +157,25 @@ impl UiBridge for NativeUi {
     }
 
     fn emit_telemetry(&self, batch: &TelemetryBatch) -> Result<(), String> {
-        *self.slots.pending_batch.lock().unwrap() = Some(batch.clone());
+        {
+            // Keep every speed sample even when the event loop coalesces snapshots.
+            let mut pending = self.slots.pending_telemetry.lock().unwrap();
+            push_speed_sample(&mut pending.speeds, speed_sample(batch));
+            pending.batch = Some(batch.clone());
+        }
         if !self.slots.telemetry_scheduled.swap(true, Ordering::AcqRel) {
             let slots = self.slots.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 slots.telemetry_scheduled.store(false, Ordering::Release);
-                if let Some(latest) = slots.pending_batch.lock().unwrap().take() {
-                    with_controller(|ctrl| ctrl.apply_telemetry(latest));
+                let pending = std::mem::take(&mut *slots.pending_telemetry.lock().unwrap());
+                if let Some(latest) = pending.batch {
+                    with_controller(|ctrl| {
+                        for sample in pending.speeds {
+                            push_speed_sample(&mut ctrl.speed_history, sample);
+                        }
+                        ctrl.refresh_speed_graph();
+                        ctrl.apply_telemetry(latest);
+                    });
                 }
             });
         }
@@ -222,8 +297,13 @@ impl ProgressModels {
 #[derive(Default)]
 pub struct DesktopModels {
     playlist_groups_model: Rc<VecModel<PlaylistGroupModel>>,
-    active_rows_model: Rc<VecModel<TransferRowModel>>,
-    completed_rows_model: Rc<VecModel<CompletedRowModel>>,
+    transfer_rows_model: Rc<VecModel<TransferRowModel>>,
+    categories_model: Rc<VecModel<CategoryNavModel>>,
+    tags_model: Rc<VecModel<TagChipModel>>,
+    category_options_model: Rc<VecModel<SharedString>>,
+    queues_model: Rc<VecModel<QueueItem>>,
+    queue_options_model: Rc<VecModel<SharedString>>,
+    log_entries_model: Rc<VecModel<LogEntryModel>>,
     inspector_segments_model: Rc<VecModel<SegmentTileModel>>,
     inspector_files_model: Rc<VecModel<TorrentFileRowModel>>,
     inspector_peers_model: Rc<VecModel<TorrentPeerRowModel>>,
@@ -234,8 +314,20 @@ pub struct DesktopModels {
 impl DesktopModels {
     pub fn attach(&self, main: &MainWindow) {
         main.set_playlist_groups(self.playlist_groups_model.clone().into());
-        main.set_active_rows(self.active_rows_model.clone().into());
-        main.set_completed_rows(self.completed_rows_model.clone().into());
+        let rows = self.transfer_rows_model.clone();
+        main.set_transfer_rows(rows.clone().into());
+        main.set_active_rows(ModelRc::new(FilterModel::new(rows.clone(), |row| {
+            !row.in_playlist && !row.is_completed
+        })));
+        main.set_completed_rows(ModelRc::new(FilterModel::new(rows, |row| {
+            !row.in_playlist && row.is_completed
+        })));
+        main.set_categories(self.categories_model.clone().into());
+        main.set_tags(self.tags_model.clone().into());
+        main.set_category_options(self.category_options_model.clone().into());
+        main.set_queue_items(self.queues_model.clone().into());
+        main.set_queue_options(self.queue_options_model.clone().into());
+        main.set_log_entries(self.log_entries_model.clone().into());
     }
 }
 
@@ -268,6 +360,118 @@ struct AddDialogRuntime {
     preview_disk_free: Option<u64>,
 }
 
+enum PickerRequest {
+    Source(OpenPickerEvent),
+    BatchText(String),
+}
+
+#[derive(Default)]
+pub struct TransferSelection {
+    selected_id: Option<String>,
+    selected_ids: HashSet<String>,
+    selection_anchor: Option<String>,
+    visible_ids: Vec<String>,
+    initialized: bool,
+}
+
+impl TransferSelection {
+    pub fn select_only(&mut self, id: &str) {
+        self.selected_ids.clear();
+        self.selected_ids.insert(id.to_owned());
+        self.selected_id = Some(id.to_owned());
+        self.selection_anchor = self.selected_id.clone();
+        self.initialized = true;
+    }
+
+    pub fn select_all(&mut self) {
+        self.selected_ids = self.visible_ids.iter().cloned().collect();
+        self.update_primary();
+        self.selection_anchor.clone_from(&self.selected_id);
+        self.initialized = true;
+    }
+
+    fn clear(&mut self) {
+        self.selected_ids.clear();
+        self.selected_id = None;
+        self.selection_anchor = None;
+        self.initialized = true;
+    }
+
+    fn update_primary(&mut self) {
+        if self
+            .selected_id
+            .as_ref()
+            .is_none_or(|id| !self.selected_ids.contains(id))
+        {
+            self.selected_id = self
+                .visible_ids
+                .iter()
+                .find(|id| self.selected_ids.contains(*id))
+                .cloned();
+        }
+    }
+
+    fn update_visible(&mut self, visible: Vec<String>) {
+        let ids: HashSet<_> = visible.iter().collect();
+        self.selected_ids.retain(|id| ids.contains(id));
+        if self
+            .selection_anchor
+            .as_ref()
+            .is_some_and(|id| !ids.contains(id))
+        {
+            self.selection_anchor = None;
+        }
+        self.visible_ids = visible;
+        if !self.initialized {
+            if let Some(first) = self.visible_ids.first().cloned() {
+                self.select_only(&first);
+            }
+        }
+        self.update_primary();
+    }
+
+    fn click(&mut self, id: &str, ctrl: bool, shift: bool) {
+        if shift {
+            let positions = self.selection_anchor.as_ref().and_then(|anchor| {
+                let start = self
+                    .visible_ids
+                    .iter()
+                    .position(|visible| visible == anchor)?;
+                let end = self.visible_ids.iter().position(|visible| visible == id)?;
+                Some((start.min(end), start.max(end)))
+            });
+            if let Some((start, end)) = positions {
+                if !ctrl {
+                    self.selected_ids.clear();
+                }
+                self.selected_ids
+                    .extend(self.visible_ids[start..=end].iter().cloned());
+                self.selected_id = Some(id.to_owned());
+                return;
+            }
+        }
+        if ctrl {
+            self.selection_anchor = Some(id.to_owned());
+            if self.selected_ids.remove(id) {
+                self.update_primary();
+            } else {
+                self.selected_ids.insert(id.to_owned());
+                self.selected_id = Some(id.to_owned());
+            }
+        } else {
+            self.select_only(id);
+        }
+    }
+
+    fn ordered_ids(&self) -> Vec<String> {
+        self.visible_ids
+            .iter()
+            .filter(|id| self.selected_ids.contains(*id))
+            .cloned()
+            .collect()
+    }
+}
+
 struct ControllerState {
     main: MainWindow,
     runtime: tokio::runtime::Handle,
@@ -277,9 +481,29 @@ struct ControllerState {
     is_mono: bool,
     is_maximized: bool,
     last_batch: Option<TelemetryBatch>,
-    speed_history: VecDeque<u64>,
+    speed_history: VecDeque<SpeedSample>,
     expanded_playlists: HashSet<String>,
-    selected_id: Option<String>,
+    selection: TransferSelection,
+    categories: Vec<DownloadCategory>,
+    queues: Vec<DownloadQueueSpec>,
+    draft_queues: Vec<DownloadQueueSpec>,
+    draft_watch_folders: Vec<WatchFolderRule>,
+    settings_session_id: u64,
+    create_torrent_session_id: u64,
+    settings_initial_alt_speed: bool,
+    rss_feeds_model: Rc<VecModel<RssFeedRuleItem>>,
+    site_logins_model: Rc<VecModel<SiteLoginItem>>,
+    grabber_items_model: Rc<VecModel<SiteGrabItemRow>>,
+    grabber_session_id: u64,
+    grabber_scan: Option<tokio::task::JoinHandle<()>>,
+    pending_bulk_remove: Vec<String>,
+    drop_basket: Option<DropBasketWindow>,
+    completion_banner: Option<CompletionBannerWindow>,
+    completion_timer: Timer,
+    settings_task: Option<tokio::task::JoinHandle<()>>,
+    preference_revision: u64,
+    saved_preference_revision: u64,
+    logs: Vec<LogEntry>,
     models: DesktopModels,
     last_disk_check: Option<Instant>,
     disk_space: Option<(u64, u64)>,
@@ -290,6 +514,7 @@ struct ControllerState {
     torrent_file_apply_pending: HashSet<String>,
     torrent_peers: HashMap<String, TorrentPeerSummary>,
     torrent_peers_pending: HashSet<String>,
+    torrent_actions_pending: HashSet<String>,
     pending_transfer_dialogs: HashSet<(String, TransferDialog)>,
     torrent_preview_files_model: Rc<VecModel<TorrentPreviewFileModel>>,
     toast_timer: Timer,
@@ -297,7 +522,7 @@ struct ControllerState {
     progress_windows: HashMap<String, ProgressWindowState>,
     complete_windows: HashMap<String, CompleteWindowState>,
     add_state: AddDialogRuntime,
-    pending_picker_requests: VecDeque<OpenPickerEvent>,
+    pending_picker_requests: VecDeque<PickerRequest>,
     refresh_target_id: Option<String>,
     verify_target_id: Option<String>,
     last_clipboard_seq: u32,
@@ -307,12 +532,13 @@ struct ControllerState {
     tray_menu_ids: TrayMenuIds,
 }
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 struct TrayMenuIds {
     show: Option<muda::MenuId>,
     add: Option<muda::MenuId>,
     pause_all: Option<muda::MenuId>,
     resume_all: Option<muda::MenuId>,
+    drop_basket: Option<CheckMenuItem>,
     quit: Option<muda::MenuId>,
 }
 
@@ -413,6 +639,7 @@ fn build_tray_icon() -> Option<(TrayIcon, TrayMenuIds)> {
     let pause_item = MenuItem::new("Pause All", true, None);
     let resume_item = MenuItem::new("Resume All", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
+    let basket_item = CheckMenuItem::new("Drop Basket", true, false, None);
 
     let ids = TrayMenuIds {
         show: Some(show_item.id().clone()),
@@ -420,11 +647,13 @@ fn build_tray_icon() -> Option<(TrayIcon, TrayMenuIds)> {
         pause_all: Some(pause_item.id().clone()),
         resume_all: Some(resume_item.id().clone()),
         quit: Some(quit_item.id().clone()),
+        drop_basket: Some(basket_item.clone()),
     };
 
     let menu = Menu::new();
     let _ = menu.append(&show_item);
     let _ = menu.append(&add_item);
+    let _ = menu.append(&basket_item);
     let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&pause_item);
     let _ = menu.append(&resume_item);
@@ -507,6 +736,14 @@ fn sync_row_segments(
 fn same_transfer_row(a: &TransferRowModel, b: &TransferRowModel) -> bool {
     a.id == b.id
         && a.filename == b.filename
+        && a.selected == b.selected
+        && a.category_name == b.category_name
+        && a.tags_summary == b.tags_summary
+        && a.size_text == b.size_text
+        && a.speed_text == b.speed_text
+        && a.eta_text == b.eta_text
+        && a.added_text == b.added_text
+        && a.in_playlist == b.in_playlist
         && a.kind == b.kind
         && a.status == b.status
         && a.is_active == b.is_active
@@ -602,6 +839,10 @@ fn can_stop(transfer: &TransferSnapshot) -> bool {
     )
 }
 
+fn transfer_category(transfer: &TransferSnapshot) -> &str {
+    transfer.category_id.as_deref().unwrap_or("general")
+}
+
 fn transfer_to_row(
     t: &TransferSnapshot,
     compact: bool,
@@ -671,6 +912,19 @@ fn transfer_to_row(
     TransferRowModel {
         id: t.id.clone().into(),
         filename: t.filename.clone().into(),
+        selected: false,
+        category_name: transfer_category(t).into(),
+        tags_summary: t.tags.join(", ").into(),
+        size_text: format_bytes(t.total_bytes.unwrap_or(t.downloaded_bytes)).into(),
+        speed_text: format_speed(t.download_speed_bps).into(),
+        eta_text: format_eta(t.eta_seconds).into(),
+        added_text: t
+            .created_at
+            .with_timezone(&chrono::Local)
+            .format("%b %d")
+            .to_string()
+            .into(),
+        in_playlist: t.playlist_id.is_some(),
         kind: match t.kind {
             TransferKind::Http => "http",
             TransferKind::Media => "media",
@@ -863,6 +1117,8 @@ impl DesktopModels {
             error_message: t.error_message.clone().unwrap_or_default().into(),
             completion_notice: t.completion_notice.clone().unwrap_or_default().into(),
             duration_text: String::new().into(),
+            category_id: t.category_id.as_deref().unwrap_or_default().into(),
+            tags_summary: t.tags.join(", ").into(),
             ..inspector
         }
     }
@@ -872,11 +1128,13 @@ impl DesktopModels {
         files: &[TorrentFileEntry],
         file_selection: Option<&HashSet<usize>>,
     ) {
-        let torrent_rows: Vec<TorrentFileRowModel> = files
-            .iter()
-            .map(|f| TorrentFileRowModel {
+        let torrent_rows = view_model::grouped_torrent_files(files)
+            .into_iter()
+            .map(|(f, folder, name)| TorrentFileRowModel {
                 index: f.index as i32,
                 relative_path: f.relative_path.clone().into(),
+                folder_label: folder.into(),
+                display_name: name.into(),
                 size_text: format_bytes(f.size_bytes).into(),
                 downloaded_text: format_bytes(f.downloaded_bytes).into(),
                 selected: file_selection.map_or(f.selected, |indices| indices.contains(&f.index)),
@@ -900,7 +1158,8 @@ impl DesktopModels {
         batch: &TelemetryBatch,
         speed_history: &[u64],
         expanded_playlists: &HashSet<String>,
-        selected_id: &mut Option<String>,
+        selection: &mut TransferSelection,
+        categories: &[DownloadCategory],
     ) {
         let counts = compute_nav_counts(&batch.transfers);
         main.set_count_all(counts.all);
@@ -947,11 +1206,29 @@ impl DesktopModels {
 
         let nav = NavFilter::from_nav_id(&main.get_active_nav());
         let query = main.get_search_query().to_string().to_ascii_lowercase();
-        let visible: Vec<&TransferSnapshot> = batch
-            .transfers
-            .iter()
-            .filter(|t| matches_filter(t, nav, &query))
-            .collect();
+        let active_category = main.get_active_category_filter();
+        let active_tag = main.get_active_tag_filter();
+        let active_queue = main.get_active_queue_filter();
+        self.update_filters(&batch.transfers, categories);
+        let filter = |t: &&TransferSnapshot| {
+            matches_filter(t, nav, &query)
+                && (active_category.is_empty() || transfer_category(t) == active_category.as_str())
+                && (active_tag.is_empty() || t.tags.iter().any(|tag| tag == active_tag.as_str()))
+                && (active_queue.is_empty() || t.queue_id == active_queue.as_str())
+        };
+        let sorted;
+        let visible = if main.get_compact_table_view() {
+            let mut rows: Vec<_> = batch.transfers.iter().filter(filter).cloned().collect();
+            view_model::sort_transfers(
+                &mut rows,
+                &main.get_sort_column(),
+                main.get_sort_ascending(),
+            );
+            sorted = rows;
+            sorted.iter().collect::<Vec<_>>()
+        } else {
+            batch.transfers.iter().filter(filter).collect()
+        };
 
         let transfer_ids: HashSet<_> = batch.transfers.iter().map(|t| t.id.as_str()).collect();
         self.row_segment_models
@@ -964,40 +1241,68 @@ impl DesktopModels {
         self.playlist_item_models
             .retain(|id, _| playlist_ids.contains(id.as_str()));
 
-        // Group playlists vs standalone transfers
-        let mut playlist_map: HashMap<String, Vec<&TransferSnapshot>> = HashMap::new();
-        let mut active_rows = Vec::new();
-        let mut completed_rows = Vec::new();
-        for &t in &visible {
-            if let Some(pid) = &t.playlist_id {
-                playlist_map.entry(pid.clone()).or_default().push(t);
-            } else if t.status == TransferStatus::Completed {
-                completed_rows.push(CompletedRowModel {
-                    id: t.id.clone().into(),
-                    filename: t.filename.clone().into(),
-                    source_domain: t.source_domain.clone().into(),
-                    size_text: format_bytes(t.total_bytes.unwrap_or(t.downloaded_bytes)).into(),
-                    tag_text: t.format_tags.first().cloned().unwrap_or_default().into(),
-                    sha_verified: match t.sha256_verified {
-                        Some(true) => 1,
-                        Some(false) => 2,
-                        None => 0,
-                    },
-                    icon_kind: classify_icon_kind(&t.filename, t.kind),
-                });
-            } else {
-                active_rows.push(transfer_to_row(t, false, &mut self.row_segment_models));
+        let table = main.get_compact_table_view();
+        let mut playlist_map: HashMap<&str, Vec<&TransferSnapshot>> = HashMap::new();
+        if !table {
+            for &transfer in &visible {
+                if let Some(id) = transfer.playlist_id.as_deref() {
+                    playlist_map.entry(id).or_default().push(transfer);
+                }
             }
         }
-
-        let mut playlist_groups: Vec<PlaylistGroupModel> = playlist_map
+        let mut playlists: Vec<_> = playlist_map
             .into_iter()
-            .map(|(pid, mut items)| {
+            .map(|(id, mut items)| {
                 items.sort_by_key(|t| t.playlist_index.unwrap_or(0));
                 let title = items
                     .iter()
-                    .find_map(|t| t.playlist_title.clone())
-                    .unwrap_or_else(|| "Playlist Queue".into());
+                    .find_map(|t| t.playlist_title.as_deref())
+                    .unwrap_or("Playlist Queue");
+                (title, id, items)
+            })
+            .collect();
+        playlists.sort_by_key(|(title, id, _)| (*title, *id));
+        let mut ids = Vec::with_capacity(visible.len());
+        if table {
+            ids.extend(visible.iter().map(|t| t.id.clone()));
+        } else {
+            for (_, id, items) in &playlists {
+                if expanded_playlists.contains(*id) {
+                    ids.extend(items.iter().map(|t| t.id.clone()));
+                }
+            }
+            for completed in [false, true] {
+                ids.extend(
+                    visible
+                        .iter()
+                        .filter(|t| {
+                            t.playlist_id.is_none()
+                                && (t.status == TransferStatus::Completed) == completed
+                        })
+                        .map(|t| t.id.clone()),
+                );
+            }
+        }
+        selection.update_visible(ids);
+
+        let category_names: HashMap<_, _> = categories
+            .iter()
+            .map(|c| (c.id.as_str(), c.name.as_str()))
+            .collect();
+        let mut make_row = |transfer: &TransferSnapshot, compact| {
+            let mut row = transfer_to_row(transfer, compact, &mut self.row_segment_models);
+            row.category_name = category_names
+                .get(transfer_category(transfer))
+                .copied()
+                .unwrap_or("General")
+                .into();
+            row.selected = selection.selected_ids.contains(&transfer.id);
+            row
+        };
+        let rows = visible.iter().map(|t| make_row(t, false)).collect();
+        let playlist_groups = playlists
+            .into_iter()
+            .map(|(title, pid, items)| {
                 let total = items
                     .first()
                     .and_then(|t| t.playlist_total)
@@ -1035,12 +1340,14 @@ impl DesktopModels {
                 if speed_sum > 0 {
                     summary_parts.push(format_speed(speed_sum));
                 }
-                let row_models = items
-                    .iter()
-                    .map(|t| transfer_to_row(t, true, &mut self.row_segment_models))
-                    .collect();
-                let item_model = self.playlist_item_models.entry(pid.clone()).or_default();
-                sync_vec_model_by(item_model, row_models, same_transfer_row);
+                let row_models = items.iter().map(|t| make_row(t, true)).collect();
+                let item_model = self.playlist_item_models.entry(pid.to_owned()).or_default();
+                reconcile_vec_model_by_key(
+                    item_model,
+                    row_models,
+                    |row| row.id.as_str(),
+                    same_transfer_row,
+                );
                 let pct_avg = if items.is_empty() {
                     0.0
                 } else {
@@ -1051,9 +1358,9 @@ impl DesktopModels {
                         / items.len() as f32
                 };
                 PlaylistGroupModel {
-                    playlist_id: pid.clone().into(),
+                    playlist_id: pid.into(),
                     title: title.into(),
-                    expanded: expanded_playlists.contains(&pid),
+                    expanded: expanded_playlists.contains(pid),
                     summary_line: summary_parts.join(" • ").into(),
                     overall_percent: pct_avg,
                     is_paused: any_paused && !has_pause_items,
@@ -1068,34 +1375,100 @@ impl DesktopModels {
                 }
             })
             .collect();
-        playlist_groups.sort_by(|a, b| {
-            a.title
-                .cmp(&b.title)
-                .then(a.playlist_id.cmp(&b.playlist_id))
-        });
-
-        sync_vec_model_by(&self.playlist_groups_model, playlist_groups, PartialEq::eq);
         reconcile_vec_model_by_key(
-            &self.active_rows_model,
-            active_rows,
+            &self.playlist_groups_model,
+            playlist_groups,
+            |group| group.playlist_id.as_str(),
+            PartialEq::eq,
+        );
+        reconcile_vec_model_by_key(
+            &self.transfer_rows_model,
+            rows,
             |row| row.id.as_str(),
             same_transfer_row,
         );
+        main.set_selected_id(selection.selected_id.as_deref().unwrap_or_default().into());
+        main.set_selected_count(selection.selected_ids.len() as i32);
+        if selection.selected_ids.len() <= 1 {
+            main.set_bulk_editor(0);
+        }
+    }
+
+    fn update_filters(&self, transfers: &[TransferSnapshot], categories: &[DownloadCategory]) {
+        let mut category_counts = HashMap::new();
+        let mut tag_counts = std::collections::BTreeMap::new();
+        for transfer in transfers {
+            *category_counts
+                .entry(transfer_category(transfer))
+                .or_insert(0) += 1;
+            for tag in &transfer.tags {
+                *tag_counts.entry(tag).or_insert(0) += 1;
+            }
+        }
+        let category_rows = categories
+            .iter()
+            .map(|category| CategoryNavModel {
+                id: category.id.as_str().into(),
+                name: category.name.as_str().into(),
+                count: category_counts
+                    .get(category.id.as_str())
+                    .copied()
+                    .unwrap_or_default(),
+            })
+            .collect();
         reconcile_vec_model_by_key(
-            &self.completed_rows_model,
-            completed_rows,
+            &self.categories_model,
+            category_rows,
             |row| row.id.as_str(),
             PartialEq::eq,
         );
+        let tag_rows = tag_counts
+            .into_iter()
+            .map(|(tag, count)| TagChipModel {
+                tag: tag.as_str().into(),
+                count,
+            })
+            .collect();
+        reconcile_vec_model_by_key(
+            &self.tags_model,
+            tag_rows,
+            |row| row.tag.as_str(),
+            PartialEq::eq,
+        );
+        let options = std::iter::once("Automatic".into())
+            .chain(
+                categories
+                    .iter()
+                    .map(|category| category.name.as_str().into()),
+            )
+            .collect();
+        sync_vec_model_by(&self.category_options_model, options, PartialEq::eq);
+    }
 
-        let valid_selection = selected_id
-            .as_deref()
-            .and_then(|id| batch.transfers.iter().find(|t| t.id == id));
-        let selected_transfer = valid_selection
-            .or_else(|| visible.first().copied())
-            .or_else(|| batch.transfers.first());
-        *selected_id = selected_transfer.map(|t| t.id.clone());
-        main.set_selected_id(selected_id.clone().unwrap_or_default().into());
+    pub fn sync_queues(&self, transfers: &[TransferSnapshot], queues: &[DownloadQueueSpec]) {
+        let mut queue_counts = HashMap::new();
+        for transfer in transfers {
+            *queue_counts.entry(transfer.queue_id.as_str()).or_insert(0) += 1;
+        }
+        let rows: Vec<QueueItem> = queues
+            .iter()
+            .map(|q| QueueItem {
+                id: q.id.as_str().into(),
+                name: q.name.as_str().into(),
+                count: queue_counts.get(q.id.as_str()).copied().unwrap_or_default(),
+                max_concurrent: q.max_concurrent as i32,
+                paused: q.paused,
+                post_action: post_action_label(q.post_action).into(),
+            })
+            .collect();
+        reconcile_vec_model_by_key(
+            &self.queues_model,
+            rows,
+            |row| row.id.as_str(),
+            PartialEq::eq,
+        );
+        let options: Vec<SharedString> = queues.iter().map(|q| q.name.as_str().into()).collect();
+        sync_vec_model_by(&self.queue_options_model, options, PartialEq::eq);
     }
 }
 
@@ -1273,11 +1646,305 @@ pub fn populate_complete_window(win: &DownloadCompleteWindow, t: &TransferSnapsh
     full_path
 }
 
+fn speed_sample(batch: &TelemetryBatch) -> SpeedSample {
+    SpeedSample {
+        timestamp_ms: batch.timestamp.timestamp_millis(),
+        down_bps: batch.aggregate_down_bps,
+        up_bps: batch.aggregate_up_bps,
+    }
+}
+
+fn push_speed_sample(history: &mut VecDeque<SpeedSample>, sample: SpeedSample) {
+    if history
+        .back()
+        .is_some_and(|last| sample.timestamp_ms <= last.timestamp_ms)
+    {
+        return;
+    }
+    let cutoff = sample.timestamp_ms.saturating_sub(30 * 60 * 1_000);
+    while history.len() >= MAX_SPEED_SAMPLES
+        || history
+            .front()
+            .is_some_and(|first| first.timestamp_ms < cutoff)
+    {
+        history.pop_front();
+    }
+    history.push_back(sample);
+}
+
+fn sparkline_samples(history: &VecDeque<SpeedSample>) -> Vec<u64> {
+    history
+        .iter()
+        .skip(history.len().saturating_sub(SPARKLINE_SAMPLES))
+        .map(|s| s.down_bps)
+        .collect()
+}
+
+pub fn populate_speed_graph(main: &MainWindow, samples: &VecDeque<SpeedSample>) {
+    let chart = view_model::build_dual_speed_chart(
+        samples,
+        main.get_graph_window_seconds() as u64,
+        320.0,
+        120.0,
+    );
+    main.set_speed_graph(SpeedGraphModel {
+        down_line: chart.down_line_cmd.into(),
+        down_fill: chart.down_fill_cmd.into(),
+        up_line: chart.up_line_cmd.into(),
+        up_fill: chart.up_fill_cmd.into(),
+        peak_down: chart.peak_down_text.into(),
+        peak_up: chart.peak_up_text.into(),
+        avg_down: chart.avg_down_text.into(),
+        avg_up: chart.avg_up_text.into(),
+        scale_max: chart.scale_max_text.into(),
+    });
+}
+
+fn update_basket(basket: &DropBasketWindow, batch: &TelemetryBatch) {
+    basket.set_down_speed(format_speed(batch.aggregate_down_bps).into());
+    basket.set_up_speed(format_speed(batch.aggregate_up_bps).into());
+    basket.set_active_count(batch.active_count as i32);
+}
+
+fn wire_file_drop(window: &slint::Window) {
+    window.on_winit_window_event(|_, event| {
+        if let WindowEvent::DroppedFile(path) = event {
+            let path = path.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                with_controller(|ctrl| ctrl.handle_dropped_file(path));
+            });
+            EventResult::PreventDefault
+        } else {
+            EventResult::Propagate
+        }
+    });
+}
+
+fn read_batch_file(path: &Path) -> Result<String, String> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let result = (|| {
+        let absolute = std::path::absolute(path)?;
+        let clean = crate::paths::local_drive_path(&absolute)?;
+        let parent = clean.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Select a local text file.")
+        })?;
+        crate::paths::validate_existing_ancestors(parent)?;
+        let link_meta = std::fs::symlink_metadata(&clean)?;
+        if !link_meta.is_file() || link_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Select a regular local text file.",
+            ));
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&clean)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Select a regular local text file.",
+            ));
+        }
+        if metadata.len() > MAX_TEXT_IMPORT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "The import limit is 2 MiB.",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        (&mut file)
+            .take(MAX_TEXT_IMPORT_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_TEXT_IMPORT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "The import limit is 2 MiB.",
+            ));
+        }
+        let text = if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+            let little_endian = bytes[0] == 0xFF;
+            let (chunks, remainder) = bytes[2..].as_chunks::<2>();
+            if !remainder.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Incomplete UTF-16 text.",
+                ));
+            }
+            let decode = if little_endian {
+                u16::from_le_bytes
+            } else {
+                u16::from_be_bytes
+            };
+            let units: Vec<_> = chunks.iter().copied().map(decode).collect();
+            String::from_utf16(&units).map_err(io::Error::other)?
+        } else {
+            String::from_utf8(bytes).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "Use UTF-8 or UTF-16 text.")
+            })?
+        };
+        Ok(text.trim_start_matches('\u{feff}').to_owned())
+    })();
+    result.map_err(|error: io::Error| format!("Could not import URLs: {error}"))
+}
+
+fn batch_url_count(text: &str) -> usize {
+    let mut seen = HashSet::new();
+    let mut in_block = false;
+    let mut block_has_url = false;
+    for line in text.trim_start_matches('\u{feff}').lines().map(str::trim) {
+        match line {
+            "<" => {
+                in_block = true;
+                block_has_url = false;
+                continue;
+            }
+            ">" => {
+                in_block = false;
+                continue;
+            }
+            "" => continue,
+            _ => {}
+        }
+        if line.starts_with('#')
+            || line.split_once(':').is_some_and(|(prefix, _)| {
+                ["cookie", "referer", "referrer"]
+                    .iter()
+                    .any(|field| prefix.eq_ignore_ascii_case(field))
+            })
+            || (in_block && block_has_url)
+        {
+            continue;
+        }
+        block_has_url = true;
+        if line.chars().any(char::is_control) {
+            continue;
+        }
+        if let Ok(mut url) = url::Url::parse(line) {
+            if (matches!(url.scheme(), "http" | "https") && url.has_host())
+                || (url.scheme() == "magnet" && parse_magnet_uri(line).is_ok())
+            {
+                url.set_fragment(None);
+                seen.insert(url);
+            }
+        }
+    }
+    seen.len()
+}
+
+async fn bulk_operation(
+    app: &AppState,
+    ids: &[String],
+    action: BulkAction,
+) -> Result<usize, String> {
+    match action {
+        BulkAction::Pause => Ok(app.bulk_pause(ids).await),
+        BulkAction::Resume => Ok(app.bulk_resume(ids).await),
+        BulkAction::Stop => Ok(app.bulk_stop(ids).await),
+        BulkAction::Remove(delete_files) => Ok(app.bulk_remove(ids, delete_files).await),
+        BulkAction::Category(category) => app.set_transfers_category(ids, category).await,
+        BulkAction::Queue(queue_id) => app.set_transfers_queue(ids, &queue_id).await,
+        BulkAction::Limit(limit) => app.bulk_set_speed_limit(ids, limit).await,
+    }
+}
+
+enum BulkAction {
+    Pause,
+    Resume,
+    Stop,
+    Remove(bool),
+    Category(Option<String>),
+    Queue(String),
+    Limit(Option<u64>),
+}
+
 impl ControllerState {
     fn show_main_window(&mut self) {
         let _ = self.main.show();
+        self.main
+            .window()
+            .with_winit_window(|window| window.set_minimized(false));
         apply_native_window_chrome(self.main.window());
         win32::bring_window_to_front(hwnd_of(self.main.window()));
+    }
+
+    fn sync_automation_status(&self) {
+        if let Some(app) = &self.app {
+            let st = app.automation_status();
+            self.main.set_alt_speed_active(st.alt_speed_active);
+            self.main
+                .set_vpn_kill_switch_active(st.vpn_kill_switch_active);
+            let (badge, tone) = if st.guard_active {
+                ("Guard", 3)
+            } else if st.schedule_window_active {
+                ("Schedule", 1)
+            } else {
+                ("", 0)
+            };
+            self.main.set_automation_badge(badge.into());
+            self.main.set_automation_badge_tone(tone);
+            if let Some(limit) = st.effective_speed_limit_bps {
+                self.main
+                    .set_speed_limit_label(format!("{}/s", format_bytes(limit)).into());
+                self.main.set_speed_limit_active(true);
+            } else {
+                self.main.set_speed_limit_label("Unlimited".into());
+                self.main.set_speed_limit_active(false);
+            }
+        }
+    }
+
+    fn sync_settings_automation_models(&self) {
+        let queue_rows: Vec<QueueItem> = self
+            .draft_queues
+            .iter()
+            .map(|q| QueueItem {
+                id: q.id.as_str().into(),
+                name: q.name.as_str().into(),
+                count: 0,
+                max_concurrent: q.max_concurrent as i32,
+                paused: q.paused,
+                post_action: post_action_label(q.post_action).into(),
+            })
+            .collect();
+        self.main
+            .set_set_queue_items(ModelRc::from(Rc::new(VecModel::from(queue_rows))));
+        let watch_rows: Vec<WatchFolderItem> = self
+            .draft_watch_folders
+            .iter()
+            .map(|w| WatchFolderItem {
+                id: w.id.as_str().into(),
+                folder: w.folder.as_str().into(),
+                target_save_dir: w.target_save_dir.as_deref().unwrap_or_default().into(),
+                enabled: w.enabled,
+                delete_after_add: w.delete_torrent_after_add,
+            })
+            .collect();
+        self.main
+            .set_set_watch_folders(ModelRc::from(Rc::new(VecModel::from(watch_rows))));
+    }
+
+    fn sync_rss_feeds(&self, rules: &[RssFeedRule]) {
+        let rows = rules
+            .iter()
+            .map(|rule| RssFeedRuleItem {
+                id: rule.id.as_str().into(),
+                name: rule.name.as_str().into(),
+                feed_url: rule.feed_url.as_str().into(),
+                include_pattern: rule.include_pattern.as_str().into(),
+                exclude_pattern: rule.exclude_pattern.as_str().into(),
+                poll_interval_minutes: i32::from(rule.poll_interval_minutes),
+                enabled: rule.enabled,
+                auto_start: rule.auto_start,
+                last_error: rule.last_error.as_deref().unwrap_or_default().into(),
+            })
+            .collect();
+        sync_vec_model_by(&self.rss_feeds_model, rows, PartialEq::eq);
     }
 
     fn refresh_theme_from_settings(&mut self) {
@@ -1287,6 +1954,29 @@ impl ControllerState {
             .map(|a| resolve_theme_flags(&a.settings()))
             .unwrap_or((self.is_light, self.is_mono));
         self.apply_theme(light, mono);
+        if let Some(app) = &self.app {
+            let settings = app.settings();
+            if self.main.get_settings_open() {
+                self.sync_rss_feeds(&settings.rss_feeds);
+                self.sync_network_secrets(&settings);
+            }
+            if self.preference_revision == self.saved_preference_revision {
+                self.load_preferences(&settings);
+            }
+            let mut changed = false;
+            if self.categories != settings.categories {
+                self.categories = settings.categories;
+                changed = true;
+            }
+            if self.queues != settings.queues {
+                self.queues = settings.queues;
+                changed = true;
+            }
+            if changed {
+                self.refresh_views();
+            }
+        }
+        self.sync_automation_status();
     }
 
     fn apply_theme(&mut self, is_light: bool, is_mono: bool) {
@@ -1303,6 +1993,308 @@ impl ControllerState {
         }
         for entry in self.complete_windows.values() {
             set_win_theme!(&entry.window, is_light, is_mono);
+        }
+        if let Some(basket) = &self.drop_basket {
+            set_win_theme!(basket, is_light, is_mono);
+        }
+        if let Some(banner) = &self.completion_banner {
+            set_win_theme!(banner, is_light, is_mono);
+        }
+    }
+
+    fn load_preferences(&mut self, settings: &AppSettings) {
+        let table_changed = self.main.get_compact_table_view() != settings.compact_table_view
+            || self.main.get_sort_column().as_str() != settings.sort_column
+            || self.main.get_sort_ascending() != settings.sort_ascending;
+        self.main
+            .set_compact_table_view(settings.compact_table_view);
+        self.main
+            .set_sort_column(settings.sort_column.as_str().into());
+        self.main.set_sort_ascending(settings.sort_ascending);
+        self.set_basket_visible(settings.show_drop_basket);
+        if table_changed {
+            self.refresh_views();
+        }
+    }
+
+    fn queue_settings_save(
+        &mut self,
+        edit: impl FnOnce(&mut AppSettings) + Send + 'static,
+        done: impl FnOnce(&mut Self, Result<(), String>) + Send + 'static,
+    ) {
+        self.queue_settings_operation(
+            move |app| async move { app.update_settings(edit).await },
+            done,
+        );
+    }
+
+    fn queue_settings_operation<F>(
+        &mut self,
+        operation: impl FnOnce(Arc<AppState>) -> F + Send + 'static,
+        done: impl FnOnce(&mut Self, Result<(), String>) + Send + 'static,
+    ) where
+        F: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let Some(app) = self.app.clone() else { return };
+        let previous = self.settings_task.take();
+        self.settings_task = Some(self.runtime.spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            let result = operation(app).await;
+            let _ =
+                slint::invoke_from_event_loop(move || with_controller(|ctrl| done(ctrl, result)));
+        }));
+    }
+
+    fn persist_preferences(&mut self) {
+        if self.app.is_none() {
+            return;
+        }
+        let table = self.main.get_compact_table_view();
+        let column = self.main.get_sort_column().to_string();
+        let ascending = self.main.get_sort_ascending();
+        let basket = self.main.get_show_drop_basket();
+        self.preference_revision = self.preference_revision.wrapping_add(1);
+        let revision = self.preference_revision;
+        self.queue_settings_save(
+            move |settings| {
+                settings.compact_table_view = table;
+                settings.sort_column = column;
+                settings.sort_ascending = ascending;
+                settings.show_drop_basket = basket;
+            },
+            move |ctrl, result| {
+                if let Err(error) = result {
+                    ctrl.show_toast(format!("Could not save preferences: {error}"), true);
+                }
+                if ctrl.preference_revision == revision {
+                    ctrl.saved_preference_revision = revision;
+                    if let Some(app) = &ctrl.app {
+                        ctrl.load_preferences(&app.settings());
+                    }
+                }
+            },
+        );
+    }
+
+    fn toggle_drop_basket(&mut self) {
+        self.set_basket_visible(!self.main.get_show_drop_basket());
+        self.persist_preferences();
+    }
+
+    fn set_basket_visible(&mut self, visible: bool) {
+        self.main.set_show_drop_basket(visible);
+        if let Some(item) = &self.tray_menu_ids.drop_basket {
+            item.set_checked(visible);
+        }
+        if !visible {
+            if let Some(basket) = &self.drop_basket {
+                let _ = basket.hide();
+            }
+            return;
+        }
+        if self.drop_basket.is_none() {
+            match DropBasketWindow::new() {
+                Ok(basket) => {
+                    let weak = basket.as_weak();
+                    basket.on_start_drag(move || {
+                        if let Some(basket) = weak.upgrade() {
+                            drag_slint_window(basket.window());
+                        }
+                    });
+                    basket.on_show_main(|| with_controller(ControllerState::show_main_window));
+                    basket.on_add_download(|| {
+                        with_controller(|ctrl| {
+                            ctrl.open_add_dialog_with_seed(OpenPickerEvent {
+                                url: None,
+                                headers: HashMap::new(),
+                            });
+                        })
+                    });
+                    basket.on_hide_basket(|| with_controller(ControllerState::toggle_drop_basket));
+                    basket.window().on_close_requested(|| {
+                        // Defer hiding until Slint has finished processing this window event.
+                        let _ = slint::invoke_from_event_loop(|| {
+                            with_controller(|ctrl| {
+                                if ctrl.main.get_show_drop_basket() {
+                                    ctrl.toggle_drop_basket();
+                                }
+                            })
+                        });
+                        slint::CloseRequestResponse::HideWindow
+                    });
+                    wire_file_drop(basket.window());
+                    set_win_theme!(&basket, self.is_light, self.is_mono);
+                    if let Some(batch) = &self.last_batch {
+                        update_basket(&basket, batch);
+                    }
+                    self.drop_basket = Some(basket);
+                }
+                Err(error) => {
+                    self.show_toast(format!("Could not create Drop Basket: {error}"), true)
+                }
+            }
+        }
+        if let Some(basket) = &self.drop_basket {
+            if !basket.window().is_visible() {
+                if let Err(error) = basket.show() {
+                    self.show_toast(format!("Could not show Drop Basket: {error}"), true);
+                } else {
+                    apply_native_window_chrome(basket.window());
+                    win32::position_drop_basket(hwnd_of(basket.window()));
+                }
+            }
+        }
+    }
+
+    fn completion_alert(&mut self, alert: CompletionAlert) {
+        let Some(app) = &self.app else { return };
+        let settings = app.settings();
+        if settings.sound_on_complete {
+            win32::play_completion_sound();
+        }
+        if !settings.notify_on_complete {
+            return;
+        }
+        let main_focused = self
+            .main
+            .window()
+            .with_winit_window(|window| window.has_focus())
+            .unwrap_or(false);
+        if self.main.window().is_visible() && main_focused {
+            self.show_toast(format!("Download complete: {}", alert.filename), false);
+            return;
+        }
+        if self.completion_banner.is_none() {
+            let Ok(banner) = CompletionBannerWindow::new() else {
+                return;
+            };
+            let weak = banner.as_weak();
+            banner.on_dismissed(move || {
+                if let Some(banner) = weak.upgrade() {
+                    let _ = banner.hide();
+                }
+            });
+            self.completion_banner = Some(banner);
+        }
+        let banner = self.completion_banner.as_ref().unwrap();
+        set_win_theme!(banner, self.is_light, self.is_mono);
+        banner.set_headline("Download complete".into());
+        banner.set_filename(alert.filename.into());
+        if banner.show().is_ok() {
+            win32::position_drop_basket(hwnd_of(banner.window()));
+            if self
+                .drop_basket
+                .as_ref()
+                .is_some_and(|basket| basket.window().is_visible())
+            {
+                let mut position = banner.window().position();
+                position.y -= (82.0 * banner.window().scale_factor()) as i32;
+                banner.window().set_position(position);
+            }
+            let weak = banner.as_weak();
+            self.completion_timer
+                .start(TimerMode::SingleShot, Duration::from_secs(6), move || {
+                    if let Some(banner) = weak.upgrade() {
+                        let _ = banner.hide();
+                    }
+                });
+        }
+    }
+
+    fn refresh_speed_graph(&self) {
+        if self.main.get_studio_mode() == 1 && !self.main.get_inspector_collapsed() {
+            populate_speed_graph(&self.main, &self.speed_history);
+        }
+    }
+
+    fn refresh_logs(&mut self) {
+        if let Some(app) = &self.app {
+            let logs = app.get_logs();
+            if self.logs != logs {
+                self.logs = logs;
+                self.update_log_rows();
+            }
+        }
+    }
+
+    fn filtered_logs(&self) -> impl Iterator<Item = &LogEntry> {
+        let level = self.main.get_log_level();
+        self.logs
+            .iter()
+            .rev()
+            .filter(move |entry| level == "All" || entry.level.eq_ignore_ascii_case(level.as_str()))
+    }
+
+    fn update_log_rows(&self) {
+        let rows = self
+            .filtered_logs()
+            .map(|entry| LogEntryModel {
+                timestamp: entry
+                    .timestamp
+                    .with_timezone(&chrono::Local)
+                    .format("%H:%M:%S")
+                    .to_string()
+                    .into(),
+                level: entry.level.to_ascii_uppercase().into(),
+                category: entry.category.as_str().into(),
+                message: entry.message.as_str().into(),
+            })
+            .collect();
+        sync_vec_model_by(&self.models.log_entries_model, rows, PartialEq::eq);
+    }
+
+    fn log_action(&mut self, action: &str) {
+        let Some(app) = self.app.clone() else { return };
+        match action {
+            "Copy" => {
+                let text = self
+                    .filtered_logs()
+                    .map(|entry| {
+                        format!(
+                            "{} [{}] [{}] {}",
+                            entry.timestamp.to_rfc3339(),
+                            entry.level,
+                            entry.category,
+                            entry.message
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\r\n");
+                match win32::copy_to_clipboard(&text) {
+                    Ok(()) => self.show_toast("Copied log entries", false),
+                    Err(error) => self.show_toast(format!("Could not copy logs: {error}"), true),
+                }
+            }
+            "Clear" => {
+                app.clear_logs();
+                self.refresh_logs();
+                self.show_toast("Logs cleared", false);
+            }
+            "Export .log…" => {
+                let owner = hwnd_of(self.main.window());
+                self.runtime.spawn(async move {
+                    let path = tokio::task::spawn_blocking(move || {
+                        win32::pick_text_export_file(owner, "slipstream.log")
+                    })
+                    .await;
+                    if let Ok(Some(path)) = path {
+                        let result = app.export_logs(&path).await;
+                        let _ = slint::invoke_from_event_loop(move || {
+                            with_controller(|ctrl| match result {
+                                Ok(count) => {
+                                    ctrl.show_toast(format!("Exported {count} log entries"), false)
+                                }
+                                Err(error) => {
+                                    ctrl.show_toast(format!("Could not export logs: {error}"), true)
+                                }
+                            })
+                        });
+                    }
+                });
+            }
+            _ => {}
         }
     }
 
@@ -1328,15 +2320,22 @@ impl ControllerState {
         let Some(batch) = &self.last_batch else {
             return;
         };
+        let active_queue = self.main.get_active_queue_filter();
+        if !active_queue.is_empty() && !self.queues.iter().any(|q| q.id == active_queue.as_str()) {
+            self.main.set_active_queue_filter("".into());
+        }
         self.models.apply_telemetry_snapshot(
             &self.main,
             batch,
-            self.speed_history.make_contiguous(),
+            &sparkline_samples(&self.speed_history),
             &self.expanded_playlists,
-            &mut self.selected_id,
+            &mut self.selection,
+            &self.categories,
         );
+        self.models.sync_queues(&batch.transfers, &self.queues);
+        self.sync_automation_status();
         self.refresh_inspector();
-        if let Some(id) = self.selected_id.clone() {
+        if let Some(id) = self.selection.selected_id.clone() {
             if self
                 .transfer(&id)
                 .is_some_and(|t| t.kind == TransferKind::Torrent)
@@ -1348,18 +2347,38 @@ impl ControllerState {
     }
 
     fn refresh_inspector(&self) {
-        let id = self.selected_id.as_deref().unwrap_or_default();
+        let id = self.selection.selected_id.as_deref().unwrap_or_default();
         let peers = self.torrent_peers.get(id);
-        if self.main.get_inspector().id != id {
+        let previous = self.main.get_inspector();
+        if previous.id != id {
             self.refresh_inspector_files();
             self.models.update_inspector_peers(peers);
         }
         self.models
             .update_inspector(&self.main, self.transfer(id), peers);
+        let updated = self.main.get_inspector();
+        if previous.id != updated.id || previous.category_id != updated.category_id {
+            let index = self
+                .categories
+                .iter()
+                .position(|category| category.id == updated.category_id.as_str());
+            self.main
+                .set_inspector_category_index(index.map_or(0, |index| index as i32 + 1));
+        }
+        if previous.id != updated.id || previous.tags_summary != updated.tags_summary {
+            self.main.set_inspector_tags(updated.tags_summary);
+        }
+        if previous.id != updated.id {
+            self.main.set_add_tracker_input("".into());
+            self.main.set_torrent_upload_limit_input("".into());
+            self.main.set_torrent_upload_limit_loaded(false);
+            self.main
+                .set_torrent_action_pending(self.torrent_actions_pending.contains(id));
+        }
     }
 
     fn refresh_inspector_files(&self) {
-        let id = self.selected_id.as_deref().unwrap_or_default();
+        let id = self.selection.selected_id.as_deref().unwrap_or_default();
         let files = self.torrent_files.get(id).map_or(&[][..], Vec::as_slice);
         self.models
             .update_inspector_files(files, self.torrent_file_selections.get(id));
@@ -1375,10 +2394,12 @@ impl ControllerState {
         {
             return;
         }
-        if self.speed_history.len() >= MAX_SPEED_SAMPLES {
-            self.speed_history.pop_front();
+        if let Some(basket) = &self.drop_basket {
+            update_basket(basket, &batch);
         }
-        self.speed_history.push_back(batch.aggregate_down_bps);
+        if self.main.get_studio_mode() == 2 {
+            self.refresh_logs();
+        }
 
         if self
             .last_disk_check
@@ -1448,6 +2469,7 @@ impl ControllerState {
         });
         let remove_id = self.main.get_remove_confirm_id();
         if self.main.get_remove_confirm_open()
+            && !remove_id.is_empty()
             && !visible_ids.contains(remove_id.as_str())
             && !self.progress_windows.contains_key(remove_id.as_str())
             && !self.complete_windows.contains_key(remove_id.as_str())
@@ -1491,7 +2513,7 @@ impl ControllerState {
                                 files.retain(|file| !padding.contains(&file.index));
                             }
                             ctrl.torrent_files.insert(id.clone(), files);
-                            if ctrl.selected_id.as_deref() == Some(&id) {
+                            if ctrl.selection.selected_id.as_deref() == Some(&id) {
                                 ctrl.refresh_inspector_files();
                             }
                         }
@@ -1507,7 +2529,7 @@ impl ControllerState {
     fn poll_torrent_details(&mut self) {
         let Some(app) = self.app.clone() else { return };
         let mut ids = HashSet::new();
-        if let Some(id) = self.selected_id.clone() {
+        if let Some(id) = self.selection.selected_id.clone() {
             if self
                 .transfer(&id)
                 .is_some_and(|t| t.kind == TransferKind::Torrent)
@@ -1528,9 +2550,16 @@ impl ControllerState {
             if !self.torrent_peers_pending.insert(id.clone()) {
                 continue;
             }
+            let load_upload_limit = self.selection.selected_id.as_deref() == Some(&id)
+                && !self.main.get_torrent_upload_limit_loaded();
             let app = app.clone();
             self.runtime.spawn(async move {
                 let result = app.get_torrent_peers(&id).await;
+                let upload_limit = if load_upload_limit {
+                    app.torrent_upload_limit(&id).await.ok()
+                } else {
+                    None
+                };
                 let _ = slint::invoke_from_event_loop(move || {
                     with_controller(|ctrl| {
                         ctrl.torrent_peers_pending.remove(&id);
@@ -1540,11 +2569,20 @@ impl ControllerState {
                             }
                             if ctrl.transfer(&id).is_some() {
                                 ctrl.torrent_peers.insert(id.clone(), summary);
-                                if ctrl.selected_id.as_deref() == Some(&id) {
+                                if ctrl.selection.selected_id.as_deref() == Some(&id) {
                                     ctrl.models
                                         .update_inspector_peers(ctrl.torrent_peers.get(&id));
                                     ctrl.refresh_inspector();
                                 }
+                            }
+                        }
+                        if let Some(limit) = upload_limit {
+                            if ctrl.selection.selected_id.as_deref() == Some(&id)
+                                && !ctrl.main.get_torrent_upload_limit_loaded()
+                            {
+                                ctrl.main
+                                    .set_torrent_upload_limit_input(format_upload_kib(limit));
+                                ctrl.main.set_torrent_upload_limit_loaded(true);
                             }
                         }
                     });
@@ -1561,32 +2599,408 @@ impl ControllerState {
         };
         self.main.set_add_open(false);
         self.main.set_add_submitting(false);
-        if let Some(event) = self.pending_picker_requests.pop_front() {
-            self.open_add_dialog_with_seed(event);
+        match self.pending_picker_requests.pop_front() {
+            Some(PickerRequest::Source(event)) => self.open_add_dialog_with_seed(event),
+            Some(PickerRequest::BatchText(text)) => self.open_batch_text(text),
+            None => {}
         }
     }
 
-    fn open_add_dialog_with_seed(&mut self, event: OpenPickerEvent) {
-        const MAX_PENDING_PICKER_REQUESTS: usize = 16;
-
-        if self.main.get_add_open() {
-            if event.url.as_deref().unwrap_or_default() != self.main.get_add_source_text().as_str()
-            {
-                if self.pending_picker_requests.len() < MAX_PENDING_PICKER_REQUESTS {
-                    self.pending_picker_requests.push_back(event);
-                    let waiting = self.pending_picker_requests.len();
-                    self.show_toast(
-                        format!("Queued download dialog request ({waiting} waiting)"),
-                        false,
-                    );
-                } else {
-                    self.show_toast("The download dialog queue is full.", true);
-                }
-            }
-            self.show_main_window();
+    fn import_metalink(&self) {
+        if !self.main.get_add_open() || self.main.get_add_submitting() || self.app.is_none() {
             return;
         }
-        self.main.set_settings_open(false);
+        let generation = self.add_state.generation;
+        let owner = hwnd_of(self.main.window());
+        self.main.set_add_submitting(true);
+        self.main.set_add_error_text("".into());
+        std::thread::spawn(move || {
+            let picked = win32::pick_metalink_file(owner);
+            let _ = slint::invoke_from_event_loop(move || {
+                with_controller(|ctrl| {
+                    if !ctrl.main.get_add_open() || ctrl.add_state.generation != generation {
+                        return;
+                    }
+                    let Some((path, app)) = picked.zip(ctrl.app.clone()) else {
+                        ctrl.main.set_add_submitting(false);
+                        return;
+                    };
+                    let save_dir = optional_text(&ctrl.main.get_add_save_dir());
+                    let queue_id = ctrl
+                        .queues
+                        .get(ctrl.main.get_add_queue_index().max(0) as usize)
+                        .map(|queue| queue.id.clone());
+                    ctrl.runtime.spawn(async move {
+                        let result = async {
+                            let entries = app.parse_metalink_file(Path::new(&path)).await?;
+                            app.enqueue_metalink_entries(entries, save_dir, queue_id)
+                                .await
+                        }
+                        .await;
+                        let _ = slint::invoke_from_event_loop(move || {
+                            with_controller(|ctrl| {
+                                if !ctrl.main.get_add_open()
+                                    || ctrl.add_state.generation != generation
+                                {
+                                    return;
+                                }
+                                if let Ok(ids) = &result {
+                                    ctrl.show_toast(
+                                        format!("Queued {} Metalink files.", ids.len()),
+                                        false,
+                                    );
+                                }
+                                ctrl.finish_add_submission(generation, result.map(|_| ()));
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    }
+
+    fn open_site_grabber(&mut self) {
+        if self.app.is_none() || self.main.get_grabber_open() {
+            return;
+        }
+        self.grabber_session_id = self.grabber_session_id.wrapping_add(1);
+        self.main.set_grabber_target_url("".into());
+        self.main.set_grabber_depth_index(0);
+        self.main.set_grabber_same_origin_only(true);
+        self.main.set_grabber_extensions("".into());
+        self.main.set_grabber_include_pattern("".into());
+        self.main.set_grabber_exclude_pattern("".into());
+        self.main.set_grabber_scanning(false);
+        self.main.set_grabber_enqueuing(false);
+        self.main.set_grabber_error_text("".into());
+        self.main.set_grabber_scanned_count_text("".into());
+        self.grabber_items_model.set_vec(Vec::new());
+        self.main
+            .set_grabber_items(self.grabber_items_model.clone().into());
+        self.update_grabber_selection_count();
+        self.main.set_grabber_open(true);
+    }
+
+    fn close_site_grabber(&mut self) {
+        self.main.set_grabber_open(false);
+        if let Some(scan) = self.grabber_scan.take() {
+            scan.abort();
+        }
+    }
+
+    fn grabber_session_is_open(&self, session: u64) -> bool {
+        self.main.get_grabber_open() && self.grabber_session_id == session
+    }
+
+    fn scan_site_grabber(&mut self) {
+        let Some(app) = self.app.clone() else { return };
+        if !self.main.get_grabber_open()
+            || self.main.get_grabber_scanning()
+            || self.main.get_grabber_enqueuing()
+        {
+            return;
+        }
+        let request = SiteGrabRequest {
+            url: self.main.get_grabber_target_url().trim().to_owned(),
+            max_depth: self.main.get_grabber_depth_index().clamp(0, 2) as u8,
+            same_origin_only: self.main.get_grabber_same_origin_only(),
+            extensions: view_model::split_list(&self.main.get_grabber_extensions()),
+            include_pattern: self.main.get_grabber_include_pattern().trim().to_owned(),
+            exclude_pattern: self.main.get_grabber_exclude_pattern().trim().to_owned(),
+        };
+        if request.url.is_empty() {
+            return;
+        }
+        self.main.set_grabber_scanning(true);
+        self.main.set_grabber_error_text("".into());
+        self.main.set_grabber_scanned_count_text("".into());
+        self.grabber_items_model.set_vec(Vec::new());
+        self.update_grabber_selection_count();
+        let session = self.grabber_session_id;
+        self.grabber_scan = Some(self.runtime.spawn(async move {
+            let result = app.grab_site_urls(request).await;
+            let _ = slint::invoke_from_event_loop(move || {
+                with_controller(|ctrl| {
+                    if !ctrl.grabber_session_is_open(session) {
+                        return;
+                    }
+                    ctrl.grabber_scan = None;
+                    ctrl.main.set_grabber_scanning(false);
+                    match result {
+                        Ok(result) => {
+                            ctrl.main.set_grabber_scanned_count_text(
+                                format!(
+                                    "{} {} scanned · {} files found",
+                                    result.scanned_pages,
+                                    if result.scanned_pages == 1 {
+                                        "page"
+                                    } else {
+                                        "pages"
+                                    },
+                                    result.items.len(),
+                                )
+                                .into(),
+                            );
+                            ctrl.grabber_items_model.set_vec(
+                                result
+                                    .items
+                                    .into_iter()
+                                    .map(view_model::site_grab_row)
+                                    .collect::<Vec<_>>(),
+                            );
+                            ctrl.update_grabber_selection_count();
+                        }
+                        Err(error) => ctrl.main.set_grabber_error_text(error.into()),
+                    }
+                });
+            });
+        }));
+    }
+
+    fn update_grabber_selection_count(&self) {
+        let count = self
+            .grabber_items_model
+            .iter()
+            .filter(|row| row.checked)
+            .count();
+        self.main.set_grabber_selected_count(count as i32);
+    }
+
+    fn enqueue_grabber_selection(&mut self) {
+        let Some(app) = self.app.clone() else { return };
+        if !self.main.get_grabber_open()
+            || self.main.get_grabber_scanning()
+            || self.main.get_grabber_enqueuing()
+        {
+            return;
+        }
+        let selected: Vec<_> = self
+            .grabber_items_model
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.checked)
+            .map(|(index, row)| (index, row.url.to_string(), row.filename.to_string()))
+            .collect();
+        if selected.is_empty() {
+            return;
+        }
+        self.main.set_grabber_enqueuing(true);
+        self.main.set_grabber_error_text("".into());
+        let session = self.grabber_session_id;
+        self.runtime.spawn(async move {
+            let mut queued = Vec::new();
+            let mut failure = None;
+            for (index, url, filename) in selected {
+                let request = AddHttpDownloadRequest {
+                    url,
+                    filename: Some(filename),
+                    ..Default::default()
+                };
+                match app.add_http_download(request).await {
+                    Ok(_) => queued.push(index),
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            let _ = slint::invoke_from_event_loop(move || {
+                with_controller(|ctrl| {
+                    if !ctrl.grabber_session_is_open(session) {
+                        return;
+                    }
+                    ctrl.main.set_grabber_enqueuing(false);
+                    if let Some(error) = failure {
+                        ctrl.main.set_grabber_error_text(
+                            format!("Queued {} files before an error: {error}", queued.len())
+                                .into(),
+                        );
+                        for index in queued.into_iter().rev() {
+                            ctrl.grabber_items_model.remove(index);
+                        }
+                        ctrl.update_grabber_selection_count();
+                    } else {
+                        ctrl.show_toast(
+                            format!("Queued {} files from Site Grabber.", queued.len()),
+                            false,
+                        );
+                        ctrl.close_site_grabber();
+                    }
+                });
+            });
+        });
+    }
+
+    fn queue_picker_request(&mut self, request: PickerRequest) {
+        const MAX_PENDING_PICKER_REQUESTS: usize = 16;
+        if self.pending_picker_requests.len() < MAX_PENDING_PICKER_REQUESTS {
+            self.pending_picker_requests.push_back(request);
+            let waiting = self.pending_picker_requests.len();
+            self.show_toast(
+                format!("Queued download dialog request ({waiting} waiting)"),
+                false,
+            );
+        } else {
+            self.show_toast("The download dialog queue is full.", true);
+        }
+    }
+
+    fn open_batch_text(&mut self, text: String) {
+        if self.main.get_add_open() {
+            self.show_main_window();
+            self.queue_picker_request(PickerRequest::BatchText(text));
+            return;
+        }
+        self.open_add_dialog_with_seed(OpenPickerEvent {
+            url: None,
+            headers: HashMap::new(),
+        });
+        self.main.set_add_tab(4);
+        self.set_batch_text(text.into());
+    }
+
+    fn set_batch_text(&self, text: SharedString) {
+        self.main
+            .set_add_batch_url_count(batch_url_count(&text) as i32);
+        self.main.set_add_batch_text(text);
+        self.main.set_add_error_text("".into());
+    }
+
+    fn handle_dropped_file(&mut self, path: PathBuf) {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default();
+        if extension.eq_ignore_ascii_case("torrent") {
+            if let Some(source) = path.to_str() {
+                self.open_add_dialog_with_seed(OpenPickerEvent {
+                    url: Some(source.to_owned()),
+                    headers: HashMap::new(),
+                });
+            } else {
+                self.show_main_window();
+                self.show_toast(
+                    "The torrent file path contains unsupported characters.",
+                    true,
+                );
+            }
+        } else if extension.eq_ignore_ascii_case("txt") || extension.eq_ignore_ascii_case("ef2") {
+            self.import_batch_file(Some(path));
+        } else {
+            self.show_main_window();
+            self.show_toast(
+                "Drop a .torrent, .txt, or .ef2 file to add downloads.",
+                false,
+            );
+        }
+    }
+
+    fn import_batch_file(&self, dropped: Option<PathBuf>) {
+        let generation = self.add_state.generation;
+        let owner = hwnd_of(self.main.window());
+        self.runtime.spawn_blocking(move || {
+            let import_into_open_dialog = dropped.is_none();
+            let Some(path) =
+                dropped.or_else(|| win32::pick_text_import_file(owner).map(PathBuf::from))
+            else {
+                return;
+            };
+            let result = read_batch_file(&path);
+            let _ = slint::invoke_from_event_loop(move || {
+                with_controller(|ctrl| {
+                    if import_into_open_dialog
+                        && (!ctrl.main.get_add_open()
+                            || ctrl.main.get_add_submitting()
+                            || ctrl.add_state.generation != generation
+                            || ctrl.main.get_add_tab() != 4)
+                    {
+                        return;
+                    }
+                    match result {
+                        Ok(text) if import_into_open_dialog => ctrl.set_batch_text(text.into()),
+                        Ok(text) => ctrl.open_batch_text(text),
+                        Err(error) => {
+                            ctrl.show_main_window();
+                            ctrl.show_toast(error, true);
+                        }
+                    }
+                })
+            });
+        });
+    }
+
+    fn category_at(&self, index: i32) -> Option<String> {
+        index
+            .checked_sub(1)
+            .and_then(|index| self.categories.get(index as usize))
+            .map(|category| category.id.clone())
+    }
+
+    fn submit_batch_urls(&mut self) {
+        let Some(app) = self.app.clone() else { return };
+        let raw = self.main.get_add_batch_text().to_string();
+        if self.main.get_add_batch_url_count() == 0 {
+            self.main
+                .set_add_error_text("Enter at least one URL or magnet link.".into());
+            return;
+        }
+        let folder = self.main.get_add_batch_save_dir().trim().to_owned();
+        let category = self.category_at(self.main.get_add_batch_category_index());
+        let paused = self.main.get_add_batch_start_paused();
+        let generation = self.add_state.generation;
+        self.main.set_add_submitting(true);
+        self.main.set_add_error_text("".into());
+        self.runtime.spawn(async move {
+            let result = app
+                .add_batch_urls(
+                    &raw,
+                    (!folder.is_empty()).then_some(folder),
+                    category,
+                    paused,
+                )
+                .await;
+            let _ = slint::invoke_from_event_loop(move || {
+                with_controller(|ctrl| match result {
+                    Ok(summary) => {
+                        ctrl.show_toast(
+                            format!(
+                                "Added {} downloads, skipped {}",
+                                summary.added, summary.skipped
+                            ),
+                            summary.added == 0,
+                        );
+                        if ctrl.add_state.generation == generation {
+                            if summary.added > 0 {
+                                ctrl.finish_add_submission(generation, Ok(()));
+                            } else {
+                                let error = summary
+                                    .errors
+                                    .into_iter()
+                                    .next()
+                                    .unwrap_or_else(|| "No downloads were added.".into());
+                                ctrl.finish_add_submission(generation, Err(error));
+                            }
+                        }
+                    }
+                    Err(error) => ctrl.finish_add_submission(generation, Err(error)),
+                })
+            });
+        });
+    }
+
+    fn open_add_dialog_with_seed(&mut self, event: OpenPickerEvent) {
+        if self.main.get_add_open() {
+            self.show_main_window();
+            if event.url.is_some()
+                && event.url.as_deref() != Some(self.main.get_add_source_text().as_str())
+            {
+                self.queue_picker_request(PickerRequest::Source(event));
+            }
+            return;
+        }
+        self.close_settings_dialog();
+        self.close_site_grabber();
+        self.main.set_create_torrent_open(false);
         self.main.set_palette_open(false);
         self.main.set_refresh_open(false);
         self.main.set_verify_open(false);
@@ -1594,9 +3008,24 @@ impl ControllerState {
         self.main.set_context_menu_open(false);
         self.main.set_speed_popover_open(false);
         self.main.set_add_tab(0);
+        self.set_batch_text("".into());
+        self.main.set_add_batch_save_dir("".into());
+        self.main.set_add_batch_category_index(0);
+        self.main.set_add_batch_start_paused(false);
+        let default_queue_idx = self
+            .queues
+            .iter()
+            .position(|q| q.id == "default")
+            .unwrap_or(0) as i32;
+        self.main.set_add_queue_index(default_queue_idx);
         self.main.set_add_torrent_start_paused(false);
         self.main.set_add_filename_override("".into());
         self.main.set_add_expected_sha256("".into());
+        self.main.set_add_mirror_urls_text("".into());
+        self.main.set_add_media_clip_start("".into());
+        self.main.set_add_media_clip_end("".into());
+        self.main.set_add_media_split_chapters(false);
+        self.main.set_add_media_sponsorblock_text("".into());
 
         if let Some(app) = &self.app {
             let s = app.settings();
@@ -2398,6 +3827,109 @@ impl ControllerState {
         });
     }
 
+    fn run_torrent_power_action(&mut self, id: String, action: TorrentPowerAction) {
+        let Some(app) = self.app.clone() else { return };
+        let Some(transfer) = self
+            .transfer(&id)
+            .filter(|t| t.kind == TransferKind::Torrent)
+        else {
+            return;
+        };
+        let picker = matches!(action, TorrentPowerAction::MoveStorage)
+            .then(|| (hwnd_of(self.main.window()), transfer.save_dir.clone()));
+        if !self.torrent_actions_pending.insert(id.clone()) {
+            return;
+        }
+        self.main.set_torrent_action_pending(true);
+        self.runtime.spawn(async move {
+            let (verb, result) = match &action {
+                TorrentPowerAction::Recheck => (
+                    "recheck the torrent",
+                    app.force_recheck_torrent(&id)
+                        .await
+                        .map(|()| Some("Torrent recheck requested")),
+                ),
+                TorrentPowerAction::MoveStorage => {
+                    let (owner, initial) = picker.expect("move action has a folder picker");
+                    let picked = tokio::task::spawn_blocking(move || {
+                        win32::pick_folder(
+                            owner,
+                            Some(initial),
+                            "Select the torrent destination folder",
+                        )
+                    })
+                    .await;
+                    let result = match picked {
+                        Ok(Ok(Some(path))) => app
+                            .move_torrent_storage(&id, Path::new(&path))
+                            .await
+                            .map(|()| Some("Torrent storage moved")),
+                        Ok(Ok(None)) => Ok(None),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    };
+                    ("move torrent storage", result)
+                }
+                TorrentPowerAction::AddTracker(tracker) => (
+                    "add the tracker",
+                    app.add_torrent_trackers(&id, vec![tracker.clone()])
+                        .await
+                        .map(|()| Some("Tracker added")),
+                ),
+                TorrentPowerAction::Reannounce => (
+                    "reannounce the torrent",
+                    app.reannounce_torrent(&id)
+                        .await
+                        .map(|()| Some("Torrent reannounced")),
+                ),
+                TorrentPowerAction::UploadLimit(rate) => (
+                    "set the upload limit",
+                    app.set_torrent_upload_limit(&id, *rate)
+                        .await
+                        .map(|()| Some("Upload limit updated")),
+                ),
+            };
+            let batch = if matches!(result, Ok(Some(_))) {
+                Some(app.snapshot().await)
+            } else {
+                None
+            };
+            let _ = slint::invoke_from_event_loop(move || {
+                with_controller(|ctrl| {
+                    ctrl.torrent_actions_pending.remove(&id);
+                    let selected = ctrl.selection.selected_id.as_deref() == Some(&id);
+                    if selected {
+                        ctrl.main.set_torrent_action_pending(false);
+                    }
+                    match result {
+                        Ok(Some(notice)) => {
+                            if selected {
+                                match action {
+                                    TorrentPowerAction::AddTracker(_) => {
+                                        ctrl.main.set_add_tracker_input("".into())
+                                    }
+                                    TorrentPowerAction::UploadLimit(rate) => {
+                                        ctrl.main.set_torrent_upload_limit_input(
+                                            format_upload_kib(rate),
+                                        );
+                                        ctrl.main.set_torrent_upload_limit_loaded(true);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if let Some(batch) = batch {
+                                ctrl.apply_telemetry(batch);
+                            }
+                            ctrl.show_toast(notice, false);
+                        }
+                        Ok(None) => {}
+                        Err(error) => ctrl.show_toast(format!("Could not {verb}: {error}"), true),
+                    }
+                });
+            });
+        });
+    }
+
     fn set_all_paused(&self, pause: bool) {
         let Some(app) = self.app.clone() else { return };
         self.dispatch_transfer_action("change transfer state", true, async move {
@@ -2423,6 +3955,168 @@ impl ControllerState {
         });
     }
 
+    fn export_selected_urls(&self) {
+        let Some(app) = self.app.clone() else { return };
+        let ids = self.selection.ordered_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let owner = hwnd_of(self.main.window());
+        self.runtime.spawn(async move {
+            let path = tokio::task::spawn_blocking(move || {
+                win32::pick_text_export_file(owner, "slipstream-urls.txt")
+            })
+            .await;
+            if let Ok(Some(path)) = path {
+                let result = app.export_transfer_urls(&ids, &path).await;
+                let _ = slint::invoke_from_event_loop(move || {
+                    with_controller(|ctrl| match result {
+                        Ok(count) => ctrl.show_toast(format!("Exported {count} URLs"), false),
+                        Err(error) => {
+                            ctrl.show_toast(format!("Could not export URLs: {error}"), true)
+                        }
+                    })
+                });
+            }
+        });
+    }
+
+    fn dispatch_bulk_action(&self, ids: Vec<String>, action: BulkAction) {
+        let Some(app) = self.app.clone() else { return };
+        let requested = ids.len();
+        let runtime = self.runtime.clone();
+        self.runtime.spawn_blocking(move || {
+            // Batch 1's bulk futures use borrowing async closures. Drive them on this worker.
+            let removing = matches!(action, BulkAction::Remove(_));
+            let (result, batch) = runtime.block_on(async {
+                let result = bulk_operation(&app, &ids, action).await;
+                (result, app.snapshot().await)
+            });
+            let _ = slint::invoke_from_event_loop(move || {
+                with_controller(|ctrl| {
+                    if removing {
+                        let remaining: HashSet<_> =
+                            batch.transfers.iter().map(|row| row.id.as_str()).collect();
+                        for id in &ids {
+                            if !remaining.contains(id.as_str()) {
+                                ctrl.close_progress_dialog(id);
+                                ctrl.pending_transfer_dialogs
+                                    .remove(&(id.clone(), TransferDialog::Complete));
+                                if let Some(entry) = ctrl.complete_windows.remove(id) {
+                                    let _ = entry.window.hide();
+                                }
+                            }
+                        }
+                    }
+                    ctrl.apply_telemetry(batch);
+                    match result {
+                        Ok(count) => ctrl.show_toast(
+                            format!("Updated {count} of {requested} transfers"),
+                            count == 0,
+                        ),
+                        Err(error) => ctrl.show_toast(error, true),
+                    }
+                })
+            });
+        });
+    }
+
+    fn handle_bulk_action(&mut self, action: &str, value: &str) {
+        if action == "Export URLs" {
+            self.export_selected_urls();
+            return;
+        }
+        let ids = self.selection.ordered_ids();
+        if ids.len() < 2 {
+            return;
+        }
+        let operation = match action {
+            "Pause" => BulkAction::Pause,
+            "Resume" => BulkAction::Resume,
+            "Stop" => BulkAction::Stop,
+            "Remove…" => {
+                self.main.set_remove_confirm_id("".into());
+                self.main.set_remove_confirm_filename(
+                    format!("{} selected transfers", ids.len()).into(),
+                );
+                self.pending_bulk_remove = ids;
+                self.main.set_remove_confirm_open(true);
+                self.main.invoke_focus_remove_confirm();
+                return;
+            }
+            "Limit" => match parse_speed_limit_slider_mbps(value) {
+                Ok(limit) => {
+                    self.main.set_bulk_editor(0);
+                    self.main.set_bulk_limit("".into());
+                    BulkAction::Limit(limit)
+                }
+                Err(error) => {
+                    self.show_toast(error, true);
+                    return;
+                }
+            },
+            _ => return,
+        };
+        self.dispatch_bulk_action(ids, operation);
+    }
+
+    fn save_inspector_metadata(&mut self) {
+        let (Some(app), Some(id)) = (self.app.clone(), self.selection.selected_id.clone()) else {
+            return;
+        };
+        if self.main.get_inspector_metadata_saving() {
+            return;
+        }
+        let category = self.category_at(self.main.get_inspector_category_index());
+        let tags: Vec<_> = self
+            .main
+            .get_inspector_tags()
+            .split(',')
+            .map(str::trim)
+            .map(str::to_owned)
+            .collect();
+        let change_category = category.as_deref()
+            != self
+                .transfer(&id)
+                .and_then(|transfer| transfer.category_id.as_deref());
+        self.main.set_inspector_metadata_saving(true);
+        self.runtime.spawn(async move {
+            let ids = [id];
+            let result = async {
+                if change_category {
+                    app.set_transfers_category(&ids, category).await?;
+                }
+                app.set_transfers_tags(&ids, tags).await
+            }
+            .await;
+            let batch = app.snapshot().await;
+            let _ = slint::invoke_from_event_loop(move || {
+                with_controller(|ctrl| {
+                    ctrl.main.set_inspector_metadata_saving(false);
+                    ctrl.apply_telemetry(batch);
+                    match result {
+                        Ok(1) => {
+                            if ctrl.selection.selected_id.as_deref() == Some(ids[0].as_str()) {
+                                let inspector = ctrl.main.get_inspector();
+                                ctrl.main.set_inspector_tags(inspector.tags_summary);
+                                let index = ctrl.categories.iter().position(|category| {
+                                    category.id == inspector.category_id.as_str()
+                                });
+                                ctrl.main.set_inspector_category_index(
+                                    index.map_or(0, |index| index as i32 + 1),
+                                );
+                            }
+                            ctrl.show_toast("Category and tags saved", false);
+                        }
+                        Ok(_) => ctrl.show_toast("The transfer is no longer available.", true),
+                        Err(error) => ctrl
+                            .show_toast(format!("Could not save category and tags: {error}"), true),
+                    }
+                })
+            });
+        });
+    }
+
     fn request_remove_transfer(&mut self, id: &str) {
         let Some(transfer) = self.transfer(id) else {
             return;
@@ -2437,6 +4131,14 @@ impl ControllerState {
     }
 
     fn confirm_remove_transfer(&mut self, id: String, delete_files: bool) {
+        if id.is_empty() {
+            self.main.set_remove_confirm_open(false);
+            let ids = std::mem::take(&mut self.pending_bulk_remove);
+            if !ids.is_empty() {
+                self.dispatch_bulk_action(ids, BulkAction::Remove(delete_files));
+            }
+            return;
+        }
         if !self.main.get_remove_confirm_open() || self.main.get_remove_confirm_id() != id.as_str()
         {
             return;
@@ -2792,10 +4494,14 @@ impl ControllerState {
     }
 
     fn submit_add_download(&mut self) {
-        let Some(app) = &self.app else { return };
         if self.main.get_add_submitting() {
             return;
         }
+        if self.main.get_add_tab() == 4 {
+            self.submit_batch_urls();
+            return;
+        }
+        let Some(app) = &self.app else { return };
         let source = self
             .main
             .get_add_source_text()
@@ -2863,6 +4569,10 @@ impl ControllerState {
 
         self.main.set_add_submitting(true);
         self.main.set_add_error_text("".into());
+        let selected_queue_id = self
+            .queues
+            .get(self.main.get_add_queue_index().max(0) as usize)
+            .map(|q| q.id.clone());
         let app_c = app.clone();
 
         if torrent {
@@ -2913,13 +4623,14 @@ impl ControllerState {
                             filename: None,
                             save_dir: save_dir.clone(),
                             max_connections: Some(max_conn),
-                            queue_id: None,
+                            queue_id: selected_queue_id.clone(),
                             headers: headers.clone(),
                             referrer: None,
                             expected_sha256: None,
                             expected_size_bytes: None,
                             start_paused: false,
                             overwrite_existing: false,
+                            ..AddHttpDownloadRequest::default()
                         })
                         .await
                     {
@@ -2936,12 +4647,39 @@ impl ControllerState {
             return;
         }
 
+        let mirror_urls = if tab == 0 {
+            view_model::split_list(&self.main.get_add_mirror_urls_text())
+        } else {
+            Vec::new()
+        };
         let use_media = self.add_state.probe.is_some()
             || tab == 1
             || tab == 2
             || !looks_like_direct_file_url(&source);
 
-        if use_media && !self.main.get_add_is_direct_http() {
+        if use_media && !self.main.get_add_is_direct_http() && mirror_urls.is_empty() {
+            let (clip_start_seconds, clip_end_seconds) = match view_model::parse_clip_range(
+                &self.main.get_add_media_clip_start(),
+                &self.main.get_add_media_clip_end(),
+            ) {
+                Ok(Some((start, end))) => (Some(start), Some(end)),
+                Ok(None) => (None, None),
+                Err(error) => {
+                    self.finish_add_submission(expected_gen, Err(error.into()));
+                    return;
+                }
+            };
+            let sponsorblock_categories =
+                view_model::split_list(&self.main.get_add_media_sponsorblock_text());
+            if sponsorblock_categories.iter().any(|category| {
+                !slipstream_media::args::SPONSORBLOCK_CATEGORIES.contains(&category.as_str())
+            }) {
+                self.finish_add_submission(
+                    expected_gen,
+                    Err("Unknown SponsorBlock category.".into()),
+                );
+                return;
+            }
             let format_id = if tab == 0 {
                 self.add_state.probe.as_ref().and_then(|probe| {
                     let sel = self.add_state.selected_format_id.as_deref()?;
@@ -3022,6 +4760,10 @@ impl ControllerState {
                 selected_entries,
                 playlist_folder_name,
                 headers,
+                clip_start_seconds,
+                clip_end_seconds,
+                split_chapters: self.main.get_add_media_split_chapters(),
+                sponsorblock_categories,
             };
             self.runtime.spawn(async move {
                 let res = app_c.add_media_download(req).await;
@@ -3039,13 +4781,15 @@ impl ControllerState {
             filename,
             save_dir,
             max_connections: Some(max_conn),
-            queue_id: None,
+            queue_id: selected_queue_id,
             headers,
             referrer: None,
             expected_sha256: sha,
             expected_size_bytes: None,
             start_paused: false,
             overwrite_existing: false,
+            mirror_urls,
+            ..AddHttpDownloadRequest::default()
         };
         self.runtime.spawn(async move {
             let res = app_c.add_http_download(req).await;
@@ -3068,9 +4812,562 @@ impl ControllerState {
         }
     }
 
+    fn settings_session_is_open(&self, session: u64) -> bool {
+        self.main.get_settings_open() && self.settings_session_id == session
+    }
+
+    fn close_settings_dialog(&self) {
+        self.main.set_settings_open(false);
+        self.main.set_set_proxy_password("".into());
+        self.main.set_set_site_login_password("".into());
+    }
+
+    fn sync_network_secrets(&self, settings: &AppSettings) {
+        self.main
+            .set_set_proxy_has_password(settings.proxy.has_password);
+        let rows = settings
+            .site_logins
+            .iter()
+            .map(view_model::site_login_row)
+            .collect();
+        sync_vec_model_by(&self.site_logins_model, rows, PartialEq::eq);
+    }
+
+    fn load_network_settings(&self, settings: &AppSettings) {
+        let proxy = &settings.proxy;
+        self.main.set_set_proxy_mode_index(match proxy.mode {
+            ProxyMode::Direct => 0,
+            ProxyMode::System => 1,
+            ProxyMode::Manual => 2,
+        });
+        self.main
+            .set_set_proxy_url(proxy.url.as_deref().unwrap_or_default().into());
+        self.main
+            .set_set_proxy_username(proxy.username.as_deref().unwrap_or_default().into());
+        self.main
+            .set_set_proxy_bypass_hosts(proxy.bypass_hosts.join(", ").into());
+        self.main.set_set_proxy_apply_to_media(proxy.apply_to_media);
+        self.main.set_set_proxy_password("".into());
+        self.reset_site_login_form();
+        self.main.set_set_network_editing(false);
+        self.sync_network_secrets(settings);
+        self.main
+            .set_set_site_logins(self.site_logins_model.clone().into());
+
+        let cookies = &settings.cookie_passthrough;
+        self.main.set_set_cookies_enabled(cookies.enabled);
+        let browser = NETWORK_COOKIE_BROWSERS
+            .iter()
+            .position(|&browser| browser == cookies.browser);
+        self.main
+            .set_set_cookies_browser_index(browser.unwrap_or(0) as i32);
+        self.main
+            .set_set_cookies_allowed_hosts(cookies.allowed_hosts.join(", ").into());
+        self.main
+            .set_set_auto_discover_checksums(settings.auto_discover_checksums);
+
+        let media = &settings.media_power;
+        self.main.set_set_media_embed_metadata(media.embed_metadata);
+        self.main
+            .set_set_media_embed_thumbnail(media.embed_thumbnail);
+        self.main.set_set_media_embed_chapters(media.embed_chapters);
+        self.main.set_set_media_split_chapters(media.split_chapters);
+        self.main
+            .set_set_media_filename_template(media.filename_template.as_str().into());
+        self.main
+            .set_set_media_sponsorblock_text(media.sponsorblock_remove.join(", ").into());
+    }
+
+    fn read_network_settings(&self, settings: &mut AppSettings) -> Result<(), String> {
+        let proxy = &mut settings.proxy;
+        proxy.mode = match self.main.get_set_proxy_mode_index() {
+            1 => ProxyMode::System,
+            2 => ProxyMode::Manual,
+            _ => ProxyMode::Direct,
+        };
+        proxy.url = optional_text(&self.main.get_set_proxy_url());
+        proxy.username = optional_text(&self.main.get_set_proxy_username());
+        proxy.bypass_hosts = view_model::split_list(&self.main.get_set_proxy_bypass_hosts());
+        proxy.apply_to_media = self.main.get_set_proxy_apply_to_media();
+
+        let cookies = &mut settings.cookie_passthrough;
+        cookies.enabled = self.main.get_set_cookies_enabled();
+        cookies.browser = NETWORK_COOKIE_BROWSERS
+            [self.main.get_set_cookies_browser_index().clamp(0, 3) as usize]
+            .into();
+        cookies.allowed_hosts = view_model::split_list(&self.main.get_set_cookies_allowed_hosts());
+        settings.auto_discover_checksums = self.main.get_set_auto_discover_checksums();
+
+        let media = &mut settings.media_power;
+        media.embed_metadata = self.main.get_set_media_embed_metadata();
+        media.embed_thumbnail = self.main.get_set_media_embed_thumbnail();
+        media.embed_chapters = self.main.get_set_media_embed_chapters();
+        media.split_chapters = self.main.get_set_media_split_chapters();
+        media.filename_template = self
+            .main
+            .get_set_media_filename_template()
+            .trim()
+            .to_owned();
+        media.sponsorblock_remove =
+            view_model::split_list(&self.main.get_set_media_sponsorblock_text());
+        crate::settings::normalize_phase4_network_and_media(settings)
+            .map_err(|error| error.to_string())
+    }
+
+    fn reset_site_login_form(&self) {
+        self.main.set_set_site_login_host("".into());
+        self.main.set_set_site_login_scheme_index(0);
+        self.main.set_set_site_login_username("".into());
+        self.main.set_set_site_login_password("".into());
+    }
+
+    fn edit_network_secrets<F>(
+        &mut self,
+        operation: impl FnOnce(Arc<AppState>) -> F + Send + 'static,
+        reset_login: bool,
+    ) where
+        F: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        if self.app.is_none()
+            || !self.main.get_settings_open()
+            || self.main.get_set_saving()
+            || self.main.get_set_network_editing()
+        {
+            return;
+        }
+        self.main.set_set_network_editing(true);
+        self.main.set_set_error_text("".into());
+        let session = self.settings_session_id;
+        self.queue_settings_operation(operation, move |ctrl, result| {
+            if !ctrl.settings_session_is_open(session) {
+                return;
+            }
+            ctrl.main.set_set_network_editing(false);
+            match result {
+                Ok(()) => {
+                    if let Some(app) = &ctrl.app {
+                        ctrl.sync_network_secrets(&app.settings());
+                    }
+                    if reset_login {
+                        ctrl.reset_site_login_form();
+                    }
+                }
+                Err(error) => ctrl.main.set_set_error_text(error.into()),
+            }
+        });
+    }
+
+    fn load_bittorrent_settings(&self, settings: &AppSettings) {
+        let network = &settings.torrent_network;
+        let seeding = &settings.torrent_seeding;
+        self.main
+            .set_set_bt_listen_port_start(network.listen_port_start.to_string().into());
+        self.main
+            .set_set_bt_listen_port_end(network.listen_port_end.to_string().into());
+        self.main.set_set_bt_enable_dht(network.enable_dht);
+        self.main.set_set_bt_enable_upnp(network.enable_upnp);
+        self.main
+            .set_set_bt_global_upload_kbps(format_upload_kib(network.global_upload_limit_bps));
+        self.main.set_set_bt_socks5_proxy(
+            network
+                .socks5_proxy_url
+                .as_deref()
+                .unwrap_or_default()
+                .into(),
+        );
+        self.main.set_set_bt_blocklist_path(
+            network.blocklist_path.as_deref().unwrap_or_default().into(),
+        );
+        self.main
+            .set_set_bt_vpn_kill_switch(network.vpn_kill_switch_enabled);
+        self.main.set_set_bt_vpn_adapter_options(
+            Rc::new(VecModel::from(vec![SharedString::from(CUSTOM_VPN_ADAPTER)])).into(),
+        );
+        self.main.set_set_bt_vpn_adapter_index(0);
+        self.main.set_set_bt_vpn_adapter_custom(
+            network
+                .vpn_adapter_name
+                .as_deref()
+                .unwrap_or_default()
+                .into(),
+        );
+        self.main.set_set_bt_adapters_refreshing(false);
+        self.main.set_set_bt_max_seed_ratio(
+            view_model::format_seed_ratio_hundredths(seeding.max_seed_ratio_hundredths).into(),
+        );
+        self.main.set_set_bt_max_seed_minutes(
+            seeding
+                .max_seed_minutes
+                .map(|minutes| minutes.to_string())
+                .unwrap_or_default()
+                .into(),
+        );
+        self.main
+            .set_set_bt_stop_seeding_on_limit(seeding.stop_seeding_on_limit);
+        self.main
+            .set_set_rss_feeds(self.rss_feeds_model.clone().into());
+        self.sync_rss_feeds(&settings.rss_feeds);
+        self.reset_new_rss_feed();
+        self.main.set_set_rss_polling(false);
+        self.main.set_set_rss_editing(false);
+        self.set_rss_notice("", false);
+    }
+
+    fn selected_vpn_adapter(&self) -> SharedString {
+        let index = self.main.get_set_bt_vpn_adapter_index();
+        if index > 0 {
+            if let Some(adapter) = self
+                .main
+                .get_set_bt_vpn_adapter_options()
+                .row_data(index as usize)
+            {
+                return adapter;
+            }
+        }
+        self.main.get_set_bt_vpn_adapter_custom()
+    }
+
+    fn refresh_vpn_adapters(&self) {
+        let Some(app) = self.app.clone() else { return };
+        if self.main.get_set_bt_adapters_refreshing() {
+            return;
+        }
+        self.main.set_set_bt_adapters_refreshing(true);
+        let session = self.settings_session_id;
+        self.runtime.spawn(async move {
+            let adapters = app.list_network_adapters().await;
+            let _ = slint::invoke_from_event_loop(move || {
+                with_controller(|ctrl| {
+                    if !ctrl.settings_session_is_open(session) {
+                        return;
+                    }
+                    let selected = ctrl.selected_vpn_adapter();
+                    let index = adapters.iter().position(|name| name == selected.as_str());
+                    let options: Vec<SharedString> =
+                        std::iter::once(SharedString::from(CUSTOM_VPN_ADAPTER))
+                            .chain(adapters.into_iter().map(SharedString::from))
+                            .collect();
+                    if index.is_none() {
+                        ctrl.main.set_set_bt_vpn_adapter_custom(selected);
+                    }
+                    ctrl.main
+                        .set_set_bt_vpn_adapter_options(Rc::new(VecModel::from(options)).into());
+                    ctrl.main
+                        .set_set_bt_vpn_adapter_index(index.map_or(0, |index| index as i32 + 1));
+                    ctrl.main.set_set_bt_adapters_refreshing(false);
+                });
+            });
+        });
+    }
+
+    fn browse_blocklist(&self) {
+        let owner = hwnd_of(self.main.window());
+        let session = self.settings_session_id;
+        std::thread::spawn(move || {
+            if let Some(path) = win32::pick_blocklist_file(owner) {
+                let _ = slint::invoke_from_event_loop(move || {
+                    with_controller(|ctrl| {
+                        if ctrl.settings_session_is_open(session) {
+                            ctrl.main.set_set_bt_blocklist_path(path.into());
+                        }
+                    });
+                });
+            }
+        });
+    }
+
+    fn read_bittorrent_settings(&self, settings: &mut AppSettings) -> Result<(), &'static str> {
+        let network = &mut settings.torrent_network;
+        network.listen_port_start = self
+            .main
+            .get_set_bt_listen_port_start()
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port == 0 || (1024..u16::MAX).contains(port))
+            .ok_or("Enter 0 to disable listening or a start port from 1024 to 65534.")?;
+        network.listen_port_end = if network.listen_port_start == 0 {
+            0
+        } else {
+            self.main
+                .get_set_bt_listen_port_end()
+                .trim()
+                .parse::<u16>()
+                .ok()
+                .filter(|&port| port >= network.listen_port_start)
+                .ok_or("Enter an end port at or above the start port, up to 65535.")?
+        };
+        network.enable_dht = self.main.get_set_bt_enable_dht();
+        network.enable_upnp = self.main.get_set_bt_enable_upnp();
+        let upload = self.main.get_set_bt_global_upload_kbps();
+        if upload != format_upload_kib(network.global_upload_limit_bps) {
+            network.global_upload_limit_bps = parse_upload_kib(&upload)?;
+        }
+        network.socks5_proxy_url = optional_text(&self.main.get_set_bt_socks5_proxy());
+        network.blocklist_path = optional_text(&self.main.get_set_bt_blocklist_path());
+        network.vpn_kill_switch_enabled = self.main.get_set_bt_vpn_kill_switch();
+        network.vpn_adapter_name = optional_text(&self.selected_vpn_adapter());
+
+        let seeding = &mut settings.torrent_seeding;
+        seeding.max_seed_ratio_hundredths =
+            view_model::parse_seed_ratio_hundredths(&self.main.get_set_bt_max_seed_ratio())?;
+        seeding.max_seed_minutes = optional_text(&self.main.get_set_bt_max_seed_minutes())
+            .map(|raw| {
+                raw.parse::<u32>()
+                    .ok()
+                    .filter(|&minutes| minutes <= 525_600)
+                    .ok_or("Enter a whole seeding duration up to 525600 minutes.")
+            })
+            .transpose()?
+            .filter(|&minutes| minutes != 0);
+        seeding.stop_seeding_on_limit = self.main.get_set_bt_stop_seeding_on_limit();
+        Ok(())
+    }
+
+    fn set_rss_notice(&self, message: impl Into<SharedString>, error: bool) {
+        self.main.set_set_rss_notice(message.into());
+        self.main.set_set_rss_notice_error(error);
+    }
+
+    fn reset_new_rss_feed(&self) {
+        self.main.set_set_new_rss_name("".into());
+        self.main.set_set_new_rss_url("".into());
+        self.main.set_set_new_rss_include("".into());
+        self.main.set_set_new_rss_exclude("".into());
+        self.main.set_set_new_rss_interval("30".into());
+    }
+
+    fn add_rss_feed(&mut self) {
+        let Some(name) = optional_text(&self.main.get_set_new_rss_name()) else {
+            self.set_rss_notice("Enter a feed name.", true);
+            return;
+        };
+        let Some(feed_url) = optional_text(&self.main.get_set_new_rss_url()) else {
+            self.set_rss_notice("Enter a feed URL.", true);
+            return;
+        };
+        let interval = self.main.get_set_new_rss_interval();
+        let Ok(poll_interval_minutes @ 5..=1440) = interval.trim().parse::<u16>() else {
+            self.set_rss_notice("Enter a polling interval from 5 to 1440 minutes.", true);
+            return;
+        };
+        let rule = RssFeedRule {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            feed_url,
+            include_pattern: self.main.get_set_new_rss_include().trim().to_owned(),
+            exclude_pattern: self.main.get_set_new_rss_exclude().trim().to_owned(),
+            save_dir: None,
+            poll_interval_minutes,
+            enabled: true,
+            auto_start: true,
+            last_checked_at: None,
+            last_error: None,
+        };
+        self.edit_rss_feeds(move |rules| rules.push(rule), true);
+    }
+
+    fn rss_busy(&self) -> bool {
+        self.main.get_set_saving()
+            || self.main.get_set_rss_polling()
+            || self.main.get_set_rss_editing()
+    }
+
+    fn edit_rss_feeds(
+        &mut self,
+        edit: impl FnOnce(&mut Vec<RssFeedRule>) + Send + 'static,
+        added: bool,
+    ) {
+        if self.app.is_none() || self.rss_busy() {
+            return;
+        }
+        let session = self.settings_session_id;
+        self.main.set_set_rss_editing(true);
+        self.set_rss_notice("", false);
+        self.queue_settings_save(
+            move |settings| edit(&mut settings.rss_feeds),
+            move |ctrl, result| {
+                if !ctrl.settings_session_is_open(session) {
+                    return;
+                }
+                ctrl.main.set_set_rss_editing(false);
+                match result {
+                    Ok(()) => {
+                        if added {
+                            ctrl.reset_new_rss_feed();
+                        }
+                        if let Some(app) = &ctrl.app {
+                            ctrl.sync_rss_feeds(&app.settings().rss_feeds);
+                        }
+                    }
+                    Err(error) => ctrl.set_rss_notice(error, true),
+                }
+            },
+        );
+    }
+
+    fn poll_rss_now(&self) {
+        let Some(app) = self.app.clone() else { return };
+        if self.rss_busy() {
+            return;
+        }
+        let session = self.settings_session_id;
+        self.main.set_set_rss_polling(true);
+        self.set_rss_notice("", false);
+        self.runtime.spawn(async move {
+            let result = app.poll_rss_feeds_now().await;
+            let _ = slint::invoke_from_event_loop(move || {
+                with_controller(|ctrl| {
+                    if !ctrl.settings_session_is_open(session) {
+                        return;
+                    }
+                    ctrl.main.set_set_rss_polling(false);
+                    ctrl.sync_rss_feeds(&app.settings().rss_feeds);
+                    match result {
+                        Ok(1) => ctrl.set_rss_notice("Added 1 torrent.", false),
+                        Ok(count) => ctrl.set_rss_notice(format!("Added {count} torrents."), false),
+                        Err(error) => ctrl.set_rss_notice(error, true),
+                    }
+                });
+            });
+        });
+    }
+
+    fn open_create_torrent(&mut self) {
+        if self.app.is_none() || self.main.get_create_torrent_open() {
+            return;
+        }
+        self.create_torrent_session_id = self.create_torrent_session_id.wrapping_add(1);
+        self.main.set_create_torrent_source_path("".into());
+        self.main.set_create_torrent_output_path("".into());
+        self.main.set_create_torrent_trackers_text("".into());
+        self.main
+            .set_create_torrent_piece_size_index(view_model::piece_length_index_from_kib(0));
+        self.main.set_create_torrent_private_torrent(false);
+        self.main.set_create_torrent_comment("".into());
+        self.main.set_create_torrent_error_text("".into());
+        self.main.set_create_torrent_success_text("".into());
+        self.main.set_create_torrent_creating(false);
+        self.main.set_create_torrent_open(true);
+    }
+
+    fn create_torrent_session_is_open(&self, session: u64) -> bool {
+        self.main.get_create_torrent_open() && self.create_torrent_session_id == session
+    }
+
+    fn browse_create_torrent(&self, picker: CreateTorrentPicker) {
+        if self.main.get_create_torrent_creating() {
+            return;
+        }
+        let session = self.create_torrent_session_id;
+        let owner = hwnd_of(self.main.window());
+        let source = self.main.get_create_torrent_source_path().to_string();
+        std::thread::spawn(move || {
+            let result = match picker {
+                CreateTorrentPicker::SourceFile => Ok(win32::pick_torrent_source_file(owner)),
+                CreateTorrentPicker::SourceFolder => win32::pick_folder(
+                    owner,
+                    optional_text(&source),
+                    "Select the torrent source folder",
+                ),
+                CreateTorrentPicker::Output => {
+                    let name = Path::new(source.trim())
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("download");
+                    Ok(win32::pick_save_torrent_file(
+                        owner,
+                        &format!("{name}.torrent"),
+                    ))
+                }
+            };
+            let _ = slint::invoke_from_event_loop(move || {
+                with_controller(|ctrl| {
+                    if !ctrl.create_torrent_session_is_open(session) {
+                        return;
+                    }
+                    match result {
+                        Ok(Some(path)) => {
+                            match picker {
+                                CreateTorrentPicker::SourceFile
+                                | CreateTorrentPicker::SourceFolder => {
+                                    ctrl.main.set_create_torrent_source_path(path.into());
+                                }
+                                CreateTorrentPicker::Output => {
+                                    ctrl.main.set_create_torrent_output_path(path.into());
+                                    ctrl.main.set_create_torrent_success_text("".into());
+                                }
+                            }
+                            ctrl.main.set_create_torrent_error_text("".into());
+                        }
+                        Ok(None) => {}
+                        Err(error) => ctrl
+                            .main
+                            .set_create_torrent_error_text(error.to_string().into()),
+                    }
+                });
+            });
+        });
+    }
+
+    fn create_torrent(&self) {
+        let Some(app) = self.app.clone() else { return };
+        if self.main.get_create_torrent_creating()
+            || !self.main.get_create_torrent_success_text().is_empty()
+        {
+            return;
+        }
+        let request = CreateTorrentRequest {
+            source_path: self.main.get_create_torrent_source_path().trim().to_owned(),
+            output_path: self.main.get_create_torrent_output_path().trim().to_owned(),
+            trackers: self
+                .main
+                .get_create_torrent_trackers_text()
+                .split(['\n', ';', ','])
+                .filter_map(optional_text)
+                .collect(),
+            piece_length_kib: view_model::piece_length_kib_from_index(
+                self.main.get_create_torrent_piece_size_index(),
+            ),
+            private: self.main.get_create_torrent_private_torrent(),
+            comment: optional_text(&self.main.get_create_torrent_comment()),
+        };
+        if request.source_path.is_empty() || request.output_path.is_empty() {
+            self.main
+                .set_create_torrent_error_text("Choose a source and an output file.".into());
+            return;
+        }
+        let session = self.create_torrent_session_id;
+        self.main.set_create_torrent_creating(true);
+        self.main.set_create_torrent_error_text("".into());
+        self.runtime.spawn(async move {
+            let result = app.create_torrent_file(request).await;
+            let _ = slint::invoke_from_event_loop(move || {
+                with_controller(|ctrl| {
+                    if !ctrl.create_torrent_session_is_open(session) {
+                        return;
+                    }
+                    ctrl.main.set_create_torrent_creating(false);
+                    match result {
+                        Ok(torrent) => ctrl.main.set_create_torrent_success_text(
+                            format!(
+                                "Created {} ({} files, {} pieces).",
+                                torrent.output_path, torrent.file_count, torrent.piece_count
+                            )
+                            .into(),
+                        ),
+                        Err(error) => ctrl.main.set_create_torrent_error_text(error.into()),
+                    }
+                });
+            });
+        });
+    }
+
     fn open_settings_dialog(&mut self) {
         if let Some(app) = &self.app {
             let s = app.settings();
+            self.load_bittorrent_settings(&s);
+            self.load_network_settings(&s);
             self.main.set_set_theme_index(match s.theme {
                 ThemeMode::System => 0,
                 ThemeMode::Dark => 1,
@@ -3100,6 +5397,12 @@ impl ControllerState {
             self.main.set_set_close_to_tray(s.close_to_tray_hibernate);
             self.main.set_set_auto_defender_scan(s.auto_defender_scan);
             self.main.set_set_monitor_clipboard(s.monitor_clipboard);
+            self.main.set_set_launch_on_startup(s.launch_on_startup);
+            self.main.set_set_launch_minimized(s.launch_minimized);
+            self.main.set_set_notify_on_complete(s.notify_on_complete);
+            self.main.set_set_sound_on_complete(s.sound_on_complete);
+            self.main
+                .set_set_show_drop_basket(self.main.get_show_drop_basket());
             self.main
                 .set_set_show_download_dialog(s.show_download_dialog);
             self.main
@@ -3114,10 +5417,76 @@ impl ControllerState {
                 .set_set_ytdlp_override(s.ytdlp_path.unwrap_or_default().into());
             self.main
                 .set_set_ffmpeg_override(s.ffmpeg_path.unwrap_or_default().into());
+
+            // Automation tab fields
+            self.main.set_set_alt_speed_enabled(s.alt_speed_enabled);
+            self.main.set_set_alt_speed_kbps(
+                (s.alt_speed_limit_bps.unwrap_or(512 * 1024) / 1024)
+                    .max(16)
+                    .to_string()
+                    .into(),
+            );
+            self.main
+                .set_set_schedule_mode_index(match s.schedule.mode {
+                    ScheduleMode::Disabled => 0,
+                    ScheduleMode::OffPeakWindow => 1,
+                    ScheduleMode::SnailWindow => 2,
+                });
+            self.main.set_set_schedule_start(
+                format_minute_of_day(s.schedule.start_minute_of_day).into(),
+            );
+            self.main
+                .set_set_schedule_end(format_minute_of_day(s.schedule.end_minute_of_day).into());
+            self.main
+                .set_set_schedule_weekdays(s.schedule.weekdays_only);
+            self.main.set_set_schedule_limit_kbps(
+                (s.schedule.window_speed_limit_bps.unwrap_or(512 * 1024) / 1024)
+                    .max(16)
+                    .to_string()
+                    .into(),
+            );
+            self.main
+                .set_set_schedule_pause_outside(s.schedule.post_window_pause);
+            self.main
+                .set_set_schedule_stop_torrents(s.schedule.stop_torrents_at_end);
+            self.main.set_set_guard_enabled(s.bandwidth_guard.enabled);
+            self.main
+                .set_set_guard_fullscreen(s.bandwidth_guard.throttle_on_fullscreen);
+            self.main
+                .set_set_guard_pause(s.bandwidth_guard.pause_instead_of_throttle);
+            self.main.set_set_guard_limit_kbps(
+                (s.bandwidth_guard.guard_speed_limit_bps / 1024)
+                    .max(16)
+                    .to_string()
+                    .into(),
+            );
+            self.main
+                .set_set_guard_processes(s.bandwidth_guard.watched_processes.join(", ").into());
+            self.settings_session_id = self.settings_session_id.wrapping_add(1);
+            self.main.set_set_saving(false);
+            self.settings_initial_alt_speed = s.alt_speed_enabled;
+            self.draft_queues = s.queues;
+            self.draft_watch_folders = s.watch_folders;
+            self.sync_settings_automation_models();
+            self.main.set_set_new_queue_name("".into());
+            self.main.set_set_new_queue_concurrent("2".into());
+            self.main.set_set_new_queue_post_action(0);
+            self.main.set_set_watch_delete_after_add(false);
+            self.main
+                .set_set_auto_extract_enabled(s.auto_extract.enabled);
+            self.main
+                .set_set_auto_extract_subfolder(s.auto_extract.create_subfolder);
+            self.main
+                .set_set_auto_extract_overwrite(s.auto_extract.overwrite_existing);
+            self.main
+                .set_set_auto_extract_delete(s.auto_extract.delete_archive_after_extract);
+            self.main.set_set_backup_notice("".into());
+
             self.main.set_set_error_text("".into());
             self.refresh_toolchain_and_browsers();
         }
         self.main.set_settings_open(true);
+        self.refresh_vpn_adapters();
     }
 
     fn refresh_toolchain_and_browsers(&mut self) {
@@ -3144,10 +5513,15 @@ impl ControllerState {
             .set_set_browsers(ModelRc::from(Rc::new(VecModel::from(b_models))));
 
         let app_c = app.clone();
+        let session = self.settings_session_id;
         self.runtime.spawn(async move {
             let status = app_c.get_toolchain_status().await;
             let _ = slint::invoke_from_event_loop(move || {
-                with_controller(|ctrl| ctrl.apply_toolchain_status(status));
+                with_controller(|ctrl| {
+                    if ctrl.settings_session_is_open(session) {
+                        ctrl.apply_toolchain_status(status);
+                    }
+                });
             });
         });
     }
@@ -3187,7 +5561,23 @@ impl ControllerState {
 
     fn save_settings(&mut self) {
         let Some(app) = &self.app else { return };
+        if self.main.get_set_saving()
+            || self.main.get_set_rss_editing()
+            || self.main.get_set_network_editing()
+        {
+            return;
+        }
         let mut s = app.settings();
+        if let Err(error) = self.read_bittorrent_settings(&mut s) {
+            self.main.set_set_settings_tab(2);
+            self.main.set_set_error_text(error.into());
+            return;
+        }
+        if let Err(error) = self.read_network_settings(&mut s) {
+            self.main.set_set_settings_tab(3);
+            self.main.set_set_error_text(error.into());
+            return;
+        }
         s.theme = match self.main.get_set_theme_index() {
             0 => ThemeMode::System,
             2 => ThemeMode::Light,
@@ -3226,6 +5616,11 @@ impl ControllerState {
         s.close_to_tray_hibernate = self.main.get_set_close_to_tray();
         s.auto_defender_scan = self.main.get_set_auto_defender_scan();
         s.monitor_clipboard = self.main.get_set_monitor_clipboard();
+        s.launch_on_startup = self.main.get_set_launch_on_startup();
+        s.launch_minimized = self.main.get_set_launch_minimized();
+        s.notify_on_complete = self.main.get_set_notify_on_complete();
+        s.sound_on_complete = self.main.get_set_sound_on_complete();
+        s.show_drop_basket = self.main.get_set_show_drop_basket();
         s.show_download_dialog = self.main.get_set_show_download_dialog();
         s.show_progress_dialog = self.main.get_set_show_progress_dialog();
         s.show_complete_dialog = self.main.get_set_show_complete_dialog();
@@ -3247,28 +5642,133 @@ impl ControllerState {
             Some(f_ov)
         };
 
+        let parse_kbps = |raw: &str, fallback: u64| -> Result<u64, String> {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(fallback);
+            }
+            let val: u64 = trimmed
+                .parse()
+                .map_err(|_| "Speed limits in KiB/s must be whole numbers.".to_owned())?;
+            if val == 0 {
+                return Err("Speed limits in KiB/s must be at least 16 KiB/s.".into());
+            }
+            Ok((val.clamp(16, 4_194_303)) * 1024)
+        };
+        let alt_bps = match parse_kbps(&self.main.get_set_alt_speed_kbps(), 512 * 1024) {
+            Ok(v) => v,
+            Err(msg) => {
+                self.main.set_set_error_text(msg.into());
+                return;
+            }
+        };
+        let sched_start = match parse_minute_of_day(&self.main.get_set_schedule_start()) {
+            Ok(m) => m,
+            Err(msg) => {
+                self.main.set_set_error_text(msg.into());
+                return;
+            }
+        };
+        let sched_end = match parse_minute_of_day(&self.main.get_set_schedule_end()) {
+            Ok(m) => m,
+            Err(msg) => {
+                self.main.set_set_error_text(msg.into());
+                return;
+            }
+        };
+        let sched_bps = match parse_kbps(&self.main.get_set_schedule_limit_kbps(), 512 * 1024) {
+            Ok(v) => v,
+            Err(msg) => {
+                self.main.set_set_error_text(msg.into());
+                return;
+            }
+        };
+        let guard_bps = match parse_kbps(&self.main.get_set_guard_limit_kbps(), 256 * 1024) {
+            Ok(v) => v,
+            Err(msg) => {
+                self.main.set_set_error_text(msg.into());
+                return;
+            }
+        };
+
+        s.alt_speed_enabled = self.main.get_set_alt_speed_enabled();
+        s.alt_speed_limit_bps = Some(alt_bps);
+        s.schedule.mode = match self.main.get_set_schedule_mode_index() {
+            1 => ScheduleMode::OffPeakWindow,
+            2 => ScheduleMode::SnailWindow,
+            _ => ScheduleMode::Disabled,
+        };
+        s.schedule.start_minute_of_day = sched_start;
+        s.schedule.end_minute_of_day = sched_end;
+        s.schedule.weekdays_only = self.main.get_set_schedule_weekdays();
+        s.schedule.window_speed_limit_bps = Some(sched_bps);
+        s.schedule.post_window_pause = self.main.get_set_schedule_pause_outside();
+        s.schedule.stop_torrents_at_end = self.main.get_set_schedule_stop_torrents();
+        s.bandwidth_guard.enabled = self.main.get_set_guard_enabled();
+        s.bandwidth_guard.throttle_on_fullscreen = self.main.get_set_guard_fullscreen();
+        s.bandwidth_guard.pause_instead_of_throttle = self.main.get_set_guard_pause();
+        s.bandwidth_guard.guard_speed_limit_bps = guard_bps;
+        s.bandwidth_guard.watched_processes = self
+            .main
+            .get_set_guard_processes()
+            .split(',')
+            .map(|p| p.trim().to_owned())
+            .filter(|p| !p.is_empty())
+            .collect();
+        s.queues = self.draft_queues.clone();
+        s.watch_folders = self.draft_watch_folders.clone();
+        s.auto_extract = slipstream_protocol::AutoExtractSettings {
+            enabled: self.main.get_set_auto_extract_enabled(),
+            create_subfolder: self.main.get_set_auto_extract_subfolder(),
+            delete_archive_after_extract: self.main.get_set_auto_extract_delete(),
+            overwrite_existing: self.main.get_set_auto_extract_overwrite(),
+        };
+
         if s.monitor_clipboard {
             self.last_clipboard_seq = win32::clipboard_sequence_number();
         }
 
         self.main.set_set_saving(true);
         self.main.set_set_error_text("".into());
-        let app_c = app.clone();
-        self.runtime.spawn(async move {
-            let res = app_c.save_settings(s).await;
-            let _ = slint::invoke_from_event_loop(move || {
-                with_controller(|ctrl| {
-                    ctrl.main.set_set_saving(false);
-                    match res {
-                        Ok(()) => {
-                            ctrl.main.set_settings_open(false);
-                            ctrl.refresh_theme_from_settings();
-                        }
-                        Err(err) => ctrl.main.set_set_error_text(err.into()),
+        let session = self.settings_session_id;
+        let alt_speed_changed = s.alt_speed_enabled != self.settings_initial_alt_speed;
+        let password = self.main.get_set_proxy_password();
+        let password = (!password.is_empty()).then(|| Some(password.to_string()));
+        self.queue_settings_operation(
+            move |app| async move {
+                app.update_settings_with_proxy_password(password, move |settings| {
+                    s.compact_table_view = settings.compact_table_view;
+                    s.sort_column.clone_from(&settings.sort_column);
+                    s.sort_ascending = settings.sort_ascending;
+                    s.categories.clone_from(&settings.categories);
+                    s.rss_feeds = std::mem::take(&mut settings.rss_feeds);
+                    s.site_logins = std::mem::take(&mut settings.site_logins);
+                    if !alt_speed_changed {
+                        s.alt_speed_enabled = settings.alt_speed_enabled;
                     }
-                });
-            });
-        });
+                    for q in &mut s.queues {
+                        if let Some(live) = settings.queues.iter().find(|live| live.id == q.id) {
+                            q.paused = live.paused;
+                        }
+                    }
+                    *settings = s;
+                })
+                .await
+            },
+            move |ctrl, result| {
+                if !ctrl.settings_session_is_open(session) {
+                    return;
+                }
+                ctrl.main.set_set_saving(false);
+                match result {
+                    Ok(()) => {
+                        ctrl.close_settings_dialog();
+                        ctrl.refresh_theme_from_settings();
+                    }
+                    Err(error) => ctrl.main.set_set_error_text(error.into()),
+                }
+            },
+        );
     }
 
     fn check_updates(&mut self, startup: bool) {
@@ -3386,12 +5886,16 @@ impl ControllerState {
             ("pause_all", "Pause / Resume All Transfers", ""),
             ("toggle_theme", "Toggle Light / Dark Theme", ""),
             ("settings", "Open Settings", ""),
+            ("export_urls", "Export URLs", ""),
             ("check_updates", "Check for Updates", ""),
             ("hibernate", "Hibernate to System Tray", ""),
         ];
         let models: Vec<PaletteActionModel> = all
             .into_iter()
-            .filter(|(_, lbl, _)| q.is_empty() || lbl.to_ascii_lowercase().contains(&q))
+            .filter(|(id, label, _)| {
+                (*id != "export_urls" || !self.selection.selected_ids.is_empty())
+                    && (q.is_empty() || label.to_ascii_lowercase().contains(&q))
+            })
             .map(|(id, lbl, hint)| PaletteActionModel {
                 id: id.into(),
                 label: lbl.into(),
@@ -3507,22 +6011,121 @@ fn wire_main_callbacks(main: &MainWindow) {
         });
     });
 
+    main.on_table_view_changed(|compact| {
+        with_controller(|ctrl| {
+            if ctrl.main.get_compact_table_view() != compact {
+                ctrl.main.set_compact_table_view(compact);
+                ctrl.refresh_views();
+                ctrl.persist_preferences();
+            }
+        })
+    });
+    main.on_sort_changed(|column| {
+        with_controller(|ctrl| {
+            let column = view_model::transfer_sort_column(&column);
+            let ascending = if ctrl.main.get_sort_column() == column {
+                !ctrl.main.get_sort_ascending()
+            } else {
+                matches!(column, "name" | "eta" | "status" | "category")
+            };
+            ctrl.main.set_sort_column(column.into());
+            ctrl.main.set_sort_ascending(ascending);
+            ctrl.refresh_views();
+            ctrl.persist_preferences();
+        })
+    });
+    main.on_category_filter_changed(|category| {
+        with_controller(|ctrl| {
+            let next = if ctrl.main.get_active_category_filter() == category {
+                "".into()
+            } else {
+                category
+            };
+            ctrl.main.set_active_category_filter(next);
+            ctrl.refresh_views();
+        })
+    });
+    main.on_tag_filter_changed(|tag| {
+        with_controller(|ctrl| {
+            let next = if ctrl.main.get_active_tag_filter() == tag {
+                "".into()
+            } else {
+                tag
+            };
+            ctrl.main.set_active_tag_filter(next);
+            ctrl.refresh_views();
+        })
+    });
+    main.on_select_all_visible(|| {
+        with_controller(|ctrl| {
+            ctrl.selection.select_all();
+            ctrl.refresh_views();
+        })
+    });
+    main.on_clear_selection(|| {
+        with_controller(|ctrl| {
+            ctrl.selection.clear();
+            ctrl.refresh_views();
+        })
+    });
+    main.on_bulk_action(|action, value| {
+        with_controller(|ctrl| ctrl.handle_bulk_action(&action, &value))
+    });
+    main.on_bulk_category(|index| {
+        with_controller(|ctrl| {
+            let ids = ctrl.selection.ordered_ids();
+            if ids.len() > 1 {
+                ctrl.main.set_bulk_editor(0);
+                ctrl.dispatch_bulk_action(ids, BulkAction::Category(ctrl.category_at(index)));
+            }
+        })
+    });
+    main.on_apply_inspector_metadata(|| with_controller(ControllerState::save_inspector_metadata));
+    main.on_toggle_drop_basket(|| with_controller(ControllerState::toggle_drop_basket));
+    main.on_studio_mode_changed(|mode| {
+        with_controller(|ctrl| {
+            ctrl.main.set_studio_mode(mode);
+            match mode {
+                1 => ctrl.refresh_speed_graph(),
+                2 => ctrl.refresh_logs(),
+                _ => {}
+            }
+        })
+    });
+    main.on_graph_window_changed(|seconds| {
+        with_controller(|ctrl| {
+            ctrl.main.set_graph_window_seconds(seconds);
+            ctrl.refresh_speed_graph();
+        })
+    });
+    main.on_log_filter_changed(|level| {
+        with_controller(|ctrl| {
+            ctrl.main.set_log_level(level);
+            ctrl.refresh_logs();
+            ctrl.update_log_rows();
+        })
+    });
+    main.on_log_action(|action| with_controller(|ctrl| ctrl.log_action(&action)));
+
     main.on_toggle_theme_clicked(|| {
         with_controller(|ctrl| {
             let next_light = !ctrl.is_light;
             ctrl.apply_theme(next_light, ctrl.is_mono);
-            if let Some(app) = &ctrl.app {
-                let mut s = app.settings();
-                s.theme = if next_light {
-                    ThemeMode::Light
-                } else {
-                    ThemeMode::Dark
-                };
-                let app_c = app.clone();
-                ctrl.runtime.spawn(async move {
-                    let _ = app_c.save_settings(s).await;
-                });
-            }
+            ctrl.queue_settings_save(
+                move |settings| {
+                    settings.theme = if next_light {
+                        ThemeMode::Light
+                    } else {
+                        ThemeMode::Dark
+                    }
+                },
+                |ctrl, result| {
+                    if let Err(error) = result {
+                        ctrl.refresh_theme_from_settings();
+                        ctrl.show_toast(format!("Could not save the theme: {error}"), true);
+                    }
+                },
+            );
         });
     });
 
@@ -3541,6 +6144,35 @@ fn wire_main_callbacks(main: &MainWindow) {
 
     main.on_open_settings_clicked(|| {
         with_controller(|ctrl| ctrl.open_settings_dialog());
+    });
+    main.on_open_grabber_clicked(|| with_controller(ControllerState::open_site_grabber));
+    main.on_grabber_close_requested(|| with_controller(ControllerState::close_site_grabber));
+    main.on_grabber_scan_clicked(|| with_controller(ControllerState::scan_site_grabber));
+    main.on_grabber_enqueue_selected_clicked(|| {
+        with_controller(ControllerState::enqueue_grabber_selection)
+    });
+    main.on_grabber_select_all_clicked(|checked| {
+        with_controller(|ctrl| {
+            for (index, mut row) in ctrl.grabber_items_model.iter().enumerate() {
+                if row.checked != checked {
+                    row.checked = checked;
+                    ctrl.grabber_items_model.set_row_data(index, row);
+                }
+            }
+            ctrl.update_grabber_selection_count();
+        });
+    });
+    main.on_grabber_toggle_item_clicked(|index| {
+        with_controller(|ctrl| {
+            let Ok(index) = usize::try_from(index) else {
+                return;
+            };
+            if let Some(mut row) = ctrl.grabber_items_model.row_data(index) {
+                row.checked = !row.checked;
+                ctrl.grabber_items_model.set_row_data(index, row);
+                ctrl.update_grabber_selection_count();
+            }
+        });
     });
 
     main.on_open_palette_clicked(|| {
@@ -3567,7 +6199,9 @@ fn wire_main_callbacks(main: &MainWindow) {
 
     main.on_select_transfer(|id| {
         with_controller(|ctrl| {
-            ctrl.selected_id = Some(id.into());
+            ctrl.selection
+                .click(&id, win32::is_ctrl_pressed(), win32::is_shift_pressed());
+            ctrl.main.set_context_menu_open(false);
             ctrl.refresh_views();
         });
     });
@@ -3582,7 +6216,11 @@ fn wire_main_callbacks(main: &MainWindow) {
 
     main.on_open_context_menu(|id, x, y| {
         with_controller(|ctrl| {
-            ctrl.selected_id = Some(id.clone().into());
+            if ctrl.selection.selected_ids.contains(id.as_str()) {
+                ctrl.selection.selected_id = Some(id.to_string());
+            } else {
+                ctrl.selection.select_only(&id);
+            }
             ctrl.refresh_views();
             if ctrl.main.get_selected_id() == id {
                 ctrl.main.set_context_menu_x(x);
@@ -3691,7 +6329,7 @@ fn wire_main_callbacks(main: &MainWindow) {
 
     main.on_toggle_torrent_file(|idx| {
         with_controller(|ctrl| {
-            let Some(id) = ctrl.selected_id.clone() else {
+            let Some(id) = ctrl.selection.selected_id.clone() else {
                 return;
             };
             let Some(files) = ctrl.torrent_files.get(&id) else {
@@ -3717,7 +6355,7 @@ fn wire_main_callbacks(main: &MainWindow) {
 
     main.on_select_torrent_files(|selected| {
         with_controller(|ctrl| {
-            let Some(id) = ctrl.selected_id.clone() else {
+            let Some(id) = ctrl.selection.selected_id.clone() else {
                 return;
             };
             let Some(files) = ctrl.torrent_files.get(&id) else {
@@ -3812,7 +6450,53 @@ fn wire_main_callbacks(main: &MainWindow) {
         });
     });
 
+    main.on_force_recheck_torrent(|id| {
+        with_controller(|ctrl| {
+            ctrl.run_torrent_power_action(id.to_string(), TorrentPowerAction::Recheck)
+        });
+    });
+    main.on_move_torrent_storage(|id| {
+        with_controller(|ctrl| {
+            ctrl.run_torrent_power_action(id.to_string(), TorrentPowerAction::MoveStorage)
+        });
+    });
+    main.on_add_torrent_tracker(|id, tracker| {
+        if let Some(tracker) = optional_text(&tracker) {
+            with_controller(|ctrl| {
+                ctrl.run_torrent_power_action(
+                    id.to_string(),
+                    TorrentPowerAction::AddTracker(tracker),
+                )
+            });
+        }
+    });
+    main.on_reannounce_torrent(|id| {
+        with_controller(|ctrl| {
+            ctrl.run_torrent_power_action(id.to_string(), TorrentPowerAction::Reannounce)
+        });
+    });
+    main.on_apply_torrent_upload_limit(|id, raw| {
+        with_controller(|ctrl| {
+            if !ctrl.main.get_torrent_upload_limit_loaded() {
+                return;
+            }
+            match parse_upload_kib(&raw) {
+                Ok(limit) => ctrl.run_torrent_power_action(
+                    id.to_string(),
+                    TorrentPowerAction::UploadLimit(limit),
+                ),
+                Err(error) => ctrl.show_toast(error, true),
+            }
+        });
+    });
+
     main.on_add_close_requested(|| with_controller(ControllerState::close_add_dialog));
+
+    main.on_add_batch_edited(|| {
+        with_controller(|ctrl| ctrl.set_batch_text(ctrl.main.get_add_batch_text()))
+    });
+    main.on_add_batch_import(|| with_controller(|ctrl| ctrl.import_batch_file(None)));
+    main.on_add_import_metalink_clicked(|| with_controller(|ctrl| ctrl.import_metalink()));
 
     main.on_add_source_edited(|txt| {
         with_controller(|ctrl| {
@@ -3893,9 +6577,31 @@ fn wire_main_callbacks(main: &MainWindow) {
         let mut owner = 0_isize;
         let mut initial = String::new();
         let mut generation = 0;
+        let mut batch = false;
         with_controller(|ctrl| {
             owner = hwnd_of(ctrl.main.window());
-            initial = ctrl.main.get_add_save_dir().to_string();
+            batch = ctrl.main.get_add_tab() == 4;
+            initial = if batch {
+                let current = ctrl.main.get_add_batch_save_dir();
+                if current.trim().is_empty() {
+                    ctrl.app.as_ref().map_or_else(String::new, |app| {
+                        let settings = app.settings();
+                        ctrl.category_at(ctrl.main.get_add_batch_category_index())
+                            .map_or_else(
+                                || settings.default_download_dir.clone(),
+                                |id| {
+                                    resolve_category_dir(&settings, &id)
+                                        .to_string_lossy()
+                                        .into_owned()
+                                },
+                            )
+                    })
+                } else {
+                    current.to_string()
+                }
+            } else {
+                ctrl.main.get_add_save_dir().to_string()
+            };
             generation = ctrl.add_state.generation;
         });
         std::thread::spawn(move || {
@@ -3903,7 +6609,11 @@ fn wire_main_callbacks(main: &MainWindow) {
                 let _ = slint::invoke_from_event_loop(move || {
                     with_controller(|ctrl| {
                         if ctrl.main.get_add_open() && ctrl.add_state.generation == generation {
-                            ctrl.main.set_add_save_dir(path.into());
+                            if batch {
+                                ctrl.main.set_add_batch_save_dir(path.into());
+                            } else {
+                                ctrl.main.set_add_save_dir(path.into());
+                            }
                         }
                     });
                 });
@@ -3987,11 +6697,105 @@ fn wire_main_callbacks(main: &MainWindow) {
 
     // Settings Callbacks
     main.on_settings_close_requested(|| {
-        with_controller(|ctrl| ctrl.main.set_settings_open(false));
+        with_controller(|ctrl| {
+            if !ctrl.main.get_set_saving() {
+                ctrl.close_settings_dialog();
+            }
+        });
     });
 
     main.on_settings_save_clicked(|| {
         with_controller(|ctrl| ctrl.save_settings());
+    });
+    main.on_settings_clear_proxy_password_clicked(|| {
+        with_controller(|ctrl| {
+            ctrl.main.set_set_proxy_password("".into());
+            if ctrl.main.get_set_proxy_has_password() {
+                ctrl.edit_network_secrets(
+                    |app| async move { app.set_proxy_password(None).await },
+                    false,
+                );
+            }
+        });
+    });
+    main.on_settings_add_site_login_clicked(|| {
+        with_controller(|ctrl| {
+            let host_pattern = ctrl.main.get_set_site_login_host().trim().to_owned();
+            let password = ctrl.main.get_set_site_login_password();
+            if host_pattern.is_empty() || password.is_empty() {
+                return;
+            }
+            let entry = SiteLoginEntry {
+                host_pattern,
+                username: ctrl.main.get_set_site_login_username().trim().to_owned(),
+                auth_scheme: if ctrl.main.get_set_site_login_scheme_index() == 1 {
+                    SiteAuthScheme::Bearer
+                } else {
+                    SiteAuthScheme::Basic
+                },
+                ..Default::default()
+            };
+            let password = password.to_string();
+            ctrl.edit_network_secrets(
+                move |app| async move { app.upsert_site_login(entry, Some(password)).await },
+                true,
+            );
+        });
+    });
+    main.on_settings_delete_site_login_clicked(|id| {
+        with_controller(|ctrl| {
+            let id = id.to_string();
+            ctrl.edit_network_secrets(
+                move |app| async move { app.delete_site_login(&id).await },
+                false,
+            );
+        });
+    });
+
+    main.on_settings_browse_blocklist_clicked(|| with_controller(|ctrl| ctrl.browse_blocklist()));
+    main.on_settings_refresh_vpn_adapters_clicked(|| {
+        with_controller(|ctrl| ctrl.refresh_vpn_adapters());
+    });
+    main.on_settings_add_rss_feed_clicked(|| with_controller(ControllerState::add_rss_feed));
+    main.on_settings_remove_rss_feed_clicked(|id| {
+        let id = id.to_string();
+        with_controller(|ctrl| {
+            ctrl.edit_rss_feeds(move |rules| rules.retain(|rule| rule.id != id), false)
+        });
+    });
+    main.on_settings_toggle_rss_feed_clicked(|id| {
+        let id = id.to_string();
+        with_controller(|ctrl| {
+            ctrl.edit_rss_feeds(
+                move |rules| {
+                    if let Some(rule) = rules.iter_mut().find(|rule| rule.id == id) {
+                        rule.enabled = !rule.enabled;
+                    }
+                },
+                false,
+            );
+        });
+    });
+    main.on_settings_poll_rss_now_clicked(|| with_controller(|ctrl| ctrl.poll_rss_now()));
+    main.on_settings_open_create_torrent_clicked(|| {
+        with_controller(ControllerState::open_create_torrent)
+    });
+    main.on_create_torrent_browse_source_file_clicked(|| {
+        with_controller(|ctrl| ctrl.browse_create_torrent(CreateTorrentPicker::SourceFile));
+    });
+    main.on_create_torrent_browse_source_folder_clicked(|| {
+        with_controller(|ctrl| ctrl.browse_create_torrent(CreateTorrentPicker::SourceFolder));
+    });
+    main.on_create_torrent_browse_output_clicked(|| {
+        with_controller(|ctrl| ctrl.browse_create_torrent(CreateTorrentPicker::Output));
+    });
+    main.on_create_torrent_create_clicked(|| with_controller(|ctrl| ctrl.create_torrent()));
+    main.on_create_torrent_close_requested(|| {
+        with_controller(|ctrl| {
+            if !ctrl.main.get_create_torrent_creating() {
+                ctrl.main.set_create_torrent_open(false);
+            }
+        });
     });
 
     main.on_settings_browse_download_dir(|| {
@@ -4012,7 +6816,7 @@ fn wire_main_callbacks(main: &MainWindow) {
 
     main.on_settings_hibernate_now(|| {
         with_controller(|ctrl| {
-            ctrl.main.set_settings_open(false);
+            ctrl.close_settings_dialog();
             let _ = ctrl.main.hide();
         });
     });
@@ -4092,6 +6896,272 @@ fn wire_main_callbacks(main: &MainWindow) {
         with_controller(|ctrl| ctrl.install_update());
     });
 
+    main.on_toggle_alt_speed_clicked(|| {
+        with_controller(|ctrl| {
+            let Some(app) = ctrl.app.clone() else { return };
+            ctrl.runtime.spawn(async move {
+                let res = app.toggle_alt_speed().await;
+                let _ = slint::invoke_from_event_loop(move || {
+                    with_controller(|ctrl| match res {
+                        Ok(enabled) => {
+                            ctrl.refresh_theme_from_settings();
+                            ctrl.show_toast(
+                                if enabled {
+                                    "Snail / Alt Speed enabled"
+                                } else {
+                                    "Snail / Alt Speed disabled"
+                                },
+                                false,
+                            );
+                        }
+                        Err(err) => ctrl.show_toast(format!("Alt Speed error: {err}"), true),
+                    });
+                });
+            });
+        });
+    });
+
+    main.on_queue_filter_changed(|queue_id| {
+        with_controller(|ctrl| {
+            let next = if ctrl.main.get_active_queue_filter() == queue_id {
+                "".into()
+            } else {
+                queue_id
+            };
+            ctrl.main.set_active_queue_filter(next);
+            ctrl.refresh_views();
+        });
+    });
+
+    main.on_toggle_queue_paused(|queue_id, pause| {
+        with_controller(|ctrl| {
+            let Some(app) = ctrl.app.clone() else { return };
+            let qid = queue_id.to_string();
+            ctrl.runtime.spawn(async move {
+                let res = if pause {
+                    app.pause_queue(&qid).await
+                } else {
+                    app.start_queue(&qid).await
+                };
+                let _ = slint::invoke_from_event_loop(move || {
+                    with_controller(|ctrl| match res {
+                        Ok(()) => ctrl.refresh_theme_from_settings(),
+                        Err(err) => ctrl.show_toast(format!("Queue update failed: {err}"), true),
+                    });
+                });
+            });
+        });
+    });
+
+    main.on_bulk_queue(|index| {
+        with_controller(|ctrl| {
+            let ids = ctrl.selection.ordered_ids();
+            let qid = ctrl.queues.get(index.max(0) as usize).map(|q| q.id.clone());
+            if ids.len() > 1 {
+                if let Some(queue_id) = qid {
+                    ctrl.main.set_bulk_editor(0);
+                    ctrl.dispatch_bulk_action(ids, BulkAction::Queue(queue_id));
+                }
+            }
+        });
+    });
+
+    main.on_settings_add_queue(|name, concurrent_raw, action_idx| {
+        with_controller(|ctrl| {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                ctrl.main
+                    .set_set_error_text("Enter a queue name before adding.".into());
+                return;
+            }
+            let mut base_id = crate::settings::category_id(trimmed);
+            if base_id.is_empty() {
+                base_id = "queue".into();
+            }
+            base_id.truncate(28);
+            let mut id = base_id.clone();
+            let mut suffix = 2usize;
+            while ctrl.draft_queues.iter().any(|q| q.id == id) {
+                id = format!("{base_id}-{suffix}");
+                suffix += 1;
+            }
+            let max_concurrent = concurrent_raw
+                .trim()
+                .parse::<usize>()
+                .unwrap_or(2)
+                .clamp(1, 16);
+            ctrl.draft_queues.push(DownloadQueueSpec {
+                id,
+                name: trimmed.to_owned(),
+                max_concurrent,
+                speed_limit_bps: None,
+                post_action: post_action_from_index(action_idx),
+                paused: false,
+            });
+            ctrl.main.set_set_new_queue_name("".into());
+            ctrl.main.set_set_error_text("".into());
+            ctrl.sync_settings_automation_models();
+        });
+    });
+
+    main.on_settings_remove_queue(|queue_id| {
+        with_controller(|ctrl| {
+            if queue_id.as_str() == "default" {
+                return;
+            }
+            ctrl.draft_queues.retain(|q| q.id != queue_id.as_str());
+            ctrl.sync_settings_automation_models();
+        });
+    });
+
+    main.on_settings_add_watch_folder(|delete_after_add| {
+        let mut owner = 0_isize;
+        let mut expected_session = 0_u64;
+        with_controller(|ctrl| {
+            owner = hwnd_of(ctrl.main.window());
+            expected_session = ctrl.settings_session_id;
+        });
+        std::thread::spawn(move || {
+            if let Ok(Some(folder)) = win32::pick_download_folder(owner, None) {
+                let _ = slint::invoke_from_event_loop(move || {
+                    with_controller(|ctrl| {
+                        if !ctrl.main.get_settings_open()
+                            || ctrl.settings_session_id != expected_session
+                        {
+                            return;
+                        }
+                        let base = Path::new(&folder)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(crate::settings::category_id)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| "watch".into());
+                        let mut id = base.clone();
+                        let mut suffix = 2usize;
+                        while ctrl.draft_watch_folders.iter().any(|w| w.id == id) {
+                            id = format!("{base}-{suffix}");
+                            suffix += 1;
+                        }
+                        ctrl.draft_watch_folders.push(WatchFolderRule {
+                            id,
+                            folder,
+                            target_save_dir: None,
+                            queue_id: None,
+                            category_id: None,
+                            enabled: true,
+                            delete_torrent_after_add: delete_after_add,
+                            start_paused: false,
+                        });
+                        ctrl.sync_settings_automation_models();
+                    });
+                });
+            }
+        });
+    });
+
+    main.on_settings_remove_watch_folder(|rule_id| {
+        with_controller(|ctrl| {
+            ctrl.draft_watch_folders
+                .retain(|w| w.id != rule_id.as_str());
+            ctrl.sync_settings_automation_models();
+        });
+    });
+
+    main.on_settings_export_backup(|| {
+        let mut owner = 0_isize;
+        let mut expected_session = 0_u64;
+        with_controller(|ctrl| {
+            owner = hwnd_of(ctrl.main.window());
+            expected_session = ctrl.settings_session_id;
+        });
+        std::thread::spawn(move || {
+            if let Some(chosen) =
+                win32::pick_json_backup_file(true, Some("slipstream-settings-backup.json"), owner)
+            {
+                let _ = slint::invoke_from_event_loop(move || {
+                    with_controller(|ctrl| {
+                        if !ctrl.main.get_settings_open()
+                            || ctrl.settings_session_id != expected_session
+                        {
+                            return;
+                        }
+                        let Some(app) = ctrl.app.clone() else { return };
+                        let path = PathBuf::from(&chosen);
+                        ctrl.runtime.spawn(async move {
+                            let res = app.export_settings_backup(&path).await;
+                            let _ = slint::invoke_from_event_loop(move || {
+                                with_controller(|ctrl| {
+                                    if !ctrl.main.get_settings_open()
+                                        || ctrl.settings_session_id != expected_session
+                                    {
+                                        return;
+                                    }
+                                    match res {
+                                        Ok(()) => {
+                                            ctrl.main.set_set_backup_notice(
+                                                format!("Exported backup to {chosen}").into(),
+                                            );
+                                            ctrl.main.set_set_error_text("".into());
+                                        }
+                                        Err(err) => ctrl.main.set_set_error_text(err.into()),
+                                    }
+                                });
+                            });
+                        });
+                    });
+                });
+            }
+        });
+    });
+
+    main.on_settings_import_backup(|| {
+        let mut owner = 0_isize;
+        let mut expected_session = 0_u64;
+        with_controller(|ctrl| {
+            owner = hwnd_of(ctrl.main.window());
+            expected_session = ctrl.settings_session_id;
+        });
+        std::thread::spawn(move || {
+            if let Some(chosen) = win32::pick_json_backup_file(false, None, owner) {
+                let _ = slint::invoke_from_event_loop(move || {
+                    with_controller(|ctrl| {
+                        if !ctrl.main.get_settings_open()
+                            || ctrl.settings_session_id != expected_session
+                        {
+                            return;
+                        }
+                        let Some(app) = ctrl.app.clone() else { return };
+                        let path = PathBuf::from(&chosen);
+                        ctrl.runtime.spawn(async move {
+                            let res = app.import_settings_backup(&path).await;
+                            let _ = slint::invoke_from_event_loop(move || {
+                                with_controller(|ctrl| {
+                                    if !ctrl.main.get_settings_open()
+                                        || ctrl.settings_session_id != expected_session
+                                    {
+                                        return;
+                                    }
+                                    match res {
+                                        Ok(_) => {
+                                            ctrl.refresh_theme_from_settings();
+                                            ctrl.open_settings_dialog();
+                                            ctrl.main.set_set_settings_tab(1);
+                                            ctrl.main.set_set_backup_notice(
+                                                format!("Imported settings backup from {chosen}")
+                                                    .into(),
+                                            );
+                                        }
+                                        Err(err) => ctrl.main.set_set_error_text(err.into()),
+                                    }
+                                });
+                            });
+                        });
+                    });
+                });
+            }
+        });
+    });
+
     // Palette, Refresh, Verify callbacks
     main.on_palette_query_edited(|_| {
         with_controller(|ctrl| ctrl.update_palette_actions());
@@ -4111,6 +7181,7 @@ fn wire_main_callbacks(main: &MainWindow) {
                     ctrl.apply_theme(next_light, ctrl.is_mono);
                 }
                 "settings" => ctrl.open_settings_dialog(),
+                "export_urls" => ctrl.export_selected_urls(),
                 "check_updates" => {
                     ctrl.open_settings_dialog();
                     ctrl.check_updates(false);
@@ -4188,6 +7259,10 @@ fn wire_main_callbacks(main: &MainWindow) {
 }
 
 pub fn run_app(demo_mode: bool) -> Result<(), String> {
+    run_app_with_options(demo_mode, DaemonOptions::default())
+}
+
+pub fn run_app_with_options(demo_mode: bool, mut options: DaemonOptions) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -4197,16 +7272,16 @@ pub fn run_app(demo_mode: bool) -> Result<(), String> {
     main.set_version_label(crate::desktop_version().into());
     main.set_demo_mode(demo_mode);
     wire_main_callbacks(&main);
+    wire_file_drop(main.window());
 
     let (app, is_light, is_mono) = if demo_mode {
         (None, false, false)
     } else {
         let slots = Arc::new(SharedBridgeSlots::default());
         let ui: Arc<dyn UiBridge> = Arc::new(NativeUi::new(slots.clone()));
-        let options = DaemonOptions {
-            resource_dir: default_resource_dir(),
-            ..DaemonOptions::default()
-        };
+        if options.resource_dir.is_none() {
+            options.resource_dir = default_resource_dir();
+        }
         let app_state = runtime.block_on(AppState::start(default_data_dir(), ui, options))?;
         *slots.app.lock().unwrap() = Some(app_state.clone());
 
@@ -4236,7 +7311,31 @@ pub fn run_app(demo_mode: bool) -> Result<(), String> {
         last_batch: None,
         speed_history: VecDeque::with_capacity(MAX_SPEED_SAMPLES),
         expanded_playlists: HashSet::new(),
-        selected_id: None,
+        selection: TransferSelection::default(),
+        categories: app
+            .as_ref()
+            .map_or_else(view_model::demo_categories, |app| app.settings().categories),
+        queues: app
+            .as_ref()
+            .map_or_else(default_download_queues, |app| app.settings().queues),
+        draft_queues: Vec::new(),
+        draft_watch_folders: Vec::new(),
+        settings_session_id: 0,
+        create_torrent_session_id: 0,
+        settings_initial_alt_speed: false,
+        rss_feeds_model: Rc::default(),
+        site_logins_model: Rc::default(),
+        grabber_items_model: Rc::default(),
+        grabber_session_id: 0,
+        grabber_scan: None,
+        pending_bulk_remove: Vec::new(),
+        drop_basket: None,
+        completion_banner: None,
+        completion_timer: Timer::default(),
+        settings_task: None,
+        preference_revision: 0,
+        saved_preference_revision: 0,
+        logs: Vec::new(),
         models: DesktopModels::default(),
         last_disk_check: None,
         disk_space: None,
@@ -4247,6 +7346,7 @@ pub fn run_app(demo_mode: bool) -> Result<(), String> {
         torrent_file_apply_pending: HashSet::new(),
         torrent_peers: HashMap::new(),
         torrent_peers_pending: HashSet::new(),
+        torrent_actions_pending: HashSet::new(),
         pending_transfer_dialogs: HashSet::new(),
         torrent_preview_files_model: Rc::default(),
         toast_timer: Timer::default(),
@@ -4274,13 +7374,20 @@ pub fn run_app(demo_mode: bool) -> Result<(), String> {
         ctrl.main
             .set_torrent_preview_files(ctrl.torrent_preview_files_model.clone().into());
         ctrl.apply_theme(is_light, is_mono);
-        ctrl.show_main_window();
         if demo_mode {
+            ctrl.show_main_window();
             let demo = demo_telemetry_batch();
-            ctrl.apply_telemetry(demo.clone());
+            push_speed_sample(&mut ctrl.speed_history, speed_sample(&demo));
             ctrl.apply_telemetry(demo);
         } else if let Some(app_state) = &app {
+            let settings = app_state.settings();
+            let minimized = crate::start_minimized() || settings.launch_minimized;
+            if !minimized || ctrl._tray_icon.is_none() {
+                ctrl.show_main_window();
+            }
+            ctrl.load_preferences(&settings);
             let initial = runtime.block_on(app_state.snapshot());
+            push_speed_sample(&mut ctrl.speed_history, speed_sample(&initial));
             ctrl.apply_telemetry(initial);
             ctrl.check_updates(true);
 
@@ -4303,6 +7410,23 @@ pub fn run_app(demo_mode: bool) -> Result<(), String> {
                 }
             });
         }
+    }
+
+    if let Some(app) = &app {
+        let mut alerts = app.subscribe_completion_alerts();
+        runtime.spawn(async move {
+            loop {
+                match alerts.recv().await {
+                    Ok(alert) => {
+                        let _ = slint::invoke_from_event_loop(move || {
+                            with_controller(|ctrl| ctrl.completion_alert(alert));
+                        });
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
     }
 
     if let Some(source) = crate::take_initial_picker_source() {
@@ -4347,6 +7471,12 @@ pub fn run_app(demo_mode: bool) -> Result<(), String> {
                         action = Some("pause_all");
                     } else if ids.resume_all.as_ref() == Some(&ev.id) {
                         action = Some("resume_all");
+                    } else if ids
+                        .drop_basket
+                        .as_ref()
+                        .is_some_and(|item| item.id() == &ev.id)
+                    {
+                        action = Some("drop_basket");
                     } else if ids.quit.as_ref() == Some(&ev.id) {
                         action = Some("quit");
                     }
@@ -4361,6 +7491,7 @@ pub fn run_app(demo_mode: bool) -> Result<(), String> {
                     }),
                     Some("pause_all") => with_controller(|ctrl| ctrl.set_all_paused(true)),
                     Some("resume_all") => with_controller(|ctrl| ctrl.set_all_paused(false)),
+                    Some("drop_basket") => with_controller(ControllerState::toggle_drop_basket),
                     Some("quit") => with_controller(|ctrl| {
                         if let Some(a) = &ctrl.app {
                             let ac = a.clone();
@@ -4383,6 +7514,7 @@ pub fn run_app(demo_mode: bool) -> Result<(), String> {
             with_controller(|ctrl| {
                 let Some(app) = ctrl.app.clone() else { return };
                 let settings = app.settings();
+                ctrl.sync_automation_status();
 
                 // Poll Windows Personalize theme when System theme mode is active (~1.8s cadence)
                 ctrl.theme_poll_counter = ctrl.theme_poll_counter.wrapping_add(1);
@@ -4527,6 +7659,34 @@ mod tests {
         reconcile_vec_model_by_key(&rows, vec![after], |row| row.id.as_str(), same_transfer_row);
         assert_eq!(rows.row_data(0).unwrap().segments.row_count(), 16);
         assert_eq!(rows.row_data(0).unwrap().segments.row_data(15), Some(0.5));
+    }
+
+    #[test]
+    fn range_selection_uses_visible_order_and_keeps_the_anchor() {
+        let mut selection = TransferSelection::default();
+        selection.update_visible(["one", "three", "two", "four"].map(str::to_owned).to_vec());
+        selection.click("three", false, false);
+        selection.click("four", false, true);
+        assert_eq!(selection.ordered_ids(), ["three", "two", "four"]);
+        assert_eq!(selection.selected_id.as_deref(), Some("four"));
+
+        selection.click("two", false, true);
+        assert_eq!(selection.ordered_ids(), ["three", "two"]);
+        selection.click("two", true, false);
+        assert_eq!(selection.selected_id.as_deref(), Some("three"));
+        selection.update_visible(vec!["four".into()]);
+        assert!(selection.ordered_ids().is_empty());
+        selection.select_all();
+        assert_eq!(selection.ordered_ids(), ["four"]);
+        selection.clear();
+        selection.update_visible(vec!["four".into()]);
+        assert!(selection.selected_id.is_none());
+    }
+
+    #[test]
+    fn batch_hint_counts_unique_urls_and_supports_ef2_blocks() {
+        let text = "\u{feff}# List\n<\nhttps://example.org/file.zip#one\nReferer: https://example.net\nhttps://ignored.example/test\n>\nhttps://example.org/file.zip#two\nnot a URL\nhttps://example.org/other.zip";
+        assert_eq!(batch_url_count(text), 2);
     }
 
     #[test]

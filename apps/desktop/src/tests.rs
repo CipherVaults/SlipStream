@@ -590,6 +590,100 @@ fn settings_normalize_validates_paths_and_trims_tool_paths() {
 }
 
 #[test]
+fn settings_normalizes_the_transfer_sort_column() {
+    let temp = TempDir::new();
+    let mut settings = AppSettings {
+        default_download_dir: temp.0.join("downloads").to_string_lossy().into_owned(),
+        ..AppSettings::default()
+    };
+    for column in [
+        "date", "name", "size", "progress", "speed", "eta", "status", "category",
+    ] {
+        settings.sort_column = column.into();
+        normalize(&mut settings, &temp.0).unwrap();
+        assert_eq!(settings.sort_column, column);
+    }
+    for column in ["", "unknown", "Name", " speed "] {
+        settings.sort_column = column.into();
+        normalize(&mut settings, &temp.0).unwrap();
+        assert_eq!(settings.sort_column, "date");
+    }
+}
+
+#[test]
+fn settings_normalizes_phase2_automation_fields_and_rejects_unsafe_watch_folders() {
+    let temp = TempDir::new();
+    let downloads = temp.0.join("Downloads");
+    let watch_ok = temp.0.join("WatchOk");
+    let outside = temp.0.join("Outside");
+    let junction = temp.0.join("WatchJunction");
+    fs::create_dir_all(&downloads).unwrap();
+    fs::create_dir_all(&watch_ok).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    directory_junction(&junction, &outside);
+
+    let mut settings = AppSettings {
+        default_download_dir: downloads.to_string_lossy().into_owned(),
+        alt_speed_enabled: true,
+        alt_speed_limit_bps: Some(128), // below 16 KiB/s floor -> clamped
+        queues: vec![],                 // empty -> repopulated with default queues
+        ..AppSettings::default()
+    };
+    settings.schedule.start_minute_of_day = 2500; // modulo 1440 = 1060
+    settings.bandwidth_guard.watched_processes = vec![
+        "  Zoom.EXE  ".into(),
+        "zoom.exe".into(),
+        r"bad\path.exe".into(),
+        "".into(),
+    ];
+    settings.watch_folders = vec![slipstream_protocol::WatchFolderRule {
+        id: "Movies!".into(),
+        folder: watch_ok.to_string_lossy().into_owned(),
+        target_save_dir: None,
+        queue_id: Some("default".into()),
+        category_id: None,
+        enabled: true,
+        delete_torrent_after_add: false,
+        start_paused: false,
+    }];
+
+    normalize(&mut settings, &temp.0).unwrap();
+    assert_eq!(settings.alt_speed_limit_bps, Some(16_384));
+    assert_eq!(settings.schedule.start_minute_of_day, 1060);
+    assert_eq!(settings.bandwidth_guard.watched_processes, vec!["zoom.exe"]);
+    assert_eq!(settings.queues.len(), 2);
+    assert_eq!(settings.queues[0].id, "default");
+    assert_eq!(settings.watch_folders[0].id, "movies");
+    assert_eq!(
+        settings.watch_folders[0].queue_id.as_deref(),
+        Some("default")
+    );
+
+    let absent = temp.0.join("Unplugged").join("Watch");
+    settings.watch_folders[0].folder = absent.to_string_lossy().into_owned();
+    settings.watch_folders[0].target_save_dir =
+        Some(absent.join("Destination").to_string_lossy().into_owned());
+    normalize(&mut settings, &temp.0).unwrap();
+    assert!(!absent.exists());
+
+    let mut bad = AppSettings {
+        default_download_dir: downloads.to_string_lossy().into_owned(),
+        ..AppSettings::default()
+    };
+    bad.watch_folders = vec![slipstream_protocol::WatchFolderRule {
+        id: "evil".into(),
+        folder: junction.to_string_lossy().into_owned(),
+        target_save_dir: None,
+        queue_id: None,
+        category_id: None,
+        enabled: true,
+        delete_torrent_after_add: false,
+        start_paused: false,
+    }];
+    assert!(normalize(&mut bad, &temp.0).is_err());
+}
+
+#[test]
 fn toolchain_status_defaults_new_fields_and_preserves_explicit_nulls() {
     let mut json = json!({
         "ytdlp_path": "C:\\Tools\\yt-dlp.exe",

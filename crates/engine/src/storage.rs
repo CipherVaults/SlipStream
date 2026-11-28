@@ -13,6 +13,13 @@ pub(crate) struct Record {
     pub filename: String,
     pub use_server_filename: bool,
     pub source_url: String,
+    // The transfer row stores JSON. Old SQLite rows default to the primary URL.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirror_urls: Vec<String>,
+    #[serde(default)]
+    pub representation_source: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_size_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duplicate_url_digest: Option<String>,
     pub source_domain: String,
@@ -28,6 +35,8 @@ pub(crate) struct Record {
     pub max_connections: u8,
     pub protocol: String,
     pub queue_id: String,
+    #[serde(default)]
+    pub queue_paused: bool,
     pub error: Option<String>,
     pub sha256_verified: Option<bool>,
     pub commit_digest: Option<String>,
@@ -53,6 +62,9 @@ impl Record {
 
     pub(crate) fn set_status(&mut self, status: TransferStatus) {
         self.status = status;
+        if status != TransferStatus::Paused {
+            self.queue_paused = false;
+        }
         self.updated_at = Utc::now();
         self.error = None;
     }
@@ -175,11 +187,40 @@ impl Database {
     }
 
     pub(crate) fn save_queue(&self, config: &QueueConfig) -> Result<()> {
-        self.0.execute(
-            "INSERT INTO queues(id, config) VALUES (?1, ?2)
-             ON CONFLICT(id) DO UPDATE SET config = excluded.config",
-            params![config.id, serde_json::to_string(config)?],
-        )?;
+        save_queue(&self.0, config)
+    }
+
+    pub(crate) fn sync_queues(
+        &mut self,
+        queues: &HashMap<String, QueueConfig>,
+        removed: &[String],
+        updated: &[Record],
+    ) -> Result<()> {
+        let transaction = self.0.transaction()?;
+        for config in queues.values() {
+            save_queue(&transaction, config)?;
+        }
+        for record in updated {
+            save_record(&transaction, record)?;
+        }
+        for id in removed {
+            transaction.execute("DELETE FROM queues WHERE id = ?1", [id])?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn remove_queue(
+        &mut self,
+        queue_id: &str,
+        updated_records: &[Record],
+    ) -> Result<()> {
+        let transaction = self.0.transaction()?;
+        for record in updated_records {
+            save_record(&transaction, record)?;
+        }
+        transaction.execute("DELETE FROM queues WHERE id = ?1", params![queue_id])?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -262,6 +303,15 @@ impl Database {
         }
         Ok(())
     }
+}
+
+fn save_queue(connection: &Connection, config: &QueueConfig) -> Result<()> {
+    connection.execute(
+        "INSERT INTO queues(id, config) VALUES (?1, ?2)
+         ON CONFLICT(id) DO UPDATE SET config = excluded.config",
+        params![config.id, serde_json::to_string(config)?],
+    )?;
+    Ok(())
 }
 
 fn save_record(conn: &Connection, record: &Record) -> Result<()> {

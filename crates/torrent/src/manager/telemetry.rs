@@ -1,5 +1,6 @@
 use super::{torrent_trackers, Entry, EntryState, ManagerInner};
 use crate::{TorrentError, TorrentVersion};
+use chrono::Utc;
 use librqbit::{api::TorrentIdOrHash, Api, TorrentStats, TorrentStatsState};
 use slipstream_protocol::{
     TorrentFileEntry, TorrentPeerEntry, TorrentPeerSummary, TransferKind, TransferSnapshot,
@@ -13,6 +14,7 @@ pub struct TorrentStatsReport {
     pub initialized: bool,
     /// Completion of the selected files, which may be a subset of the torrent.
     pub finished: bool,
+    pub seeding_seconds: u64,
     pub sequential: bool,
     pub download_limit_bps: Option<u64>,
     pub upload_limit_bps: Option<u64>,
@@ -115,7 +117,11 @@ impl Entry {
             ratio: report.ratio,
             completed_pieces: count(report.completed_pieces),
             total_pieces: count(report.total_pieces),
-            trackers: torrent_trackers(state.metadata.as_deref(), self.magnet.as_ref()),
+            trackers: torrent_trackers(
+                state.metadata.as_deref(),
+                self.magnet.as_ref(),
+                &state.extra_trackers,
+            ),
             peers,
         }
     }
@@ -135,6 +141,19 @@ impl Entry {
             self.sync_bitmap(manager, state, stats.unwrap());
         }
         let finished = initialized && stats.is_some_and(|stats| stats.finished);
+        if initialized && state.reset_completion_after_recheck {
+            if !finished {
+                state.completed_at = None;
+            }
+            state.reset_completion_after_recheck = false;
+        }
+        let seeding_seconds = if finished {
+            let now = Utc::now();
+            let completed_at = state.completed_at.get_or_insert(now);
+            (now - *completed_at).num_seconds().max(0) as u64
+        } else {
+            0
+        };
         let metadata = state.metadata.as_ref();
         let (total_bytes, downloaded_bytes) = metadata.map_or_else(
             || {
@@ -237,7 +256,7 @@ impl Entry {
             filename,
             source_url: self.source.clone(),
             source_domain: String::new(),
-            save_dir: self.save_dir.to_string_lossy().into_owned(),
+            save_dir: state.save_dir.to_string_lossy().into_owned(),
             total_bytes,
             downloaded_bytes,
             uploaded_bytes,
@@ -264,6 +283,8 @@ impl Entry {
             speed_limit_bps: state.options.download_limit_bps,
             connect_rtt_ms: None,
             description: None,
+            category_id: None,
+            tags: Vec::new(),
             created_at: self.created_at,
             updated_at: state.updated_at,
         };
@@ -272,6 +293,7 @@ impl Entry {
             snapshot,
             initialized,
             finished,
+            seeding_seconds,
             sequential,
             download_limit_bps: state.options.download_limit_bps,
             upload_limit_bps: state.options.upload_limit_bps,

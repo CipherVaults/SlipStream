@@ -14,6 +14,131 @@ import {
 } from "./widgets.slint";
 import { ConnectionRowModel, TorrentPeerRowModel } from "./app_types.slint";
 
+export component DropBasketWindow inherits Window {
+    title: "SlipStream Drop Basket";
+    width: 224px;
+    height: 72px;
+    no-frame: true;
+    always-on-top: true;
+    background: Theme.bg-canvas;
+    default-font-family: Theme.font-sans;
+
+    in property <string> down-speed: "0 B/s";
+    in property <string> up-speed: "0 B/s";
+    in property <int> active-count: 0;
+    callback start-drag();
+    callback show-main();
+    callback add-download();
+    callback hide-basket();
+
+    Rectangle {
+        background: Theme.bg-elevated;
+        border-radius: 9px;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+
+        drag-area := TouchArea {
+            property <length> drag-x;
+            property <length> drag-y;
+            property <bool> drag-armed: false;
+            mouse-cursor: grab;
+            pointer-event(event) => {
+                if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                    self.drag-x = self.mouse-x;
+                    self.drag-y = self.mouse-y;
+                    self.drag-armed = true;
+                } else if event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel {
+                    self.drag-armed = false;
+                }
+            }
+            moved => {
+                if self.drag-armed && self.pressed && (Math.abs((self.mouse-x - self.drag-x) / 1px) > 4 || Math.abs((self.mouse-y - self.drag-y) / 1px) > 4) {
+                    self.drag-armed = false;
+                    root.start-drag();
+                }
+            }
+            double-clicked => { root.show-main(); }
+        }
+
+        HorizontalLayout {
+            padding: 9px;
+            spacing: 8px;
+
+            Image {
+                source: @image-url("../icons/icon.png");
+                width: 28px;
+                height: 28px;
+                y: (parent.height - self.height) / 2;
+            }
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                spacing: 2px;
+                Text { text: "↓ " + root.down-speed; color: Theme.accent; font-size: 11px; overflow: elide; }
+                Text { text: "↑ " + root.up-speed; color: Theme.green; font-size: 11px; overflow: elide; }
+                HorizontalLayout {
+                    alignment: start;
+                    PillBadge { text: root.active-count + " active"; tone: root.active-count > 0 ? 1 : 0; }
+                }
+            }
+            CircleIconButton {
+                icon: @image-url("icons/plus.svg");
+                ghost-square: true;
+                y: (parent.height - self.height) / 2;
+                clicked => { root.add-download(); }
+            }
+            CircleIconButton {
+                icon: @image-url("icons/x.svg");
+                ghost-square: true;
+                y: (parent.height - self.height) / 2;
+                clicked => { root.hide-basket(); }
+            }
+        }
+    }
+}
+
+export component CompletionBannerWindow inherits Window {
+    title: "SlipStream completion";
+    width: 320px;
+    height: 72px;
+    no-frame: true;
+    always-on-top: true;
+    background: Theme.bg-elevated;
+    default-font-family: Theme.font-sans;
+
+    in property <string> headline;
+    in property <string> filename;
+    callback dismissed();
+
+    Rectangle {
+        border-width: 1px;
+        border-color: Theme.accent;
+        HorizontalLayout {
+            padding: 12px;
+            spacing: 10px;
+            Image {
+                source: @image-url("../icons/icon.png");
+                width: 28px;
+                height: 28px;
+                y: (parent.height - self.height) / 2;
+            }
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                spacing: 3px;
+                Text { text: root.headline; font-size: 13px; color: Theme.text-1; overflow: elide; }
+                Text { text: root.filename; font-size: 11px; color: Theme.text-2; overflow: elide; }
+            }
+            CircleIconButton {
+                icon: @image-url("icons/x.svg");
+                ghost-square: true;
+                y: (parent.height - self.height) / 2;
+                clicked => { root.dismissed(); }
+            }
+        }
+    }
+}
+
 component FloatingChrome inherits HorizontalLayout {
     in property <string> title-text;
     in property <bool> show-minimize: true;

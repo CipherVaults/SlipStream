@@ -1,4 +1,4 @@
-use crate::{EngineError, Result};
+use crate::{EngineError, EngineProxyConfig, Result};
 use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use futures_util::{StreamExt, TryStreamExt};
@@ -11,7 +11,7 @@ use reqwest::header::{
 use reqwest::{Client, Method, Response, StatusCode, Version};
 use serde::{Deserialize, Serialize};
 use slipstream_protocol::{is_private_or_loopback_ip, sanitize_filename, validate_http_url};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -144,14 +144,34 @@ pub(crate) struct Source {
 }
 
 pub(crate) struct Http {
+    clients: HttpClients,
+    strict_clients: Option<HttpClients>,
+    proxy_hosts: Arc<HashSet<String>>,
+    allow_loopback: bool,
+}
+
+struct HttpClients {
     client: Client,
     ipv4_client: Client,
-    allow_loopback: bool,
+    http1_client: Client,
+    http1_ipv4_client: Client,
+}
+
+impl HttpClients {
+    fn select(&self, profile: FetchProfile) -> &Client {
+        match (profile.ipv4_only, profile.http1_only) {
+            (false, false) => &self.client,
+            (true, false) => &self.ipv4_client,
+            (false, true) => &self.http1_client,
+            (true, true) => &self.http1_ipv4_client,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct FetchProfile {
     pub(crate) ipv4_only: bool,
+    pub(crate) http1_only: bool,
     strip_cookies: bool,
     strip_referer: bool,
 }
@@ -166,6 +186,34 @@ impl FetchProfile {
                 EngineError::InvalidRequest(message) => message == Self::IPV4_REQUIRED,
                 _ => false,
             }
+    }
+
+    pub(crate) fn should_fallback_http1(self, error: &EngineError) -> bool {
+        if self.http1_only {
+            return false;
+        }
+        match error {
+            EngineError::Status { status, .. } => status.as_u16() == 421,
+            EngineError::Http(err) => {
+                let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+                while let Some(cause) = current {
+                    let msg = cause.to_string().to_ascii_lowercase();
+                    if msg.contains("http2")
+                        || msg.contains("h2")
+                        || msg.contains("refused_stream")
+                        || msg.contains("enhance_your_calm")
+                        || msg.contains("protocol_error")
+                        || msg.contains("goaway")
+                        || msg.contains("reset by peer")
+                    {
+                        return true;
+                    }
+                    current = cause.source();
+                }
+                err.is_request()
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn fallback(
@@ -202,6 +250,7 @@ pub(crate) enum ProbeMode {
 struct CheckedDns {
     allow_loopback: bool,
     ipv4_only: bool,
+    proxy_hosts: Arc<HashSet<String>>,
 }
 
 #[derive(Clone)]
@@ -211,11 +260,16 @@ impl Resolve for CheckedDns {
     fn resolve(&self, name: Name) -> Resolving {
         let allow_loopback = self.allow_loopback;
         let ipv4_only = self.ipv4_only;
+        let trusted_proxy = self
+            .proxy_hosts
+            .contains(name.as_str().trim_end_matches('.'));
         Box::pin(async move {
             let mut addrs: Vec<SocketAddr> =
                 tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
-            for addr in &addrs {
-                check_ip(addr.ip(), allow_loopback)?;
+            if !trusted_proxy {
+                for addr in &addrs {
+                    check_ip(addr.ip(), allow_loopback)?;
+                }
             }
             if ipv4_only {
                 addrs.retain(SocketAddr::is_ipv4);
@@ -256,6 +310,10 @@ fn check_destination(url: Url, allow_loopback: bool) -> Result<Url> {
     Ok(url)
 }
 
+pub(crate) fn validate_download_url(raw: &str, allow_loopback: bool) -> Result<Url> {
+    check_destination(validate_http_url(raw)?, allow_loopback)
+}
+
 /// Resolve a redirect location and apply the URL and literal IP policy.
 /// The HTTP client also applies the IP policy to every DNS result before dialing.
 pub fn validate_redirect_target(base: &Url, location: &str, allow_loopback: bool) -> Result<Url> {
@@ -269,13 +327,20 @@ pub fn validate_redirect_target(base: &Url, location: &str, allow_loopback: bool
 }
 
 impl Source {
+    pub(crate) fn for_mirror(&self, raw: &str, allow_loopback: bool) -> Result<Self> {
+        let url = validate_download_url(raw, allow_loopback)?;
+        let mut headers = self.headers.clone();
+        apply_redirect_header_policy(&mut headers, &self.url, &url);
+        Ok(Self { url, headers })
+    }
+
     pub(crate) fn new(
         raw_url: &str,
         headers: &HashMap<String, String>,
         referrer: Option<&str>,
         allow_loopback: bool,
     ) -> Result<Self> {
-        let url = check_destination(validate_http_url(raw_url)?, allow_loopback)?;
+        let url = validate_download_url(raw_url, allow_loopback)?;
         let mut request_headers = HeaderMap::new();
         for (name, value) in headers {
             let name = HeaderName::from_bytes(name.as_bytes())
@@ -343,9 +408,15 @@ impl Source {
 }
 
 impl Http {
-    pub(crate) fn new(allow_loopback: bool, timeout: Duration) -> Result<Self> {
-        let build = |ipv4_only| {
-            Client::builder()
+    pub(crate) fn new(
+        allow_loopback: bool,
+        timeout: Duration,
+        config: &EngineProxyConfig,
+    ) -> Result<Self> {
+        let proxies = config.proxies()?;
+        let proxy_hosts = Arc::new(proxies.hosts);
+        let build = |ipv4_only, http1_only, proxy_hosts| {
+            let mut builder = Client::builder()
                 .use_rustls_tls()
                 .redirect(reqwest::redirect::Policy::none())
                 .no_proxy()
@@ -360,15 +431,45 @@ impl Http {
                 .dns_resolver(Arc::new(CheckedDns {
                     allow_loopback,
                     ipv4_only,
-                }))
-                .build()
-                .map_err(EngineError::Http)
+                    proxy_hosts,
+                }));
+            if http1_only {
+                builder = builder.http1_only();
+            }
+            for proxy in &proxies.rules {
+                builder = builder.proxy(proxy.clone());
+            }
+            builder.build().map_err(EngineError::Http)
+        };
+        let client_set = |hosts: &Arc<HashSet<String>>| -> Result<HttpClients> {
+            Ok(HttpClients {
+                client: build(false, false, hosts.clone())?,
+                ipv4_client: build(true, false, hosts.clone())?,
+                http1_client: build(false, true, hosts.clone())?,
+                http1_ipv4_client: build(true, true, hosts.clone())?,
+            })
         };
         Ok(Self {
-            client: build(false)?,
-            ipv4_client: build(true)?,
+            clients: client_set(&proxy_hosts)?,
+            strict_clients: (!proxy_hosts.is_empty())
+                .then(|| client_set(&Arc::default()))
+                .transpose()?,
+            proxy_hosts,
             allow_loopback,
         })
+    }
+
+    fn client(&self, url: &Url, profile: FetchProfile) -> &Client {
+        // Proxy endpoints may be private. If the destination itself names a proxy,
+        // use strict DNS so a bypass rule cannot grant it that exception.
+        match (url.host(), &self.strict_clients) {
+            (Some(Host::Domain(host)), Some(strict))
+                if self.proxy_hosts.contains(host.trim_end_matches('.')) =>
+            {
+                strict.select(profile)
+            }
+            _ => self.clients.select(profile),
+        }
     }
 
     async fn request(
@@ -380,11 +481,6 @@ impl Http {
         if_range: Option<&str>,
     ) -> Result<Response> {
         let mut url = source.url.clone();
-        let client = if profile.ipv4_only {
-            &self.ipv4_client
-        } else {
-            &self.client
-        };
         let mut headers = if profile.strip_referer {
             [USER_AGENT, ACCEPT, ACCEPT_LANGUAGE, ACCEPT_ENCODING]
                 .into_iter()
@@ -419,7 +515,8 @@ impl Http {
                 ));
             }
             let started = Instant::now();
-            let mut response = client
+            let mut response = self
+                .client(&url, profile)
                 .request(method.clone(), url.clone())
                 .headers(headers.clone())
                 .send()
@@ -476,7 +573,13 @@ impl Http {
                 .await
             {
                 Ok(response) => Some(response),
-                Err(error) if error.is_transient() && !profile.ipv4_unavailable(&error) => None,
+                Err(error)
+                    if error.is_transient()
+                        && !profile.ipv4_unavailable(&error)
+                        && !profile.should_fallback_http1(&error) =>
+                {
+                    None
+                }
                 Err(error) => return Err(error),
             };
             initial_rtt = head.as_ref().and_then(connect_rtt_ms);
@@ -1093,6 +1196,7 @@ mod tests {
         let resolver = CheckedDns {
             allow_loopback: true,
             ipv4_only: true,
+            proxy_hosts: Arc::default(),
         };
         let addresses: Vec<_> = resolver
             .resolve("localhost".parse().unwrap())

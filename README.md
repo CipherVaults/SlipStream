@@ -24,9 +24,10 @@ SlipStream combines a multi-segment HTTP download engine, a managed `yt-dlp` + `
 Traditional Windows download managers often expose an unauthenticated localhost HTTP server to intercept browser downloads—allowing arbitrary websites or local scripts to hit control APIs. SlipStream replaces that pattern with **Browser Native Messaging → current-user SID-ACL Windows Named Pipe (`PIPE_REJECT_REMOTE_CLIENTS` + 256-bit `D:P` `session.token`)**, narrowed browser RPC privileges, explicit path/junction confinement, and clean visual restraint.
 
 - **Created by:** Mohamed Sayed
+- **Publisher:** CipherVaults
 - **Target OS:** Windows 10 / Windows 11 (`x86_64`)
 - **Public repository:** [CipherVaults/SlipStream](https://github.com/CipherVaults/SlipStream)
-- **Latest release:** [v2.1.0](https://github.com/CipherVaults/SlipStream/releases/tag/v2.1.0)
+- **Latest release:** [v3.0.0](https://github.com/CipherVaults/SlipStream/releases/tag/v3.0.0)
 
 ---
 
@@ -72,6 +73,7 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 
 ## Security & Verification
 
+- **v3.0.0 Power-User Automation, BitTorrent, DPAPI Privacy & Safety Eval Verification:** Added Win32 DPAPI secret storage (`vault.dat`), `Direct` / Windows `System` / `Manual` HTTP(S) proxy modes, origin-scoped HTTPS `SiteLoginEntry` auth headers, multi-mirror HTTP failover, Metalink v3/v4 parsing, same-origin `SHA256SUMS` discovery, bounded HTML Site Grabber with SSRF loopback guards, VPN adapter kill-switch, live upload limits, SOCKS5, seed ratio/time caps, RSS Auto-Downloader, scheduled speed windows, Gaming/Process Guard, named queues, safe auto-extraction, and privileged `PRIVILEGED_YTDLP_FLAGS` gating—verified with **311 / 311** passing Rust workspace tests (including `slipstream-safety-eval` 1,200 single-input + 108 stateful chaos chains) and **87 / 87** browser extension Vitest tests.
 - **v2.1.0 Reliability, Torrent Preview & Audit Verification:** Remediated all 19 findings from the independent cross-model Codex CLI (`gpt-6.2-sol`) audit across DNS-validated magnet previews, expired preview token rejection, keyed `Rc<VecModel>` click stability, Win32 foreground/monitor fit without `AttachThreadInput`, concurrent `.local-picker` handoff retries, extension `magnet:` fallback navigation, non-destructive `SlipStream.Magnet` NSIS registration, and `skip_serializing_if` backward wire compatibility—verified with **219 / 219** passing Rust workspace tests (including `slipstream-safety-eval`) and **87 / 87** browser extension Vitest tests.
 - **v2.0.0 Pure Rust + Slint Audit & Verification:** Replaced Tauri v2, WebView2 (`msedgewebview2.exe`), and Node/React desktop dependencies with a single native Slint binary (`0` child WebView2 processes). Remediated all 19 findings from the cross-model Codex CLI (`gpt-6.2-sol`) audit across Win32 clipboard bounds/COM pickers/Open-with, origin-scoped seeded headers, overlay state handling, and signed update staging (`FILE_SHARE_READ` lock + CI `slipstream-sign --verify` gate), verified with **209 / 209** passing Rust workspace tests and **69 / 69** browser extension tests.
 - **v1.2.1 Security Audit & DevSecOps Review (`run-2`, `/security-audit` + `/security-auditor`):** Audited `23` coverage units (`15` `candidate`, `7` `covered`, `1` `out_of_scope`) across Rust engines, MV3 extension, React UI, and GitHub Actions with cross-model Codex CLI + Neon verification (`0` confirmed vulnerabilities under read-only/offline policy; `3` prior `v1.0.0` leads verified mitigated in `v1.2.0`). `v1.2.1` landed defense-in-depth hardening across `48+` files—including Completed/legacy SQLite credential scrubbing, strict cross-origin redirect header allowlists + origin-only `Referer` trimming, media userinfo rejection + proxy env cleanup, BitTorrent public-tracker filtering, Win32 Job Objects for `ffmpeg` grandchildren, `GrabBatchUrls` & probe concurrency bounds, WebView CSP/referrer hardening, floating pill live-format & incognito fixes, collision-safe playlist folders/filenames, SHA-pinned CI/Release actions, and lockfile-pinned `@tauri-apps/cli`.
@@ -81,8 +83,8 @@ Traditional Windows download managers often expose an unauthenticated localhost 
 
 ## Download, Installation & Browser Setup
 
-1. **Installer** Download `SlipStream_2.1.0_x64-setup.exe` and run the per-user installer. It includes the native messaging host, media tools, and both browser extension builds. [v2.1.0 release assets](https://github.com/CipherVaults/SlipStream/releases/tag/v2.1.0)
-2. **Portable ZIP** Extract `SlipStream-2.1.0-windows-x64-portable.zip` and run `SlipStream.exe`. Keep the extracted `bin/` and `extensions/` directories beside it.
+1. **Installer** Download `SlipStream_3.0.0_x64-setup.exe` and run the per-user installer. It includes the native messaging host, media tools, and both browser extension builds. [v3.0.0 release assets](https://github.com/CipherVaults/SlipStream/releases/tag/v3.0.0)
+2. **Portable ZIP** Extract `SlipStream-3.0.0-windows-x64-portable.zip` and run `SlipStream.exe`. Keep the extracted `bin/` and `extensions/` directories beside it.
 3. **Browser extension** In **Settings → Browser Integration**, select your browser. For Chrome, Edge, or Brave, enable **Developer mode**, select **Load unpacked**, and choose the revealed folder. In Firefox, choose **Load Temporary Add-on** and select the revealed `manifest.json`. Separate browser extension ZIPs are also available on the release page.
 
 **Upgrading from v1.x** SlipStream keeps the valid native messaging IDs already registered for each browser and adds the bundled extension ID. If an older unpacked copy’s ID is missing from the registration, copy the ID from the browser’s extensions page and enter it in **Settings → Browser Integration** for that browser.
@@ -127,7 +129,7 @@ The release workflow smoke-tests pinned media tools in a job with no secrets. Th
 
 ## Credits
 
-SlipStream is created, designed, and maintained by **Mohamed Sayed**.
+SlipStream is created, designed, and maintained by **Mohamed Sayed** (Publisher: **CipherVaults**).
 
 ---
 

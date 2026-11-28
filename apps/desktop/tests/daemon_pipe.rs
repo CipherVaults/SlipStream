@@ -284,6 +284,7 @@ fn http_request(server: &HttpServer, path: &str, filename: &str) -> AddHttpDownl
         expected_size_bytes: None,
         start_paused: false,
         overwrite_existing: false,
+        ..AddHttpDownloadRequest::default()
     }
 }
 
@@ -332,6 +333,7 @@ fn options(pipe: &str, registry_key: &str) -> DaemonOptions {
     DaemonOptions {
         pipe_name: Some(pipe.into()),
         allow_loopback: true,
+        allow_power_actions: false,
         registry_base_key: Some(registry_key.into()),
         resource_dir: None,
         torrent: TorrentManagerConfig {
@@ -347,6 +349,12 @@ fn installed_settings(data: &Path, downloads: &Path) -> AppSettings {
     let settings = AppSettings {
         default_download_dir: downloads.to_string_lossy().into_owned(),
         auto_defender_scan: false,
+        torrent_network: slipstream_protocol::TorrentNetworkSettings {
+            listen_port_start: 0,
+            listen_port_end: 0,
+            enable_dht: false,
+            ..Default::default()
+        },
         ..AppSettings::default()
     };
     fs::write(
@@ -355,6 +363,302 @@ fn installed_settings(data: &Path, downloads: &Path) -> AppSettings {
     )
     .unwrap();
     settings
+}
+
+#[tokio::test]
+async fn batch_import_metadata_exports_and_native_diagnostics_round_trip() {
+    let temp = TempDir::new();
+    let downloads = temp.0.join("Downloads");
+    installed_settings(&temp.0, &downloads);
+    let pipe = format!(r"\\.\pipe\SlipStream.BatchImport.{}", Uuid::new_v4());
+    let registry = RegistryKey::isolated();
+    let mut config = options(&pipe, &registry.0);
+    config.allow_loopback = false;
+    let state = AppState::start(temp.0.clone(), Arc::new(FakeUi::default()), config)
+        .await
+        .unwrap();
+    let zip = "https://example.com/files/item.ZIP";
+    let uncategorized = "https://example.com/unknown";
+    let magnet = "magnet:?xt=urn:btih:abababababababababababababababababababab";
+    let text = format!("\u{feff}  {zip}\r\n{zip}#duplicate\r\n<\r\n{uncategorized}\r\nCookie: secret\r\nreferer: http://127.0.0.1/\r\n>\r\n{magnet}\r\nhttp://127.0.0.1/blocked\r\nhttp://169.254.169.254/blocked\r\n");
+    let summary = state
+        .add_batch_urls(&text, None, Some("video".into()), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        (summary.added, summary.skipped, summary.errors.len()),
+        (3, 3, 2)
+    );
+    assert!(summary
+        .errors
+        .iter()
+        .all(|error| error.contains("private or loopback")));
+
+    let batch = state.snapshot().await;
+    assert!(batch
+        .transfers
+        .iter()
+        .all(|row| row.category_id.as_deref() == Some("video")
+            && row.status == TransferStatus::Paused));
+    let zip_id = batch
+        .transfers
+        .iter()
+        .find(|row| row.source_url == zip)
+        .unwrap()
+        .id
+        .clone();
+    let other_id = batch
+        .transfers
+        .iter()
+        .find(|row| row.source_url == uncategorized)
+        .unwrap()
+        .id
+        .clone();
+    let torrent_id = batch
+        .transfers
+        .iter()
+        .find(|row| row.kind == TransferKind::Torrent)
+        .unwrap()
+        .id
+        .clone();
+    let ids = vec![
+        zip_id.clone(),
+        other_id.clone(),
+        zip_id.clone(),
+        "missing".into(),
+    ];
+    assert_eq!(state.set_transfers_category(&ids, None).await.unwrap(), 2);
+    assert!(state
+        .set_transfers_category(&ids, Some("missing".into()))
+        .await
+        .is_err());
+    assert_eq!(
+        state
+            .get_transfer_snapshot(&zip_id)
+            .await
+            .unwrap()
+            .category_id
+            .as_deref(),
+        Some("compressed")
+    );
+    assert_eq!(
+        state
+            .get_transfer_snapshot(&other_id)
+            .await
+            .unwrap()
+            .category_id
+            .as_deref(),
+        Some("general")
+    );
+    let tags: Vec<_> = ["  libr\nar\ty ", "library", "\u{7f}", &"雪".repeat(30)]
+        .into_iter()
+        .map(str::to_owned)
+        .chain((0..10).map(|i| format!("tag-{i}")))
+        .collect();
+    assert_eq!(state.set_transfers_tags(&ids, tags).await.unwrap(), 2);
+    let updated = state.get_transfer_snapshot(&zip_id).await.unwrap();
+    assert_eq!(updated.tags.len(), 8);
+    assert_eq!(updated.tags[..2], ["library", &"雪".repeat(24)]);
+    let metadata_path = temp.0.join("transfer_meta.json");
+    let sidecar: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    assert_eq!(sidecar[&zip_id]["tags"][0], "library");
+    assert_eq!(sidecar[&torrent_id]["category_id"], "video");
+
+    let token = SessionToken::read(&temp.0.join("session.token")).unwrap();
+    let mut bridge = Bridge(Some(
+        PipeClient::connect(&pipe, &token, "batch-test")
+            .await
+            .unwrap(),
+    ));
+    let Response::Status { batch, .. } = bridge.request(Request::GetStatus).await else {
+        panic!("expected native telemetry");
+    };
+    let row = batch.transfers.iter().find(|row| row.id == zip_id).unwrap();
+    assert_eq!(row.tags, updated.tags);
+    assert_eq!(row.category_id, updated.category_id);
+    assert!(matches!(
+        bridge
+            .request(Request::PauseTransfer {
+                transfer_id: "missing".into()
+            })
+            .await,
+        Response::Error { .. }
+    ));
+    assert!(state.get_logs().iter().any(|log| log.category == "pipe"));
+
+    let urls = temp.0.join("urls.txt");
+    fs::write(&urls, "old export").unwrap();
+    let mut export_ids = ids.clone();
+    export_ids.push(torrent_id.clone());
+    assert_eq!(
+        state
+            .export_transfer_urls(&export_ids, urls.to_str().unwrap())
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        fs::read_to_string(urls).unwrap(),
+        format!("{zip}\n{uncategorized}\n{magnet}\n")
+    );
+    let diagnostics = temp.0.join("diagnostics.log");
+    let count = state.get_logs().len();
+    assert_eq!(
+        state
+            .export_logs(diagnostics.to_str().unwrap())
+            .await
+            .unwrap(),
+        count
+    );
+    let logs = fs::read_to_string(diagnostics).unwrap();
+    assert!(logs.contains("Batch import: 3 added, 3 skipped"));
+    assert!(logs.contains("Authenticated native request failed"));
+    assert!(!logs.contains("secret"));
+
+    let junction = temp.0.join("junction");
+    directory_junction(&junction, &downloads);
+    for path in [
+        PathBuf::from("relative.txt"),
+        PathBuf::from(r"\\host\share\out.txt"),
+        junction.join("bad.txt"),
+        junction.clone(),
+        downloads.join("..").join("traversal.txt"),
+        downloads.clone(),
+        downloads.join("out.txt:stream"),
+    ] {
+        let path = path.to_str().unwrap();
+        assert!(
+            state.export_transfer_urls(&export_ids, path).await.is_err(),
+            "{path}"
+        );
+        assert!(state.export_logs(path).await.is_err(), "{path}");
+    }
+    assert!(!downloads.join("bad.txt").exists());
+    assert!(!temp.0.join("traversal.txt").exists());
+
+    assert_eq!(
+        state
+            .bulk_set_speed_limit(&ids, Some(128_000))
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        state
+            .get_transfer_snapshot(&zip_id)
+            .await
+            .unwrap()
+            .speed_limit_bps,
+        Some(128_000)
+    );
+    assert_eq!(
+        state.bulk_stop(&[other_id.clone(), "missing".into()]).await,
+        1
+    );
+    assert_eq!(
+        state.get_transfer_snapshot(&other_id).await.unwrap().status,
+        TransferStatus::Canceled
+    );
+    assert_eq!(
+        state
+            .bulk_remove(&[other_id.clone(), other_id.clone()], false)
+            .await,
+        1
+    );
+    let sidecar: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    assert!(sidecar.get(&other_id).is_none());
+    state.shutdown().await.unwrap();
+    drop(bridge);
+
+    let restarted = AppState::start(
+        temp.0.clone(),
+        Arc::new(FakeUi::default()),
+        options(&format!("{pipe}-restart"), &registry.0),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        restarted.get_transfer_snapshot(&zip_id).await.unwrap().tags,
+        updated.tags
+    );
+    assert!(restarted.get_transfer_snapshot(&other_id).await.is_err());
+    let sidecar: serde_json::Value =
+        serde_json::from_slice(&fs::read(metadata_path).unwrap()).unwrap();
+    assert!(sidecar.get(&torrent_id).is_none());
+    restarted.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn bulk_resume_delivers_fresh_http_completion_alerts_without_replaying_history() {
+    let temp = TempDir::new();
+    let downloads = temp.0.join("Downloads");
+    installed_settings(&temp.0, &downloads);
+    let pipe = format!(r"\\.\pipe\SlipStream.CompletionAlert.{}", Uuid::new_v4());
+    let registry = RegistryKey::isolated();
+    let server = HttpServer::start().await;
+    let state = AppState::start(
+        temp.0.clone(),
+        Arc::new(FakeUi::default()),
+        options(&pipe, &registry.0),
+    )
+    .await
+    .unwrap();
+    let mut alerts = state.subscribe_completion_alerts();
+    let mut request = http_request(&server, "hold", "first.bin");
+    let id = state.add_http_download(request.clone()).await.unwrap();
+    wait_for(&state, &id, TransferStatus::Active).await;
+    assert_eq!(
+        state
+            .bulk_pause(&[id.clone(), id.clone(), "missing".into()])
+            .await,
+        1
+    );
+    wait_for(&state, &id, TransferStatus::Paused).await;
+    request.url = server.url("download");
+    state
+        .refresh_download_url(RefreshDownloadUrlRequest {
+            transfer_id: id.clone(),
+            new_url: request.url.clone(),
+            headers: HashMap::new(),
+            referrer: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(state.bulk_resume(std::slice::from_ref(&id)).await, 1);
+    let alert = timeout(Duration::from_secs(15), alerts.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(alert.transfer_id, id);
+    assert_eq!(alert.kind, TransferKind::Http);
+    assert_eq!(alert.filename, "first.bin");
+    state.shutdown().await.unwrap();
+
+    let restarted = AppState::start(
+        temp.0.clone(),
+        Arc::new(FakeUi::default()),
+        options(&format!("{pipe}-restart"), &registry.0),
+    )
+    .await
+    .unwrap();
+    let mut alerts = restarted.subscribe_completion_alerts();
+    request.filename = Some("second.bin".into());
+    let second = restarted.add_http_download(request).await.unwrap();
+    let alert = timeout(Duration::from_secs(15), alerts.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(alert.transfer_id, second);
+    assert!(timeout(Duration::from_millis(300), alerts.recv())
+        .await
+        .is_err());
+    assert_eq!(
+        restarted.get_transfer_snapshot(&id).await.unwrap().status,
+        TransferStatus::Completed
+    );
+    restarted.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -660,6 +964,7 @@ async fn media_download_opens_progress_and_completion_dialogs() {
     settings.ffmpeg_path = Some(executable);
     state.save_settings(settings).await.unwrap();
     let server = HttpServer::start().await;
+    let mut alerts = state.subscribe_completion_alerts();
     let id = state
         .add_media_download(media_request(&server.url("video")))
         .await
@@ -667,6 +972,12 @@ async fn media_download_opens_progress_and_completion_dialogs() {
     ui.wait_for("progress", &id).await;
     wait_for(&state, &id, TransferStatus::Completed).await;
     ui.wait_for("complete", &id).await;
+    let alert = timeout(Duration::from_secs(5), alerts.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(alert.transfer_id, id);
+    assert_eq!(alert.kind, TransferKind::Media);
     state.shutdown().await.unwrap();
 }
 
@@ -704,6 +1015,7 @@ fn media_request(url: &str) -> AddMediaDownloadRequest {
         selected_entries: None,
         playlist_folder_name: None,
         headers: Default::default(),
+        ..AddMediaDownloadRequest::default()
     }
 }
 
@@ -1073,6 +1385,7 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
                 selected_entries: None,
                 playlist_folder_name: None,
                 headers: Default::default(),
+                ..AddMediaDownloadRequest::default()
             },
         })
         .await;
@@ -1158,6 +1471,7 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
                     selected_entries: None,
                     playlist_folder_name: None,
                     headers: Default::default(),
+                    ..AddMediaDownloadRequest::default()
                 },
             })
             .await,
@@ -1197,7 +1511,7 @@ async fn pipe_routes_transfers_and_reopens_a_hibernated_window() {
     state.set_torrent_files(&torrent, vec![0]).await.unwrap();
     state.set_speed_limit(Some(7)).await.unwrap();
     let batch = state.snapshot().await;
-    assert_eq!(batch.speed_limit_bps, Some(7));
+    assert_eq!(batch.speed_limit_bps, Some(16_384));
     assert_eq!(
         batch
             .transfers
@@ -1449,7 +1763,7 @@ async fn settings_reload_and_rebase_an_empty_torrent_manager() {
     state.set_speed_limit(Some(1024)).await.unwrap();
     let persisted: AppSettings =
         serde_json::from_slice(&fs::read(temp.0.join("settings.json")).unwrap()).unwrap();
-    assert_eq!(persisted.global_speed_limit_bps, Some(1024));
+    assert_eq!(persisted.global_speed_limit_bps, Some(16_384));
     assert!(new_dir.is_dir());
     assert!(fs::read_dir(&temp.0).unwrap().all(|entry| entry
         .unwrap()
@@ -1467,7 +1781,7 @@ async fn settings_reload_and_rebase_an_empty_torrent_manager() {
         .await
         .unwrap();
     let batch = state.snapshot().await;
-    assert_eq!(batch.speed_limit_bps, Some(1024));
+    assert_eq!(batch.speed_limit_bps, Some(16_384));
     assert_eq!(batch.transfers[0].id, torrent);
     assert_eq!(
         fs::canonicalize(&batch.transfers[0].save_dir).unwrap(),
@@ -1483,7 +1797,7 @@ async fn settings_reload_and_rebase_an_empty_torrent_manager() {
     .unwrap();
     assert_eq!(state.settings().default_connections, 32);
     assert_eq!(state.settings().max_concurrent_downloads, 1);
-    assert_eq!(state.snapshot().await.speed_limit_bps, Some(1024));
+    assert_eq!(state.snapshot().await.speed_limit_bps, Some(16_384));
     state.shutdown().await.unwrap();
 }
 
@@ -1622,6 +1936,7 @@ async fn media_playlist_publishes_successful_items_with_original_indices_and_mot
                 selected_entries: None,
                 playlist_folder_name: None,
                 headers: Default::default(),
+                ..AddMediaDownloadRequest::default()
             },
         })
         .await;
@@ -2128,6 +2443,7 @@ async fn completed_media_shutdown_ssrf_guard_and_reparse_tool_rejection() {
                     selected_entries: None,
                     playlist_folder_name: None,
                     headers: Default::default(),
+                    ..AddMediaDownloadRequest::default()
                 })
                 .await
                 .is_err(),
@@ -2163,6 +2479,7 @@ async fn completed_media_shutdown_ssrf_guard_and_reparse_tool_rejection() {
             selected_entries: None,
             playlist_folder_name: None,
             headers: Default::default(),
+            ..AddMediaDownloadRequest::default()
         })
         .await
         .unwrap();
@@ -2213,9 +2530,175 @@ async fn completed_media_shutdown_ssrf_guard_and_reparse_tool_rejection() {
             selected_entries: None,
             playlist_folder_name: None,
             headers: Default::default(),
+            ..AddMediaDownloadRequest::default()
         })
         .await
         .unwrap();
     wait_for(&state, &media_id, TransferStatus::Completed).await;
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn phase2_alt_speed_backup_queues_and_auto_extract_round_trip() {
+    use std::io::Write;
+
+    let mut zip_buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut zip_buf);
+        writer
+            .start_file("hello.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"phase2 auto extract payload").unwrap();
+        writer.finish().unwrap();
+    }
+    let zip_bytes = zip_buf.into_inner();
+    let zip_for_server = zip_bytes.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let body = zip_for_server.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                while !buf.ends_with(b"\r\n\r\n") {
+                    let Ok(b) = stream.read_u8().await else {
+                        return;
+                    };
+                    buf.push(b);
+                }
+                let req = String::from_utf8_lossy(&buf);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes()).await;
+                if !req.starts_with("HEAD ") {
+                    let _ = stream.write_all(&body).await;
+                }
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+
+    let temp = TempDir::new();
+    let downloads = temp.0.join("Downloads");
+    let mut settings = installed_settings(&temp.0, &downloads);
+    settings.ytdlp_path = Some(
+        temp.0
+            .join("trusted-ytdlp.exe")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    settings.ffmpeg_path = Some(
+        temp.0
+            .join("trusted-ffmpeg.exe")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let trusted_tools = (settings.ytdlp_path.clone(), settings.ffmpeg_path.clone());
+    settings.alt_speed_limit_bps = Some(256 * 1024);
+    settings.auto_extract = slipstream_protocol::AutoExtractSettings {
+        enabled: true,
+        create_subfolder: true,
+        delete_archive_after_extract: false,
+        overwrite_existing: true,
+    };
+    fs::write(
+        temp.0.join("settings.json"),
+        serde_json::to_vec(&settings).unwrap(),
+    )
+    .unwrap();
+
+    let pipe = format!(r"\\.\pipe\SlipStream.Phase2.{}", Uuid::new_v4());
+    let registry = RegistryKey::isolated();
+    let mut config = options(&pipe, &registry.0);
+    config.allow_loopback = true;
+    let state = AppState::start(temp.0.clone(), Arc::new(FakeUi::default()), config)
+        .await
+        .unwrap();
+
+    assert!(!state.automation_status().alt_speed_active);
+    let toggled = state.toggle_alt_speed().await.unwrap();
+    assert!(toggled);
+    let status = state.automation_status();
+    assert!(status.alt_speed_active);
+    assert_eq!(status.effective_speed_limit_bps, Some(256 * 1024));
+
+    let backup_path = temp.0.join("slipstream-backup.json");
+    state.export_settings_backup(&backup_path).await.unwrap();
+    assert!(backup_path.is_file());
+    assert!(state
+        .export_settings_backup(Path::new(r"\\evil\share\b.json"))
+        .await
+        .is_err());
+    assert!(state
+        .import_settings_backup(Path::new(r"C:\Temp\..\evil.json"))
+        .await
+        .is_err());
+    let mut bundle: slipstream_protocol::SettingsBackupBundle =
+        serde_json::from_slice(&fs::read(&backup_path).unwrap()).unwrap();
+    bundle.settings.ytdlp_path = Some(
+        temp.0
+            .join("backup-ytdlp.exe")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    bundle.settings.ffmpeg_path = None;
+    fs::write(&backup_path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+    let imported = state.import_settings_backup(&backup_path).await.unwrap();
+    assert!(imported.alt_speed_enabled);
+    assert_eq!(imported.ytdlp_path, trusted_tools.0);
+    assert_eq!(imported.ffmpeg_path, trusted_tools.1);
+    let persisted: AppSettings =
+        serde_json::from_slice(&fs::read(temp.0.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(persisted.ytdlp_path, trusted_tools.0);
+    assert_eq!(persisted.ffmpeg_path, trusted_tools.1);
+
+    state.pause_queue("bulk").await.unwrap();
+    let tid = state
+        .add_http_download(AddHttpDownloadRequest {
+            url: format!("http://{addr}/bundle.zip"),
+            filename: Some("bundle.zip".into()),
+            save_dir: None,
+            max_connections: Some(1),
+            queue_id: Some("bulk".into()),
+            headers: HashMap::new(),
+            referrer: None,
+            expected_sha256: None,
+            expected_size_bytes: None,
+            start_paused: false,
+            overwrite_existing: true,
+            ..AddHttpDownloadRequest::default()
+        })
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        state.snapshot().await.transfers[0].status,
+        TransferStatus::Queued
+    );
+
+    state.start_queue("bulk").await.unwrap();
+    wait_for(&state, &tid, TransferStatus::Completed).await;
+
+    let extracted = downloads.join("bundle").join("hello.txt");
+    let mut zone = extracted.as_os_str().to_owned();
+    zone.push(":Zone.Identifier");
+    timeout(Duration::from_secs(5), async {
+        while !extracted.is_file() {
+            sleep(Duration::from_millis(25)).await;
+        }
+        // Publication is the synchronization point for both the file and its mark.
+        assert_eq!(fs::read(&zone).unwrap(), b"[ZoneTransfer]\r\nZoneId=3\r\n");
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        fs::read(&extracted).unwrap(),
+        b"phase2 auto extract payload"
+    );
+
+    server.abort();
     state.shutdown().await.unwrap();
 }

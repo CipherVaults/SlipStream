@@ -4,7 +4,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use slipstream_protocol::{validate_http_url, validate_safe_filename_component, MediaContainer};
+use slipstream_protocol::{
+    validate_http_proxy_url, validate_http_url, validate_safe_filename_component, MediaContainer,
+};
 
 use crate::MediaError;
 
@@ -39,7 +41,24 @@ const YTDLP_FLAGS: &[&str] = &[
     "--write-thumbnail",
     "--convert-thumbnails",
     "--add-metadata",
+    "--sponsorblock-remove",
+    "--embed-chapters",
+    "--split-chapters",
+    "--embed-thumbnail",
+    "--download-sections",
     "--",
+];
+const PRIVILEGED_YTDLP_FLAGS: &[&str] = &["--proxy", "--cookies-from-browser"];
+pub const COOKIE_BROWSERS: &[&str] = &["chrome", "edge", "brave", "firefox"];
+pub const SPONSORBLOCK_CATEGORIES: &[&str] = &[
+    "sponsor",
+    "intro",
+    "outro",
+    "selfpromo",
+    "preview",
+    "filler",
+    "interaction",
+    "music_offtopic",
 ];
 const FFMPEG_FLAGS: &[&str] = &[
     "-hide_banner",
@@ -290,6 +309,22 @@ pub(crate) fn is_http_403_error(error: &MediaError) -> bool {
     )
 }
 
+pub(crate) fn protect_ytdlp_error(
+    mut error: MediaError,
+    proxy: Option<&str>,
+    cookies_from_browser: Option<&str>,
+) -> MediaError {
+    let private_proxy = proxy
+        .and_then(|raw| validate_http_url(raw).ok())
+        .is_some_and(|url| !url.username().is_empty() || url.password().is_some());
+    if let (true, MediaError::ToolFailed { stderr, .. }) =
+        (private_proxy || cookies_from_browser.is_some(), &mut error)
+    {
+        *stderr = "yt-dlp failed while using private network credentials".into();
+    }
+    error
+}
+
 fn media_header<'a>(name: &str, value: &'a str) -> Result<(&'static str, &'a str), MediaError> {
     let name = ["Referer", "Origin", "User-Agent", "Accept-Language"]
         .into_iter()
@@ -507,6 +542,79 @@ impl BuildYtDlpArgs {
         self
     }
 
+    pub fn proxy(mut self, raw: &str) -> Result<Self, MediaError> {
+        let url = validate_http_proxy_url(raw)
+            .map_err(|_| MediaError::argument("proxy URL", "expected an HTTP or HTTPS proxy"))?;
+        self.privileged_option("--proxy", url.as_str());
+        Ok(self)
+    }
+
+    pub fn cookies_from_browser(mut self, browser: &str) -> Result<Self, MediaError> {
+        if !COOKIE_BROWSERS.contains(&browser) {
+            return Err(MediaError::argument("cookie browser", browser));
+        }
+        self.privileged_option("--cookies-from-browser", browser);
+        Ok(self)
+    }
+
+    pub fn sponsorblock_remove(mut self, categories: &[String]) -> Result<Self, MediaError> {
+        for category in categories {
+            if !SPONSORBLOCK_CATEGORIES.contains(&category.as_str()) {
+                return Err(MediaError::argument("SponsorBlock category", category));
+            }
+        }
+        if !categories.is_empty() {
+            self.option("--sponsorblock-remove", categories.join(","));
+        }
+        Ok(self)
+    }
+
+    pub fn embed_chapters(mut self) -> Self {
+        self.flag("--embed-chapters");
+        self
+    }
+
+    pub fn split_chapters(mut self, playlist: bool) -> Self {
+        self.flag("--split-chapters");
+        let stem = if playlist {
+            "%(playlist_index,autonumber)06d-%(autonumber)06d"
+        } else {
+            "%(autonumber)06d"
+        };
+        self.option(
+            "-o",
+            format!("chapter:media-{stem}-chapter-%(section_number)06d.%(ext)s"),
+        );
+        self
+    }
+
+    pub fn embed_thumbnail(mut self) -> Self {
+        self.flag("--embed-thumbnail");
+        self
+    }
+
+    pub fn download_sections(mut self, start: u64, end: u64) -> Result<Self, MediaError> {
+        if start >= end {
+            return Err(MediaError::argument(
+                "clip range",
+                "start must be before end",
+            ));
+        }
+        let time = |seconds: u64| {
+            format!(
+                "{:02}:{:02}:{:02}",
+                seconds / 3600,
+                seconds / 60 % 60,
+                seconds % 60
+            )
+        };
+        self.option(
+            "--download-sections",
+            format!("*{}-{}", time(start), time(end)),
+        );
+        Ok(self)
+    }
+
     pub fn build(mut self, url: &str) -> Result<Vec<OsString>, MediaError> {
         let url = validate_http_url(url)?;
         self.flag("--");
@@ -535,6 +643,12 @@ impl BuildYtDlpArgs {
 
     fn option(&mut self, flag: &str, value: impl Into<OsString>) {
         self.flag(flag);
+        self.args.push(value.into());
+    }
+
+    fn privileged_option(&mut self, flag: &str, value: impl Into<OsString>) {
+        debug_assert!(PRIVILEGED_YTDLP_FLAGS.contains(&flag));
+        self.args.push(flag.into());
         self.args.push(value.into());
     }
 }
@@ -696,6 +810,70 @@ fn container_muxer(container: MediaContainer) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase4_flags_are_separate_and_strictly_validated() {
+        let builder = BuildYtDlpArgs::download(false);
+        let args: Vec<_> = builder
+            .clone()
+            .proxy("https://proxy.example:8443")
+            .unwrap()
+            .cookies_from_browser("brave")
+            .unwrap()
+            .sponsorblock_remove(&["sponsor".into(), "music_offtopic".into()])
+            .unwrap()
+            .embed_chapters()
+            .split_chapters(false)
+            .embed_thumbnail()
+            .add_metadata()
+            .download_sections(65, 3_662)
+            .unwrap()
+            .build("https://example.org/video")
+            .unwrap();
+        for (flag, value) in [
+            ("--proxy", "https://proxy.example:8443/"),
+            ("--cookies-from-browser", "brave"),
+            ("--sponsorblock-remove", "sponsor,music_offtopic"),
+            ("--download-sections", "*00:01:05-01:01:02"),
+        ] {
+            if PRIVILEGED_YTDLP_FLAGS.contains(&flag) {
+                assert!(validate_ytdlp_flag(flag).is_err(), "{flag}");
+            } else {
+                validate_ytdlp_flag(flag).unwrap();
+            }
+            assert!(args
+                .windows(2)
+                .any(|pair| pair[0] == flag && pair[1] == value));
+        }
+        for flag in [
+            "--embed-chapters",
+            "--split-chapters",
+            "--embed-thumbnail",
+            "--add-metadata",
+        ] {
+            validate_ytdlp_flag(flag).unwrap();
+            assert!(args.iter().any(|arg| arg == flag));
+        }
+        for proxy in [
+            "--exec",
+            "socks5://proxy:8080",
+            "http://proxy\n--exec",
+            "http://proxy:0",
+        ] {
+            assert!(builder.clone().proxy(proxy).is_err());
+        }
+        for browser in ["chrome:/profile", "--exec", "Chrome", "safari"] {
+            assert!(builder.clone().cookies_from_browser(browser).is_err());
+        }
+        for category in ["all", "sponsor,intro", "--exec", "sponsor\n"] {
+            assert!(builder
+                .clone()
+                .sponsorblock_remove(&[category.into()])
+                .is_err());
+        }
+        assert!(builder.clone().download_sections(10, 9).is_err());
+        assert!(builder.download_sections(10, 10).is_err());
+    }
 
     #[test]
     fn http_403_retry_classifier_requires_a_distinct_status() {

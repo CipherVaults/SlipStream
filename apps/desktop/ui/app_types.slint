@@ -1,8 +1,46 @@
 // Shared Slint data models mirroring SlipStream core protocol & UI state
 
+export struct CategoryNavModel {
+    id: string,
+    name: string,
+    count: int,
+}
+
+export struct TagChipModel {
+    tag: string,
+    count: int,
+}
+
+export struct LogEntryModel {
+    timestamp: string,
+    level: string,
+    category: string,
+    message: string,
+}
+
+export struct SpeedGraphModel {
+    down-line: string,
+    down-fill: string,
+    up-line: string,
+    up-fill: string,
+    peak-down: string,
+    peak-up: string,
+    avg-down: string,
+    avg-up: string,
+    scale-max: string,
+}
+
 export struct TransferRowModel {
     id: string,
     filename: string,
+    selected: bool,
+    in-playlist: bool,
+    category-name: string,
+    tags-summary: string,
+    size-text: string,
+    speed-text: string,
+    eta-text: string,
+    added-text: string,
     kind: string,
     status: string,
     is-active: bool,
@@ -59,9 +97,23 @@ export struct SegmentTileModel {
 export struct TorrentFileRowModel {
     index: int,
     relative-path: string,
+    folder-label: string,
+    display-name: string,
     size-text: string,
     downloaded-text: string,
     selected: bool,
+}
+
+export struct RssFeedRuleItem {
+    id: string,
+    name: string,
+    feed-url: string,
+    include-pattern: string,
+    exclude-pattern: string,
+    poll-interval-minutes: int,
+    enabled: bool,
+    auto-start: bool,
+    last-error: string,
 }
 
 export struct TorrentPeerRowModel {
@@ -83,6 +135,8 @@ export struct TorrentPreviewFileModel {
 
 export struct InspectorModel {
     has-selection: bool,
+    category-id: string,
+    tags-summary: string,
     id: string,
     filename: string,
     source-url: string,
@@ -159,4 +213,38 @@ export struct ConnectionRowModel {
     num-text: string,
     downloaded-text: string,
     info-text: string,
+}
+
+export struct QueueItem {
+    id: string,
+    name: string,
+    count: int,
+    max-concurrent: int,
+    paused: bool,
+    post-action: string,
+}
+
+export struct WatchFolderItem {
+    id: string,
+    folder: string,
+    target-save-dir: string,
+    enabled: bool,
+    delete-after-add: bool,
+}
+
+export struct SiteLoginItem {
+    id: string,
+    host-pattern: string,
+    username: string,
+    auth-scheme: string,
+    has-password: bool,
+    enabled: bool,
+}
+
+export struct SiteGrabItemRow {
+    url: string,
+    filename: string,
+    kind: string,
+    source-page: string,
+    checked: bool,
 }
